@@ -587,6 +587,89 @@ def walk_geometry(page: Page) -> None:
     check(abs(strip_box()["w"] - 544) <= 2, f"a double-click did not restore the usual width: {strip_box()}")
 
 
+def walk_taps(page: Page) -> None:
+    """`#2266` step D, on a desk by mouse: a tap with no read standing
+    marks where Read starts and says nothing; a paused tap cues held;
+    a mid-paragraph tap starts at its sentence without scrolling; a
+    table tap starts at its row."""
+    card = page.locator("#documents-list .doc-card", has_text="canary-taps")
+    card.click()
+    page.wait_for_function(
+        "(words) => (document.getElementById('doc-body')?.textContent || '').includes(words)",
+        arg="TARGET-taps-GAMMA-1", timeout=20_000)
+    install_lit_log(page)
+    set_voice(page, False, "cloud")
+
+    def scroll_top() -> float:
+        return float(page.evaluate("() => document.getElementById('scroll-area').scrollTop"))
+
+    # No read standing: the tap only marks its block.
+    said_at = len(sidecar_texts())
+    para = page.locator("#doc-body > p", has_text="TARGET-taps-BETA-2").first
+    para.scroll_into_view_if_needed(timeout=20_000)
+    click_centre(page, para, False, "the BETA-2 paragraph (marking tap)")
+    marked = page.evaluate(
+        "() => document.querySelector('[data-read-start=\"true\"]')?.textContent || ''")
+    check("TARGET-taps-BETA-2" in str(marked), f"the tap marked {marked!r}, not its paragraph")
+    check(page.evaluate("() => document.getElementById('read-steer').hidden") is True,
+          "a marking tap brought the strip up")
+    check(len(sidecar_texts()) == said_at, "a marking tap said something")
+
+    # Read starts at the mark.
+    lit_at = lit_marker(page)
+    page.click("#read-aloud")
+    wait_first_lit(page, lit_at, "TARGET-taps-BETA-2", "Read from the mark")
+
+    # Paused: a tap cues its block held (not the last block, so the
+    # resume below still has somewhere to play to).
+    page.click("#read-aloud")
+    page.wait_for_function("() => readAloudOwner().nowPlaying?.paused === true", timeout=20_000)
+    lit_at = lit_marker(page)
+    beta1 = page.locator("#doc-body > p", has_text="TARGET-taps-BETA-1").first
+    beta1.scroll_into_view_if_needed(timeout=20_000)
+    click_centre(page, beta1, False, "the BETA-1 paragraph (paused tap)")
+    wait_first_lit(page, lit_at, "TARGET-taps-BETA-1", "the paused tap")
+    check(page.evaluate("() => readAloudOwner().nowPlaying?.paused === true") is True,
+          "a paused tap resumed the voice")
+    check(str(page.evaluate("() => document.getElementById('read-steer-count')?.textContent")) == "6 of 9",
+          "the paused tap did not cue its block")
+    page.click("#read-aloud")
+    page.wait_for_function("() => readAloudOwner().nowPlaying?.paused === false", timeout=20_000)
+
+    # A table tap starts at its row (its own spoken piece).
+    lit_at = lit_marker(page)
+    marker = len(sidecar_texts())
+    cell = page.locator("#doc-body td", has_text="ROW-GAMMA-taps").first
+    cell.scroll_into_view_if_needed(timeout=20_000)
+    click_centre(page, cell, False, "the ROW-GAMMA cell")
+    wait_first_lit(page, lit_at, "ROW-GAMMA-taps", "tapping the table row")
+    wait_said(page, "cloud", marker, "ROW-GAMMA-taps")
+
+    # A tap deep in a long paragraph starts at its sentence's piece,
+    # and the reader's scroll does not move for it.
+    long_para = page.locator("#doc-body > p", has_text="LONGtapsSTART").first
+    long_para.scroll_into_view_if_needed(timeout=20_000)
+    # Let follow-scroll settle: the top holds still across three looks.
+    before = scroll_top()
+    stable = 0
+    deadline = time.time() + 20
+    while stable < 3 and time.time() < deadline:
+        time.sleep(0.1)
+        now_top = scroll_top()
+        stable = stable + 1 if now_top == before else 0
+        before = now_top
+    box = long_para.bounding_box(timeout=20_000)
+    check(box is not None, "the long paragraph has no box to tap")
+    assert box is not None
+    lit_at = lit_marker(page)
+    marker = len(sidecar_texts())
+    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] * 0.8)
+    wait_first_lit(page, lit_at, "LONGtapsSTART", "tapping deep in the long paragraph")
+    wait_said(page, "cloud", marker, "third sentence")
+    check(abs(scroll_top() - before) <= 1,
+          f"a body tap scrolled the reader: {before} -> {scroll_top()}")
+
+
 def walk_authored(page: Page, touch: bool) -> None:
     card = page.locator("#documents-list .doc-card", has_text="authored-doc")
     if touch:
@@ -619,6 +702,7 @@ def main() -> int:
         (work / "canary-cloud").write_text(canary_document("cloudcanary"))
         (work / "canary-device").write_text(canary_document("devicecanary"))
         (work / "canary-phone").write_text(canary_document("phonecanary"))
+        (work / "canary-taps").write_text(canary_document("taps"))
         (work / "vibe-talk.toml").write_text(
             f'[server]\nbind = "127.0.0.1:{port}"\n'
             '[discord]\nbot_token = "documents-scrubber-check-bot-token-never-sent"\n'
@@ -647,7 +731,8 @@ def main() -> int:
                     check(time.time() < deadline, "the server did not come up")
                     time.sleep(0.25)
             names = ("big-phonecloud", "big-phonedevice", "big-deskcloud", "big-deskdevice",
-                     "authored-doc", "table-doc", "canary-cloud", "canary-device", "canary-phone")
+                     "authored-doc", "table-doc", "canary-cloud", "canary-device", "canary-phone",
+                     "canary-taps")
             call(base, "POST", f"/api/v1/channels/{CHANNEL}/reply", WRITE_TOKEN,
                  {"text": "Docs: " + " and ".join(f"https://paste.example/{name}" for name in names)})
             docs = []
@@ -701,6 +786,9 @@ def main() -> int:
                     ctx.close()
                 ctx, page = fresh_page(1280, 800, False)
                 walk_geometry(page)
+                ctx.close()
+                ctx, page = fresh_page(1280, 800, False)
+                walk_taps(page)
                 ctx.close()
                 browser.close()
             print("documents scrubber browser check: numbers on the document (author's win, title "

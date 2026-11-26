@@ -7203,6 +7203,16 @@ def _act_navigator_nested(driver: Driver) -> None:
     )
 
 
+def _act_navigator_marker(driver: Driver) -> None:
+    """`#2266` step D: a tap with no read standing marks where Read will start."""
+    _open_reader_doc(driver, NAVIGATOR_NESTED_URL, "navigator-nested", "137-navigator-read-start-marker")
+    driver.page.locator("#doc-body > p", has_text="Beta paragraph one").first.click()
+    driver.page.wait_for_function(
+        "() => !!document.querySelector('[data-read-start=\"true\"]')",
+        timeout=20_000,
+    )
+
+
 def _act_navigator_flat(driver: Driver) -> None:
     """`#2266`: a heading-less document: one § Whole document cell over its ticks."""
     _navigator_read(driver, NAVIGATOR_FLAT_URL, "navigator-flat", "133-navigator-flat")
@@ -11149,7 +11159,7 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="135-navigator-fat-after",
-        what="#2266 after one fat Next from §1: standing at the next section §1.1 (pair with 128)",
+        what="#2266 after one fat Next from §1: standing at the next section §1.1 (pair with 134)",
         act=_act_navigator_fat_after,
         profiles=MATRIX_PROFILES,
         expect=(
@@ -11160,12 +11170,24 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="136-navigator-thin-after",
-        what="#2266 after one thin Next from §1's heading: its first paragraph tick (pair with 128)",
+        what="#2266 after one thin Next from §1's heading: its first paragraph tick (pair with 134)",
         act=_act_navigator_thin_after,
         profiles=MATRIX_PROFILES,
         expect=(
             ("#2266 the first paragraph tick stands current after the thin press",
              "document.querySelector('#doc-nav .doc-nav-chunk[aria-current=\"true\"]')?.getAttribute('aria-label') === 'Read from 1 ¶ 1'"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="137-navigator-read-start-marker",
+        what="#2266 a tap with no read standing marks where Read will start (dashed frame, no strip)",
+        act=_act_navigator_marker,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("#2266 the tapped paragraph carries the read-start mark",
+             "!!document.querySelector('[data-read-start=\"true\"]')"),
+            ("no read stands for the mark", "document.getElementById('read-steer').hidden === true"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
@@ -11454,7 +11476,7 @@ def run_captures(
     # with the [documents] paste section (and the message cache) run.sh writes when those scenes
     # are NAMED with --only. A wider walk's server has neither, so it skips them by name, as it
     # skips Discuss above, rather than failing on a document that never registers.
-    reader_scenes = [s for s in scenes if s.name.startswith(("118-", "119-", "132-", "133-", "134-", "135-", "136-"))]
+    reader_scenes = [s for s in scenes if s.name.startswith(("118-", "119-", "132-", "133-", "134-", "135-", "136-", "137-"))]
     if reader_scenes and not wanted:
         for scene in reader_scenes:
             print(f"  skip  {scene.name:<30} no [documents] section on a wider walk's server")

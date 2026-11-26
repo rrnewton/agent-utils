@@ -35,7 +35,7 @@ interface Point { x: number; y: number }
  * maps back (`documentModelBlockForListed`). For a message read there is no
  * model and `block` stays the prepared list's own index.
  */
-interface ReadFrom { part: number; block: number | null; piece?: number; recovery?: number; hold?: boolean; chunk?: number }
+interface ReadFrom { part: number; block: number | null; piece?: number; offset?: number; recovery?: number; hold?: boolean; chunk?: number }
 
 /**
  * `#1838 vibe-talk-reader-continues-into-thread`. A read captured before a view switch, so the
@@ -766,12 +766,23 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       });
       if (flat.length === 0) throw new Error("This document has no text to read.");
       const wanted = doc!.from && doc!.from.block !== null
-        ? documentListedBlockForModel(listed, docPayload.kinds, doc!.from.block, doc!.from.piece ?? 0)
+        ? documentListedBlockForModel(listed, docPayload.kinds, doc!.from.block, fromPiece(doc!.from, docPayload.texts))
         : null;
       const startSegment = wanted === null || wanted === -1 ? 0
         : Math.max(0, segments.findIndex((segment) => segment.block === null || segment.block >= wanted));
       startAt = flat.findIndex((one) => one.segment >= startSegment);
       if (startAt < 0) startAt = 0;
+      // `#2266` step D: an offset seek starts inside its block — the
+      // device voice's own chunks of that block, walked to the offset.
+      const seekOffset = doc!.from?.offset;
+      if (seekOffset !== undefined && seekOffset > 0) {
+        let heard = 0;
+        while (startAt + 1 < flat.length && flat[startAt]!.segment === startSegment
+            && heard + flat[startAt]!.text.length < seekOffset) {
+          heard += flat[startAt]!.text.length;
+          startAt += 1;
+        }
+      }
     } else {
       const text = parts.map((part) => {
         const message = readableMessage(part);
@@ -2734,14 +2745,37 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     return nowPlaying === null ? 0 : (modelBlockOfPlaying(nowPlaying) ?? 0);
   }
 
+  /**
+   * `#2266` step D: which spoken piece of a model block holds char
+   * `offset` of its text, by the shared piece rule the server cuts by
+   * (clamped inside the block, so a drawn/model text drift still lands
+   * in the right block).
+   */
+  function pieceOfOffset(text: string, offset: number): number {
+    const pieces = readPieces(text);
+    for (let at = 0; at < pieces.length; at += 1) {
+      if (offset < pieces[at]!.end) return at;
+    }
+    return Math.max(0, pieces.length - 1);
+  }
+
+  /** A document seek's piece: its own, or its offset's piece in the block's text. */
+  function fromPiece(from: ReadFrom, texts: readonly string[]): number {
+    if (from.piece !== undefined) return from.piece;
+    if (from.offset !== undefined && from.block !== null) {
+      return pieceOfOffset(texts[from.block] ?? "", from.offset);
+    }
+    return 0;
+  }
+
   /** `#2266`: the segment a seek to model block `modelBlock` starts at in `playing`, or -1. */
-  function segmentOfModelBlock(playing: Playing, modelBlock: number): number {
+  function segmentOfModelBlock(playing: Playing, modelBlock: number, piece = 0): number {
     if (!playing.document || !playing.segments || playing.segments.length === 0) return -1;
     const current = playing.segments[playing.segment ?? 0] as SpeechSegment | undefined;
     const part = current ? current.part : 0;
     const listed = playing.blocks && playing.blocks[part] ? playing.blocks[part]! : null;
     if (!listed) return -1;
-    const target = documentListedBlockForModel(listed, playing.document.kinds, modelBlock, 0);
+    const target = documentListedBlockForModel(listed, playing.document.kinds, modelBlock, piece);
     if (target === -1) return -1;
     return playing.segments.findIndex((segment) =>
       segment.part === part && (segment.block === null || segment.block >= target));
@@ -4401,6 +4435,18 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const key = String(doc.key);
     const id = `doc:${key}`;
     const parts = [id];
+    // `#2266` step D: a seek inside the document already standing is a
+    // jump, not a restart — the retained entry plays again from the new
+    // place, a held read cues held, and the paint lands at once. A jump's
+    // own rebuild re-enters here under `readJumping` and takes the
+    // ordinary path below; a read still preparing is superseded as today.
+    if (from !== null && from.block !== null && !readJumping && pendingRead === null) {
+      const standing = effectivePlaying();
+      if (standing !== null && standing.kind === "document" && standing.id === id && standing.document) {
+        const target = segmentOfModelBlock(standing, from.block, fromPiece(from, doc.texts));
+        if (target !== -1 && jumpReading(target)) return;
+      }
+    }
     const already = from === null && ((nowPlaying !== null && nowPlaying!.id === id) || pendingRead === id);
     noteReadStop(already || (nowPlaying === null && pendingRead === null) ? "user_stop" : "superseded");
     stopReading();
@@ -4439,7 +4485,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         entry = await prepareDocumentSpeech(key);
       } catch (error) {
         if (ticket !== readingTicket) return;
-        cloudDocumentFailed("refused", (error as Error).message, payload, from ? from.block : null, null, from?.piece ?? 0);
+        cloudDocumentFailed("refused", (error as Error).message, payload, from ? from.block : null, null, from ? fromPiece(from, payload.texts) : 0);
         return;
       }
       if (ticket !== readingTicket) return;
@@ -4448,7 +4494,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const ready: (PreparedEntry | null)[] = [entry];
     const segments = speechSegments(ready);
     if (segments.length === 0) {
-      cloudDocumentFailed("refused", "that document has nothing to read", payload, from ? from.block : null, null, from?.piece ?? 0);
+      cloudDocumentFailed("refused", "that document has nothing to read", payload, from ? from.block : null, null, from ? fromPiece(from, payload.texts) : 0);
       return;
     }
     pendingRead = null;
@@ -4459,7 +4505,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // piece here, the inverse of reporting, and never compare the two spaces.
     // A target past the last spoken piece clamps to the last segment.
     const target = from !== null && from.block !== null
-      ? documentListedBlockForModel(entry.blocks ?? [], payload.kinds, from.block, from.piece ?? 0)
+      ? documentListedBlockForModel(entry.blocks ?? [], payload.kinds, from.block, fromPiece(from, payload.texts))
       : null;
     let first = 0;
     if (from !== null) {

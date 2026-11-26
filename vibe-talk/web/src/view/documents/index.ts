@@ -47,7 +47,7 @@ export interface DocumentsViewDependencies {
     sections?: readonly number[];
     onReadingBlock?: (block: number | null, element?: number | null) => unknown;
     onReact?: (block: number, text: string) => unknown;
-  }, from?: { part: number; block: number | null }): unknown;
+  }, from?: { part: number; block: number | null; piece?: number; offset?: number }): unknown;
   /** `#2006`: where a Documents React posts, as kept in Settings. */
   reactPolicy(): "mention" | "discussion";
   /** `#2006`: open the quick reply for a document React, posting through `send`. */

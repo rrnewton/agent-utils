@@ -5667,6 +5667,54 @@ test("`#1039 documents-read-parity`: a cloud document handed its entry plays it 
   assert.equal(ownerReadState(page), "ready");
 });
 
+test("`#2266 vibe-talk-doc-reader-navigator-campaign`: a seek inside the standing document jumps on its retained entry, held where held, at its offset's piece", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ content: "a message that is never read" })]);
+  const texts = [
+    "Jump opening block here.",
+    "Jump middle first sentence stays here with enough plain words after it to carry the "
+      + "piece rule past its sixty word line so the server and the page both cut this block "
+      + "in two pieces at its sentence ends exactly as they always have done before now. "
+      + "Jump middle second sentence follows on with enough plain words of its own to stand "
+      + "as the second piece of the same block when the balancing rule weighs the two "
+      + "sentences against each other and keeps each one whole at the cut it chooses here.",
+    "Jump closing block here.",
+  ];
+  // The middle block is spoken in two pieces: listed 1 and 2, both of element 1.
+  const entry = { url: "/api/v1/speech/ticket-for-doc-jump", until: { mono: 9007199254740991, wall: 9007199254740991 },
+    blocks: [
+      { kind: "paragraph", spoken: true, element: 0, piece: 0, pieces: 1 },
+      { kind: "paragraph", spoken: true, element: 1, piece: 0, pieces: 2 },
+      { kind: "paragraph", spoken: true, element: 1, piece: 1, pieces: 2 },
+      { kind: "paragraph", spoken: true, element: 2, piece: 0, pieces: 1 },
+    ] };
+  const doc = { key: "jumpdoc", texts, kinds: ["paragraph", "paragraph", "paragraph"], entry };
+  await readDocumentNow(page, doc);
+  assert.equal(page.el("read-steer-count").text(), "1 of 3", "the count does not count model blocks");
+  assert.deepEqual(page.prepareCalls, [], "the given entry was prepared again");
+  // A seek to the last model block jumps on the retained entry: no new
+  // prepare, and the player asked for is its listed piece (block 3).
+  await readDocumentNow(page, doc, { part: 0, block: 2 });
+  await page.settle();
+  assert.deepEqual(page.prepareCalls, [], "a seek inside the standing document prepared again");
+  assert.equal(page.el("read-steer-count").text(), "3 of 3", "the seek did not land on the last block");
+  assert.equal(blockOf(page.players.at(-1).url), "3", "the jump did not play the last block's piece");
+  // Held, a seek by offset cues its piece held: the middle block's
+  // second sentence is listed block 2, and nothing is said until Resume.
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "the premise: the read is not held");
+  const playersBefore = page.players.length;
+  await readDocumentNow(page, doc, { part: 0, block: 1, offset: texts[1].indexOf("Jump middle second") });
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "a held seek started the voice");
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the held seek did not cue the middle block");
+  assert.ok(page.players.length > playersBefore, "the held seek built no player for its piece");
+  assert.equal(blockOf(page.players.at(-1).url), "2", "the offset seek did not cue its sentence's piece");
+  assert.deepEqual(page.prepareCalls, [], "a held seek prepared again");
+});
+
 // --- `#1039 documents-read-parity` stage 3: the reader reads through the owner ------------------
 //
 // The Documents reader's Read no longer queues raw device speech of its own: it hands the shared

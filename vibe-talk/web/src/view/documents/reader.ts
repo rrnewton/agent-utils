@@ -57,7 +57,7 @@ export interface DocumentsReaderDependencies {
     onReadingBlock?: (block: number | null, element?: number | null) => unknown;
     /** `#2006`: React pressed on this read: its block and words, for the view's reply. */
     onReact?: (block: number, text: string) => unknown;
-  }, from?: { part: number; block: number | null }): unknown;
+  }, from?: { part: number; block: number | null; piece?: number; offset?: number }): unknown;
   /** `#2006`: React was pressed on the open document's read (its block, words and box). */
   onDocumentReact?: (react: { key: string; block: number; text: string; box: { top: number; bottom: number; left: number; right: number } | null }) => unknown;
   /** Stop the reading of document `key`, where that document's is the one playing; no other. */
@@ -445,6 +445,11 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   let navBlocks: ReturnType<typeof documentReadBlocks> | null = null;
   let navModel: SectionModel | null = null;
   let navBlock = 0;
+  /** `#2266` step D: a body tap with no read standing marks where Read starts. */
+  let pendingStart: { key: string; block: number; offset?: number; piece?: number } | null = null;
+  let markerElement: HTMLElement | null = null;
+  /** A body tap's landing keeps the reader's scroll where the tap put it. */
+  let keepScrollOnce = false;
 
   /** Scroll the rendered heading `id` into view; say whether it was drawn. */
   function scrollToHeading(id: string): boolean {
@@ -784,6 +789,96 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
    * keeps the reader as it was.
    */
   let navBuiltKey: string | null = null;
+  /** A row drag in flight (`#2266` step D), and the click it must not become. */
+  let navDrag: { row: HTMLElement; x: number; left: number; moved: boolean } | null = null;
+  let navDragMoved = false;
+
+  /** The navigator row over `target`, walking parents as the body tap does. */
+  function navRowOf(target: unknown): HTMLElement | null {
+    let node: unknown = target;
+    while (node !== null && typeof node === "object") {
+      const el = node as { className?: unknown; parentNode?: unknown };
+      if (typeof el.className === "string" && el.className.split(/\s+/).includes("doc-nav-row")) {
+        return node as HTMLElement;
+      }
+      node = el.parentNode ?? null;
+    }
+    return null;
+  }
+
+  function onNavScroll(event: Event): void {
+    const row = navRowOf(event.target);
+    if (row !== null) updateRowClip(row);
+  }
+
+  function onNavWheel(event: WheelEvent): void {
+    const row = navRowOf(event.target);
+    if (row === null) return;
+    const shaped = row as { scrollWidth?: unknown; clientWidth?: unknown };
+    if (typeof shaped.scrollWidth !== "number" || typeof shaped.clientWidth !== "number") return;
+    if (shaped.scrollWidth <= shaped.clientWidth + 1) return;
+    let delta = (event.deltaY || 0) !== 0 ? event.deltaY : (event.deltaX || 0);
+    if (event.deltaMode === 1) delta *= 16;
+    if (delta === 0) return;
+    row.scrollLeft += delta;
+    updateRowClip(row);
+    if (typeof event.preventDefault === "function") event.preventDefault();
+  }
+
+  function onNavPointerDown(event: PointerEvent): void {
+    if (!event || (event.button !== undefined && event.button !== 0)) return;
+    const row = navRowOf(event.target);
+    if (row === null || typeof row.scrollLeft !== "number") return;
+    navDrag = { row, x: event.clientX, left: row.scrollLeft, moved: false };
+  }
+
+  function onNavPointerMove(event: PointerEvent): void {
+    if (navDrag === null || !event) return;
+    if (event.buttons === 0) {
+      onNavPointerUp();
+      return;
+    }
+    const dx = event.clientX - navDrag.x;
+    if (Math.abs(dx) > 6) navDrag.moved = true;
+    if (navDrag.moved) {
+      navDrag.row.scrollLeft = navDrag.left - dx;
+      updateRowClip(navDrag.row);
+    }
+  }
+
+  function onNavPointerUp(): void {
+    if (navDrag === null) return;
+    navDragMoved = navDrag.moved;
+    navDrag = null;
+  }
+
+  /** Arrow keys walk the section row's focus, revealing each cell in turn. */
+  function onNavKeyDown(event: KeyboardEvent): void {
+    if (!event || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return;
+    if (event.ctrlKey || event.altKey || event.metaKey) return;
+    const target = event.target as { className?: unknown } | null;
+    if (target === null || typeof target !== "object"
+        || typeof target.className !== "string"
+        || !target.className.split(/\s+/).includes("doc-nav-section")) return;
+    let nav: HTMLElement;
+    try {
+      nav = deps.byId("doc-nav");
+    } catch {
+      return;
+    }
+    const buttons = Array.from(nav.querySelectorAll(".doc-nav-section"));
+    const at = buttons.indexOf(target as Element);
+    if (at === -1) return;
+    const next = buttons[at + (event.key === "ArrowRight" ? 1 : -1)] as HTMLElement | undefined;
+    if (next === undefined || typeof next.focus !== "function") return;
+    if (typeof event.preventDefault === "function") event.preventDefault();
+    next.focus();
+    const row = navRowOf(next);
+    if (row !== null) {
+      scrollCellIntoRow(row, next);
+      updateRowClip(row);
+    }
+  }
 
   /** The one section covers the whole document with no heading of its own. */
   function wholeDocumentOnly(built: ScrubberNavModel): boolean {
@@ -791,6 +886,20 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     return built.sections.length === 1
       && navModel !== null
       && (navModel.sections[0] as SectionModel["sections"][number]).headingBlock === null;
+  }
+
+  /**
+   * `#2266` step D: mark a row's clipped edges for the stylesheet's
+   * fade, from where the row stands scrolled now.
+   */
+  function updateRowClip(row: HTMLElement): void {
+    const shaped = row as { scrollLeft?: unknown; clientWidth?: unknown; scrollWidth?: unknown };
+    if (typeof shaped.scrollLeft !== "number" || typeof shaped.clientWidth !== "number"
+        || typeof shaped.scrollWidth !== "number") return;
+    if (shaped.scrollLeft > 1) row.setAttribute("data-clip-left", "");
+    else row.removeAttribute("data-clip-left");
+    if (shaped.scrollLeft + shaped.clientWidth < shaped.scrollWidth - 1) row.setAttribute("data-clip-right", "");
+    else row.removeAttribute("data-clip-right");
   }
 
   /** Scroll one row sideways only enough to show `cell`; never the page. */
@@ -857,7 +966,9 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
         button.className = "doc-nav-chunk";
         button.setAttribute("data-start", String(cell.block));
         button.setAttribute("aria-label", cell.address !== "" ? `Read from ${cell.address}` : "Read from here");
-        button.style.setProperty("flex-grow", String(Math.max(1, cell.weight)));
+        if (button.style && typeof button.style.setProperty === "function") {
+          button.style.setProperty("flex-grow", String(Math.max(1, cell.weight)));
+        }
         chunksLine.appendChild(button);
       }
       nav.appendChild(chunksLine);
@@ -905,6 +1016,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       const row = current?.parentNode as HTMLElement | null | undefined;
       if (current !== undefined && row) scrollCellIntoRow(row, current as HTMLElement);
     }
+    nav.querySelectorAll(".doc-nav-row").forEach((row) => updateRowClip(row as HTMLElement));
   }
 
   function renderNavigator(): void {
@@ -1046,7 +1158,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       const box = el.getBoundingClientRect();
       if (box.top >= view.top && box.bottom <= view.bottom) return;
     }
-    deps.intoView(el, "center");
+    deps.intoView(el, "nearest");
   }
 
   /**
@@ -1084,6 +1196,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     // A live position report means this document's read stands, even
     // where a restart reported a stop (a null block) on its way here.
     readingActive = true;
+    if (pendingStart !== null) clearReadStartMarker();
     navBlock = block;
     renderNavigator();
     const target = documentBlocks(body)[block] as HTMLElement | undefined;
@@ -1091,7 +1204,8 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     if (target === undefined) return;
     target.setAttribute(READING_BLOCK_ATTRIBUTE, "current");
     litElement = target;
-    keepBlockInView(target);
+    if (keepScrollOnce) keepScrollOnce = false;
+    else keepBlockInView(target);
   }
 
   /**
@@ -1102,7 +1216,8 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
    * already giving), so the Read button stays the starter it has always
    * been; a tap with a block restarts the read there.
    */
-  function startReading(fromBlock: number | null): void {
+  function startReading(fromBlock: number | null, at?: { offset?: number; piece?: number }): void {
+    clearReadStartMarker();
     if (currentDoc === null) {
       deps.onStatus?.("Nothing to read yet.");
       return;
@@ -1116,6 +1231,12 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     // first block inside the call (`#1330 doc-read-highlight`).
     readingActive = true;
     readKey = currentDoc.key;
+    // `#2266` step D: the tap's block paints in the navigator at once;
+    // the owner's first report corrects it if it landed elsewhere.
+    if (fromBlock !== null) {
+      navBlock = fromBlock;
+      renderNavigator();
+    }
     const doc = {
       key: currentDoc.key,
       title: currentDoc.title,
@@ -1136,7 +1257,13 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     };
     // The owner reports its own failures; nothing here follows the ask.
     void Promise.resolve(
-      fromBlock === null ? deps.readDocument(doc) : deps.readDocument(doc, { part: 0, block: fromBlock }),
+      fromBlock === null
+        ? deps.readDocument(doc)
+        : deps.readDocument(doc, {
+            part: 0, block: fromBlock,
+            ...(at?.offset !== undefined ? { offset: at.offset } : {}),
+            ...(at?.piece !== undefined ? { piece: at.piece } : {}),
+          }),
     ).catch(() => undefined);
   }
 
@@ -1171,8 +1298,13 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     return at === -1 ? 0 : at;
   }
 
-  /** Read: the document from the first block on screen (`#2003`). */
+  /** Read: from the read-start marker where a tap left one, else the first block on screen (`#2003`). */
   function readAloud(): void {
+    if (pendingStart !== null && currentDoc !== null && pendingStart.key === currentDoc.key) {
+      const tap = pendingStart;
+      startReading(tap.block, tap);
+      return;
+    }
     startReading(firstVisibleBlock());
   }
 
@@ -1180,6 +1312,167 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   function stopOwnReading(): void {
     readingActive = false;
     if (currentDoc !== null) deps.stopSpeaking?.(currentDoc.key);
+  }
+
+  /** One body tap's place in its block (`#2266` step D): a char offset, a table row, the tapped word. */
+  interface TapPoint {
+    offset?: number;
+    piece?: number;
+    range?: Range;
+  }
+
+  function startHighlightSupported(): boolean {
+    return typeof CSS !== "undefined" && CSS !== null && Boolean(CSS.highlights)
+      && typeof Highlight === "function";
+  }
+
+  function clearReadStartMarker(): void {
+    pendingStart = null;
+    if (markerElement !== null && typeof markerElement.removeAttribute === "function") {
+      markerElement.removeAttribute("data-read-start");
+    }
+    markerElement = null;
+    if (startHighlightSupported()) {
+      try {
+        CSS.highlights.delete("read-start");
+      } catch {
+        // No word was marked on this host; the block mark is the marker.
+      }
+    }
+  }
+
+  function setReadStartMarker(block: number, tap: TapPoint): void {
+    clearReadStartMarker();
+    if (currentDoc === null) return;
+    pendingStart = {
+      key: currentDoc.key, block,
+      ...(tap.offset !== undefined ? { offset: tap.offset } : {}),
+      ...(tap.piece !== undefined ? { piece: tap.piece } : {}),
+    };
+    let body: HTMLElement;
+    try {
+      body = deps.byId("doc-body");
+    } catch {
+      return;
+    }
+    const el = documentBlocks(body)[block] as HTMLElement | undefined;
+    if (el === undefined) return;
+    el.setAttribute("data-read-start", "true");
+    markerElement = el;
+    if (tap.range !== undefined && startHighlightSupported()) {
+      try {
+        CSS.highlights.set("read-start", new Highlight(tap.range));
+      } catch {
+        // The block mark above still stands.
+      }
+    }
+  }
+
+  /**
+   * `node`/`offset` as a char offset into `root`'s drawn words, walking
+   * its text in order (the gutter section numbers are not the document's
+   * words and do not count). Null where the walk cannot place it.
+   */
+  function textOffsetWithin(root: HTMLElement, node: Node, offset: number): number | null {
+    let total = 0;
+    let found: number | null = null;
+    const walk = (el: Node): void => {
+      if (found !== null) return;
+      if (el === node) {
+        found = total + offset;
+        return;
+      }
+      const kids = (el as { childNodes?: ArrayLike<Node> }).childNodes;
+      if (!kids || typeof kids.length !== "number" || kids.length === 0) {
+        if (typeof el.textContent === "string") total += el.textContent.length;
+        return;
+      }
+      for (let at = 0; at < kids.length; at += 1) {
+        const kid = kids[at] as Node;
+        const cls = (kid as { className?: unknown }).className;
+        if (typeof cls === "string" && cls.split(/\s+/).includes("doc-secnum")) continue;
+        walk(kid);
+        if (found !== null) return;
+      }
+    };
+    walk(root);
+    return found;
+  }
+
+  /**
+   * Where in `blockEl` a tap fell: its table row, else the word under
+   * the caret and that word's char offset in the block's drawn words.
+   * Nothing where this host cannot place a caret (the block's start).
+   */
+  function tapPoint(event: MouseEvent, blockEl: HTMLElement): TapPoint {
+    const tag = String(blockEl.tagName || "").toLowerCase();
+    if (tag === "table") {
+      let node: unknown = event.target;
+      let row: HTMLElement | null = null;
+      while (node !== null && typeof node === "object" && node !== (blockEl as unknown)) {
+        if (String((node as { tagName?: unknown }).tagName || "").toLowerCase() === "tr") {
+          row = node as HTMLElement;
+          break;
+        }
+        node = (node as { parentNode?: unknown }).parentNode ?? null;
+      }
+      if (row !== null && typeof blockEl.querySelectorAll === "function") {
+        const rows = Array.from(blockEl.querySelectorAll("tr")) as unknown as HTMLElement[];
+        const at = rows.indexOf(row);
+        if (at !== -1) {
+          const hasHead = blockEl.querySelectorAll("thead").length > 0;
+          return { piece: Math.max(0, at - (hasHead ? 1 : 0)) };
+        }
+      }
+      return {};
+    }
+    const doc = (globalThis as { document?: Document }).document;
+    if (!doc || typeof event.clientX !== "number" || typeof event.clientY !== "number") return {};
+    let node: Node | null = null;
+    let offset = 0;
+    try {
+      const anyDoc = doc as Document & {
+        caretRangeFromPoint?: (x: number, y: number) => Range | null;
+        caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+      };
+      if (typeof anyDoc.caretRangeFromPoint === "function") {
+        const range = anyDoc.caretRangeFromPoint(event.clientX, event.clientY);
+        if (range) {
+          node = range.startContainer;
+          offset = range.startOffset;
+        }
+      } else if (typeof anyDoc.caretPositionFromPoint === "function") {
+        const position = anyDoc.caretPositionFromPoint(event.clientX, event.clientY);
+        if (position) {
+          node = position.offsetNode;
+          offset = position.offset;
+        }
+      }
+    } catch {
+      return {};
+    }
+    if (node === null || typeof blockEl.contains !== "function" || !blockEl.contains(node)) return {};
+    const at = textOffsetWithin(blockEl, node, offset);
+    if (at === null) return {};
+    let range: Range | undefined;
+    const text = typeof node.textContent === "string" ? node.textContent : "";
+    if (text !== "" && typeof doc.createRange === "function") {
+      let from = Math.min(offset, text.length);
+      while (from > 0 && !/\s/.test(text[from - 1] as string)) from -= 1;
+      let to = Math.min(offset, text.length);
+      while (to < text.length && !/\s/.test(text[to] as string)) to += 1;
+      if (to > from) {
+        try {
+          const word = doc.createRange();
+          word.setStart(node, from);
+          word.setEnd(node, to);
+          range = word;
+        } catch {
+          range = undefined;
+        }
+      }
+    }
+    return range !== undefined ? { offset: at, range } : { offset: at };
   }
 
   /**
@@ -1214,12 +1507,12 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       node = element.parentNode ?? null;
     }
     if (docKey === null) {
-      // No marked link under the tap: a tap on a drawn block reads from
-      // that block only while this document's read is already active
-      // (`#1505`, `#1543`); an inactive tap selects or does nothing, and a
-      // tap on a plain link or a button, or one ending a text selection,
-      // is not a read.
-      if (currentDoc === null || !readingActive) return;
+      // No marked link under the tap (`#2266` step D): while this
+      // document's read stands, a tap jumps it to the tapped word (held
+      // where it is held); with no read standing, the tap marks where
+      // Read will start and says nothing. A tap on a plain link or a
+      // button, or one ending a text selection, is neither.
+      if (currentDoc === null) return;
       let node: unknown = event.target;
       let sawInteractive = false;
       while (node !== null && typeof node === "object" && node !== (body as unknown)) {
@@ -1239,7 +1532,13 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       while (node !== null && typeof node === "object" && node !== (body as unknown)) {
         const at = blocks.indexOf(node as HTMLElement);
         if (at !== -1) {
-          startReading(at);
+          const tap = tapPoint(event, blocks[at] as HTMLElement);
+          if (readingActive) {
+            keepScrollOnce = true;
+            startReading(at, tap);
+          } else {
+            setReadStartMarker(at, tap);
+          }
           return;
         }
         node = (node as { parentNode?: unknown }).parentNode ?? null;
@@ -1390,6 +1689,8 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     navModel = navBlocks !== null ? buildSections(navBlocks) : null;
     navBlock = 0;
     navBuiltKey = null;
+    clearReadStartMarker();
+    keepScrollOnce = false;
     renderNavigator();
     startWatching();
     if (highlightTerms !== undefined && markdown !== null) {
@@ -1427,7 +1728,20 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     // rebuilt per section, never per block, and name their block in
     // `data-start`. A host without the strip keeps the reader as it was.
     try {
-      listening.listen<MouseEvent>(deps.byId("doc-nav"), "click", (event) => {
+      const navEl = deps.byId("doc-nav");
+      listening.listen(navEl, "scroll", (event) => onNavScroll(event), { capture: true });
+      listening.listen<WheelEvent>(navEl, "wheel", (event) => onNavWheel(event), { passive: false });
+      listening.listen<PointerEvent>(navEl, "pointerdown", (event) => onNavPointerDown(event));
+      listening.listen<PointerEvent>(navEl, "pointermove", (event) => onNavPointerMove(event));
+      listening.listen(navEl, "pointerup", () => onNavPointerUp());
+      listening.listen(navEl, "pointercancel", () => onNavPointerUp());
+      listening.listen<KeyboardEvent>(navEl, "keydown", (event) => onNavKeyDown(event));
+      listening.listen<MouseEvent>(navEl, "click", (event) => {
+        // A drag that moved ends in a click that is not a tap.
+        if (navDragMoved) {
+          navDragMoved = false;
+          return;
+        }
         const target = event.target;
         if (target === null || typeof target !== "object") return;
         const cell = typeof (target as HTMLElement).closest === "function"

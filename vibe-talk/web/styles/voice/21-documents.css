@@ -566,6 +566,18 @@
 .doc-nav-row:last-child {
   margin-bottom: 0;
 }
+/* `#2266` step D: a clipped row edge fades, so a reader can see that
+   the row scrolls (wheel, drag and arrow keys reveal the rest). The
+   reader marks the clipped sides as it paints and as the row scrolls. */
+.doc-nav-row[data-clip-left] {
+  mask-image: linear-gradient(to right, transparent, black 1.2rem);
+}
+.doc-nav-row[data-clip-right] {
+  mask-image: linear-gradient(to right, black calc(100% - 1.2rem), transparent);
+}
+.doc-nav-row[data-clip-left][data-clip-right] {
+  mask-image: linear-gradient(to right, transparent, black 1.2rem, black calc(100% - 1.2rem), transparent);
+}
 .doc-nav-unit,
 .doc-nav-chunk {
   /* `#2266`: one fixed cell height, so the two rows (and the strip
@@ -623,6 +635,18 @@
   background: var(--warn);
   color: var(--bg);
   font-weight: 700;
+}
+/* `#2266` step D: where Read will start, marked by a tap with no read
+   standing — a dashed frame, distinct from the reading light's fill,
+   and the tapped word itself where the browser highlights ranges. */
+#doc-body [data-read-start="true"] {
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+  border-radius: 0.3rem;
+}
+::highlight(read-start) {
+  background-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  text-decoration: underline 0.12em var(--accent);
 }
 /* Section numbers on the document (`#1508`): a small gutter label before
    each heading, in the heading's own line, muted beside its words. */

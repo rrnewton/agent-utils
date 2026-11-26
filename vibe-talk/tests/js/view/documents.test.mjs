@@ -2681,6 +2681,28 @@ test("documents reader: a tap on a block reads from that block only while readin
   });
 });
 
+test("documents reader: a tap with no read standing marks where Read starts, and says nothing (#2266)", async () => {
+  await withReader({ content: LIST_DOC, outline: [] }, async ({ reader, els, reads, readFroms }) => {
+    const { items } = drawnListBody(els);
+    const label = readerEl("span");
+    label.textContent = "second item";
+    items[1].appendChild(label);
+    await flush(dispatchClick(els["doc-body"], { target: label }));
+    assert.equal(reads.length, 0, "a tap with no read standing spoke");
+    assert.equal(items[1].getAttribute("data-read-start"), "true", "the tapped block carries no read-start mark");
+    // A second tap moves the mark; it never stands in two places.
+    await flush(dispatchClick(els["doc-body"], { target: items[2] }));
+    assert.equal(reads.length, 0, "a second marking tap spoke");
+    assert.equal(items[1].getAttribute("data-read-start"), null, "the mark stayed on the first tap's block");
+    assert.equal(items[2].getAttribute("data-read-start"), "true", "the mark did not move to the second tap");
+    // Read starts at the mark, and the mark is consumed.
+    reader.readAloud();
+    assert.equal(reads.length, 1, "Read started no read from the mark");
+    assert.deepEqual(readFroms[0], { part: 0, block: 3 }, "Read did not start at the marked block");
+    assert.equal(items[2].getAttribute("data-read-start"), null, "the mark survived its Read");
+  });
+});
+
 test("documents reader: with nothing open to say, Read says so and hands the owner nothing (#1039 stage 3)", async () => {
   await withReader({ content: "" }, async ({ reader, els, reads, statuses }) => {
     reader.readAloud();

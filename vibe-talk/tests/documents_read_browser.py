@@ -394,6 +394,20 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
           f"an inactive tap on document text started a read: {state}")
     check(page.locator("#read-steer").is_hidden(), "an inactive tap on document text showed the read strip")
     check(utterances(page) == [], "an inactive tap on document text spoke")
+    # `#2266`: the inactive tap instead marks where Read will start.
+    marked = page.evaluate(
+        "() => document.querySelector('[data-read-start=\"true\"]')?.textContent || ''")
+    check(blocks[1][:20] in str(marked), f"an inactive tap left no read-start mark: {marked!r}")
+    # Move the mark to the first block, so the Read below starts where
+    # the first-visible rule would have put it anyway.
+    first_block = page.locator("#doc-body > p", has_text=blocks[0][:20])
+    if touch:
+        first_block.tap()
+    else:
+        first_block.click()
+    marked = page.evaluate(
+        "() => document.querySelector('[data-read-start=\"true\"]')?.textContent || ''")
+    check(blocks[0][:20] in str(marked), f"the read-start mark did not move: {marked!r}")
     # Read: the strip counts the blocks, the device voice says them in order,
     # and the read is the owner's document read — no queue of the reader's own.
     # The block being read is lit in the reader (`#1330 doc-read-highlight`).
@@ -658,11 +672,23 @@ def walk_list(page: Page, base: str) -> None:
     check(state["id"] is None and state["pending"] is None,
           f"a tap on document text after the read stopped started a read: {state}")
     check(len(utterances(page)) == said_before, "a tap after the read stopped spoke")
+    # `#2266`: that tap marked the closing paragraph instead; move the
+    # mark home so the Read below starts where it always did.
+    marked = page.evaluate(
+        "() => document.querySelector('[data-read-start=\"true\"]')?.textContent || ''")
+    check("Closing paragraph" in str(marked), f"the stopped tap marked {marked!r}, not its paragraph")
+    page.locator("#doc-body > h1, #doc-body > h2").first.tap()
     # Tap-to-read while active (`#1505`, `#1543`): Read restarts the read,
     # then a tap on the closing paragraph jumps there, and a tap on a list
     # item jumps to that item.
+    said_before = len(utterances(page))
     page.tap("#read-aloud")
-    wait_count(page, f"1 of {count}")
+    # The heading's utterance is short enough to finish before a count
+    # poll on a busy host; the first new utterance is the start proof.
+    page.wait_for_function(
+        "(n) => window.deviceSpeech.length > n", arg=said_before, timeout=20_000)
+    check(utterances(page)[said_before] == LIST_BLOCKS[0],
+          f"Read from the mark said {utterances(page)[said_before]!r}, not the first block")
     said_before = len(utterances(page))
     page.locator("#doc-body > p", has_text="Closing paragraph").tap()
     wait_count(page, f"{count} of {count}")
