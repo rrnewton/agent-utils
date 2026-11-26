@@ -24,7 +24,7 @@ steps:
       rss_baseline_bytes: 2684354560
 
   # The app page's suite, straight through node: tests/js/voice_page.test.mjs over web/voice.js, as
-  # four interleaved slices (`VOICE_PAGE_SHARD`, `test-time-vibe-talk`) that run side by side.
+  # six interleaved slices (`VOICE_PAGE_SHARD`, `test-time-vibe-talk`) that run side by side.
   #
   # Not through its cargo-test harness (`the_voice_page_suite_passes` in tests/voice_page.rs, which
   # `test.unit` skips by name and `cargo test` alone still runs, the same slices at once): that

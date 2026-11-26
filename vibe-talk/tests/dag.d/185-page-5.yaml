@@ -1,0 +1,26 @@
+steps:
+  - group: test
+    job: page-5
+    desc: the app page's suite, slice 5 of six, node over web/voice.js
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    deps: [setup.node22, setup.contract-tools]
+    cmd: >-
+      cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
+      VOICE_PAGE_SHARD=5/6 ../scripts/with-node22 node --max-old-space-size=1024 --test-reporter=spec --test-reporter-destination=stdout
+      --test-reporter=tap
+      --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-5}.tap"
+      tests/js/voice_page.test.mjs
+    jobs_flag: ""
+    timeout: 4800
+    # `#2320 vibe-talk-page-slice-cpu-budget`: the fifth and sixth slices. With four, every slice
+    # used 440-605 of its 600 CPU seconds in the gates of 2026-11-26 (page-3 535-605,
+    # killed twice), mostly the esbuild service rebuilding the page for the negative
+    # controls; six keep the same runaway guard at about two thirds of the old work each.
+    cpu_timeout: 600
+    hint:
+      est_duration_s: 60
+      classification: cpu-bound
+      # node is one thread of JavaScript plus its collector's.
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1610612736
+

@@ -1,5 +1,5 @@
 ---
-title: 'vibe-talk-page-slice-cpu-budget: the app page suite runs in five slices so no slice reaches its 600 cpu-second budget on a loaded host'
+title: 'vibe-talk-page-slice-cpu-budget: the app page suite runs in six slices so no slice reaches its 600 cpu-second budget on a loaded host'
 status: open
 priority: 1
 issue_type: task
@@ -9,7 +9,7 @@ labels:
 - validation
 - flake
 created_at: 2026-11-26T18:30:00-05:00
-updated_at: 2026-11-26T18:30:00-05:00
+updated_at: 2026-11-26T18:50:00-05:00
 ---
 
 # Description
@@ -18,14 +18,14 @@ updated_at: 2026-11-26T18:30:00-05:00
 
 # Design
 
-Test-only: run the suite in five slices instead of four. Add `vibe-talk/tests/dag.d/161-page-4.yaml` as a copy of the slice steps with `VOICE_PAGE_SHARD=4/5`, and change slices 0-3 to `i/5` with their descriptions saying five. The suite's own slicing (`fixture.mjs`, positions i, i+n, ...) and the graph contract test (every slice of one count is one step's, once) already handle any count. `cpu_timeout` stays 600 for every slice, so each now runs at about 80% of the old per-slice work. Nothing else changes.
+Test-only: run the suite in six slices instead of four. Add `vibe-talk/tests/dag.d/184-page-4.yaml` and `185-page-5.yaml` as copies of the slice step with `VOICE_PAGE_SHARD=4/6` and `5/6`, and change slices 0-3 to `i/6` with their descriptions saying six. The suite's own slicing (`fixture.mjs`, positions i, i+n, ...) and the graph contract test (every slice of one count is one step's, once) already handle any count. `cpu_timeout` stays 600 for every slice, so each now runs about two thirds of the old per-slice work: by the 2026-11-26 measurements about 380 CPU seconds at load, two thirds of the budget (five slices would leave about 480, too little margin on a truly hot host). Nothing else changes.
 
 # Acceptance Criteria
 
-- Five page slices `vibe-talk.test.page-0` .. `page-4` with `VOICE_PAGE_SHARD=i/5`, each with `cpu_timeout: 600`; the validation graph contract test passes.
-- The five slices together run every test of the suite exactly once (the slicing rule), shown by one local run of all five whose test counts add up to the four-slice total.
-- Measured CPU per slice on the next gates is recorded in the Notes; if a slice still exceeds about two thirds of its budget at load, a sixth slice follows under this issue.
+- Six page slices `vibe-talk.test.page-0` .. `page-5` with `VOICE_PAGE_SHARD=i/6`, each with `cpu_timeout: 600`; the validation graph contract test passes.
+- The six slices together run every test of the suite exactly once (the slicing rule), shown by one local run of all six whose test counts add up to the four-slice total.
+- Measured CPU per slice on the next gates is recorded in the Notes; if a slice still exceeds about two thirds of its budget at load, that is reported here.
 
 # Notes
 
-Evidence from the gate journals (`step_end` `cpu_usage_usec`) of 11 retained gates on 2026-11-26 and the `process_snapshot` at the kill. Coordinator's choice (2026-11-26): a fifth slice rather than a larger budget; if a fifth slice were awkward, 900 rather than 1200. Caching the negative controls' bundle builds would cut the suite's CPU far more, but changes test code beyond this fix; it is a separate follow-up.
+Evidence from the gate journals (`step_end` `cpu_usage_usec`) of 11 retained gates on 2026-11-26 and the `process_snapshot` at the kill. Coordinator's choice (2026-11-26): more slices rather than a larger budget, six for two-thirds headroom (rule 346). Caching the negative controls' bundle builds would cut the suite's CPU far more, but changes test code beyond this fix; it gets its own follow-up issue.
