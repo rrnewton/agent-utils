@@ -3929,7 +3929,8 @@ test("`#624 voice-page-modularity`: a column's older-pages record and the channe
   const a = freshOlderPages(); const b = freshOlderPages();
   a.cursor = "x";
   assert.equal(b.cursor, null, "a fresh column shared its older pages");
-  assert.deepStrictEqual(freshOlderPages(), { moreAbove: false, cursor: null, inFlight: false, step: null, deferred: false });
+  assert.deepStrictEqual(freshOlderPages(), { moreAbove: false, cursor: null, inFlight: false, step: null, deferred: false,
+    pendingAt: null, failedAt: null });
   const seen = [];
   const summary = { replaceChildren: (...kids) => seen.push(kids) };
   const owner = createOlderPages({

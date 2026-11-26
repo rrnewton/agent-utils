@@ -34,6 +34,8 @@ export interface LiveStreamDependencies {
   reportUnrelayed(messages: unknown[], reason: string): void;
   refreshServerSettings(): Promise<void>;
   onSettingsFrame(frame: LiveFrame): void;
+  /** `#2264`: the server's walk of a view's older history ended (`takeOlderEvent`). */
+  onOlderEvent(event: { channel_id?: unknown; view?: unknown; thread_id?: unknown; before?: unknown; ok?: unknown }): void;
   hiddenNow(): boolean;
   noteHiddenMessage(): void;
   relayToAgent(message: Message, selfPosted: boolean, replayed?: boolean, arrival?: unknown): void;
@@ -210,6 +212,18 @@ function onStreamFrame(frame: LiveFrame): void {
   // stream between messages: it is about no channel and carries no cursor of its own.
   if (frame.event === "settings") {
     onSettingsFrame(frame);
+    return;
+  }
+  // `#2264 vibe-talk-all-view-older-load-stuck`. The server's walk of a view's older history, begun
+  // for a step back it answered `older_pending`, ended: about one step, carrying no message.
+  if (frame.event === "older") {
+    let event = null;
+    try {
+      event = JSON.parse(frame.data || "null");
+    } catch (_error) {
+      return;
+    }
+    if (deps.contractIs("LiveOlderEvent", event)) deps.onOlderEvent(event);
     return;
   }
   if (!frame.data) {

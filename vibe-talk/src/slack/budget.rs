@@ -206,7 +206,8 @@ impl Priority {
             ReadReason::Write => Self::Write,
             ReadReason::Backfill | ReadReason::Shadow => Self::Crawl,
             ReadReason::Naming | ReadReason::SummaryWindow => Self::Background,
-            ReadReason::Poll | ReadReason::Side => Self::Page,
+            // `#2264`: the older walk behind a step back yields to live work.
+            ReadReason::Poll | ReadReason::Side | ReadReason::OlderWalk => Self::Page,
             ReadReason::Relist
             | ReadReason::Probe
             | ReadReason::ReplyMark
@@ -838,6 +839,40 @@ mod tests {
             sent.ceiling_wait(METHOD, Priority::Page, 20, now + WINDOW),
             None
         );
+    }
+
+    #[test]
+    fn an_older_walk_never_takes_the_share_live_ingestion_reads_in() {
+        // `#2264 vibe-talk-all-view-older-load-stuck`: the step back's older read was a
+        // person's (the whole ceiling), and sixteen of them in a minute left live ingestion's
+        // history reads refused. The walk behind a step back is page work: it stops at half
+        // the ceiling, and live work keeps sending up to its own three quarters past it.
+        const METHOD: &str = "conversations.history";
+        assert_eq!(Priority::of(ReadReason::OlderWalk), Priority::Page);
+        assert_eq!(Priority::of(ReadReason::Older), Priority::Interactive);
+        assert!(!one_try_while_limiting(Priority::of(ReadReason::OlderWalk)));
+        let now = Instant::now();
+        let mut sent = Sent::default();
+        let mut walk = 0;
+        while sent
+            .ceiling_wait(METHOD, Priority::of(ReadReason::OlderWalk), 20, now)
+            .is_none()
+        {
+            sent.record(METHOD, Priority::of(ReadReason::OlderWalk), now);
+            walk += 1;
+            assert!(walk <= 20, "the walk was never held");
+        }
+        assert_eq!(walk, 10, "the walk took more than half the ceiling");
+        let mut live = 0;
+        while sent
+            .ceiling_wait(METHOD, Priority::of(ReadReason::LivePoll), 20, now)
+            .is_none()
+        {
+            sent.record(METHOD, Priority::of(ReadReason::LivePoll), now);
+            live += 1;
+            assert!(live <= 20, "live work was never held");
+        }
+        assert_eq!(live, 5, "live work lost its share to the walk");
     }
 
     #[test]

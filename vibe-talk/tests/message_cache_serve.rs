@@ -4293,3 +4293,430 @@ async fn a_transcript_day_interleaves_the_sent_messages_v2_names() {
         "a trace chunk was marked vestigial: {body}"
     );
 }
+
+/// A step back of All in [`SLACK_CH`] from `cursor`, as the page asks for it when the reader
+/// scrolls to the top of what is loaded.
+fn older_step_path(cursor: &str) -> String {
+    path(
+        SLACK_CH,
+        &format!(
+            "/timeline?view=flat&limit=2&reason=older&before={}",
+            url_encode(cursor)
+        ),
+    )
+}
+
+/// A Slack deployment whose copy held the whole history and then had an offer dropped, the
+/// state of the owner's busiest channel on 2026-11-25: every claim it holds is listed before
+/// the drop, so no step back is the copy's until something lists the stretch again. Hands back
+/// the served newest page's backward cursor.
+async fn dropped_after_full_history(
+    tag: &str,
+) -> (
+    AppState,
+    slack_fake::Fake,
+    Arc<ManualClock>,
+    TempDir,
+    String,
+) {
+    let (state, fake, clock, dir) = slack_threads_deployment_with(tag, false, FULL_HISTORY).await;
+    settle_band(&state, &clock).await;
+    state.message_cache.set_serve(true);
+    let newest = ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=flat&limit=2&reason=poll"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(texts(&newest), ["message 4", "message 5"], "{newest}");
+    let cursor = served_cursor(&newest);
+    clock.advance(SECOND);
+    state
+        .message_cache
+        .cache()
+        .expect("a cache")
+        .mark_suspect_reason(&ChanKey::new(SLACK, SLACK_CH), "fill_writes_no_rows");
+    settled(&state).await;
+    clock.advance(SECOND);
+    (state, fake, clock, dir, cursor)
+}
+
+/// The `consumer="older_walk"` lines `capture` holds: one per walk.
+fn walk_lines(capture: &vibe_talk::testing::LogCapture) -> Vec<String> {
+    capture
+        .text()
+        .lines()
+        .filter(|line| line.contains("consumer=\"older_walk\""))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn older_steps_after_a_drop_start_one_walk_and_the_step_is_then_served_from_the_copy() {
+    // `#2264 vibe-talk-all-view-older-load-stuck`. The owner scrolled up in All and saw "Loading
+    // older" for good: after a dropped offer no claim of the copy stood, every step started its
+    // own Slack walk from the newest page, none finished inside the step's wait, their answers
+    // were dropped, and nothing they read was a listing the copy could prove a step with —
+    // sixteen steps, sixteen walks, no rows. Now the first step begins the view's one walk,
+    // which re-lists Main below the page; every repeat while it runs is answered at once,
+    // pending, and begins nothing; the walk says on the stream that it ended; and the same step
+    // is then answered from the copy. Slack's history read is held at the fake, so the walk is
+    // in flight for as long as the test needs it, with no clock.
+    let (state, fake, _clock, _dir, cursor) = dropped_after_full_history("older-one-walk").await;
+    let hold = slack_fake::Hold::new(SLACK_CH);
+    fake.with(|fixture| fixture.hold_history = Some(hold.clone()));
+    let mut ended = state.live.subscribe_older();
+    let history = fake.calls("conversations.history");
+    let replies = fake.calls("conversations.replies");
+    let capture = vibe_talk::testing::LogCapture::start();
+
+    let first = ok(&state, &older_step_path(&cursor), WRITE_TOKEN).await;
+    assert!(texts(&first).is_empty(), "{first}");
+    assert_eq!(first["older_pending"], true, "{first}");
+    assert_eq!(first["has_more"], true, "{first}");
+    assert_eq!(first["next_before"], cursor.as_str(), "{first}");
+    tokio::time::timeout(WAIT, hold.arrived.notified())
+        .await
+        .expect("the walk's read reached Slack");
+
+    // The page's own loop, and the reader's scrolling: every repeat is pending at once.
+    for repeat in 0..4 {
+        let again = ok(&state, &older_step_path(&cursor), WRITE_TOKEN).await;
+        assert_eq!(again["older_pending"], true, "repeat {repeat}: {again}");
+        assert!(texts(&again).is_empty(), "repeat {repeat}: {again}");
+    }
+    assert_eq!(
+        fake.calls("conversations.history"),
+        history + 1,
+        "five steps began more than one Slack read"
+    );
+    assert_eq!(
+        fake.calls("conversations.replies"),
+        replies,
+        "a replies read"
+    );
+
+    hold.release.notify_one();
+    let event = tokio::time::timeout(WAIT, ended.recv())
+        .await
+        .expect("the walk said it ended")
+        .expect("an older event");
+    assert_eq!(event.channel_id.as_str(), SLACK_CH);
+    assert_eq!(event.view, TimelineView::Flat);
+    assert_eq!(event.before, cursor);
+    assert!(event.ok, "{event:?}");
+
+    let step = ok(&state, &older_step_path(&cursor), WRITE_TOKEN).await;
+    assert_eq!(
+        texts(&step),
+        ["message 2", "message 3", "only reply"],
+        "the step after the walk: {step}"
+    );
+    assert!(step.get("older_pending").is_none(), "{step}");
+    let mut words = served_from(&capture, SLACK_CH);
+    assert_eq!(words.pop().as_deref(), Some("cache-older"), "{words:?}");
+    assert_eq!(
+        words,
+        [
+            "cache-older-empty",
+            "cache-older-pending",
+            "cache-older-pending",
+            "cache-older-pending",
+            "cache-older-pending"
+        ]
+    );
+    // One Main read (no thread, no replies), one log line saying what the walk did.
+    assert_eq!(fake.calls("conversations.history"), history + 1);
+    assert_eq!(fake.calls("conversations.replies"), replies);
+    let read = fake
+        .requests("conversations.history")
+        .pop()
+        .expect("the walk's read");
+    assert!(
+        !read.contains_key("latest"),
+        "the re-list starts at the newest page: {read:?}"
+    );
+    let lines = walk_lines(&capture);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    for word in [
+        format!("channel={SLACK_CH}"),
+        "view=Flat".to_owned(),
+        "walk=\"relist\"".to_owned(),
+        "pages=1".to_owned(),
+        "rows=6".to_owned(),
+        "outcome=\"relisted\"".to_owned(),
+        "answered=\"event\"".to_owned(),
+        "ms=".to_owned(),
+    ] {
+        assert!(lines[0].contains(&word), "{word} not in {}", lines[0]);
+    }
+    for text in ["message 2", "only reply"] {
+        assert!(
+            !lines[0].contains(text),
+            "a walk line carried text: {}",
+            lines[0]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_older_walk_says_so_on_the_stream_and_backs_the_view_off() {
+    // `#2264`: a walk that fails ends with an `older` event that says so (the page offers its
+    // retry), and backs the view off: a step meanwhile is answered at once, not pending, and
+    // begins no Slack read; once the back-off is over a step begins the next walk.
+    let (state, fake, _clock, _dir, cursor) = dropped_after_full_history("older-failed").await;
+    let hold = slack_fake::Hold::new(SLACK_CH);
+    fake.with(|fixture| {
+        fixture.hold_history = Some(hold.clone());
+        fixture
+            .fail
+            .insert("conversations.history".to_owned(), "fatal_error".to_owned());
+    });
+    let mut ended = state.live.subscribe_older();
+    let first = ok(&state, &older_step_path(&cursor), WRITE_TOKEN).await;
+    assert_eq!(first["older_pending"], true, "{first}");
+    tokio::time::timeout(WAIT, hold.arrived.notified())
+        .await
+        .expect("the walk's read reached Slack");
+    hold.release.notify_one();
+    let event = tokio::time::timeout(WAIT, ended.recv())
+        .await
+        .expect("the walk said it ended")
+        .expect("an older event");
+    assert!(!event.ok, "{event:?}");
+    let history = fake.calls("conversations.history");
+    let backed_off = ok(&state, &older_step_path(&cursor), WRITE_TOKEN).await;
+    assert!(texts(&backed_off).is_empty(), "{backed_off}");
+    assert!(
+        backed_off.get("older_pending").is_none(),
+        "nothing is coming, so the step is not pending: {backed_off}"
+    );
+    assert_eq!(backed_off["next_before"], cursor.as_str(), "{backed_off}");
+    assert_eq!(
+        fake.calls("conversations.history"),
+        history,
+        "a read while backed off"
+    );
+
+    fake.with(|fixture| fixture.fail.clear());
+    state
+        .older_walks
+        .age(vibe_talk::cache_first::OLDER_BACKOFF_MAX);
+    let step = ok(&state, &older_step_path(&cursor), WRITE_TOKEN).await;
+    let step = if step["older_pending"] == true {
+        // The walk outlasted the step's wait: it ends on the stream, and the step is the copy's.
+        let event = tokio::time::timeout(WAIT, ended.recv())
+            .await
+            .expect("the retry's walk said it ended")
+            .expect("an older event");
+        assert!(event.ok, "{event:?}");
+        ok(&state, &older_step_path(&cursor), WRITE_TOKEN).await
+    } else {
+        step
+    };
+    assert_eq!(
+        texts(&step),
+        ["message 2", "message 3", "only reply"],
+        "{step}"
+    );
+}
+
+#[tokio::test]
+async fn a_step_that_waits_on_the_read_behind_a_partial_answer_is_told_when_it_ends() {
+    // `#2264`: the read begun behind a partial answer from the copy holds the view's claim too.
+    // A step that finds it held is answered pending, and must still hear the stream's `older`
+    // event when that read ends, or the page would wait for good; then the step begins the
+    // view's own walk and gets its rows.
+    let d = deployment("older-waits-behind").await;
+    d.fill_newest(8).await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    let body = d.served_reload(3).await;
+    let proven = d.step_back(3, &served_cursor(&body)).await;
+    // The proven step's own read behind it (its claims are two hours old) ends first.
+    stepped_behind(&d.state, READ_CHANNEL, TimelineView::Main).await;
+    let older = |cursor: &str| {
+        path(
+            READ_CHANNEL,
+            &format!(
+                "/timeline?view=main&limit=3&reason=older&before={}",
+                url_encode(cursor)
+            ),
+        )
+    };
+    let mut ended = d.state.live.subscribe_older();
+    let held = d.chat.hold_next_timeline();
+    let partial = ok(&d.state, &older(&served_cursor(&proven)), WRITE_TOKEN).await;
+    assert_eq!(texts(&partial), ["message 4", "message 5"], "{partial}");
+    tokio::time::timeout(WAIT, held.entered)
+        .await
+        .expect("the read behind the partial answer was begun")
+        .expect("the read behind the partial answer reached the provider");
+    let cursor = served_cursor(&partial);
+    let waiting = ok(&d.state, &older(&cursor), WRITE_TOKEN).await;
+    assert_eq!(waiting["older_pending"], true, "{waiting}");
+    held.release.send(()).expect("the read behind is waiting");
+    let event = tokio::time::timeout(WAIT, ended.recv())
+        .await
+        .expect("the waiting step was told the read ended")
+        .expect("an older event");
+    assert_eq!(event.before, cursor);
+    assert!(event.ok, "{event:?}");
+    let step = ok(&d.state, &older(&cursor), WRITE_TOKEN).await;
+    // The provider's own step, from just below the page: its rows end with message 3.
+    assert_eq!(
+        texts(&step).last().map(String::as_str),
+        Some("message 3"),
+        "{step}"
+    );
+}
+
+/// `#2264`: a Slack channel of 240 messages a minute apart (every tenth from the sixth a thread of
+/// two replies), live-polled, whose copy holds its newest Main and All pages, listed and then put
+/// in doubt by a dropped offer, serving on: the owner's All after a drop, at a size whose walk back
+/// needs several re-lists.
+async fn long_history_after_a_drop(
+    tag: &str,
+) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
+    let mut fixture = slack_fake::FakeState::default();
+    let total = 240;
+    let mut history: Vec<Value> = (0..total)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("history message {n}"),
+            )
+        })
+        .collect();
+    for n in (5..total).step_by(10) {
+        let index = usize::try_from(n).expect("index");
+        slack_fake::thread(
+            &mut fixture,
+            SLACK_CH,
+            &mut history[index],
+            &[
+                (slack_fake::ts(n * 60 + 10, 0), format!("reply a to {n}")),
+                (slack_fake::ts(n * 60 + 20, 0), format!("reply b to {n}")),
+            ],
+        );
+    }
+    fixture.history.insert(SLACK_CH.to_owned(), history);
+    let fake = slack_fake::Fake::start(fixture, 100).await;
+    let dir = TempDir::new(tag);
+    let clock = ManualClock::at(slack_ms(total * 60 + 3_600));
+    let text = format!(
+        r#"
+[auth]
+read_token = "{READ_TOKEN}"
+write_token = "{WRITE_TOKEN}"
+
+[[providers]]
+key = "{SLACK}"
+kind = "slack"
+api_base = "{base}"
+token = "{token}"
+live_poll_seconds = 30
+
+[[channels]]
+id = "{SLACK_CH}"
+label = "team"
+writable = true
+{FULL_HISTORY}"#,
+        base = fake.base,
+        token = slack_fake::TOKEN,
+    );
+    let (mut state, _discord, _store) = testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=100"),
+        WRITE_TOKEN,
+    )
+    .await;
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=flat&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    clock.advance(11 * MINUTE);
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=100"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    state.message_cache.set_serve(true);
+    clock.advance(SECOND);
+    state
+        .message_cache
+        .cache()
+        .expect("a cache")
+        .mark_suspect_reason(&ChanKey::new(SLACK, SLACK_CH), "fill_writes_no_rows");
+    settled(&state).await;
+    clock.advance(SECOND);
+    (state, fake, clock, dir)
+}
+
+#[tokio::test]
+async fn after_a_drop_all_is_walked_back_to_its_start_from_the_copy_with_one_walk_at_a_time() {
+    // `#2264`: from the newest page to the channel's first message, every step of All after a
+    // drop is answered from the copy: by the re-list of the view's one walk where nothing lists
+    // the stretch, then from what it listed; never by the provider's own walk.
+    let (state, _fake, _clock, _dir) = long_history_after_a_drop("older-to-start").await;
+    let newest = ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=flat&limit=50&reason=poll"),
+        WRITE_TOKEN,
+    )
+    .await;
+    let mut cursor = served_cursor(&newest);
+    let capture = vibe_talk::testing::LogCapture::start();
+    let mut seen = texts(&newest);
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        assert!(
+            steps < 40,
+            "the walk never reached the start: {:?}",
+            served_from(&capture, SLACK_CH)
+        );
+        let step = ok(
+            &state,
+            &path(
+                SLACK_CH,
+                &format!(
+                    "/timeline?view=flat&limit=50&reason=older&before={}",
+                    url_encode(&cursor)
+                ),
+            ),
+            WRITE_TOKEN,
+        )
+        .await;
+        assert!(
+            step.get("older_pending").is_none(),
+            "a fast walk left the step pending: {step}"
+        );
+        seen.extend(texts(&step));
+        if step["has_more"] == false {
+            break;
+        }
+        cursor = step["next_before"].as_str().expect("a way back").to_owned();
+    }
+    assert!(
+        seen.iter().any(|text| text == "history message 0"),
+        "the start was not reached"
+    );
+    let words = served_from(&capture, SLACK_CH);
+    assert!(
+        words.iter().all(|word| word.starts_with("cache-older")),
+        "a step was not the copy's: {words:?}\n{}",
+        walk_lines(&capture).join("\n")
+    );
+}

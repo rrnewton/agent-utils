@@ -116,6 +116,9 @@ pub struct AppState {
     /// its refreshes have fared. `#1227 poll-storm-stale-thread`; see
     /// [`crate::cache_first::RefreshSchedule`].
     pub refresh_schedule: Arc<crate::cache_first::RefreshSchedule>,
+    /// Per view, how this server's walks of older history behind step backs have fared, and
+    /// where the last re-list stopped. `#2264 vibe-talk-all-view-older-load-stuck`.
+    pub older_walks: Arc<crate::cache_first::OlderWalks>,
     /// The letters standing in for the long ids and hashes in channel text.
     ///
     /// Here rather than per request because the point of a letter is that it means the same account

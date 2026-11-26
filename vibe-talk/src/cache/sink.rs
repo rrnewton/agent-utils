@@ -2720,6 +2720,26 @@ impl Sink {
         Some((cache, ChanKey::new(key, channel.as_str())))
     }
 
+    /// The view whose pages re-list the stretch a step back of `view` in `channel` rests on, so
+    /// that [`Self::held_below`] can prove the step from claims listed now: Main, read page by
+    /// page as chained listings, for Slack's Main and All (whose step the file answers from
+    /// Main with each thread's held replies). `None` where the copy does not step that way, or
+    /// does not serve at all, and the step keeps the provider's own walk. `#2264
+    /// vibe-talk-all-view-older-load-stuck`.
+    #[must_use]
+    pub fn relist_view(&self, channel: &ChannelId, view: TimelineView) -> Option<TimelineView> {
+        if !self.serve_enabled() {
+            return None;
+        }
+        let routes = self.state.routes();
+        let route = routes
+            .fills
+            .get(channel)
+            .filter(|route| self.verification(&route.key) == Verification::Verified)?;
+        (route.shape == Shape::Slack && matches!(view, TimelineView::Flat | TimelineView::Main))
+            .then_some(TimelineView::Main)
+    }
+
     /// A step back of `limit` from a page answered from the cache, whose oldest message was
     /// written at `at_ms` with the id `id`, answered from the file. Proven whole
     /// ([`super::below::proven`]) it is the step itself; unproven, the covered suffix

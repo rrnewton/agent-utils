@@ -1711,34 +1711,40 @@ pub async fn timeline(
                 // Noted inside, proven or partial (`#2066 vibe-talk-page-freeze`).
                 return Ok((channel, page));
             }
-            // `#1886` addendum-1: a step back the copy cannot prove no
-            // longer waits on the provider in the foreground.
-            let stepped = {
-                let state = state.clone();
-                let channel_id = channel.id.clone();
-                let stepped_request = request.clone();
-                let below = below.clone();
-                race_older(
-                    crate::held_replies::scope(held, async move {
-                        step_back_from_served(&state, caller, &channel_id, &stepped_request, &below)
-                            .await
-                    }),
-                    request,
-                )
-                .await?
+            // `#2264 vibe-talk-all-view-older-load-stuck`: one walk of the view at a time,
+            // re-listing the stretch where the copy steps from Main, the provider's own walk
+            // elsewhere; the first step waits `OLDER_WAIT` for it, every other answers at once.
+            let walk = match state.message_cache.relist_view(&channel.id, request.view) {
+                Some(view) => OlderWalk::Relist {
+                    below: below.clone(),
+                    view,
+                },
+                None => OlderWalk::Served {
+                    below: below.clone(),
+                },
             };
-            match stepped {
-                OlderStep::Upstream(page) => {
-                    crate::cache_first::note(crate::cache_first::Source::Upstream);
-                    (page, None)
+            match older_step(state, caller, &channel.id, request, walk, held).await? {
+                OlderAnswer::Page(read) => {
+                    began_ms = read.began_ms;
+                    fetch_began = read.fetch_began;
+                    (read.page, read.position)
                 }
-                OlderStep::Fallback(page) => {
-                    crate::cache_first::note(crate::cache_first::Source::OlderEmpty);
-                    (*page, None)
+                OlderAnswer::Relisted => {
+                    if let Some(page) =
+                        older_from_cache(state, caller, &channel, request, below).await?
+                    {
+                        return Ok((channel, page));
+                    }
+                    // Proven a moment ago and refused now (a drop in between): nothing is
+                    // coming for this step, so the page offers its retry.
+                    crate::cache_first::note(crate::cache_first::Source::OlderPending);
+                    (older_fallback(request, false), None)
                 }
+                OlderAnswer::Pending => (older_fallback(request, true), None),
+                OlderAnswer::BackedOff => (older_fallback(request, false), None),
             }
         }
-        (None, stand_in) => {
+        (None, true) => {
             let read = UpstreamTimeline {
                 state: state.clone(),
                 channel: channel.id.clone(),
@@ -1749,46 +1755,70 @@ pub async fn timeline(
                 fill,
                 timeline_read,
             };
-            if stand_in {
-                // Off the request's task, so that it runs on, and still fills the cache, after the
-                // request has been answered from the cache.
-                match read_or_stand_in(state, &channel.id, request, read).await? {
-                    Answered::Upstream(answer) => {
-                        crate::cache_first::note(crate::cache_first::Source::Upstream);
-                        *answer
-                    }
-                    // `#622 cache-first-reads`: versioned as of when that read began.
-                    Answered::Landed(landed) => {
-                        crate::cache_first::note(crate::cache_first::Source::Landed);
-                        let crate::cache_first::LandedRead {
-                            page,
-                            position,
-                            began_ms: landed_ms,
-                            fetch_began: landed_began,
-                        } = *landed;
-                        began_ms = landed_ms;
-                        fetch_began = landed_began;
-                        (page, position)
-                    }
-                    Answered::StandIn(page) => {
-                        return stood_in(state, channel, request, page).await;
-                    }
+            // Off the request's task, so that it runs on, and still fills the cache, after the
+            // request has been answered from the cache.
+            match read_or_stand_in(state, &channel.id, request, read).await? {
+                Answered::Upstream(answer) => {
+                    crate::cache_first::note(crate::cache_first::Source::Upstream);
+                    *answer
                 }
-            } else {
-                // `#1886` addendum-1: a step back at a provider cursor
-                // (no copy page to prove from) gets the same bounded
-                // wait as one at a served cursor.
-                match race_older(read.run(), request).await? {
-                    OlderStep::Upstream(answer) => {
-                        crate::cache_first::note(crate::cache_first::Source::Upstream);
-                        answer
-                    }
-                    OlderStep::Fallback(page) => {
-                        crate::cache_first::note(crate::cache_first::Source::OlderEmpty);
-                        (*page, None)
-                    }
+                // `#622 cache-first-reads`: versioned as of when that read began.
+                Answered::Landed(landed) => {
+                    crate::cache_first::note(crate::cache_first::Source::Landed);
+                    let crate::cache_first::LandedRead {
+                        page,
+                        position,
+                        began_ms: landed_ms,
+                        fetch_began: landed_began,
+                    } = *landed;
+                    began_ms = landed_ms;
+                    fetch_began = landed_began;
+                    (page, position)
+                }
+                Answered::StandIn(page) => {
+                    return stood_in(state, channel, request, page).await;
                 }
             }
+        }
+        // `#1886` addendum-1, `#2264`: a step back at a provider cursor (no copy page to prove
+        // from) gets the same one walk of the view at a time as one at a served cursor.
+        (None, false) if request.before.is_some() => {
+            match older_step(
+                state,
+                caller,
+                &channel.id,
+                request,
+                OlderWalk::Provider,
+                held,
+            )
+            .await?
+            {
+                OlderAnswer::Page(read) => {
+                    began_ms = read.began_ms;
+                    fetch_began = read.fetch_began;
+                    (read.page, read.position)
+                }
+                OlderAnswer::Pending => (older_fallback(request, true), None),
+                OlderAnswer::BackedOff | OlderAnswer::Relisted => {
+                    (older_fallback(request, false), None)
+                }
+            }
+        }
+        (None, false) => {
+            let answer = UpstreamTimeline {
+                state: state.clone(),
+                channel: channel.id.clone(),
+                request: request.clone(),
+                resumed,
+                held,
+                shadow: shadow.take(),
+                fill,
+                timeline_read,
+            }
+            .run()
+            .await?;
+            crate::cache_first::note(crate::cache_first::Source::Upstream);
+            answer
         }
     };
     page.next_after = if request.before.is_some() {
@@ -1881,75 +1911,533 @@ pub const FIRST_PAINT_WAIT: std::time::Duration = std::time::Duration::from_mill
 /// never what the reader waits on.
 pub const OLDER_WAIT: std::time::Duration = FIRST_PAINT_WAIT;
 
-/// The answer to a step back [`race_older`] produced.
-enum OlderStep<T> {
-    /// The provider answered within [`OLDER_WAIT`]: its own answer.
-    Upstream(T),
-    /// It did not: a page from the server's copy (empty, more above, the
-    /// same cursor) while the read runs on in the background. Boxed: a
-    /// whole page beside the upstream answer's pair is a large variant
-    /// to carry for a page with no rows (`clippy::large_enum_variant`).
-    Fallback(Box<crate::threads::TimelinePage>),
+/// The page a step back is answered with while no rows can be given yet (`#1886` addendum-1,
+/// `#2264 vibe-talk-all-view-older-load-stuck`): empty, more above, the SAME cursor, marked as the
+/// server's copy. `pending` when this server's one walk of the view is under way, so the page
+/// waits for the stream's `older` event; not, when a failed walk backs the view off and nothing
+/// is coming, so the page says the fetch failed and offers a retry.
+fn older_fallback(
+    request: &crate::threads::TimelineRequest,
+    pending: bool,
+) -> crate::threads::TimelinePage {
+    crate::threads::TimelinePage {
+        has_more: true,
+        next_before: request.before.clone(),
+        refresh_failed: Some(CACHE_FIRST.to_owned()),
+        as_of: Some(crate::clock::iso_from_ms(crate::store::now_ms())),
+        older_pending: pending,
+        ..crate::threads::TimelinePage::default()
+    }
 }
 
-/// Run one step back upstream, off the request's task, answering with
-/// the provider's page when it lands within [`OLDER_WAIT`] and with a
-/// fallback page otherwise (`#1886` addendum-1). The read is never
-/// abandoned: spawned, it fills the cache whether or not its answer
-/// was the one served.
-///
-/// Only the page's own step back is raced - the read the reader is
-/// waiting on, which the client sends as `reason=older`. The server's
-/// own older reads (speech preparation, naming, a generic catch-up)
-/// keep the provider's answer exactly as before: they are machinery
-/// that expects it, and several of their clocks are paused in tests,
-/// where a wall-clock race would fire at once. Their reasons are their
-/// own (`Speech`, `Naming`, ...), never `Older`.
-async fn race_older<T, F>(
-    read: F,
-    request: &crate::threads::TimelineRequest,
-) -> Result<OlderStep<T>, OpError>
-where
-    T: Send + 'static,
-    F: std::future::Future<Output = Result<T, OpError>> + Send + 'static,
-{
-    let reason = crate::read_reason::ReadReason::current();
-    if reason != crate::read_reason::ReadReason::Older {
-        return Ok(OlderStep::Upstream(read.await?));
-    }
-    // Off this task, with the read's reason, hurry and records carried
-    // over and handed back, as `read_or_stand_in` hands its spawned
-    // read's back - so the request's counting and its one error line
-    // still say what the read did.
-    let hurried = crate::read_reason::hurried();
-    let mut task = tokio::spawn(reason.scope(crate::read_reason::hurry(hurried, async move {
-        crate::cache_first::noting(crate::upstream_profile::noting_failures(read)).await
-    })));
-    match tokio::time::timeout(OLDER_WAIT, &mut task).await {
-        Ok(joined) => {
-            let ((result, failed), noted) = joined.map_err(|_| {
-                OpError::Chat(ChatError::Transport(
-                    "the older read stopped before it answered".to_owned(),
-                ))
-            })?;
-            if let Some(source) = noted {
-                crate::cache_first::note(source);
-            }
-            if let Some(failed) = failed {
-                crate::upstream_profile::note_failure_of(failed);
-            }
-            Ok(OlderStep::Upstream(result?))
+/// How many provider pages one re-list below a step back reads at most (`#2264`): each is
+/// [`crate::backfill::FULL_LIMIT`] rows of Main, one call, so a re-list reaches a thousand
+/// messages below where it starts; one that has not found a step's worth below the page by
+/// then hands the step to the provider's own walk.
+pub const RELIST_PAGES: usize = 10;
+
+/// How long a re-list waits for the cache's writer to apply what it offered before it asks the
+/// file whether the step is now proven: a bound on a condition, not a budget.
+const RELIST_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the one walk of a view behind a step back reads (`#2264
+/// vibe-talk-all-view-older-load-stuck`).
+enum OlderWalk {
+    /// Re-list the stretch below a served page from `view`'s pages (Main), as chained listings,
+    /// so the copy proves the step; the provider's own walk only if it still cannot.
+    Relist {
+        below: crate::timeline_served::Below,
+        view: crate::threads::TimelineView,
+    },
+    /// The provider's own walk from a served page ([`step_back_from_served`]).
+    Served {
+        below: crate::timeline_served::Below,
+    },
+    /// The provider's own step at its own cursor.
+    Provider,
+}
+
+impl OlderWalk {
+    fn word(&self) -> &'static str {
+        match self {
+            Self::Relist { .. } => "relist",
+            Self::Served { .. } => "served",
+            Self::Provider => "provider",
         }
-        Err(_) => Ok(OlderStep::Fallback(Box::new(
-            crate::threads::TimelinePage {
-                has_more: true,
-                next_before: request.before.clone(),
-                refresh_failed: Some(CACHE_FIRST.to_owned()),
-                as_of: Some(crate::clock::iso_from_ms(crate::store::now_ms())),
-                ..crate::threads::TimelinePage::default()
-            },
-        ))),
     }
+}
+
+/// How a walk ([`OlderWalk`]) ended.
+enum WalkEnd {
+    /// The stretch is re-listed: the copy answers the step now.
+    Relisted,
+    /// The provider's own page for the step.
+    Page(Box<crate::cache_first::LandedRead>),
+    /// It failed, or gave up after [`crate::cache_first::OLDER_REFUSAL_RETRIES`] refusals.
+    Failed(OpError),
+}
+
+/// What one walk read, for its log line.
+#[derive(Default)]
+struct WalkTally {
+    pages: usize,
+    rows: usize,
+    refusals: u32,
+}
+
+/// What a step back the copy could not answer at once ([`older_from_cache`]) is answered with.
+enum OlderAnswer {
+    /// The provider's page: read in time, or kept from the view's walk that landed after an
+    /// earlier request for the same cursor.
+    Page(Box<crate::cache_first::LandedRead>),
+    /// The walk re-listed the stretch in time: ask the copy again.
+    Relisted,
+    /// The view's walk is under way (begun now, or by an earlier request): no rows yet.
+    Pending,
+    /// A failed walk of the view backs it off: nothing begun, nothing coming.
+    BackedOff,
+}
+
+/// Whether `error` is this server's own budget refusing a read it never sent: due again in
+/// seconds, as for a refresh (`#1715 vibe-talk-refresh-refused-stale-page`).
+fn refused_unsent(error: &OpError) -> bool {
+    matches!(error, OpError::Chat(chat) if chat.never_sent())
+}
+
+/// Answer a step back the copy could not answer at once (`#2264
+/// vibe-talk-all-view-older-load-stuck`). The owner's All view showed "Loading older" for good:
+/// every step started its own provider walk from the newest page, none finished inside
+/// [`OLDER_WAIT`] under Slack's limits, each walk's answer was dropped, and sixteen page steps
+/// started sixteen walks against the owner's quota, starving live ingestion.
+///
+/// Now there is ONE walk of a view at a time, the message cache's backward claim, begun by the
+/// first step that finds none running, and paced by the budget ([`ReadReason::OlderWalk`] holds
+/// it below live work; a refusal waits and tries again, bounded). That step waits up to
+/// [`OLDER_WAIT`] for it. Every other step of the view while it runs, and every step while a
+/// failed walk backs the view off, is answered at once and begins nothing. A walk that outlasts
+/// its request keeps what it brought for the next step from the same cursor and says it ended
+/// on the stream (`older`), so the page steps again at once.
+///
+/// Only the page's own step back (`reason=older`) is treated so; the server's own older reads
+/// (speech preparation, naming, a tool, ...) read as they always have.
+///
+/// [`ReadReason::OlderWalk`]: crate::read_reason::ReadReason::OlderWalk
+async fn older_step(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    walk: OlderWalk,
+    held: Option<std::sync::Arc<dyn crate::held_replies::HeldReplies>>,
+) -> Result<OlderAnswer, OpError> {
+    use crate::cache_first::{note, LandedAnswer, Source};
+    use crate::read_reason::ReadReason;
+    if ReadReason::current() != ReadReason::Older {
+        // The server's own reads keep the provider's answer, read here.
+        let walk = match walk {
+            OlderWalk::Relist { below, .. } => OlderWalk::Served { below },
+            other => other,
+        };
+        let mut tally = WalkTally::default();
+        return match provider_walk(state, caller, channel, request, &walk, held, &mut tally, 0)
+            .await
+        {
+            WalkEnd::Page(read) => {
+                note(Source::Upstream);
+                Ok(OlderAnswer::Page(read))
+            }
+            WalkEnd::Failed(error) => Err(error),
+            WalkEnd::Relisted => Ok(OlderAnswer::Relisted),
+        };
+    }
+    let key =
+        RefreshKey::timeline_backward(channel.clone(), request.view, request.thread_id.as_deref());
+    if let Some(kept) = state.landed.take(&key, request.before.as_deref()) {
+        return match kept {
+            LandedAnswer::Page(read) => {
+                note(Source::Landed);
+                Ok(OlderAnswer::Page(read))
+            }
+            LandedAnswer::Refused(error) => Err(error),
+        };
+    }
+    if state.older_walks.backed_off(&key) {
+        note(Source::OlderPending);
+        return Ok(OlderAnswer::BackedOff);
+    }
+    let before = request.before.clone().unwrap_or_default();
+    let Some(claim) = state.older_walks.claim_or_wait(&key, &before, || {
+        state.message_cache.claim_refresh(key.clone())
+    }) else {
+        note(Source::OlderPending);
+        return Ok(OlderAnswer::Pending);
+    };
+    let ended = spawn_older_walk(
+        state.clone(),
+        caller,
+        channel.clone(),
+        request.clone(),
+        walk,
+        held,
+        claim,
+        key,
+    );
+    match tokio::time::timeout(OLDER_WAIT, ended).await {
+        Ok(Ok(WalkEnd::Relisted)) => Ok(OlderAnswer::Relisted),
+        Ok(Ok(WalkEnd::Page(read))) => {
+            note(Source::Upstream);
+            Ok(OlderAnswer::Page(read))
+        }
+        Ok(Ok(WalkEnd::Failed(error))) => Err(error),
+        Ok(Err(_)) => Err(OpError::Chat(ChatError::Transport(
+            "the older read stopped before it answered".to_owned(),
+        ))),
+        Err(_) => {
+            note(Source::OlderEmpty);
+            Ok(OlderAnswer::Pending)
+        }
+    }
+}
+
+/// Begin the one walk of a view under `claim` ([`older_step`]), off the request's task, and hand
+/// back where its end will be sent. A request that stopped waiting has dropped the receiver: the
+/// walk then keeps a provider page for the next step from the same cursor
+/// ([`crate::cache_first::OLDER_KEPT`]) and publishes the stream's `older` event either way.
+/// One log line per walk (`consumer="older_walk"`): channel, view, how it read, pages, rows,
+/// refusals, outcome and milliseconds, never a message or its text.
+#[allow(clippy::too_many_arguments)]
+fn spawn_older_walk(
+    state: AppState,
+    caller: crate::auth::Scope,
+    channel: ChannelId,
+    request: crate::threads::TimelineRequest,
+    walk: OlderWalk,
+    held: Option<std::sync::Arc<dyn crate::held_replies::HeldReplies>>,
+    claim: RefreshClaim,
+    key: RefreshKey,
+) -> tokio::sync::oneshot::Receiver<WalkEnd> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let generation = state.landed.generation();
+    drop(tokio::spawn(
+        crate::read_reason::ReadReason::OlderWalk.scope(crate::read_reason::hurry(
+            false,
+            async move {
+                let started = std::time::Instant::now();
+                let how = walk.word();
+                let mut tally = WalkTally::default();
+                let end = match walk {
+                    OlderWalk::Relist { below, view } => {
+                        match relist_below(
+                            &state,
+                            caller,
+                            &channel,
+                            request.clone(),
+                            &below,
+                            view,
+                            &key,
+                            &mut tally,
+                        )
+                        .await
+                        {
+                            Ok(true) => WalkEnd::Relisted,
+                            // Re-listed, and the copy still cannot prove the step: the provider's own
+                            // walk, so the page still gets its rows.
+                            Ok(false) => {
+                                provider_walk(
+                                    &state,
+                                    caller,
+                                    &channel,
+                                    &request,
+                                    &OlderWalk::Served { below },
+                                    held,
+                                    &mut tally,
+                                    crate::cache_first::OLDER_REFUSAL_RETRIES,
+                                )
+                                .await
+                            }
+                            Err(error) => WalkEnd::Failed(error),
+                        }
+                    }
+                    other => {
+                        provider_walk(
+                            &state,
+                            caller,
+                            &channel,
+                            &request,
+                            &other,
+                            held,
+                            &mut tally,
+                            crate::cache_first::OLDER_REFUSAL_RETRIES,
+                        )
+                        .await
+                    }
+                };
+                let ok = !matches!(end, WalkEnd::Failed(_));
+                let outcome = match &end {
+                    WalkEnd::Relisted => "relisted",
+                    WalkEnd::Page(_) => "page",
+                    WalkEnd::Failed(error) => error.code(),
+                };
+                state.older_walks.note_outcome(&key, ok);
+                let answered = match sender.send(end) {
+                    Ok(()) => "request",
+                    Err(end) => {
+                        if let WalkEnd::Page(read) = end {
+                            state.landed.keep_for(
+                                key.clone(),
+                                request.before.clone(),
+                                generation,
+                                crate::cache_first::LandedAnswer::Page(read),
+                                crate::cache_first::OLDER_KEPT,
+                            );
+                        }
+                        publish_older_ends(
+                            &state,
+                            &channel,
+                            &request,
+                            [request.before.clone().unwrap_or_default()],
+                            ok,
+                        );
+                        "event"
+                    }
+                };
+                // The steps answered pending while this walk ran, each at its own cursor.
+                let waiting = state.older_walks.release(&key, claim);
+                publish_older_ends(&state, &channel, &request, waiting, ok);
+                tracing::info!(
+                    consumer = "older_walk",
+                    channel = %channel,
+                    view = ?request.view,
+                    walk = how,
+                    pages = tally.pages,
+                    rows = tally.rows,
+                    refusals = tally.refusals,
+                    outcome,
+                    answered,
+                    ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "a step back's walk of older history ended"
+                );
+            },
+        )),
+    ));
+    receiver
+}
+
+/// Say on the stream that the view's walk ended, for each step at `cursors` (`#2264`).
+fn publish_older_ends(
+    state: &AppState,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    cursors: impl IntoIterator<Item = String>,
+    ok: bool,
+) {
+    for before in cursors {
+        state.live.publish_older(crate::contract::LiveOlderEvent {
+            channel_id: channel.clone(),
+            view: request.view,
+            thread_id: request.thread_id.clone(),
+            before,
+            ok,
+        });
+    }
+}
+
+/// The provider's own step for `walk` ([`OlderWalk::Served`] or [`OlderWalk::Provider`]):
+/// waiting out this server's own budget refusing a read up to `retries` times.
+#[allow(clippy::too_many_arguments)]
+async fn provider_walk(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    walk: &OlderWalk,
+    held: Option<std::sync::Arc<dyn crate::held_replies::HeldReplies>>,
+    tally: &mut WalkTally,
+    retries: u32,
+) -> WalkEnd {
+    loop {
+        let fetch_began = std::time::Instant::now();
+        let began_ms = crate::store::now_ms();
+        let read = match walk {
+            OlderWalk::Served { below } | OlderWalk::Relist { below, .. } => {
+                let mut pages = 0;
+                let read = crate::held_replies::scope(
+                    held.clone(),
+                    step_back_from_served(state, caller, channel, request, below, &mut pages),
+                )
+                .await;
+                tally.pages += pages;
+                read.map(|page| (page, None))
+            }
+            OlderWalk::Provider => {
+                tally.pages += 1;
+                UpstreamTimeline {
+                    state: state.clone(),
+                    channel: channel.clone(),
+                    request: request.clone(),
+                    resumed: None,
+                    held: held.clone(),
+                    shadow: None,
+                    fill: state.message_cache.begin_for(caller, channel),
+                    timeline_read: crate::cache::observe::TimelineRead::Before,
+                }
+                .run()
+                .await
+            }
+        };
+        match read {
+            Ok((page, position)) => {
+                tally.rows += page.messages.len();
+                return WalkEnd::Page(Box::new(crate::cache_first::LandedRead {
+                    page,
+                    position,
+                    began_ms,
+                    fetch_began,
+                }));
+            }
+            Err(error) if refused_unsent(&error) && tally.refusals < retries => {
+                tally.refusals += 1;
+                tokio::time::sleep(crate::cache_first::older_refusal_wait(tally.refusals)).await;
+            }
+            Err(error) => return WalkEnd::Failed(error),
+        }
+    }
+}
+
+/// Re-list the stretch below a served page's oldest message from `view`'s pages (`#2264
+/// vibe-talk-all-view-older-load-stuck`): after any offer for the channel was dropped, the copy
+/// trusts no claim listed before it, and nothing listed the older stretches again (a step back's
+/// page is offered as rows only, and Slack's All page holding a thread is no Main listing), so
+/// every step past the newest page went to the provider for good. This reads Main, one call a
+/// page and no replies, from the newest page (or on from where the view's last re-list stopped,
+/// when no drop came since), offering each page as a listing chained to the one before it, as
+/// the full-history walk does, until a step's worth lies below the page or the provider has no
+/// more. Then the file is asked whether it proves the step: `Ok(true)` when it does.
+#[allow(clippy::too_many_arguments)]
+async fn relist_below(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    request: crate::threads::TimelineRequest,
+    below: &crate::timeline_served::Below,
+    view: crate::threads::TimelineView,
+    key: &RefreshKey,
+    tally: &mut WalkTally,
+) -> Result<bool, OpError> {
+    use crate::cache::observe::TimelineRead;
+    let Some((at_ms, id)) = below.oldest() else {
+        return Ok(false);
+    };
+    let cache = state.message_cache.cache();
+    let clock_ms = || {
+        cache
+            .as_ref()
+            .map_or_else(crate::store::now_ms, |cache| cache.now_ms())
+    };
+    let dropped_ms = cache.as_ref().and_then(|cache| {
+        state
+            .message_cache
+            .chan_key(channel)
+            .and_then(|chan| cache.last_drop_ms(&chan))
+    });
+    // On from where the last re-list stopped only when the step lies at or below it (its rows
+    // are all older than the frontier) and no offer was dropped since that re-list began: its
+    // listings still stand, and chain on.
+    let frontier = state.older_walks.frontier(key).filter(|frontier| {
+        frontier.below_ms >= at_ms && dropped_ms.is_none_or(|dropped| dropped < frontier.began_ms)
+    });
+    let began_ms = frontier
+        .as_ref()
+        .map_or_else(clock_ms, |frontier| frontier.began_ms);
+    let mut read = crate::threads::TimelineRequest {
+        view,
+        thread_id: None,
+        before: frontier.as_ref().map(|frontier| frontier.cursor.clone()),
+        after: None,
+        limit: crate::backfill::FULL_LIMIT,
+    };
+    let mut below_ms = frontier.as_ref().map(|frontier| frontier.below_ms);
+    let want = usize::from(request.limit.max(1)) + 1;
+    let mut found = 0usize;
+    let mut reached = None;
+    for _ in 0..RELIST_PAGES {
+        // Begun before the read, so its stamp is no later than what the read saw.
+        let fill = state.message_cache.begin_for(caller, channel);
+        let page = loop {
+            match state.chat.fetch_timeline(channel, &read).await {
+                Ok(page) => break page,
+                Err(error)
+                    if error.never_sent()
+                        && tally.refusals < crate::cache_first::OLDER_REFUSAL_RETRIES =>
+                {
+                    tally.refusals += 1;
+                    tokio::time::sleep(crate::cache_first::older_refusal_wait(tally.refusals))
+                        .await;
+                }
+                Err(error) => {
+                    state.older_walks.set_frontier(key, reached);
+                    return Err(error.into());
+                }
+            }
+        };
+        tally.pages += 1;
+        tally.rows += page.messages.len();
+        if let Some(fill) = fill {
+            match below_ms {
+                None => fill.offer_timeline(&read, TimelineRead::Newest, &page),
+                Some(below_ms) => fill.offer_older(&read, &page, below_ms),
+            };
+        }
+        found += page
+            .messages
+            .iter()
+            .filter(|message| below.holds(message))
+            .count();
+        let next = page.next_before.clone().filter(|_| page.has_more);
+        let oldest = page
+            .messages
+            .iter()
+            .filter_map(|message| crate::clock::instant_ms(&message.timestamp))
+            .min();
+        match (next, oldest) {
+            // A continuation that does not move would read the same page for ever.
+            (Some(next), Some(oldest)) if read.before.as_deref() != Some(next.as_str()) => {
+                reached = Some(crate::cache_first::OlderFrontier {
+                    cursor: next.clone(),
+                    below_ms: oldest,
+                    began_ms,
+                });
+                below_ms = Some(oldest);
+                read.before = Some(next);
+                if found >= want {
+                    break;
+                }
+            }
+            // The start of the conversation, or nowhere further to go.
+            _ => {
+                reached = None;
+                break;
+            }
+        }
+    }
+    state.older_walks.set_frontier(key, reached);
+    if let Some(cache) = &cache {
+        if !cache.barrier(RELIST_SETTLE).await {
+            return Ok(false);
+        }
+    }
+    let ask = Ask::Timeline {
+        view: request.view,
+        thread: request.thread_id.clone(),
+        limit: usize::from(request.limit.max(1)),
+    };
+    let reach =
+        crate::timeline_served::WALK_PAGES.saturating_mul(usize::from(request.limit.max(1)));
+    Ok(state
+        .message_cache
+        .held_below(channel, &ask, (at_ms, id), reach)
+        .await
+        .is_some())
 }
 
 /// How long `request` waits on upstream before the cache stands in for it: [`FIRST_PAINT_WAIT`]
@@ -3174,17 +3662,33 @@ fn spawn_behind_older(
     drop(tokio::spawn(reason.scope(crate::read_reason::hurry(
         true,
         async move {
-            let _claim = claim;
-            match step_back_from_served(&state, caller, &channel, &request, &below).await {
-                Ok(_) => publish_serve_corrections(&state, &channel, served).await,
-                Err(error) => tracing::info!(
-                    consumer = "cache_older",
-                    view = ?request.view,
-                    error = error.code(),
-                    "the step back read behind a page answered from the message cache failed; the \
-                     next step is answered from the cache again"
-                ),
-            }
+            let ok = match step_back_from_served(&state, caller, &channel, &request, &below, &mut 0)
+                .await
+            {
+                Ok(_) => {
+                    publish_serve_corrections(&state, &channel, served).await;
+                    true
+                }
+                Err(error) => {
+                    tracing::info!(
+                        consumer = "cache_older",
+                        view = ?request.view,
+                        error = error.code(),
+                        "the step back read behind a page answered from the message cache failed; \
+                         the next step is answered from the cache again"
+                    );
+                    false
+                }
+            };
+            // `#2264`: a step answered pending while this read held the view's claim is told it
+            // ended, and takes its step again (beginning the view's walk, if it still must).
+            let key = RefreshKey::timeline_backward(
+                channel.clone(),
+                request.view,
+                request.thread_id.as_deref(),
+            );
+            let waiting = state.older_walks.release(&key, claim);
+            publish_older_ends(&state, &channel, &request, waiting, ok);
         },
     ))));
 }
@@ -3204,6 +3708,7 @@ async fn step_back_from_served(
     channel: &ChannelId,
     request: &crate::threads::TimelineRequest,
     below: &crate::timeline_served::Below,
+    pages_read: &mut usize,
 ) -> Result<crate::threads::TimelinePage, OpError> {
     use crate::cache::observe::TimelineRead;
     let mut read = crate::threads::TimelineRequest {
@@ -3219,6 +3724,7 @@ async fn step_back_from_served(
     let mut pages = 0;
     loop {
         pages += 1;
+        *pages_read += 1;
         let fill = state.message_cache.begin_for(caller, channel);
         let page = state.chat.fetch_timeline(channel, &read).await?;
         if let Some(fill) = fill {
@@ -9279,14 +9785,11 @@ mod tests {
         assert!(!summary.unread_exact);
     }
 
-    #[tokio::test]
-    async fn a_slow_step_back_answers_with_the_copy_fallback_and_a_fast_one_with_the_provider_page()
+    #[test]
+    fn a_step_back_with_no_rows_yet_says_more_above_at_the_same_cursor_and_whether_any_are_coming()
     {
-        // `#1886` addendum-1: past OLDER_WAIT the answer is the copy's
-        // fallback (empty, more above, the same cursor, marked), and the
-        // provider read is left running; inside the wait it is the
-        // provider's own page. The futures are gated on a Notify, not a
-        // clock, except for the product wait itself.
+        // `#1886` addendum-1 and `#2264`: the copy's fallback for a step back is empty, more
+        // above, the same cursor, marked; `older_pending` only while the view's walk runs.
         let request = crate::threads::TimelineRequest {
             view: crate::threads::TimelineView::Flat,
             thread_id: None,
@@ -9294,36 +9797,19 @@ mod tests {
             after: None,
             limit: 10,
         };
-        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
-        let held_gate = gate.clone();
-        // Only the page's own reason (`Older`) is raced; say so here.
-        let stepped = crate::read_reason::ReadReason::Older
-            .scope(race_older(
-                async move {
-                    held_gate.notified().await;
-                    Ok(crate::threads::TimelinePage::default())
-                },
-                &request,
-            ))
-            .await
-            .expect("raced");
-        match stepped {
-            OlderStep::Fallback(page) => {
-                assert!(page.messages.is_empty());
-                assert!(page.has_more);
-                assert_eq!(page.next_before.as_deref(), Some("cursor-1"));
-                assert_eq!(page.refresh_failed.as_deref(), Some(CACHE_FIRST));
-            }
-            OlderStep::Upstream(_) => panic!("a gated read answered as the provider's page"),
+        for pending in [true, false] {
+            let page = older_fallback(&request, pending);
+            assert!(page.messages.is_empty());
+            assert!(page.has_more);
+            assert_eq!(page.next_before.as_deref(), Some("cursor-1"));
+            assert_eq!(page.refresh_failed.as_deref(), Some(CACHE_FIRST));
+            assert_eq!(page.older_pending, pending);
         }
-        gate.notify_one();
-        let stepped = race_older(
-            async move { Ok(crate::threads::TimelinePage::default()) },
-            &request,
-        )
-        .await
-        .expect("raced");
-        assert!(matches!(stepped, OlderStep::Upstream(_)));
+        let wire = serde_json::to_value(older_fallback(&request, false)).expect("serialises");
+        assert!(
+            wire.get("older_pending").is_none(),
+            "absent means false: {wire}"
+        );
     }
 
     #[test]

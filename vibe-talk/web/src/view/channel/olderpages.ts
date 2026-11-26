@@ -12,6 +12,14 @@ export interface OlderPagesRecord {
   inFlight: boolean;
   step: Promise<void> | null;
   deferred: boolean;
+  /**
+   * `#2264 vibe-talk-all-view-older-load-stuck`: the cursor whose step back the server answered
+   * `older_pending` (its one walk of the view is fetching the rows), and the one whose walk failed.
+   * Each holds only while it is still the column's cursor, so a newest page that moves the cursor
+   * ends it by itself.
+   */
+  pendingAt?: string | null;
+  failedAt?: string | null;
 }
 
 /** What the older pages ask of the page. */
@@ -50,7 +58,7 @@ export interface OlderPages {
  * @returns {OlderPagesRecord}
  */
 export function freshOlderPages(): OlderPagesRecord {
-  return { moreAbove: false, cursor: null, inFlight: false, step: null, deferred: false };
+  return { moreAbove: false, cursor: null, inFlight: false, step: null, deferred: false, pendingAt: null, failedAt: null };
 }
 
 /** The older pages over `deps`. */

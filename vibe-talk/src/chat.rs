@@ -2032,6 +2032,8 @@ pub fn newer_than_trimmed(
         observed_ms: page.observed_ms,
         settled_below_ms: None,
         refresh_failed: page.refresh_failed,
+        // A delta is no step back. `#2264`.
+        older_pending: false,
         // What the newest page took from the cache, still not read. `#603 server-side-search`.
         held: page.held,
     }

@@ -648,7 +648,12 @@ export function foldPageIn(
   // instead of waiting for a later threads read to bring the same summaries.
   for (const summary of payload.threads || []) upsertThreadSummary(canon, summary);
   if (view !== "thread") canon.hasThreads = payload.has_threads === true;
-  if (!failed || !covered) {
+  // A step back from the copy still lowers the view's floor to what it brought, or its rows are held
+  // and never drawn: the projection shows the view down to its floor. It answers for no absence all
+  // the same (above). `#2264 vibe-talk-all-view-older-load-stuck`: every step back of Slack's All the
+  // server answers from its copy says `refresh_failed` (All is put together as its stand-in is), and
+  // the rows of each such step were taken into the store and left off the screen.
+  if (!failed || !covered || older) {
     coverViewOf(canon, key, view, view === "threads" ? payload.threads || [] : payload.messages || [], older, hasMore,
       payload.notice || "");
   }

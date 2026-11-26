@@ -509,6 +509,11 @@ pub struct LiveHub {
     /// a page that reconnects re-reads the whole document, which is one small GET,
     /// so a change missed here is a delay and never a divergence.
     settings: broadcast::Sender<Vec<crate::client_settings::SyncedSetting>>,
+    /// The end of this server's walk of a view's older history, begun for a step back it could
+    /// not answer from its copy (`#2264 vibe-talk-all-view-older-load-stuck`): carried on the
+    /// same streams as messages, as an event of its own name, so the page that asked steps again
+    /// at once. No replay tail: a page that reconnects takes the step again itself.
+    older: broadcast::Sender<crate::contract::LiveOlderEvent>,
     /// How many reaction updates and corrections this hub has published: the uniqueness of
     /// their event ids. A subscriber resumes after the LAST event of the id it names, so an
     /// update or correction reusing its message's create id would silently swallow everything
@@ -566,6 +571,7 @@ impl LiveHub {
             cache: std::sync::OnceLock::new(),
             store: std::sync::OnceLock::new(),
             settings: settings_sender,
+            older: broadcast::channel(OLDER_CAPACITY).0,
             reaction_memory: Mutex::new(BTreeMap::new()),
             updates: std::sync::atomic::AtomicU64::new(0),
         }
@@ -612,6 +618,19 @@ impl LiveHub {
         }
         // No subscriber is not an error: nobody is open to tell.
         let _ = self.settings.send(changed);
+    }
+
+    /// Tell every open page that a walk of `event`'s view's older history ended. `#2264
+    /// vibe-talk-all-view-older-load-stuck`.
+    pub fn publish_older(&self, event: crate::contract::LiveOlderEvent) {
+        // No subscriber is not an error: nobody is open to tell.
+        let _ = self.older.send(event);
+    }
+
+    /// Ends of older-history walks from now on, for one stream to carry.
+    #[must_use]
+    pub fn subscribe_older(&self) -> broadcast::Receiver<crate::contract::LiveOlderEvent> {
+        self.older.subscribe()
     }
 
     /// Settings changes from now on, for one stream to carry.
@@ -1820,6 +1839,14 @@ pub const EVENT_RESET: &str = "reset";
 /// stream's message order, and a cursor must never be moved by it.
 pub const EVENT_SETTINGS: &str = "settings";
 
+/// The SSE event name for the end of a walk of a view's older history. `#2264
+/// vibe-talk-all-view-older-load-stuck`.
+pub const EVENT_OLDER: &str = "older";
+
+/// How many `older` events one slow subscriber may fall behind before it skips some: each is
+/// one walk's end, at most one per channel view at a time.
+const OLDER_CAPACITY: usize = 64;
+
 /// Turn one [`Subscription`] into the body of a Server-Sent Events response.
 ///
 /// The replay tail goes out first, oldest first, then everything live. Each event carries an
@@ -1879,10 +1906,13 @@ pub fn events(
         /// Synced-settings changes to carry between messages (`#457
         /// settings-server-side`): the other thing every open page must hear.
         settings_receiver: broadcast::Receiver<Vec<crate::client_settings::SyncedSetting>>,
+        /// Ends of older-history walks, this channel's carried (`#2264`).
+        older_receiver: broadcast::Receiver<crate::contract::LiveOlderEvent>,
     }
     let markup = crate::render::markup_for(&app.config, &channel);
     let profiles = crate::render::profile_base_for(&app.config, &channel);
     let settings_receiver = app.live.subscribe_settings();
+    let older_receiver = app.live.subscribe_older();
     let start = State {
         replay: subscription.replay.into_iter().collect(),
         receiver: subscription.receiver,
@@ -1896,6 +1926,7 @@ pub fn events(
         caller,
         replay_hues: None,
         settings_receiver,
+        older_receiver,
     };
     futures_util::stream::unfold(start, |mut state| async move {
         if state.reset_on_attach {
@@ -1960,6 +1991,18 @@ pub fn events(
                             Err(broadcast::error::RecvError::Lagged(_))
                             | Err(broadcast::error::RecvError::Closed) => {
                                 state.settings_receiver = state.app.live.subscribe_settings();
+                            }
+                        }
+                    }
+                    older = state.older_receiver.recv() => {
+                        match older {
+                            Ok(event) if event.channel_id == state.channel => {
+                                return Some((Ok(older_event(&event)), state));
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Lagged(_))
+                            | Err(broadcast::error::RecvError::Closed) => {
+                                state.older_receiver = state.app.live.subscribe_older();
                             }
                         }
                     }
@@ -2036,8 +2079,11 @@ pub fn all_events(
         app: AppState,
         caller: crate::auth::Scope,
         settings_receiver: broadcast::Receiver<Vec<crate::client_settings::SyncedSetting>>,
+        /// Ends of older-history walks, for listed channels (`#2264`).
+        older_receiver: broadcast::Receiver<crate::contract::LiveOlderEvent>,
     }
     let settings_receiver = app.live.subscribe_settings();
+    let older_receiver = app.live.subscribe_older();
     let start = State {
         start: subscription.start,
         replay: subscription.replay.into_iter().collect(),
@@ -2047,6 +2093,7 @@ pub fn all_events(
         app,
         caller,
         settings_receiver,
+        older_receiver,
     };
     futures_util::stream::unfold(start, |mut state| async move {
         if state.reset_on_attach {
@@ -2075,6 +2122,18 @@ pub fn all_events(
                             | Err(broadcast::error::RecvError::Closed) => {
                                 state.settings_receiver =
                                     state.app.live.subscribe_settings();
+                            }
+                        }
+                    }
+                    older = state.older_receiver.recv() => {
+                        match older {
+                            Ok(event) if state.app.channel(event.channel_id.as_str()).is_some() => {
+                                return Some((Ok(older_event(&event)), state));
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Lagged(_))
+                            | Err(broadcast::error::RecvError::Closed) => {
+                                state.older_receiver = state.app.live.subscribe_older();
                             }
                         }
                     }
@@ -2272,6 +2331,21 @@ fn reset_event(missed: u64) -> axum::response::sse::Event {
     axum::response::sse::Event::default()
         .event(EVENT_RESET)
         .data(data)
+}
+
+/// A live stream `older` event (`#2264 vibe-talk-all-view-older-load-stuck`): no `id`, as a
+/// settings event has none, so it never moves a subscriber's resume cursor.
+fn older_event(event: &crate::contract::LiveOlderEvent) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .event(EVENT_OLDER)
+        .json_data(event)
+        // Plain strings and a bool: serialization cannot fail. If it ever could, the page's
+        // own tap takes the step again; nothing here is worth ending the stream for.
+        .unwrap_or_else(|_| {
+            axum::response::sse::Event::default()
+                .event(EVENT_OLDER)
+                .data("{}")
+        })
 }
 
 fn settings_event(

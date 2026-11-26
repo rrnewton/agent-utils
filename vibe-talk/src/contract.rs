@@ -1539,6 +1539,26 @@ pub struct LiveResetEvent {
     pub detail: &'static str,
 }
 
+/// The data of a live stream `older` event: this server's one walk of a view's older history,
+/// begun for a step back it could not answer from its own copy, has ended. `#2264
+/// vibe-talk-all-view-older-load-stuck`: a page whose step back was answered `older_pending`
+/// takes the same step again when `ok` (the rows are now this server's to answer with), and says
+/// the fetch failed, offering a retry, when not. It carries no message and no text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct LiveOlderEvent {
+    /// Channel whose history was walked.
+    pub channel_id: ChannelId,
+    /// View the step back was for.
+    pub view: crate::threads::TimelineView,
+    /// The thread, for a step back in a thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// The `before` cursor of the step the walk was begun for.
+    pub before: String,
+    /// Whether the walk brought what it read; false when it failed or gave up.
+    pub ok: bool,
+}
+
 /// Who spoke a `vibe-talk-v1` transcript line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -2198,6 +2218,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<PutComposerDraftRequest>(),
         generator.subschema_for::<PutComposerDraftResponse>(),
         generator.subschema_for::<DeleteComposerDraftRequest>(),
+        // `#2264 vibe-talk-all-view-older-load-stuck`. Appended, for the same reason.
+        generator.subschema_for::<LiveOlderEvent>(),
     ]
 }
 

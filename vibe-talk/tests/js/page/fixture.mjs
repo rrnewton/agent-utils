@@ -5805,6 +5805,15 @@ const TUNING_BANDS = {
     "back a tap at a time; above two hundred the page is asking for more than the server will " +
     "give it, and the bounded suffix #128 exists for stops being bounded by anything this page " +
     "chose"],
+  // `#2264 vibe-talk-all-view-older-load-stuck`: a pending step back asked again by the page itself.
+  OLDER_RECHECK_UNATTACHED_MS: [2000, 20000,
+    "how long a step back the server answered pending waits before the page asks again with no live " +
+    "stream to hear the walk end on. Under two seconds it asks while a healthy walk is still reading; " +
+    "past twenty the reader of a server without live delivery waits on nothing for the rows"],
+  OLDER_RECHECK_ATTACHED_MS: [10000, 120000,
+    "the backstop for an `older` event a reconnect lost: a pending step back asked again although the " +
+    "stream is open. Under ten seconds it races the event it backs up; past two minutes a lost event " +
+    "leaves the reader on Fetching for longer than any walk takes"],
   OLDER_TRIGGER_PX: [8, 300,
     "how close to the top counts as asking for more. At a viewport's worth EVERY scroll fires a " +
     "step — including one at the bottom — so a single flick walks the whole channel; at zero the " +

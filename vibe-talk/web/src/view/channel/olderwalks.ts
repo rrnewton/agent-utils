@@ -1877,6 +1877,13 @@ function renderOlderControl() {
   const disabled = walk ? walk.stopping : olderPages().inFlight && !offered;
   if (button.disabled !== disabled) button.disabled = disabled;
   let label = olderPages().inFlight ? (walking ? "Loading earlier messages…" : "Loading older messages…") : "Older messages";
+  // `#2264 vibe-talk-all-view-older-load-stuck`: the server is fetching this step's rows, or could not.
+  const older = olderPages();
+  if (!older.inFlight && older.cursor !== null && older.pendingAt === older.cursor) {
+    label = `Fetching older messages from ${serviceWords()}…`;
+  } else if (!older.inFlight && older.cursor !== null && older.failedAt === older.cursor) {
+    label = `Couldn't fetch older messages from ${serviceWords()}. Tap to try again`;
+  }
   if (walk) {
     label = walk.stopping ? "Stopping…" : searchWalkProgress(walk);
   } else if (offered) {

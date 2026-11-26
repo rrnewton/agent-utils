@@ -998,6 +998,21 @@
       "untrusted_content_notice": "third-party text"
     }
   ],
+  "LiveOlderEvent": [
+    {
+      "before": "vt-served.cursor",
+      "channel_id": "100",
+      "ok": true,
+      "view": "flat"
+    },
+    {
+      "before": "cursor",
+      "channel_id": "100",
+      "ok": false,
+      "thread_id": "1700000000.000100",
+      "view": "thread"
+    }
+  ],
   "LiveResetEvent": [
     {
       "detail": "re-read",
@@ -2011,6 +2026,33 @@
       "next_before": null,
       "notice": null,
       "page_build": "0123456789abcdef0123456789abcdef",
+      "returned": 0,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "flat"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": true,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [],
+      "next_before": "vt-served.cursor",
+      "notice": null,
+      "older_pending": true,
+      "page_build": "0123456789abcdef0123456789abcdef",
+      "refresh_failed": "cache-first",
       "returned": 0,
       "thread": null,
       "threads": [],

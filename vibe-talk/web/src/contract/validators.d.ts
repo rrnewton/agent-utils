@@ -1489,6 +1489,36 @@ export interface LiveMessageEvent {
 }
 
 /**
+ * The data of a live stream `older` event: this server's one walk of a view's older history,
+ * begun for a step back it could not answer from its own copy, has ended. `#2264
+ * vibe-talk-all-view-older-load-stuck`: a page whose step back was answered `older_pending`
+ * takes the same step again when `ok` (the rows are now this server's to answer with), and says
+ * the fetch failed, offering a retry, when not. It carries no message and no text.
+ */
+export interface LiveOlderEvent {
+  /**
+   * The `before` cursor of the step the walk was begun for.
+   */
+  before: string;
+  /**
+   * Channel whose history was walked.
+   */
+  channel_id: ChannelId;
+  /**
+   * Whether the walk brought what it read; false when it failed or gave up.
+   */
+  ok: boolean;
+  /**
+   * The thread, for a step back in a thread.
+   */
+  thread_id?: string | null;
+  /**
+   * View the step back was for.
+   */
+  view: TimelineView;
+}
+
+/**
  * The data of a live stream `reset` event: the subscriber fell behind the replay tail.
  */
 export interface LiveResetEvent {
@@ -3180,6 +3210,14 @@ export interface TimelineResponse {
    */
   observed_ms?: number | null;
   /**
+   * On a step back (`before`) only: this server is fetching the rows below the cursor from
+   * the chat service right now, in its one walk of the view, and the page is empty for that
+   * reason, not because nothing is older. The page says so, takes no further step on its own,
+   * and steps again when the stream's `older` event says the walk ended (`#2264
+   * vibe-talk-all-view-older-load-stuck`). Absent means false.
+   */
+  older_pending?: boolean;
+  /**
    * The content hash of the page script this server serves, the `v=` of `/voice.js?v=<hash>` in
    * its shell. `#529 page-build-stale-notice`.
    *
@@ -3841,6 +3879,7 @@ export interface Contract {
   PutComposerDraftRequest: PutComposerDraftRequest;
   PutComposerDraftResponse: PutComposerDraftResponse;
   DeleteComposerDraftRequest: DeleteComposerDraftRequest;
+  LiveOlderEvent: LiveOlderEvent;
 }
 
 /** A contract type a peer may extend with new `type` tags. */

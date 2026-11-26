@@ -7,7 +7,7 @@ labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-25T17:40:00-05:00
-updated_at: 2026-11-25T17:40:00-05:00
+updated_at: 2026-11-25T19:50:00-05:00
 ---
 
 # Description
@@ -37,3 +37,12 @@ Fix, within the quota rules: a cache-older-empty answer schedules a server-side 
 # Notes
 
 Owner request 374, part B (parts A and C, the Discuss pane split and the earlier-summary strikethrough, are separate lanes).
+
+Root cause (2026-11-25, reproduced on a local server against a fake Slack):
+- After any dropped cache offer, the copy refuses every step back whose claim was listed before the drop.
+- Nothing listed those stretches again: a step back's page is offered as rows only, and a Slack All page that holds a thread is no listing of Main.
+- So every step walked the chat service from its newest page. The walk lost the race against the 1.5 s step wait, and the step was answered empty at the same cursor. The walk's own answer was dropped, and nothing it read made the next step provable.
+- Each repeat started another walk, with no claim to stop it.
+- The page took each empty answer as a normal step and fired the next one on the next scroll event.
+- A second defect sat on the same path: the page never drew a step back answered from the copy for Slack All. Every such answer is marked refresh_failed, and the page would not lower the view's floor for it.
+- The citation the owner clicked after the reload made no older read at all: the reloaded page already held the message.

@@ -1943,6 +1943,41 @@
       ],
       "type": "object"
     },
+    "LiveOlderEvent": {
+      "description": "The data of a live stream `older` event: this server's one walk of a view's older history,\nbegun for a step back it could not answer from its own copy, has ended. `#2264\nvibe-talk-all-view-older-load-stuck`: a page whose step back was answered `older_pending`\ntakes the same step again when `ok` (the rows are now this server's to answer with), and says\nthe fetch failed, offering a retry, when not. It carries no message and no text.",
+      "properties": {
+        "before": {
+          "description": "The `before` cursor of the step the walk was begun for.",
+          "type": "string"
+        },
+        "channel_id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "Channel whose history was walked."
+        },
+        "ok": {
+          "description": "Whether the walk brought what it read; false when it failed or gave up.",
+          "type": "boolean"
+        },
+        "thread_id": {
+          "description": "The thread, for a step back in a thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "view": {
+          "$ref": "#/$defs/TimelineView",
+          "description": "View the step back was for."
+        }
+      },
+      "required": [
+        "channel_id",
+        "view",
+        "before",
+        "ok"
+      ],
+      "type": "object"
+    },
     "LiveResetEvent": {
       "description": "The data of a live stream `reset` event: the subscriber fell behind the replay tail.",
       "properties": {
@@ -4050,6 +4085,10 @@
             "null"
           ]
         },
+        "older_pending": {
+          "description": "On a step back (`before`) only: this server is fetching the rows below the cursor from\nthe chat service right now, in its one walk of the view, and the page is empty for that\nreason, not because nothing is older. The page says so, takes no further step on its own,\nand steps again when the stream's `older` event says the walk ended (`#2264\nvibe-talk-all-view-older-load-stuck`). Absent means false.",
+          "type": "boolean"
+        },
         "page_build": {
           "description": "The content hash of the page script this server serves, the `v=` of `/voice.js?v=<hash>` in\nits shell. `#529 page-build-stale-notice`.\n\nOn every read, newest page and delta alike, so a page left open across a deploy learns at its\nnext refresh that it is running an older script than the server now serves, and offers a\nreload — never reloading by itself. Absent from an older server, which a page treats as\nsaying nothing.",
           "type": [
@@ -5230,6 +5269,9 @@
     },
     {
       "$ref": "#/$defs/DeleteComposerDraftRequest"
+    },
+    {
+      "$ref": "#/$defs/LiveOlderEvent"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

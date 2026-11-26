@@ -14,7 +14,7 @@ import { BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL, 
   inTwoColumns, json, jumpSaysArrived, jumpShown, longMessage, manyThreadColumns, markupHolds,
   markupPlace, message, newPage, outgoingRetry, outgoingRows, pagedChannel, parkMidway, passTime,
   pickThread, press, proposal, pullDown, reReadChannel, readerOn, relayed, reopenedChannel, replyButton, replyInStream,
-  rowWithId, savedOutgoing, scrollToGap, sentWithoutKey, setReadNew, settingsGroup, showDiscord,
+  rowWithId, savedOutgoing, scrollToGap, searchHistory, timelineAnswer, sentWithoutKey, setReadNew, settingsGroup, showDiscord,
   shownIds, sideAtFoot, signIn, sourceCalls, sourceConstant, speakRelay, sseMessage, sseUpdate, startTalking,
   tallChannel, test, threadPage, touchAt, upstreamReadButton, withLiveChannel, youSay } from "./fixture.mjs";
 
@@ -834,6 +834,134 @@ test("reaching the top loads the next step without a tap, and only one at a time
   await page.settle();
   assert.equal(page.pagesServed.length, 3, "a second tap started a second step on top of the first");
   assert.equal(page.el("discord-log").children.length, 12);
+});
+
+/**
+ * `#2264 vibe-talk-all-view-older-load-stuck`. A threaded channel in All whose server answers every
+ * step back `older_pending` (its one walk of the view is fetching the rows) until `server.walking` is
+ * turned off, or says the walk failed (`server.failed`). Every older read's path is kept.
+ */
+function olderWalkServer(page) {
+  const all = searchHistory(page, { threads: true, pages: 4 });
+  const serve = page.timeline;
+  const server = { walking: true, failed: false, older: [] };
+  page.timeline = async (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    const before = url.searchParams.get("before");
+    if (before) {
+      server.older.push(before);
+      if (server.walking || server.failed) {
+        return json(200, timelineAnswer({
+          view: url.searchParams.get("view"), has_more: true, next_before: before,
+          refresh_failed: "cache-first", ...(server.failed ? {} : { older_pending: true }),
+        }));
+      }
+    }
+    return serve(path, options);
+  };
+  return { all, server };
+}
+
+/** The stream's `older` event for `before` in this channel's All. */
+function olderEvent(before, ok = true) {
+  return `event: older\ndata: ${JSON.stringify({ channel_id: CHANNEL.id, view: "flat", before, ok })}\n\n`;
+}
+
+test("`#2264`: a step back the server is still fetching says so, takes no further step on scroll, and is taken again when the walk ends", async () => {
+  const page = newPage();
+  const { all, server } = olderWalkServer(page);
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  const area = page.el("scroll-area");
+  const before = page.el("discord-log").children.length;
+
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  await page.settle();
+  assert.equal(server.older.length, 1, `${server.older.length} older reads, not the one step`);
+  assert.equal(page.el("load-older").textContent, "Fetching older messages from Discord…");
+  assert.equal(page.el("discord-log").children.length, before, "a pending step drew rows");
+
+  // The owner's loop: every scroll event at the top used to start another walk upstream.
+  for (let i = 0; i < 5; i += 1) {
+    area.scrollTop = 0;
+    await area.dispatch("scroll");
+  }
+  await page.settle();
+  assert.equal(server.older.length, 1, "scrolling at the top stepped back again while the walk ran");
+
+  // The walk ends: the page takes the same step again at once, and the rows arrive.
+  server.walking = false;
+  await deliver(page, page.stream(), olderEvent(server.older[0]));
+  await page.settle();
+  assert.deepStrictEqual(server.older, [server.older[0], server.older[0]], "the event did not retake the same step");
+  assert.ok(page.el("discord-log").children.length > before, "the older rows were not drawn");
+  assert.ok(rowWithId(page, all[all.length - 5].id), "the row just older than the page is missing");
+  assert.equal(page.el("load-older").textContent, "Older messages");
+
+  // An event for any other step changes nothing.
+  await deliver(page, page.stream(), olderEvent("some-other-cursor"));
+  assert.equal(server.older.length, 2, "an event for another step took one");
+});
+
+test("`#2264`: a walk that fails says so on the control, takes no step on scroll, and a tap tries again", async () => {
+  const page = newPage();
+  const { server } = olderWalkServer(page);
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  const area = page.el("scroll-area");
+  const before = page.el("discord-log").children.length;
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  await page.settle();
+  const cursor = server.older[0];
+
+  await deliver(page, page.stream(), olderEvent(cursor, false));
+  await page.settle();
+  assert.equal(page.el("load-older").textContent, "Couldn't fetch older messages from Discord. Tap to try again");
+  assert.equal(server.older.length, 1, "a failed walk was retried without the reader");
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  await page.settle();
+  assert.equal(server.older.length, 1, "scrolling retried a failed walk");
+
+  // While the server still backs the view off, a tap is answered as failed again, at the same cursor.
+  server.walking = false;
+  server.failed = true;
+  await page.el("load-older").click();
+  await page.settle();
+  assert.equal(server.older.length, 2);
+  assert.equal(page.el("load-older").textContent, "Couldn't fetch older messages from Discord. Tap to try again");
+  // Once it does not, the tap brings the rows.
+  server.failed = false;
+  await page.el("load-older").click();
+  await page.settle();
+  assert.equal(server.older.length, 3);
+  assert.ok(page.el("discord-log").children.length > before, "the retry drew nothing");
+  assert.equal(page.el("load-older").textContent, "Older messages");
+});
+
+test("`#2264`: a step back of All answered from the server's copy draws its rows", async () => {
+  // Every step back of Slack's All the server answers from its copy says `refresh_failed`, as All's
+  // stand-in does. Its rows were taken into the store and never drawn: the view's floor stayed where
+  // it was, and the projection shows the view down to its floor.
+  const page = newPage();
+  const all = searchHistory(page, { threads: true, pages: 4 });
+  const serve = page.timeline;
+  page.timeline = async (path, options) => {
+    const answer = JSON.parse(await (await serve(path, options)).text());
+    if (!new URL(path, "http://fixture.test").searchParams.get("before")) return json(200, answer);
+    return json(200, { ...answer, refresh_failed: "cache-first", as_of: new Date(page.clock() - 1000).toISOString() });
+  };
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  const before = page.el("discord-log").children.length;
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  await page.settle();
+  assert.ok(page.el("discord-log").children.length > before, "the copy's step drew no row");
+  assert.ok(rowWithId(page, all[all.length - 5].id), "the row just older than the page is not on screen");
 });
 
 test("A SCROLL THAT IS NOT NEAR THE TOP LOADS NOTHING", async () => {

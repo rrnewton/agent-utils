@@ -151,6 +151,11 @@ pub enum ReadReason {
     /// of live and background work in Slack's shared budget, with a reserved share of each
     /// method's ceiling. `#1715 vibe-talk-refresh-refused-stale-page`.
     Refresh,
+    /// The server: its one walk of a view's older history, begun behind a step back it could
+    /// not answer from its own copy (`#2264 vibe-talk-all-view-older-load-stuck`). Held to the
+    /// page work's half of each method's ceiling in Slack's shared budget, below live work, so
+    /// a walk never takes the share live ingestion needs; the step's own read stays `older`.
+    OlderWalk,
     /// The server: learning the token's own account (`auth.test` and the
     /// `users.info` that names it). `#1847 vibe-talk-slack-communication-audit`:
     /// these ran untagged, so the tally could not say what they were for.
@@ -162,7 +167,7 @@ pub enum ReadReason {
 }
 
 /// Every reason, in declaration order. For tests and documentation.
-pub const ALL: [ReadReason; 33] = [
+pub const ALL: [ReadReason; 34] = [
     ReadReason::Enter,
     ReadReason::Poll,
     ReadReason::Live,
@@ -193,6 +198,7 @@ pub const ALL: [ReadReason; 33] = [
     ReadReason::LivePoll,
     ReadReason::Write,
     ReadReason::Refresh,
+    ReadReason::OlderWalk,
     ReadReason::Identity,
     ReadReason::Other,
     ReadReason::Untagged,
@@ -233,6 +239,7 @@ impl ReadReason {
             Self::LivePoll => "live-poll",
             Self::Write => "write",
             Self::Refresh => "refresh",
+            Self::OlderWalk => "older-walk",
             Self::Identity => "identity",
             Self::Other => "other",
             Self::Untagged => "untagged",

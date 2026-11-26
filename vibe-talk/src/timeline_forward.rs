@@ -547,6 +547,8 @@ pub async fn generic_since<C: ChatClient + ?Sized>(
             observed_ms: newest.observed_ms,
             settled_below_ms: None,
             refresh_failed: newest.refresh_failed,
+            // A delta is no step back. `#2264`.
+            older_pending: false,
             // What the newest page took from the cache, still not read. `#603 server-side-search`.
             held: newest.held,
         },

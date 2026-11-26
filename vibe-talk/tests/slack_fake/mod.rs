@@ -103,6 +103,9 @@ pub struct FakeState {
     pub fail_posts: Vec<usize>,
     /// Answer the next `conversations.replies` request for one thread late: see [`Hold`].
     pub hold_replies: Option<Hold>,
+    /// Answer the next `conversations.history` request for one conversation late: see [`Hold`],
+    /// whose `thread` names the conversation here. `#2264 vibe-talk-all-view-older-load-stuck`.
+    pub hold_history: Option<Hold>,
     /// The handle `auth.test` reports for the token's account; `vibe-bot` when unset.
     /// `#325 provider-diagnostics-ids`.
     pub auth_user: Option<String>,
@@ -499,7 +502,17 @@ fn post_delay(shared: &Mutex<FakeState>, uri: &Uri) -> Option<std::time::Duratio
 
 /// The [`Hold`] this request matches, taken so that it holds no later request.
 fn take_hold(shared: &Mutex<FakeState>, uri: &Uri, body: &[u8]) -> Option<Hold> {
-    if uri.path().trim_start_matches("/api/") != "conversations.replies" {
+    let method = uri.path().trim_start_matches("/api/");
+    if method == "conversations.history" {
+        let mut state = shared.lock().expect("state");
+        let conversation = form(body).get("channel").cloned();
+        return if state.hold_history.as_ref().map(|hold| &hold.thread) == conversation.as_ref() {
+            state.hold_history.take()
+        } else {
+            None
+        };
+    }
+    if method != "conversations.replies" {
         return None;
     }
     let mut state = shared.lock().expect("state");

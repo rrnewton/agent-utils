@@ -281,6 +281,11 @@ pub enum Source {
     /// page, always saying there is more, with the provider's step read behind it when
     /// the walk can reach it. `#2066 vibe-talk-page-freeze` (`crate::ops`).
     OlderPartial,
+    /// No rows yet: a repeat of a step back while this server's one walk of the view runs, or
+    /// while a failed walk backs the view off. Answered at once, no read begun: the page
+    /// waits for the stream's `older` event (`older_pending`), or says the fetch failed.
+    /// `#2264 vibe-talk-all-view-older-load-stuck`.
+    OlderPending,
     /// No rows at all: a step back whose provider read outlasted its bounded wait and
     /// whose cache held nothing servable below the cursor — an empty page saying there
     /// is more, at the same cursor, while the read fills the cache behind it. Split
@@ -309,6 +314,7 @@ impl Source {
             Self::Older => "cache-older",
             Self::OlderPartial => "cache-older-partial",
             Self::OlderEmpty => "cache-older-empty",
+            Self::OlderPending => "cache-older-pending",
             Self::Upstream => "upstream",
             Self::StandIn => "stand-in",
             Self::Held => "held",
@@ -380,12 +386,14 @@ struct Inner {
     read_ms: HashMap<RefreshKey, i64>,
 }
 
-/// One landed read: when it landed, the cursor it continued from, and how it ended.
+/// One landed read: when it landed, the cursor it continued from, how it ended, and how long it
+/// answers the next read for.
 #[derive(Debug)]
 struct Kept {
     at: Instant,
     after: Option<String>,
     answer: LandedAnswer,
+    kept_for: Duration,
 }
 
 impl Landed {
@@ -414,19 +422,35 @@ impl Landed {
         generation: u64,
         answer: LandedAnswer,
     ) {
+        self.keep_for(key, after, generation, answer, LANDED_KEPT);
+    }
+
+    /// [`Self::keep`], answering the next read for `kept_for` rather than [`LANDED_KEPT`]: an
+    /// older step's walk that outlasted its request ([`OLDER_KEPT`]), which the page takes when
+    /// the stream says it landed, however long the page took to hear it. `#2264
+    /// vibe-talk-all-view-older-load-stuck`.
+    pub fn keep_for(
+        &self,
+        key: RefreshKey,
+        after: Option<String>,
+        generation: u64,
+        answer: LandedAnswer,
+        kept_for: Duration,
+    ) {
         let mut inner = self.inner();
         if inner.generation != generation {
             return;
         }
         inner
             .reads
-            .retain(|_, kept| kept.at.elapsed() < LANDED_KEPT);
+            .retain(|_, kept| kept.at.elapsed() < kept.kept_for);
         inner.reads.insert(
             key,
             Kept {
                 at: Instant::now(),
                 after,
                 answer,
+                kept_for,
             },
         );
     }
@@ -436,10 +460,9 @@ impl Landed {
     #[must_use]
     pub fn take(&self, key: &RefreshKey, after: Option<&str>) -> Option<LandedAnswer> {
         let mut inner = self.inner();
-        let fits = inner
-            .reads
-            .get(key)
-            .is_some_and(|kept| kept.at.elapsed() < LANDED_KEPT && kept.after.as_deref() == after);
+        let fits = inner.reads.get(key).is_some_and(|kept| {
+            kept.at.elapsed() < kept.kept_for && kept.after.as_deref() == after
+        });
         if fits {
             inner.reads.remove(key).map(|kept| kept.answer)
         } else {
@@ -480,7 +503,7 @@ impl Landed {
         self.inner()
             .reads
             .get(key)
-            .is_some_and(|kept| kept.at.elapsed() < LANDED_KEPT && kept.after.as_deref() == after)
+            .is_some_and(|kept| kept.at.elapsed() < kept.kept_for && kept.after.as_deref() == after)
     }
 
     /// Make everything kept `by` older. For tests of what happens as it ages.
@@ -490,6 +513,165 @@ impl Landed {
             kept.at = kept.at.checked_sub(by).unwrap_or(kept.at);
         }
     }
+}
+
+/// How long the answer of an older step's walk that outlasted its request answers the next step
+/// from the same cursor ([`Landed::keep_for`]). `#2264 vibe-talk-all-view-older-load-stuck`.
+pub const OLDER_KEPT: Duration = Duration::from_secs(120);
+
+/// The first wait after an older walk failed, before the next step of that view may start
+/// another; each further failure doubles it, to [`OLDER_BACKOFF_MAX`]. A walk that brings what
+/// it read clears it. `#2264 vibe-talk-all-view-older-load-stuck`.
+pub const OLDER_BACKOFF_BASE: Duration = Duration::from_secs(15);
+
+/// The longest wait [`OLDER_BACKOFF_BASE`] doubles to.
+pub const OLDER_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// How many times one older walk waits out this server's own budget refusing a read before it
+/// gives up, as a refresh does (`#1715 vibe-talk-refresh-refused-stale-page`).
+pub const OLDER_REFUSAL_RETRIES: u32 = 4;
+
+/// Where one view's re-list of its older history stopped (`#2264`): the provider cursor its last
+/// page handed back and the oldest message time on that page, so the next re-list of the view
+/// goes on from there rather than walking down from the newest page again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OlderFrontier {
+    /// The provider's own cursor to read on from.
+    pub cursor: String,
+    /// The oldest message time the re-list reached, in Unix milliseconds: its listings are
+    /// chained down to here.
+    pub below_ms: i64,
+    /// When the re-list's first read began, by the message cache's clock: a dropped offer after
+    /// it puts its listings in doubt again, and the next re-list starts from the newest page.
+    pub began_ms: i64,
+}
+
+/// This server's walks of views' older history behind step backs (`#2264
+/// vibe-talk-all-view-older-load-stuck`): per view, the back-off a failed walk sets and where
+/// the last re-list stopped. Memory only, one entry per view stepped back in. One walk per view
+/// at a time is the message cache's backward claim, not this.
+#[derive(Debug, Default)]
+pub struct OlderWalks {
+    inner: Mutex<HashMap<RefreshKey, OlderWalkSlot>>,
+}
+
+#[derive(Debug, Default)]
+struct OlderWalkSlot {
+    backed_off_until: Option<Instant>,
+    failures: u32,
+    frontier: Option<OlderFrontier>,
+    /// The `before` cursors of steps answered pending while the view's claim was held by a read
+    /// begun elsewhere: each is told when that read ends ([`OlderWalks::release`]).
+    waiting: std::collections::BTreeSet<String>,
+}
+
+impl OlderWalks {
+    /// Nothing walked yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RefreshKey, OlderWalkSlot>> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether a failed walk of `view` backs the next one off still.
+    #[must_use]
+    pub fn backed_off(&self, view: &RefreshKey) -> bool {
+        self.lock()
+            .get(view)
+            .and_then(|slot| slot.backed_off_until)
+            .is_some_and(|until| until > Instant::now())
+    }
+
+    /// Note how a walk of `view` ended: a success clears its back-off; a failure sets one,
+    /// doubling from [`OLDER_BACKOFF_BASE`] to [`OLDER_BACKOFF_MAX`].
+    pub fn note_outcome(&self, view: &RefreshKey, ok: bool) {
+        let mut inner = self.lock();
+        let slot = inner.entry(view.clone()).or_default();
+        if ok {
+            slot.failures = 0;
+            slot.backed_off_until = None;
+            return;
+        }
+        slot.failures = slot.failures.saturating_add(1);
+        let shift = slot.failures.saturating_sub(1).min(16);
+        let wait = OLDER_BACKOFF_BASE
+            .saturating_mul(1u32 << shift)
+            .min(OLDER_BACKOFF_MAX);
+        slot.backed_off_until = Some(Instant::now() + wait);
+    }
+
+    /// Where the last re-list of `view` stopped, if one did.
+    #[must_use]
+    pub fn frontier(&self, view: &RefreshKey) -> Option<OlderFrontier> {
+        self.lock().get(view).and_then(|slot| slot.frontier.clone())
+    }
+
+    /// Record where a re-list of `view` stopped; `None` forgets it.
+    pub fn set_frontier(&self, view: &RefreshKey, frontier: Option<OlderFrontier>) {
+        self.lock().entry(view.clone()).or_default().frontier = frontier;
+    }
+
+    /// The view's backward claim for a walk, taken with `claim` (the message cache's
+    /// [`crate::cache::sink::Sink::claim_refresh`]) under this record's lock; when another read
+    /// holds it, `before` waits for that read's end instead, and `None`. Taken and released
+    /// ([`Self::release`]) under the same lock, so a step either begins the walk or is told
+    /// when the one running ends: never neither. `#2264`.
+    pub fn claim_or_wait(
+        &self,
+        view: &RefreshKey,
+        before: &str,
+        claim: impl FnOnce() -> Option<crate::cache::sink::RefreshClaim>,
+    ) -> Option<crate::cache::sink::RefreshClaim> {
+        let mut inner = self.lock();
+        let claimed = claim();
+        if claimed.is_none() {
+            inner
+                .entry(view.clone())
+                .or_default()
+                .waiting
+                .insert(before.to_owned());
+        }
+        claimed
+    }
+
+    /// Give up the view's backward claim, and hand back the `before` cursors of the steps that
+    /// waited on it ([`Self::claim_or_wait`]), for the stream's `older` event.
+    #[must_use]
+    pub fn release(
+        &self,
+        view: &RefreshKey,
+        claim: crate::cache::sink::RefreshClaim,
+    ) -> Vec<String> {
+        let mut inner = self.lock();
+        drop(claim);
+        inner
+            .get_mut(view)
+            .map(|slot| std::mem::take(&mut slot.waiting).into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Make every back-off `by` shorter. For tests of the back-off.
+    #[doc(hidden)]
+    pub fn age(&self, by: Duration) {
+        for slot in self.lock().values_mut() {
+            slot.backed_off_until = slot
+                .backed_off_until
+                .map(|until| until.checked_sub(by).unwrap_or(until));
+        }
+    }
+}
+
+/// How long the `n`th wait out of a budget refusal of an older walk's read lasts: from
+/// [`REFUSAL_RETRY_BASE`], doubling to [`REFUSAL_RETRY_MAX`], as a refused refresh's retry does.
+#[must_use]
+pub fn older_refusal_wait(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(16);
+    REFUSAL_RETRY_BASE
+        .saturating_mul(1u32 << shift)
+        .min(REFUSAL_RETRY_MAX)
 }
 
 #[cfg(test)]

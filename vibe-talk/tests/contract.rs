@@ -19,9 +19,9 @@ use vibe_talk::contract::{
     CatchupStamp, CatchupUnreadRef, CatchupUpdateRequest, CatchupWindow, ClientConfigResponse,
     ClientSettings, CommittedPostResponse, ComposerDraft, ComposerDrafts,
     DeleteComposerDraftRequest, DraftScope, LabelCount, LabelGroupRequest, LabelGroupsResponse,
-    LabelsResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent,
-    MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse, NoiseRules,
-    PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
+    LabelsResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveOlderEvent,
+    LiveResetEvent, MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse,
+    NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
     ThreadPinChangeResponse, ThreadPinsResponse, TimelineResponse, TokenScope, TranscriptRole,
     TranscriptThreadInfo, TranscriptsResponse, UpstreamClearAttemptView, UpstreamClearNowOutcome,
@@ -761,6 +761,15 @@ fn samples() -> Value {
                 ..TimelinePage::default()
             })),
             to(&timeline(TimelineView::Flat, TimelinePage::default())),
+            // `#2264 vibe-talk-all-view-older-load-stuck`: a step back answered while this
+            // server's one walk of the view runs: empty, more above, the same cursor, pending.
+            to(&timeline(TimelineView::Flat, TimelinePage {
+                has_more: true,
+                next_before: Some("vt-served.cursor".into()),
+                refresh_failed: Some("cache-first".into()),
+                older_pending: true,
+                ..TimelinePage::default()
+            })),
             // `#203 incremental-refresh`: a newest page that can be continued forward, a complete
             // delta with one upsert and one deletion, and an incomplete one that says there is
             // more and that the backend could not bring it up to date just now.
@@ -837,6 +846,24 @@ fn samples() -> Value {
             observed_ms: Some(1_790_000_000_000),
         })],
         "LiveResetEvent": [to(&LiveResetEvent { missed: 12, detail: "re-read" })],
+        // `#2264 vibe-talk-all-view-older-load-stuck`: a walk that landed, in All, and one
+        // that failed, in a thread.
+        "LiveOlderEvent": [
+            to(&LiveOlderEvent {
+                channel_id: vibe_talk::model::ChannelId("100".into()),
+                view: vibe_talk::threads::TimelineView::Flat,
+                thread_id: None,
+                before: "vt-served.cursor".into(),
+                ok: true,
+            }),
+            to(&LiveOlderEvent {
+                channel_id: vibe_talk::model::ChannelId("100".into()),
+                view: vibe_talk::threads::TimelineView::Thread,
+                thread_id: Some("1700000000.000100".into()),
+                before: "cursor".into(),
+                ok: false,
+            }),
+        ],
         "VibeTalkV1ServerFrame": [
             to(&VibeTalkV1ServerFrame::SessionStarted {
                 greeting: None,

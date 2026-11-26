@@ -599,6 +599,13 @@ pub struct TimelinePage {
     /// timeline-read-failures`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_failed: Option<String>,
+    /// On a step back (`before`) only: this server is fetching the rows below the cursor from
+    /// the chat service right now, in its one walk of the view, and the page is empty for that
+    /// reason, not because nothing is older. The page says so, takes no further step on its own,
+    /// and steps again when the stream's `older` event says the walk ended (`#2264
+    /// vibe-talk-all-view-older-load-stuck`). Absent means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub older_pending: bool,
     /// Messages of this page taken from the server's own copy rather than read upstream: the
     /// replies of threads the message cache held whole ([`crate::held_replies`], `#603
     /// server-side-search`). Never sent: it keeps the read from being offered back to the cache

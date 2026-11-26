@@ -70,6 +70,9 @@ export interface TimelineOlderPages {
   inFlight: boolean;
   step: Promise<void> | null;
   deferred: boolean;
+  /** `#2264`: see `OlderPagesRecord` (web/src/view/channel/olderpages.ts). */
+  pendingAt?: string | null;
+  failedAt?: string | null;
 }
 
 /** The column being worked on's read state (`loadState()`), as far as this view touches it. */
@@ -186,6 +189,8 @@ export interface TimelineViewDependencies {
   refreshFailed(payload: TimelineResponse): boolean;
   within<T>(ms: number, request: (signal: CancelSignal | undefined) => Promise<T>, abandoned?: ((answer: Promise<T>) => void) | null): Promise<T>;
   clock: ClockPort;
+  /** Whether the channel's live stream is open now, to hear the `older` event on (`#2264`). */
+  streamAttached(): boolean;
   discordNode(messages: Message[]): HTMLElement;
   threadCards(threads: readonly ThreadSummary[]): HTMLElement[];
   glom(messages: readonly Message[]): Message[][];
@@ -354,6 +359,8 @@ export interface TimelineView {
   loadOlder(signal?: CancelSignal): Promise<void> | null;
   maybeLoadOlder(): void;
   takeDeferredOlder(): void;
+  takeOlderEvent(event: { channel_id?: unknown; view?: unknown; thread_id?: unknown; before?: unknown; ok?: unknown }): void;
+  olderStepHeld(): boolean;
   appendChannelRow(arriving: Message, live?: boolean, folded?: boolean): void;
   appendToColumns(arriving: Message, live?: boolean, replayed?: boolean): Message;
   applyReadRuns(): void;
@@ -380,6 +387,15 @@ export interface TimelineView {
 
 /** How long one timeline read may run before the page gives up on it. */
 const CHANNEL_READ_TIMEOUT_MS = 20000;
+/**
+ * `#2264 vibe-talk-all-view-older-load-stuck`: how long after a pending step back the page asks again
+ * by itself, with no live stream open to hear the walk end on (live delivery off, or the stream down),
+ * and with one, as the backstop for an `older` event a reconnect lost. Either repeat costs the server
+ * nothing upstream: it begins no walk while the view's walk runs.
+ */
+const OLDER_RECHECK_UNATTACHED_MS = 5000;
+const OLDER_RECHECK_ATTACHED_MS = 30000;
+
 /** How many older pages `pagesBackTo` follows at most. */
 const REPLY_JUMP_PAGES = 5;
 
@@ -1785,7 +1801,8 @@ async function loadOlderTimeline(signal?: CancelSignal): Promise<void> {
   olderPages().inFlight = true;
   renderOlderControl();
   try {
-    const path = timelineReader.timelinePath(olderPages().cursor, null, timelineReader.olderReadReason());
+    const sent = olderPages().cursor;
+    const path = timelineReader.timelinePath(sent, null, timelineReader.olderReadReason());
     steps.pause();
     let payload;
     try {
@@ -1795,6 +1812,28 @@ async function loadOlderTimeline(signal?: CancelSignal): Promise<void> {
     }
     if (context !== channelContextKey() || generation !== loadState().generation) return;
     olderPages().inFlight = false;
+    // `#2264 vibe-talk-all-view-older-load-stuck`. An empty step at the same cursor is the server
+    // saying no rows can be given yet: its one walk of the view is fetching them (`older_pending`),
+    // and the stream's `older` event says when it ends (`takeOlderEvent`); or a failed walk backs the
+    // view off, and only the reader's tap tries again. Either way nothing is drawn, the cursor stays,
+    // and the scroll takes no further step meanwhile (`maybeLoadOlder`): every one used to start
+    // another walk upstream, and the control said "Loading older" for good.
+    if (sent !== null && payload.next_before === sent && payload.has_more === true &&
+        (payload.messages || []).length === 0 && (payload.threads || []).length === 0 &&
+        (payload.older_pending === true || refreshFailed(payload))) {
+      olderPages().pendingAt = payload.older_pending === true ? sent : null;
+      olderPages().failedAt = payload.older_pending === true ? null : sent;
+      if (payload.older_pending === true) {
+        deps.clock.setTimeout(() => inColumn(steps.column, () => {
+          if (olderPages().pendingAt !== sent || olderPages().cursor !== sent) return;
+          olderPages().pendingAt = null;
+          guardQuietly(loadOlder)();
+        }), deps.streamAttached() ? OLDER_RECHECK_ATTACHED_MS : OLDER_RECHECK_UNATTACHED_MS);
+      }
+      return;
+    }
+    olderPages().pendingAt = null;
+    olderPages().failedAt = null;
     preservingScroll(() => {
       applyTimelinePage(payload, true);
       // `#262 search-load-older`. The search's pass over the rows that just arrived, inside the same
@@ -2013,6 +2052,9 @@ function maybeLoadOlder() {
   // drawn and then hidden by the search, moved the scroll position at the head enough to fire the next
   // step, and the page read the channel's whole history back that nobody asked for.
   if (searchOffered()) return;
+  // `#2264`: nor while the server is fetching this step's rows, or after it could not: the stream's
+  // `older` event, or the reader's tap, takes the step then.
+  if (olderStepHeld()) return;
   if (el("scroll-area").scrollTop > OLDER_TRIGGER_PX) {
     return;
   }
@@ -2034,6 +2076,40 @@ function maybeLoadOlder() {
     return;
   }
   guardQuietly(loadOlder)();
+}
+
+/**
+ * Whether the column's next step back waits on the server (`#2264`): its cursor's step was answered
+ * `older_pending`, or its walk failed. Only while that is still the column's cursor.
+ */
+function olderStepHeld(): boolean {
+  const older = olderPages();
+  return older.cursor !== null && (older.pendingAt === older.cursor || older.failedAt === older.cursor);
+}
+
+/**
+ * The stream's `older` event (`#2264 vibe-talk-all-view-older-load-stuck`): the server's walk of a
+ * view's older history, begun for a step back it answered `older_pending`, ended. In each column whose
+ * step that was (same channel, view, thread and cursor): when the walk brought its rows, the step is
+ * taken again at once, and the server answers it from what the walk brought; when it failed, the
+ * control says so and offers the retry.
+ */
+function takeOlderEvent(event: { channel_id?: unknown; view?: unknown; thread_id?: unknown; before?: unknown; ok?: unknown }): void {
+  const take = () => {
+    const older = olderPages();
+    if (typeof event.before !== "string" || older.pendingAt !== event.before || older.cursor !== event.before) return;
+    if (String(selectedChannelId()) !== String(event.channel_id) || selection().view !== event.view) return;
+    if (selection().view === "thread" && String(selection().threadId) !== String(event.thread_id)) return;
+    older.pendingAt = null;
+    if (event.ok === true) {
+      guardQuietly(loadOlder)();
+    } else {
+      older.failedAt = event.before;
+      renderOlderControl();
+    }
+  };
+  take();
+  inOtherColumn(take);
 }
 
 /** The finger has left the glass. Take the step that was refused while it was down. */
@@ -2905,7 +2981,7 @@ function readRunsSuspended() {
     rowsAsDrawn, applyTimelinePage,
     renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage,
     loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta,
-    loadDiscord, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition,
+    loadDiscord, loadOlder, maybeLoadOlder, takeDeferredOlder, takeOlderEvent, olderStepHeld, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition,
     dispose() { disposed = true; },
   };
 }
