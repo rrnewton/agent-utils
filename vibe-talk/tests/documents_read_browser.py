@@ -423,7 +423,7 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     wait_lit(page, blocks[1])
     page.wait_for_function("() => window.deviceSpeech.length >= 2", timeout=20_000)
     check(utterances(page)[-1] == blocks[1], "an active tap on document text did not jump the read there")
-    act('#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("1")')
+    act('#doc-nav .doc-nav-chunks .doc-nav-chunk[aria-label="Read from 0 ¶ 1"]')
     wait_count(page, f"1 of {count}")
     wait_lit(page, blocks[0])
 
@@ -461,7 +461,7 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     # and the reader follows it into the scroller's view (`#1330`).
     check(block_off_screen(page, blocks[-1]),
           "the premise: the last block already stands in view before the jump")
-    act(f'#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("{count}")')
+    act(f'#doc-nav .doc-nav-chunks .doc-nav-chunk[aria-label="Read from 0 ¶ {count}"]')
     wait_count(page, f"{count} of {count}")
     wait_lit(page, blocks[-1])
     wait_lit_in_view(page)
@@ -490,7 +490,7 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
     act("#read-aloud")
     wait_count(page, f"1 of {count}")
-    act(f'#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("{count}")')
+    act(f'#doc-nav .doc-nav-chunks .doc-nav-chunk[aria-label="Read from 0 ¶ {count}"]')
     wait_count(page, f"{count} of {count}")
     said_before_finish = len(utterances(page))
     act("#read-next")

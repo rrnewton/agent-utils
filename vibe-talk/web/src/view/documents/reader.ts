@@ -24,7 +24,7 @@ import { documentHeadingId, renderDocumentMarkdown } from "./render.ts";
 import { firstMeaningfulVisible } from "../dom/index.ts";
 import { documentReadBlocks } from "./blocks.ts";
 import { authorNumberOf, buildScrubberNav, buildSections } from "./sections.ts";
-import type { ScrubSectionCell, SectionModel } from "./sections.ts";
+import type { ScrubberNavModel, SectionModel } from "./sections.ts";
 import { splitIssueHeader } from "./issueheader.ts";
 import { readerAnchorDelta, readerAnchorOf } from "./viewstate.ts";
 import type { ReaderAnchor } from "./viewstate.ts";
@@ -52,6 +52,8 @@ export interface DocumentsReaderDependencies {
     texts: readonly string[];
     /** The block model's kind of each of `texts`, in the same order (`#1505`). */
     kinds?: readonly string[];
+    /** `#2266`: first block of each section, in order, for section stepping. */
+    sections?: readonly number[];
     onReadingBlock?: (block: number | null, element?: number | null) => unknown;
     /** `#2006`: React pressed on this read: its block and words, for the view's reply. */
     onReact?: (block: number, text: string) => unknown;
@@ -767,22 +769,144 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   }
 
   /**
-   * Draw the navigator (`#1541 documents-nav-outline-tree`): two rows
-   * inside the read scrubber, built from the Outline's section tree.
-   * Row one is the tree unfolded only along the path to the current
-   * section — expanded sections drawn as thin rectangular outlines
-   * holding their visible children, tint deepening with depth, the
-   * current section filled; row two is the current section's own
-   * chunks as rectangular blocks in the timeline's language, one
-   * chunk exactly one block, labelled with its local place in the
-   * section. Hidden runs in either row are one "…" cell. Every cell
-   * starts reading at its own block through the same `startReading`
-   * a tap in the body takes, so the read and the light follow in the
-   * one block model. Shown only while a read of the open document
-   * stands (the scrubber is its home; at the reader's head it was
-   * always on and scrolled away). A host without the element keeps
-   * the reader as it was.
+   * Draw the navigator (`#1541 documents-nav-outline-tree`, revised
+   * `#2266`): two rows inside the read scrubber. Row one is every
+   * section flat in document order, its § number and title; row two
+   * is the current section's own chunks as unnumbered ticks, one
+   * chunk exactly one block. Every cell starts reading at its own
+   * block through the same `startReading` a tap in the body takes
+   * (one delegated listener on the container, in `wire`). Cells are
+   * built once per document and current section; a position report
+   * only moves the current/heard marking, so focus and presses
+   * survive block boundaries. Shown only while a read of the open
+   * document stands (the scrubber is its home; at the reader's head
+   * it was always on and scrolled away). A host without the element
+   * keeps the reader as it was.
    */
+  let navBuiltKey: string | null = null;
+
+  /** The one section covers the whole document with no heading of its own. */
+  function wholeDocumentOnly(built: ScrubberNavModel): boolean {
+    if (built.sections.length === 0) return true;
+    return built.sections.length === 1
+      && navModel !== null
+      && (navModel.sections[0] as SectionModel["sections"][number]).headingBlock === null;
+  }
+
+  /** Scroll one row sideways only enough to show `cell`; never the page. */
+  function scrollCellIntoRow(row: HTMLElement, cell: HTMLElement): void {
+    if (typeof row.getBoundingClientRect !== "function" || typeof cell.getBoundingClientRect !== "function") return;
+    if (typeof row.clientWidth !== "number" || row.clientWidth === 0) return;
+    const rowBox = row.getBoundingClientRect();
+    const cellBox = cell.getBoundingClientRect();
+    if (cellBox.left < rowBox.left) row.scrollLeft -= (rowBox.left - cellBox.left) + 4;
+    else if (cellBox.right > rowBox.right) row.scrollLeft += (cellBox.right - rowBox.right) + 4;
+  }
+
+  function sectionButton(number: string, title: string, start: number, label: string): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "doc-nav-unit doc-nav-section";
+    button.setAttribute("data-start", String(start));
+    button.setAttribute("aria-label", label);
+    button.setAttribute("title", number === "" ? "§ Whole document" : `§${number} ${title}`.trim());
+    const num = document.createElement("span");
+    num.className = "doc-nav-num";
+    num.textContent = number === "" ? "§" : `§${number}`;
+    const words = document.createElement("span");
+    words.className = "doc-nav-title";
+    words.textContent = title;
+    button.appendChild(num);
+    button.appendChild(words);
+    return button;
+  }
+
+  function buildNavigatorDom(nav: HTMLElement, built: ScrubberNavModel): void {
+    // Focus inside the rows survives a rebuild: same row, same start.
+    let focusStart: string | null = null;
+    let focusChunk = false;
+    if (typeof document !== "undefined" && document.activeElement !== null
+        && typeof nav.contains === "function" && nav.contains(document.activeElement)) {
+      const active = document.activeElement as HTMLElement;
+      focusStart = typeof active.getAttribute === "function" ? active.getAttribute("data-start") : null;
+      focusChunk = typeof active.className === "string" && active.className.includes("doc-nav-chunk");
+    }
+    nav.textContent = "";
+    const sectionsLine = document.createElement("div");
+    sectionsLine.className = "doc-nav-row doc-nav-sections";
+    sectionsLine.setAttribute("role", "group");
+    sectionsLine.setAttribute("aria-label", "Sections of the document");
+    if (wholeDocumentOnly(built)) {
+      sectionsLine.appendChild(sectionButton("", "Whole document", 0, "Read from the start"));
+    } else {
+      for (const cell of built.sections) {
+        sectionsLine.appendChild(sectionButton(
+          cell.number, cell.title, cell.start,
+          `Read from section ${cell.number} ${cell.title}`.trim()));
+      }
+    }
+    nav.appendChild(sectionsLine);
+    if (built.chunks.length > 0) {
+      const chunksLine = document.createElement("div");
+      chunksLine.className = "doc-nav-row doc-nav-chunks";
+      chunksLine.setAttribute("role", "group");
+      chunksLine.setAttribute("aria-label", "Chunks of the current section");
+      for (const cell of built.chunks) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "doc-nav-chunk";
+        button.setAttribute("data-start", String(cell.block));
+        button.setAttribute("aria-label", cell.address !== "" ? `Read from ${cell.address}` : "Read from here");
+        button.style.setProperty("flex-grow", String(Math.max(1, cell.weight)));
+        chunksLine.appendChild(button);
+      }
+      nav.appendChild(chunksLine);
+    }
+    if (focusStart !== null) {
+      const again = Array.from(nav.querySelectorAll(focusChunk ? ".doc-nav-chunk" : ".doc-nav-section"))
+        .find((el) => el.getAttribute("data-start") === focusStart) as HTMLElement | undefined;
+      if (again !== undefined && typeof again.focus === "function") again.focus();
+    }
+  }
+
+  function paintNavigator(nav: HTMLElement, built: ScrubberNavModel): void {
+    const mark = (el: Element, current: boolean, heard: boolean): void => {
+      if (current) el.setAttribute("aria-current", "true");
+      else el.removeAttribute("aria-current");
+      if (heard) el.setAttribute("data-heard", "");
+      else el.removeAttribute("data-heard");
+    };
+    let currentSectionButton: Element | undefined;
+    let currentChunkButton: Element | undefined;
+    const sectionButtons = nav.querySelectorAll(".doc-nav-section");
+    if (wholeDocumentOnly(built)) {
+      if (sectionButtons[0] !== undefined) {
+        mark(sectionButtons[0], true, false);
+        currentSectionButton = sectionButtons[0];
+      }
+    } else {
+      built.sections.forEach((cell, at) => {
+        const button = sectionButtons[at];
+        if (button !== undefined) {
+          mark(button, cell.current, cell.heard);
+          if (cell.current) currentSectionButton = button;
+        }
+      });
+    }
+    const chunkButtons = nav.querySelectorAll(".doc-nav-chunk");
+    built.chunks.forEach((cell, at) => {
+      const button = chunkButtons[at];
+      if (button !== undefined) {
+        mark(button, cell.current, cell.heard);
+        if (cell.current) currentChunkButton = button;
+      }
+    });
+    for (const current of [currentSectionButton, currentChunkButton]) {
+      const row = current?.parentNode as HTMLElement | null | undefined;
+      if (current !== undefined && row) scrollCellIntoRow(row, current as HTMLElement);
+    }
+  }
+
   function renderNavigator(): void {
     let nav: HTMLElement;
     try {
@@ -793,108 +917,22 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     if (!nav) return;
     if (!readingActive || navBlocks === null || navModel === null) {
       nav.hidden = true;
+      navBuiltKey = null;
       return;
     }
-    const width = (typeof nav.clientWidth === "number" && nav.clientWidth > 0)
-      ? nav.clientWidth
-      : 360;
-    const built = buildScrubberNav(navBlocks, navModel, navBlock, width);
-    let cellCount = built.chunks.length;
-    const countSections = (cells: ScrubSectionCell[]): void => {
-      for (const cell of cells) {
-        cellCount += 1;
-        if (cell.kind === "section" && cell.children !== null) countSections(cell.children);
-      }
-    };
-    countSections(built.roots);
-    nav.hidden = cellCount <= 1;
-    if (nav.hidden) return;
-    nav.textContent = "";
-    const makeCell = (className: string, text: string, label: string, start: number): HTMLButtonElement => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = className;
-      button.textContent = text;
-      button.setAttribute("aria-label", label);
-      listening.listen<MouseEvent>(button, "click", (event) => {
-        if (typeof event.stopPropagation === "function") event.stopPropagation();
-        startReading(start);
-      });
-      return button;
-    };
-    // Section widths follow the visible cells, not the sections'
-    // character counts: the row is navigated by its number labels, so
-    // each label keeps a readable share and an unfolded outline takes
-    // one share per cell it holds. (Character-proportional widths
-    // starved small sections to slivers beside one huge section.)
-    const makeSection = (cell: ScrubSectionCell): { el: HTMLElement; cells: number } => {
-      if (cell.kind === "gap") {
-        const target = navModel?.sections[cell.sectionIndex];
-        const button = makeCell(
-          "doc-nav-unit doc-nav-gap", "…",
-          `Read from section ${target?.number ?? ""}`.trim(), cell.start,
-        );
-        button.setAttribute("data-gap", "");
-        return { el: button, cells: 1 };
-      }
-      const button = makeCell(
-        "doc-nav-unit doc-nav-section", cell.number,
-        `Read from section ${cell.number} ${cell.title}`.trim(), cell.start,
-      );
-      if (cell.current) button.setAttribute("aria-current", "true");
-      if (cell.heard) button.setAttribute("data-heard", "");
-      if (cell.children === null) return { el: button, cells: 1 };
-      // An unfolded section: a thin outline around its own label and
-      // its visible children (a span, never a button around buttons).
-      const outline = document.createElement("span");
-      outline.className = "doc-nav-outline";
-      outline.setAttribute("data-depth", String(cell.depth));
-      if (cell.ancestor) outline.setAttribute("data-ancestor", "");
-      outline.appendChild(button);
-      const kids = document.createElement("span");
-      kids.className = "doc-nav-children";
-      let cells = 1;
-      for (const child of cell.children) {
-        const made = makeSection(child);
-        cells += made.cells;
-        kids.appendChild(made.el);
-      }
-      kids.style.setProperty("flex-grow", String(Math.max(1, cells - 1)));
-      outline.appendChild(kids);
-      outline.style.setProperty("flex-grow", String(cells));
-      return { el: outline, cells };
-    };
-    if (built.roots.length > 0) {
-      const line = document.createElement("div");
-      line.className = "doc-nav-row doc-nav-sections";
-      line.setAttribute("role", "group");
-      line.setAttribute("aria-label", "Sections of the document");
-      for (const cell of built.roots) line.appendChild(makeSection(cell).el);
-      nav.appendChild(line);
+    const built = buildScrubberNav(navBlocks, navModel, navBlock);
+    if (built.sections.length + built.chunks.length <= 1) {
+      nav.hidden = true;
+      navBuiltKey = null;
+      return;
     }
-    if (built.chunks.length > 0) {
-      const line = document.createElement("div");
-      line.className = "doc-nav-row doc-nav-chunks";
-      line.setAttribute("role", "group");
-      line.setAttribute("aria-label", "Blocks of the current section");
-      for (const cell of built.chunks) {
-        if (cell.kind === "gap") {
-          const button = makeCell("doc-nav-chunk doc-nav-gap", "…", "Read from here", cell.block);
-          button.setAttribute("data-gap", "");
-          line.appendChild(button);
-          continue;
-        }
-        const button = makeCell(
-          "doc-nav-chunk", String(cell.local),
-          cell.address !== "" ? `Read from ${cell.address}` : "Read from here", cell.block,
-        );
-        button.style.setProperty("flex-grow", String(Math.max(1, cell.weight)));
-        if (cell.current) button.setAttribute("aria-current", "true");
-        if (cell.heard) button.setAttribute("data-heard", "");
-        line.appendChild(button);
-      }
-      nav.appendChild(line);
+    nav.hidden = false;
+    const key = `${readKey}|${built.currentSection}`;
+    if (key !== navBuiltKey) {
+      buildNavigatorDom(nav, built);
+      navBuiltKey = key;
     }
+    paintNavigator(nav, built);
   }
 
   /** The attribute on the block being read: read-aloud's own for a message's block. */
@@ -1083,6 +1121,8 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       title: currentDoc.title,
       texts: blocks.map((block) => block.text),
       kinds: blocks.map((block) => block.kind),
+      // `#2266`: the one section definition, for the owner's fat arrows.
+      sections: buildSections(blocks).sections.map((section) => section.start),
       onReadingBlock,
       onReact: (block: number, text: string) => {
         if (currentDoc === null) return;
@@ -1349,6 +1389,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     navBlocks = markdown !== null ? documentReadBlocks(markdown) : null;
     navModel = navBlocks !== null ? buildSections(navBlocks) : null;
     navBlock = 0;
+    navBuiltKey = null;
     renderNavigator();
     startWatching();
     if (highlightTerms !== undefined && markdown !== null) {
@@ -1382,6 +1423,25 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     listening.listen<MouseEvent>(deps.byId("doc-body"), "click", (event) => {
       void onBodyClick(event);
     });
+    // `#2266`: the navigator's one delegated listener — cells are
+    // rebuilt per section, never per block, and name their block in
+    // `data-start`. A host without the strip keeps the reader as it was.
+    try {
+      listening.listen<MouseEvent>(deps.byId("doc-nav"), "click", (event) => {
+        const target = event.target;
+        if (target === null || typeof target !== "object") return;
+        const cell = typeof (target as HTMLElement).closest === "function"
+          ? (target as HTMLElement).closest("[data-start]")
+          : null;
+        if (cell === null) return;
+        const start = Number(cell.getAttribute("data-start"));
+        if (!Number.isInteger(start)) return;
+        if (typeof event.stopPropagation === "function") event.stopPropagation();
+        startReading(start);
+      });
+    } catch {
+      // No scrubber rows on this host; reading works without them.
+    }
     listening.listen(deps.byId("doc-back"), "click", () => {
       stopOwnReading();
       deps.onBack();

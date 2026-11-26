@@ -311,8 +311,17 @@ def walk_big(page: Page, touch: bool, card_name: str, label: str, width: int, vo
     page.wait_for_selector("#read-steer #doc-nav:not([hidden]) .doc-nav-row", timeout=20_000)
     rows = page.evaluate("() => document.querySelectorAll('#doc-nav .doc-nav-row').length")
     check(rows == 2, f"the scrubber navigator shows {rows} rows at {width}px, want exactly 2")
+    # `#2266`: every section stands in the row as its § number, nothing
+    # folded behind a gap cell, and chunk ticks carry no numbers.
+    secnums = page.evaluate(
+        "() => [...document.querySelectorAll('#doc-nav .doc-nav-num')].map((el) => el.textContent)")
+    check(secnums[:4] == ["§0", "§1", "§1.1", "§1.2"] and "§3.2" in secnums and "§12.3" in secnums,
+          f"the section row does not stand flat in order: {secnums[:6]!r}... total {len(secnums)}")
     nav_text = page.evaluate("() => document.getElementById('doc-nav').textContent")
-    check("3" in nav_text, f"section numbers are missing from the navigator rows: {nav_text[:80]!r}")
+    check("…" not in nav_text, f"a gap cell still hides sections or chunks: {nav_text[:80]!r}")
+    tick_texts = page.evaluate(
+        "() => [...document.querySelectorAll('#doc-nav .doc-nav-chunk')].map((el) => el.textContent)")
+    check(all(text == "" for text in tick_texts), f"chunk ticks still carry numbers: {tick_texts[:6]!r}")
     timeline_display = page.evaluate(
         "() => getComputedStyle(document.getElementById('read-timeline')).display")
     check(timeline_display == "none",
@@ -324,8 +333,8 @@ def walk_big(page: Page, touch: bool, card_name: str, label: str, width: int, vo
       return { scroll: nav.scrollWidth, client: nav.clientWidth,
                left: box.left, right: box.right, vw: window.innerWidth };
     }""")
-    check(fit["scroll"] <= fit["client"] + 1,
-          f"the navigator spills sideways at {width}px: scrollWidth {fit['scroll']} > clientWidth {fit['client']}")
+    # Rows scroll sideways inside the strip by design (`#2266`); the
+    # strip itself must stay on screen.
     check(fit["left"] >= -1 and fit["right"] <= fit["vw"] + 1,
           f"the scrubber spills off screen at {width}px: {fit}")
 
@@ -333,7 +342,7 @@ def walk_big(page: Page, touch: bool, card_name: str, label: str, width: int, vo
     # the light lands on it — first lit after the tap, first words said.
     marker = spoken_marker(page, voice)
     lit_at = lit_marker(page)
-    tap_cell(page.locator('#doc-nav .doc-nav-section:text-is("2")').first)
+    tap_cell(page.locator('#doc-nav .doc-nav-section[aria-label^="Read from section 2 "]').first)
     wait_first_lit(page, lit_at, "Part 2 of", "tapping section 2")
     # Spoken order proves the start only on the device voice: cloud
     # synthesis runs ahead of playback, so its record cannot order a
@@ -342,19 +351,28 @@ def walk_big(page: Page, touch: bool, card_name: str, label: str, width: int, vo
     if voice != "cloud":
         wait_spoken(page, voice, marker, "Part 2 of")
 
-    # Deep navigation: into section 3 (it unfolds in place), then its
-    # child 3.2, which stands current and highlighted.
+    # Deep navigation: into section 3, then its child 3.2, which
+    # stands current and highlighted (scrolled into its row's view).
     lit_at = lit_marker(page)
-    tap_cell(page.locator('#doc-nav .doc-nav-section:text-is("3")').first)
+    tap_cell(page.locator('#doc-nav .doc-nav-section[aria-label^="Read from section 3 "]').first)
     wait_first_lit(page, lit_at, "Part 3 of", "tapping section 3")
     lit_at = lit_marker(page)
-    tap_cell(page.locator('#doc-nav .doc-nav-section:text-is("3.2")').first)
+    tap_cell(page.locator('#doc-nav .doc-nav-section[aria-label^="Read from section 3.2 "]').first)
     wait_first_lit(page, lit_at, "Part 3.2 of", "tapping section 3.2")
     deep_rows = page.evaluate("() => document.querySelectorAll('#doc-nav .doc-nav-row').length")
     check(deep_rows == 2, f"deep in 3.2 the navigator shows {deep_rows} rows at {width}px, want 2")
     current_section = page.evaluate(
-        "() => document.querySelector('#doc-nav .doc-nav-section[aria-current=\"true\"]')?.textContent")
-    check(current_section == "3.2", f"the current section is {current_section!r}, want 3.2 highlighted")
+        "() => document.querySelector('#doc-nav .doc-nav-section[aria-current=\"true\"] .doc-nav-num')?.textContent")
+    check(current_section == "§3.2", f"the current section is {current_section!r}, want §3.2 highlighted")
+    in_row = page.evaluate("""() => {
+      const cell = document.querySelector('#doc-nav .doc-nav-section[aria-current="true"]');
+      const row = cell?.closest('.doc-nav-row');
+      if (!cell || !row) return false;
+      const cellBox = cell.getBoundingClientRect();
+      const rowBox = row.getBoundingClientRect();
+      return cellBox.left >= rowBox.left - 1 && cellBox.right <= rowBox.right + 1;
+    }""")
+    check(in_row is True, "the current section cell is scrolled out of its row")
     fit = page.evaluate("""() => {
       const nav = document.getElementById('doc-nav');
       const steer = document.getElementById('read-steer');
@@ -362,14 +380,15 @@ def walk_big(page: Page, touch: bool, card_name: str, label: str, width: int, vo
       return { scroll: nav.scrollWidth, client: nav.clientWidth,
                left: box.left, right: box.right, vw: window.innerWidth };
     }""")
-    check(fit["scroll"] <= fit["client"] + 1 and fit["left"] >= -1 and fit["right"] <= fit["vw"] + 1,
+    check(fit["left"] >= -1 and fit["right"] <= fit["vw"] + 1,
           f"deep in 3.2 the scrubber spills at {width}px: {fit}")
 
-    # A chunk tap lands on exactly its own block: chunk 3 of section
-    # 3.2 is its second paragraph (chunk 1 is the heading).
+    # A chunk tap lands on exactly its own block: the tick addressed
+    # 3.2 ¶ 2 is the section's second paragraph (the heading tick
+    # addresses as the section itself).
     lit_at = lit_marker(page)
-    tap_cell(page.locator('#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("3")').first)
-    wait_first_lit(page, lit_at, f"Paragraph 3.2 number 1 of {label}", "tapping chunk 3 of 3.2")
+    tap_cell(page.locator('#doc-nav .doc-nav-chunks .doc-nav-chunk[aria-label="Read from 3.2 ¶ 2"]').first)
+    wait_first_lit(page, lit_at, f"Paragraph 3.2 number 1 of {label}", "tapping chunk ¶ 2 of 3.2")
 
     shots = os.environ.get("DOCNAV_SCREENSHOTS", "")
     if shots:
@@ -393,16 +412,16 @@ def walk_table(page: Page, touch: bool, voice: str) -> None:
     set_voice(page, touch, voice)
     page.tap("#read-aloud") if touch else page.click("#read-aloud")
     page.wait_for_selector("#read-steer #doc-nav:not([hidden]) .doc-nav-chunk", timeout=20_000)
-    # Section 1's chunks in order: 1 heading, 2 before, 3 the table,
-    # 4 after. Each tap must light exactly that block. On the cloud
-    # voice the table is spoken a row at a time (`#2266`): chunk 4 is
+    # Section 1's ticks by address: its heading, ¶ 1 before, ¶ 2 the
+    # table, ¶ 3 after. Each tap must light exactly that block. On the
+    # cloud voice the table is spoken a row at a time (`#2266`): ¶ 3 is
     # the block AFTER those rows, not the fourth spoken piece.
-    for local, words in (("2", "Before the table"), ("4", "After the table")):
+    for address, words in (("Read from 1 ¶ 1", "Before the table"), ("Read from 1 ¶ 3", "After the table")):
         lit_at = lit_marker(page)
-        tap_cell(page.locator(f'#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("{local}")').first)
-        wait_first_lit(page, lit_at, words, f"tapping table chunk {local}")
+        tap_cell(page.locator(f'#doc-nav .doc-nav-chunks .doc-nav-chunk[aria-label="{address}"]').first)
+        wait_first_lit(page, lit_at, words, f"tapping table tick {address}")
     lit_at = lit_marker(page)
-    tap_cell(page.locator('#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("3")').first)
+    tap_cell(page.locator('#doc-nav .doc-nav-chunks .doc-nav-chunk[aria-label="Read from 1 ¶ 2"]').first)
     wait_first_lit(page, lit_at, "Alpha", "tapping the table chunk")
     lit_tag = page.evaluate(
         "() => document.querySelector('#doc-body [data-reading-block=\"current\"]')?.tagName")
@@ -413,8 +432,13 @@ def walk_table(page: Page, touch: bool, voice: str) -> None:
         page.screenshot(path=str(Path(shots) / "scrubber-table-393.png"))
 
 def walk_canary(page: Page, touch: bool, card_name: str, label: str, voice: str) -> None:
-    """`#2266`: every tap after the long paragraph and the table lands on
-    its own block, by coordinates, lit + spoken + counted, either voice."""
+    """`#2266`: every control after the long paragraph and the table
+    lands on its own block — thin arrows a visible chunk a press, fat
+    arrows the top row's sections, cells and body by coordinates —
+    lit, spoken and counted in model blocks, either voice."""
+    def act(selector: str) -> None:
+        page.tap(selector) if touch else page.click(selector)
+
     card = page.locator("#documents-list .doc-card", has_text=card_name)
     card.tap() if touch else card.click()
     page.wait_for_function(
@@ -422,23 +446,25 @@ def walk_canary(page: Page, touch: bool, card_name: str, label: str, voice: str)
         arg=f"TARGET-{label}-GAMMA-1", timeout=20_000)
     install_lit_log(page)
     set_voice(page, touch, voice)
-    page.tap("#read-aloud") if touch else page.click("#read-aloud")
+    act("#read-aloud")
     page.wait_for_function(
         "() => document.querySelectorAll('#doc-body [data-reading-block=\"current\"]').length === 1",
         timeout=20_000)
     page.wait_for_selector("#read-steer #doc-nav:not([hidden]) .doc-nav-row", timeout=20_000)
 
-    # Counted: 9 drawn blocks. The device voice counts its blocks; the
-    # cloud voice counts its spoken pieces (more, by the split paragraph
-    # and the table's rows) — the two numberings the seek must not mix.
+    # Labels and count: § sections flat, ticks unnumbered, and the
+    # count in drawn blocks (9) on either voice — never spoken pieces.
+    secnums = page.evaluate(
+        "() => [...document.querySelectorAll('#doc-nav .doc-nav-num')].map((el) => el.textContent)")
+    check(secnums == ["§1", "§2", "§2.1"], f"the canary section row is {secnums!r}")
+    tick_texts = page.evaluate(
+        "() => [...document.querySelectorAll('#doc-nav .doc-nav-chunk')].map((el) => el.textContent)")
+    check(all(text == "" for text in tick_texts), f"canary ticks carry numbers: {tick_texts!r}")
     count = str(page.evaluate("() => document.getElementById('read-steer-count')?.textContent || ''"))
-    total = int(count.split(" of ")[1]) if " of " in count else -1
-    if voice == "cloud":
-        check(total > 9, f"the cloud count {count!r} does not outnumber the 9 drawn blocks")
-    else:
-        check(total == 9, f"the device count {count!r} is not the 9 drawn blocks")
+    check(count.endswith(" of 9"), f"the {voice} count {count!r} does not count the 9 drawn blocks")
 
-    # A body tap before any navigator tap, while the fresh read stands.
+    # A body tap first, while the fresh read stands at the top (and
+    # before synthesis lookahead can cache its target away).
     lit_at = lit_marker(page)
     marker = spoken_marker(page, voice)
     para = page.locator("#doc-body > p", has_text=f"TARGET-{label}-BETA-2").first
@@ -447,28 +473,42 @@ def walk_canary(page: Page, touch: bool, card_name: str, label: str, voice: str)
     wait_first_lit(page, lit_at, f"TARGET-{label}-BETA-2", "tapping the BETA-2 paragraph")
     wait_said(page, voice, marker, f"TARGET-{label}-BETA-2")
 
-    # Later taps assert speech only on the device voice: a cloud restart
-    # replays the server's speech cache without asking the sidecar again,
-    # so its record goes quiet exactly where the landing is right. The
-    # first tap above carries the cloud spoken assert (nothing cached
-    # for its target yet); these landings are carried by the lit log.
-    for cell, heading in (("2", f"Beta {label} section"), ("2.1", f"Gamma {label} subsection")):
-        lit_at = lit_marker(page)
-        marker = spoken_marker(page, voice)
-        click_centre(page, page.locator(f'#doc-nav .doc-nav-section:text-is("{cell}")').first,
-                     touch, f"section cell {cell}")
-        wait_first_lit(page, lit_at, heading, f"tapping section {cell}")
-        if voice != "cloud":
-            wait_spoken(page, voice, marker, heading)
+    # A section cell by coordinates, back to the top section.
+    lit_at = lit_marker(page)
+    click_centre(page, page.locator('#doc-nav .doc-nav-section[aria-label^="Read from section 1 "]').first,
+                 touch, "section cell 1")
+    wait_first_lit(page, lit_at, f"Alpha {label} start", "tapping section §1")
 
-    # Deep in 2.1 its chunks are its heading, then its paragraph.
+    # Thin arrows step one visible chunk a press, the table whole.
+    for words in (f"LONG{label}START", f"ROW-ALPHA-{label}", f"Beta {label} section"):
+        lit_at = lit_marker(page)
+        act("#read-next")
+        wait_first_lit(page, lit_at, words, f"thin Next to {words!r}")
+
+    # Fat arrows step the top row's sections.
+    lit_at = lit_marker(page)
+    act("#read-section-next")
+    wait_first_lit(page, lit_at, f"Gamma {label} subsection", "fat Next section")
+
+    # Later taps assert speech only on the device voice: a cloud
+    # restart replays the server's speech cache without asking the
+    # sidecar again, so its record goes quiet where the landing is
+    # right; the lit log carries those landings.
     lit_at = lit_marker(page)
     marker = spoken_marker(page, voice)
-    click_centre(page, page.locator('#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("2")').first,
-                 touch, "chunk 2 of the subsection")
-    wait_first_lit(page, lit_at, f"TARGET-{label}-GAMMA-1", "tapping the subsection's chunk 2")
+    click_centre(page, page.locator('#doc-nav .doc-nav-chunks .doc-nav-chunk[aria-label="Read from 2.1 ¶ 1"]').first,
+                 touch, "the subsection's paragraph tick")
+    wait_first_lit(page, lit_at, f"TARGET-{label}-GAMMA-1", "tapping the subsection's paragraph tick")
     if voice != "cloud":
         wait_spoken(page, voice, marker, f"TARGET-{label}-GAMMA-1")
+
+    lit_at = lit_marker(page)
+    marker = spoken_marker(page, voice)
+    click_centre(page, page.locator('#doc-nav .doc-nav-section[aria-label^="Read from section 2 "]').first,
+                 touch, "section cell 2")
+    wait_first_lit(page, lit_at, f"Beta {label} section", "tapping section §2")
+    if voice != "cloud":
+        wait_spoken(page, voice, marker, f"Beta {label} section")
 
     shots = os.environ.get("DOCNAV_SCREENSHOTS", "")
     if shots:

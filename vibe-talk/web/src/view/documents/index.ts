@@ -44,6 +44,7 @@ export interface DocumentsViewDependencies {
   readDocument(doc: {
     key: string; title?: string; texts: readonly string[];
     kinds?: readonly string[];
+    sections?: readonly number[];
     onReadingBlock?: (block: number | null, element?: number | null) => unknown;
     onReact?: (block: number, text: string) => unknown;
   }, from?: { part: number; block: number | null }): unknown;

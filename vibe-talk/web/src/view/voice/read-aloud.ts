@@ -89,6 +89,8 @@ interface DocumentPayload {
   texts: readonly string[];
   /** `#1505`: the block model's kind of each of `texts`, in the same order, where the caller cut one. */
   kinds?: readonly string[];
+  /** `#2266`: first model block of each section, in order, where the caller cut sections. */
+  sections?: readonly number[];
   /** `#1330 doc-read-highlight`: where this read is, for the surface that drew it. */
   onReadingBlock?: DocumentReadingBlock;
   /** `#2006 vibe-talk-documents-react`: React pressed on this read: its block and words. */
@@ -2714,18 +2716,57 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * voice-page-read-nav-center`: pressed while the read plays, it pauses the read first, which holds the
    * sentence being heard, and replies to that at once.
    */
-  /** The caller's block-model index of the current document segment, as `showDocumentBlock` reports it. */
-  function documentModelBlock(): number {
-    const playing = nowPlaying;
-    if (playing === null || !playing.document) return 0;
-    const segment = playing.segments && playing.segment !== undefined ? playing.segments[playing.segment] : undefined;
-    if (!segment || segment.block === null) return 0;
+  /** The model block `playing`'s current segment is of, or null where it names none. */
+  function modelBlockOfPlaying(playing: Playing): number | null {
+    if (!playing.document || !playing.segments || playing.segment === undefined) return null;
+    const segment = playing.segments[playing.segment] as SpeechSegment | undefined;
+    if (!segment || segment.block === null) return null;
     const kinds = playing.document.kinds;
     if (!kinds || kinds.length === 0) return segment.block;
     const listed = playing.blocks && playing.blocks[segment.part] ? playing.blocks[segment.part]! : null;
     if (!listed) return kinds.length === 1 ? 0 : segment.block;
     // `#2266`: the one listed->model mapping (core/speech), shared with seeking.
     return documentModelBlockForListed(listed, kinds, segment.block);
+  }
+
+  /** The caller's block-model index of the current document segment, as `showDocumentBlock` reports it. */
+  function documentModelBlock(): number {
+    return nowPlaying === null ? 0 : (modelBlockOfPlaying(nowPlaying) ?? 0);
+  }
+
+  /** `#2266`: the segment a seek to model block `modelBlock` starts at in `playing`, or -1. */
+  function segmentOfModelBlock(playing: Playing, modelBlock: number): number {
+    if (!playing.document || !playing.segments || playing.segments.length === 0) return -1;
+    const current = playing.segments[playing.segment ?? 0] as SpeechSegment | undefined;
+    const part = current ? current.part : 0;
+    const listed = playing.blocks && playing.blocks[part] ? playing.blocks[part]! : null;
+    if (!listed) return -1;
+    const target = documentListedBlockForModel(listed, playing.document.kinds, modelBlock, 0);
+    if (target === -1) return -1;
+    return playing.segments.findIndex((segment) =>
+      segment.part === part && (segment.block === null || segment.block >= target));
+  }
+
+  /**
+   * `#2266`: where each section of a read begins, as segment indices. A
+   * document whose caller cut sections steps by that one tree (the same
+   * starts its navigator's top row shows); anything else keeps the flat
+   * heading rule (`readSectionStarts`).
+   */
+  function sectionStartsOf(playing: Playing): number[] {
+    if (playing.kind === "document" && playing.document?.sections?.length && playing.segments) {
+      const starts: number[] = [];
+      for (const start of playing.document.sections) {
+        const segment = segmentOfModelBlock(playing, start);
+        if (segment !== -1 && !starts.includes(segment)) starts.push(segment);
+      }
+      starts.sort((a, b) => a - b);
+      if (starts.length > 0) {
+        if (starts[0] !== 0) starts.unshift(0);
+        return starts;
+      }
+    }
+    return readSectionStarts(playing as Playing & { segments: SpeechSegment[] });
   }
 
   function reactToHeldSentence() {
@@ -2751,7 +2792,24 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // `#2058`: while a jump's speech is still in flight the painted position speaks.
     if (nowPlaying === null) {
       if (jumpPaint === null || jumpPaint.segments.length < 2) return "";
+      // `#2266`: a document counts its model blocks, painted or playing.
+      const doc = jumpPaint.document;
+      if (doc?.kinds?.length) {
+        if (doc.kinds.length < 2) return "";
+        const segment = jumpPaint.segments[jumpPaint.segment] as SpeechSegment | undefined;
+        const listed = segment && jumpPaint.blocks && jumpPaint.blocks[segment.part]
+          ? jumpPaint.blocks[segment.part]! : null;
+        const model = segment && segment.block !== null && listed
+          ? documentModelBlockForListed(listed, doc.kinds, segment.block) : 0;
+        return `${model + 1} of ${doc.kinds.length}`;
+      }
       return `${jumpPaint.segment + 1} of ${jumpPaint.segments.length}`;
+    }
+    // `#2266`: a document's count, its chunk row and its light agree:
+    // model blocks, not spoken pieces.
+    if (nowPlaying.kind === "document" && nowPlaying.document?.kinds?.length) {
+      const kinds = nowPlaying.document.kinds;
+      return kinds.length < 2 ? "" : `${documentModelBlock() + 1} of ${kinds.length}`;
     }
     if (!nowPlaying!.segments || nowPlaying!.segments!.length < 2) return "";
     return `${nowPlaying!.segment! + 1} of ${nowPlaying!.segments!.length}`;
@@ -2897,7 +2955,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     deps.el("read-next").disabled = false;
     // `#2058`: mid-jump the strip counts from the paint; the rebuilt read recounts on arrival.
     const steer = effectivePlaying()!;
-    deps.el("read-section-next").disabled = !readSectionStarts(steer as Playing & { segments: SpeechSegment[] }).some((start) => start > steer.segment!);
+    deps.el("read-section-next").disabled = !sectionStartsOf(steer).some((start) => start > steer.segment!);
     if (wasHidden) placeReadSteer();
   }
 
@@ -3206,6 +3264,22 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   function stepReading(delta: number) {
     const playing = effectivePlaying();
     if (playing === null || !playing.segments) return false;
+    // `#2266`: on a document the thin arrows step visible chunks — one
+    // model block a press, so every step changes the lit chunk (a
+    // table's remaining rows are one chunk, stepped over whole).
+    if (playing.kind === "document" && playing.document?.kinds?.length) {
+      const current = modelBlockOfPlaying(playing);
+      if (current !== null) {
+        const last = playing.document.kinds.length - 1;
+        if (delta > 0 && current >= last) {
+          endReadGoingOn(false);
+          setReadState("ready");
+          return true;
+        }
+        const target = segmentOfModelBlock(playing, Math.max(0, Math.min(last, current + delta)));
+        if (target !== -1) return jumpReading(target);
+      }
+    }
     if (delta > 0 && playing.segment! + 1 >= playing.segments!.length) {
       // `#1039 documents-read-parity`: finishing a document archives nothing and goes nowhere.
       if (playing.kind === "document") {
@@ -3232,7 +3306,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   function stepSection(delta: number) {
     const playing = effectivePlaying();
     if (playing === null || !playing.segments) return false;
-    const starts = readSectionStarts(playing as Playing & { segments: SpeechSegment[] });
+    const starts = sectionStartsOf(playing);
     const at = playing.segment!;
     if (delta > 0) {
       const next = starts.find((start) => start > at);
@@ -4222,7 +4296,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * read alone. Nothing calls this yet: the documents view wires it in a later stage.
    */
   async function readDocument(
-    doc: { key: string; title?: string; texts: readonly string[]; kinds?: readonly string[]; entry?: PreparedEntry | null; onReadingBlock?: DocumentReadingBlock; onReact?: (block: number, text: string) => unknown },
+    doc: { key: string; title?: string; texts: readonly string[]; kinds?: readonly string[]; sections?: readonly number[]; entry?: PreparedEntry | null; onReadingBlock?: DocumentReadingBlock; onReact?: (block: number, text: string) => unknown },
     from: ReadFrom | null = null
   ) {
     const tapBegan = speechTimingNow();
@@ -4240,6 +4314,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     setReadState("working");
     const payload: DocumentPayload = { key, title: doc.title, entry: doc.entry ?? null, texts: doc.texts,
       ...(doc.kinds ? { kinds: doc.kinds } : {}),
+      ...(doc.sections ? { sections: doc.sections } : {}),
       ...(doc.onReadingBlock ? { onReadingBlock: doc.onReadingBlock } : {}),
       ...(doc.onReact ? { onReact: doc.onReact } : {}) };
     if (readAloudPlayback !== "audio") {

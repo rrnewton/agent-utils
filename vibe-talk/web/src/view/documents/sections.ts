@@ -99,6 +99,18 @@ export function authorNumberOf(text: string): string | null {
   return null;
 }
 
+/**
+ * A heading's words without its author's opening number (`#2266`): the
+ * title a section cell shows beside its § number, so an authored
+ * `3.2 Deep` never reads "3.2 3.2 Deep". Unnumbered headings keep
+ * their words whole.
+ */
+export function bareHeadingTitle(text: string): string {
+  const trimmed = text.trim();
+  if (authorNumberOf(trimmed) === null) return trimmed;
+  return trimmed.replace(/^\S+\s+/, "").trim();
+}
+
 /** Build the section model over `blocks` (the read model's own blocks). */
 export function buildSections(blocks: readonly DocumentReadBlock[]): SectionModel {
   const headings: Array<{ block: number; level: number; text: string }> = [];
@@ -193,7 +205,11 @@ export function buildSections(blocks: readonly DocumentReadBlock[]): SectionMode
     }
     sections.push({
       number: labelOf.get(entry.block) ?? String(entry.sibling),
-      title: entry.text,
+      // `#2266`: beside the winning author number only the bare words
+      // show; a number that did not win its depth stays part of the title.
+      title: authorWon.get(entry.depth) === true && entry.author !== null
+        ? bareHeadingTitle(entry.text)
+        : entry.text,
       depth: entry.depth,
       start: entry.block,
       end,
@@ -225,158 +241,70 @@ export function sectionIndexAt(model: SectionModel, at: number): number {
   return model.sectionOfBlock[at] as number;
 }
 
-/** A block's spoken address: `3.2 ¶ 4` (the Introduction is `0 ¶ n`). */
+/**
+ * A block's spoken address: `3.2 ¶ 4` (the Introduction is `0 ¶ n`).
+ * `#2266`: a section's heading block addresses as the section itself
+ * (`3.2`, no paragraph number), so it never shares `¶ 1` with the
+ * first body block after it.
+ */
 export function blockAddress(model: SectionModel, at: number): string {
   const index = sectionIndexAt(model, at);
   if (index === -1) return "";
   const section = model.sections[index] as DocumentSection;
+  if (at === section.headingBlock) return section.number;
   let offset = at - section.start + 1;
-  if (section.headingBlock !== null && at >= section.headingBlock) offset -= 1;
-  if (model.titleBlock >= section.start && model.titleBlock <= at) offset -= 1;
+  if (section.headingBlock !== null && at > section.headingBlock) offset -= 1;
+  if (model.titleBlock >= section.start && model.titleBlock < at) offset -= 1;
   return `${section.number} ¶ ${Math.max(1, offset)}`;
 }
 
 // The scrubber navigator over the section tree (`#1541
-// documents-nav-outline-tree`, owner UI request 066, revising the
-// focus-plus-context navigator `#1508` built): two rows that live in the
-// read scrubber, built from the Outline's tree rather than from raw
-// block indices. Row one is the section tree unfolded only along the
-// path to the current section; row two is the current section's own
-// chunks, one chunk exactly one block, so a label always names the tap's
-// exact target. Overflow is windowed with "…" cells, never merged away:
-// aggregation is what made `#1508`'s cells land on paragraphs their
-// labels did not suggest. Reading order is the block model's document
-// order throughout, so a table's chunk sits between the chunks before
-// and after it by construction.
+// documents-nav-outline-tree`, revised by `#2266
+// vibe-talk-doc-reader-navigator-campaign`): two rows that live in the
+// read scrubber, built from the section tree rather than from raw
+// block indices. Row one is EVERY section flat in document order
+// (the row scrolls; nothing is folded or hidden behind a gap cell);
+// row two is the current section's own chunks, one chunk exactly one
+// block, every chunk present as an unnumbered tick. Reading order is
+// the block model's document order throughout, so a table's chunk
+// sits between the chunks before and after it by construction.
 
-/** One visible section of the scrubber's section row. */
-export interface ScrubSectionNode {
-  kind: "section";
+/** One cell of the section row: one real section, in document order. */
+export interface ScrubSectionCell {
   /** Index into `SectionModel.sections`. */
   sectionIndex: number;
   number: string;
   title: string;
   /** First block of the section: the tap target. */
   start: number;
-  /** One past the section's last block. */
-  end: number;
   depth: number;
   /** The section holding the reading position. */
   current: boolean;
-  /** An ancestor of the current section (drawn expanded). */
-  ancestor: boolean;
   /** Wholly before the reading position. */
   heard: boolean;
-  /** Visible children where this section is unfolded, else null. */
-  children: ScrubSectionCell[] | null;
 }
 
-/** A run of sibling sections the window hid, as one "…" cell. */
-export interface ScrubGapNode {
-  kind: "gap";
-  /** First block of the run's first hidden section: the tap target. */
-  start: number;
-  /** Index of the run's first hidden section. */
-  sectionIndex: number;
+/** One cell of the chunk row: exactly one block, drawn as a tick. */
+export interface ScrubChunkCell {
+  /** The block this chunk is: the tap target. */
+  block: number;
+  weight: number;
+  current: boolean;
+  heard: boolean;
+  /** Spoken address of the block (`3.2 ¶ 4`), for its label. */
+  address: string;
 }
 
-/** One cell of the section row, in document order. */
-export type ScrubSectionCell = ScrubSectionNode | ScrubGapNode;
-
-/** One cell of the chunk row: one block, or a hidden run as "…". */
-export type ScrubChunkCell =
-  | {
-      kind: "chunk";
-      /** The block this chunk is: the tap target. */
-      block: number;
-      /** Its 1-based place among the section's own chunks. */
-      local: number;
-      weight: number;
-      current: boolean;
-      heard: boolean;
-      /** Spoken address of the block (`3.2 ¶ 4`), for its label. */
-      address: string;
-    }
-  | { kind: "gap"; block: number };
-
-/** The scrubber's two rows at one reading position and width. */
+/** The scrubber's two rows at one reading position. */
 export interface ScrubberNavModel {
-  /** Row one: the unfolded section forest (empty with no sections). */
-  roots: ScrubSectionCell[];
-  /** Row two: the current section's own chunks, windowed. */
+  /** Row one: every section, flat in document order. */
+  sections: ScrubSectionCell[];
+  /** Row two: the current section's own chunks, every one present. */
   chunks: ScrubChunkCell[];
   /** Section holding the reading position, or -1 with no sections. */
   currentSection: number;
   /** Where the reading position sits: `3.2 ¶ 4`. */
   address: string;
-  /** The most cells either row may hold at this width. */
-  maxCells: number;
-}
-
-/** Cell cap from the strip width, at the design's 24 px target size. */
-export function scrubberMaxCells(widthPx: number): number {
-  const width = Math.max(96, Math.floor(widthPx) || 360);
-  return Math.max(5, Math.floor(width / 24));
-}
-
-/**
- * The window of a list of `count` items around `focus` that fits
- * `maxCells` cells: kept indices in order, each maximal hidden run
- * (leading, inner, or trailing) as one gap naming its first hidden
- * index. The focus is always kept; its nearest neighbours are kept
- * next; the first and last items are kept where the cap leaves room.
- * With room for everything, every index is kept and no gap appears.
- */
-export function windowIndices(
-  count: number,
-  focus: number,
-  maxCells: number,
-): Array<{ index: number } | { gap: number }> {
-  if (count <= 0) return [];
-  const at = Math.max(0, Math.min(focus, count - 1));
-  if (count <= maxCells) {
-    return Array.from({ length: count }, (_unused, index) => ({ index }));
-  }
-  const cellsOf = (keep: ReadonlySet<number>): number => {
-    const sorted = [...keep].sort((a, b) => a - b);
-    let cells = sorted.length;
-    if ((sorted[0] as number) > 0) cells += 1;
-    if ((sorted[sorted.length - 1] as number) < count - 1) cells += 1;
-    for (let i = 1; i < sorted.length; i += 1) {
-      if ((sorted[i] as number) - (sorted[i - 1] as number) > 1) cells += 1;
-    }
-    return cells;
-  };
-  const keep = new Set<number>([at]);
-  // The list's ends first (they say where the list begins and ends),
-  // then the focus's neighbours outward, each only while it fits.
-  const tryAdd = (index: number): boolean => {
-    if (index < 0 || index >= count || keep.has(index)) return false;
-    keep.add(index);
-    if (cellsOf(keep) <= maxCells) return true;
-    keep.delete(index);
-    return false;
-  };
-  tryAdd(0);
-  tryAdd(count - 1);
-  for (let step = 1; step < count; step += 1) {
-    const left = tryAdd(at - step);
-    const right = tryAdd(at + step);
-    if (!left && !right && at - step < 0 && at + step >= count) break;
-    if (cellsOf(keep) >= maxCells && !left && !right) break;
-  }
-  const out: Array<{ index: number } | { gap: number }> = [];
-  let i = 0;
-  while (i < count) {
-    if (keep.has(i)) {
-      out.push({ index: i });
-      i += 1;
-      continue;
-    }
-    out.push({ gap: i });
-    while (i < count && !keep.has(i)) i += 1;
-  }
-  return out;
 }
 
 /**
@@ -398,115 +326,40 @@ export function sectionChunkRange(
   };
 }
 
-/**
- * Build the scrubber's two rows for reading position `currentBlock`.
- * You-are-here: the tree is unfolded only along the path to the
- * current section — a section is expanded exactly when it is the
- * current section or one of its ancestors — the siblings that
- * unfolding showed are kept adjacent to the path, and every other run
- * is one "…" cell. The section row's cells (labels and gaps, across
- * every unfolded list) and the chunk row's cells each stay within
- * `scrubberMaxCells(widthPx)`, so both rows fit the strip.
- */
+/** Build the scrubber's two rows for reading position `currentBlock`. */
 export function buildScrubberNav(
   blocks: readonly DocumentReadBlock[],
   model: SectionModel,
   currentBlock: number,
-  widthPx: number,
 ): ScrubberNavModel {
-  const maxCells = scrubberMaxCells(widthPx);
   const address = blockAddress(model, currentBlock);
-  // Block weights by prefix sum, so a section's weight is one subtraction.
-  const prefix: number[] = [0];
-  blocks.forEach((block) => {
-    prefix.push((prefix[prefix.length - 1] as number) + Math.max(1, block.text.length));
-  });
-  const weightOf = (start: number, end: number): number =>
-    Math.max(1, (prefix[end] as number) - (prefix[start] as number));
-
   let currentSection = sectionIndexAt(model, currentBlock);
   // A position in no section (the title block) stands at the first
-  // section's path, as the reader opens there.
+  // section, as the reader opens there.
   if (currentSection < 0 && model.sections.length > 0) currentSection = 0;
+
+  const sections: ScrubSectionCell[] = model.sections.map((section, index) => ({
+    sectionIndex: index,
+    number: section.number,
+    title: section.title,
+    start: section.start,
+    depth: section.depth,
+    current: index === currentSection,
+    heard: section.end <= currentBlock,
+  }));
 
   const chunkRange = currentSection >= 0
     ? sectionChunkRange(model, currentSection)
     : { start: 0, end: blocks.length };
-  const chunkCount = Math.max(0, chunkRange.end - chunkRange.start);
-  const chunkFocus = chunkCount === 0
-    ? 0
-    : Math.max(0, Math.min(currentBlock - chunkRange.start, chunkCount - 1));
-  const chunks: ScrubChunkCell[] = windowIndices(chunkCount, chunkFocus, maxCells).map((entry) => {
-    if ("gap" in entry) return { kind: "gap" as const, block: chunkRange.start + entry.gap };
-    const block = chunkRange.start + entry.index;
-    return {
-      kind: "chunk" as const,
+  const chunks: ScrubChunkCell[] = [];
+  for (let block = chunkRange.start; block < chunkRange.end; block += 1) {
+    chunks.push({
       block,
-      local: entry.index + 1,
-      weight: weightOf(block, block + 1),
+      weight: Math.max(1, (blocks[block] as DocumentReadBlock).text.length),
       current: block === currentBlock,
       heard: block < currentBlock,
       address: blockAddress(model, block),
-    };
-  });
-
-  if (currentSection < 0) {
-    return { roots: [], chunks, currentSection, address, maxCells };
-  }
-
-  // The path from the top level to the current section, as a set.
-  const onPath = new Set<number>();
-  for (let at = currentSection; at >= 0; at = (model.sections[at] as DocumentSection).parent) {
-    onPath.add(at);
-  }
-  const expanded = (index: number): boolean =>
-    onPath.has(index) && (model.sections[index] as DocumentSection).children.length > 0;
-  // Cell budget per sibling list: the root list plus one list per
-  // expanded section on the path share the row's cap between them.
-  const listCount = 1 + [...onPath].filter((index) => expanded(index)).length;
-  const perList = Math.max(3, Math.floor(maxCells / listCount));
-
-  const buildNode = (index: number): ScrubSectionNode => {
-    const section = model.sections[index] as DocumentSection;
-    const node: ScrubSectionNode = {
-      kind: "section",
-      sectionIndex: index,
-      number: section.number,
-      title: section.title,
-      start: section.start,
-      end: section.end,
-      depth: section.depth,
-      current: index === currentSection,
-      ancestor: onPath.has(index) && index !== currentSection,
-      heard: section.end <= currentBlock,
-      children: null,
-    };
-    if (expanded(index)) {
-      // Focus the window on the child the path continues through; at
-      // the current section itself the path ends, so its first child.
-      const pathChild = section.children.find((child) => onPath.has(child));
-      node.children = buildList(section.children, pathChild ?? (section.children[0] as number));
-    }
-    return node;
-  };
-  const buildList = (indices: readonly number[], focusSection: number): ScrubSectionCell[] => {
-    const focusPos = Math.max(0, indices.indexOf(focusSection));
-    return windowIndices(indices.length, focusPos, perList).map((entry) => {
-      if ("gap" in entry) {
-        const hidden = indices[entry.gap] as number;
-        return {
-          kind: "gap" as const,
-          start: (model.sections[hidden] as DocumentSection).start,
-          sectionIndex: hidden,
-        };
-      }
-      return buildNode(indices[entry.index] as number);
     });
-  };
-  const rootIndices = model.sections
-    .map((section, index) => (section.parent === -1 ? index : -1))
-    .filter((index) => index >= 0);
-  const rootOnPath = rootIndices.find((index) => onPath.has(index)) ?? (rootIndices[0] as number);
-  const roots = buildList(rootIndices, rootOnPath);
-  return { roots, chunks, currentSection, address, maxCells };
+  }
+  return { sections, chunks, currentSection, address };
 }

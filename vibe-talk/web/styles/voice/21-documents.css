@@ -533,15 +533,14 @@
 #doc-body > :first-child {
   margin-top: 0;
 }
-/* The scrubber navigator (`#1541 documents-nav-outline-tree`): two rows
-   inside the orange read strip, in place of the flat per-block timeline
-   while a document read stands. Row one is the outline's section tree
-   unfolded to the current section — unfolded sections as thin
-   rectangular outlines holding their visible children, the tint
-   deepening slightly with depth — and row two is the current
-   section's blocks as rectangular chunks in the timeline's language.
-   Cells shrink rather than spill: the model caps each row's cells to
-   the strip width, and hidden runs stand as one "…" cell. */
+/* The scrubber navigator (`#1541`, revised `#2266`): two rows inside
+   the orange read strip, in place of the flat per-block timeline while
+   a document read stands. Row one is every section flat in document
+   order — its § number never truncated, its title beside it where the
+   regime shows titles — and the row scrolls sideways when long; row
+   two is the current section's blocks as unnumbered ticks stretching
+   to the row's width, compressing to their minimum before the row
+   scrolls. Nothing is folded and no run hides behind a gap cell. */
 #read-steer #doc-nav {
   flex: 1 0 100%;
   min-width: 0;
@@ -561,60 +560,56 @@
   gap: 3px;
   min-width: 0;
   margin-bottom: 3px;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
 .doc-nav-row:last-child {
   margin-bottom: 0;
 }
-.doc-nav-outline {
-  display: flex;
-  gap: 3px;
-  flex: 1 1 0;
-  min-width: 0;
-  overflow: hidden;
-  padding: 2px;
-  border: 1px solid var(--warn);
-  border-radius: 0.35rem;
-  background: color-mix(in srgb, var(--warn) 6%, transparent);
-}
-.doc-nav-outline[data-depth="1"] {
-  background: color-mix(in srgb, var(--warn) 13%, transparent);
-}
-.doc-nav-outline[data-depth="2"] {
-  background: color-mix(in srgb, var(--warn) 20%, transparent);
-}
-.doc-nav-outline[data-depth="3"] {
-  background: color-mix(in srgb, var(--warn) 27%, transparent);
-}
-.doc-nav-children {
-  display: flex;
-  gap: 3px;
-  flex: 1 1 0;
-  min-width: 0;
-}
 .doc-nav-unit,
 .doc-nav-chunk {
-  flex: 1 1 0;
-  min-width: 0;
   min-height: 1.75rem;
-  padding: 2px 1px;
+  padding: 2px 4px;
   overflow: hidden;
   border: 1px solid var(--warn);
   border-radius: 0.3rem;
   background: transparent;
   color: inherit;
   font: inherit;
-  /* Small enough that a three-character section number (`3.2`) and a
-     three-digit chunk place read whole inside a phone-width cell. */
   font-size: 0.68em;
   white-space: nowrap;
-  text-overflow: ellipsis;
   touch-action: manipulation;
 }
-.doc-nav-outline > .doc-nav-section {
-  flex: 1 1 0;
+.doc-nav-section {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+  max-width: 12rem;
+}
+.doc-nav-num {
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+.doc-nav-title {
+  display: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Titles show in the desktop regime, and for the current section
+   everywhere: a phone row of § numbers still names where it stands. */
+.doc-nav-section[aria-current="true"] .doc-nav-title {
+  display: inline;
+}
+@media (min-width: 900px) and (pointer: fine) {
+  .doc-nav-title {
+    display: inline;
+  }
 }
 .doc-nav-chunk {
-  font-size: 0.62em;
+  flex: 1 1 0;
+  min-width: 8px;
+  padding: 2px 1px;
 }
 .doc-nav-unit[data-heard],
 .doc-nav-chunk[data-heard] {
@@ -625,11 +620,6 @@
   background: var(--warn);
   color: var(--bg);
   font-weight: 700;
-}
-.doc-nav-gap {
-  flex: 0 1 auto;
-  border-style: dashed;
-  opacity: 0.75;
 }
 /* Section numbers on the document (`#1508`): a small gutter label before
    each heading, in the heading's own line, muted beside its words. */
