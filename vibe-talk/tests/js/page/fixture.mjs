@@ -5325,6 +5325,30 @@ const TUNING_BANDS = {
   FREEZE_MAX_EVENTS: [40, 40, "events in the freeze ring and one report: the server's exact cap"],
   SCRIPT_CHARS: [256, 256, "chars of one long frame's invoker kept: the server's exact cap"],
   FLUSH_QUIET_MS: [1000, 60000, "the least while between the freeze watch's unforced postings"],
+  // `#2276 vibe-talk-client-debug-mode`. The caps match the server's exactly (a report over one is
+  // refused whole); the ring and the timings must stay cheap enough to leave on, since the mode
+  // must not cause the lag it diagnoses, and the sample interval is the measured one (under 5%
+  // CPU on the phone layout's walk).
+  DEBUG_SPAN_RING: [128, 4096, "finished spans kept for attributing a stall"],
+  DEBUG_NAME_CHARS: [96, 96, "chars of one code name sent: the server's exact cap"],
+  DEBUG_EVENT_SPANS: [6, 6, "spans one stall names: the server's exact cap"],
+  DEBUG_OPEN_SPANS: [4, 4, "open spans one stall names: the server's exact cap"],
+  DEBUG_RECENT_SPANS: [8, 8, "recent span ends one stall names: the server's exact cap"],
+  DEBUG_FRAME_SCRIPTS: [4, 4, "scripts one long frame names: the server's exact cap"],
+  DEBUG_PROFILE_FRAMES: [6, 6, "frames each profile list names: the server's exact cap"],
+  DEBUG_SUMMARY_SPANS: [16, 16, "span names one summary totals: the server's exact cap"],
+  DEBUG_SUMMARY_FRAMES: [20, 20, "long frames one summary lists: the server's exact cap"],
+  DEBUG_DETAILED_EVENTS: [10, 10, "events of one freeze report with detail: the server's exact cap"],
+  DETAILED_EVENTS: [10, 10, "the freeze watch's copy of the server's detailed-event cap"],
+  DEBUG_SUMMARY_EVERY_MS: [60000, 600000, "the least while between two summary-only reports, in ms"],
+  DEBUG_SLOW_FRAME_MS: [50, 500, "a long frame at or over this makes a period worth a summary, in ms"],
+  DEBUG_SLOW_SPAN_MS: [16, 500, "a span at or over this makes a period worth a summary, in ms"],
+  DEBUG_NODES_SPAN_MS: [8, 200, "a span at or over this records the element count at its end, in ms"],
+  DEBUG_SAMPLE_MS: [10, 100, "the profiler's sampling interval while the debug mode is on, in ms"],
+  DEBUG_PROFILE_BUFFER: [1000, 20000, "samples one profiler buffers before a roll"],
+  DEBUG_PROFILE_ROLL_MS: [5000, 120000, "how often a quiet profiler is restarted, in ms"],
+  EVENT_TIMING_MIN_MS: [16, 104, "the shortest Event Timing entry asked for, in ms (the browser's floor is 16)"],
+  PENDING_GIVE_UP_MS: [250, 10000, "a profile roll older than this no longer holds a report back, in ms"],
   // `#2066 vibe-talk-page-freeze` (the #2059 note's S1). Preparations in flight together:
   // one is a serial round-trip per thread on screen; unbounded restacks the burst upstream.
   PREPARE_GROUPS_AT_ONCE: [2, 8, "thread groups one speech preparation asks for at once"],

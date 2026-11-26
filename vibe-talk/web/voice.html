@@ -3019,6 +3019,18 @@
                       </label>
                       <p id="scroll-trace-hint" class="hint">Keeps the last minute of each list's scrolls, with what asked for each, for sending to the server's log when a list jumps somewhere it should not.</p>
                       <button id="scroll-trace-send" type="button">Send scroll trace</button>
+                      <!--
+                        `#2276 vibe-talk-client-debug-mode`. What held the page when it lagged is knowable only on
+                        the phone it lagged on. This times the page's own work (key handling, search, redraws,
+                        the scroll owner), keeps long-frame detail and, from the next load, samples the main
+                        thread, and sends timings and code names (never words or ids) with the freeze reports
+                        and the scroll trace. OFF by default, kept on this device alone.
+                      -->
+                      <label class="toggle">
+                        <input id="client-debug" type="checkbox" aria-describedby="client-debug-hint" />
+                        Client debug mode
+                      </label>
+                      <p id="client-debug-hint" class="hint">Records which of this page's own code ran when it lagged or froze, and sends the timings with the freeze reports and the scroll trace. No message words or ids are sent. Sampling starts at the next load.</p>
                     </div>
                   </section>
 

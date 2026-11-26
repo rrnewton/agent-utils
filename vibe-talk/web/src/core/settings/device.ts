@@ -496,6 +496,15 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (on: boolean) => (on ? "1" : null),
     refused: { value: false },
   } satisfies DeviceSetting<boolean>,
+  /** `#2276 vibe-talk-client-debug-mode`. Whether the client debug mode records what held the
+   * main thread, for the freeze reports and scroll traces to carry: kept "1", forgotten when off.
+   * The key is `CLIENT_DEBUG_KEY` in web/src/view/shell/clientdebug.ts. */
+  clientDebug: {
+    key: "vibe-talk.voice.client-debug",
+    read: (raw: string | null) => raw === "1",
+    write: (on: boolean) => (on ? "1" : null),
+    refused: { value: false },
+  } satisfies DeviceSetting<boolean>,
   /**
    * `#892 voice-page-optimistic-done`. Whether each key's time to its paint is said on the console
    * (web/src/view/shell/keytiming.ts): kept "1", forgotten when off. Set from the console; no control.

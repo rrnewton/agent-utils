@@ -21,8 +21,10 @@
 use serde::{Deserialize, Serialize};
 
 /// The largest request body the route reads. A full minute at [`MAX_ENTRIES`] with every string
-/// at its cap fits inside it; the route answers 413 past it.
-pub const MAX_BODY_BYTES: usize = 256 * 1_024;
+/// at its cap fits inside it; the route answers 413 past it. The last 16 KiB are the client debug
+/// mode's summary's room (`#2276`; [`crate::client_debug::DebugSummary`] at every cap is about
+/// 8 KiB), so turning the mode on never pushes a minute that fitted before over the cap.
+pub const MAX_BODY_BYTES: usize = (256 + 16) * 1_024;
 
 /// The most entries one report carries: the page's ring holds no more.
 pub const MAX_ENTRIES: usize = 600;
@@ -165,6 +167,11 @@ pub struct TraceReport {
     pub started_at: f64,
     /// The scrolls, oldest first. At most [`MAX_ENTRIES`].
     pub entries: Vec<TraceEntry>,
+    /// What held the main thread over the minute, where the owner's client debug mode is on
+    /// (`#2276 vibe-talk-client-debug-mode`): span totals and the slowest long frames, on the
+    /// entries' own clock. Timings and code names only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<crate::client_debug::DebugSummary>,
 }
 
 fn check_text(name: &str, value: &str, max: usize) -> Result<(), String> {
@@ -209,6 +216,9 @@ impl TraceReport {
         }
         for (at, entry) in self.entries.iter().enumerate() {
             entry.validate(at)?;
+        }
+        if let Some(summary) = &self.debug {
+            summary.validate()?;
         }
         Ok(())
     }
@@ -351,6 +361,7 @@ mod tests {
             v: 1,
             started_at: 10_000.0,
             entries,
+            debug: None,
         }
     }
 
@@ -444,6 +455,33 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn a_report_carries_the_debug_summary_and_refuses_a_bad_one() {
+        use crate::client_debug::fixtures::full_summary;
+        let with = TraceReport {
+            debug: Some(full_summary()),
+            ..report(vec![entry()])
+        };
+        with.validate().expect("a summary at every cap is valid");
+        let summary_bytes = serde_json::to_vec(&full_summary())
+            .expect("serializes")
+            .len();
+        assert!(
+            summary_bytes <= 16 * 1_024,
+            "{summary_bytes} bytes overflow the summary's room"
+        );
+        let mut bad = with.clone();
+        if let Some(summary) = bad.debug.as_mut() {
+            summary.frames[0].src = "voice.js?token=secret".to_owned();
+        }
+        assert!(bad.validate().is_err());
+        let plain = serde_json::to_value(report(vec![entry()])).expect("serializes");
+        assert!(
+            plain.get("debug").is_none(),
+            "a trace without the mode is as before"
+        );
     }
 
     #[test]

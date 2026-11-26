@@ -97,6 +97,8 @@ export interface ElementById {
   "clear-backlog": HTMLButtonElement;
   "clear-view": HTMLButtonElement;
   "clear-view-label": HTMLSpanElement;
+  "client-debug": HTMLInputElement;
+  "client-debug-hint": HTMLParagraphElement;
   "close-browse-channels": HTMLButtonElement;
   "close-help": HTMLButtonElement;
   "close-settings": HTMLButtonElement;

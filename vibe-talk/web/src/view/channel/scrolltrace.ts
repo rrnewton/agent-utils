@@ -68,6 +68,11 @@ export interface ScrollTraceDependencies {
   selection?(): { readonly collapsed: boolean; readonly length: number; readonly desc: string } | null;
   /** Post a report without being asked (a qualifying shift or selection loss). */
   autoSend?(report: string): void;
+  /**
+   * The owner's client debug mode's summary to ride with the minute (`#2276`: what held the
+   * main thread, on the entries' own clock), or null while the mode is off. Absent: none.
+   */
+  debugSummary?(): unknown;
 }
 
 /** The trace's commands. */
@@ -144,6 +149,16 @@ export function createScrollTrace(deps: ScrollTraceDependencies): ScrollTrace {
   /** A scroll being noted: noting one never notes another (a measure that scrolled would loop). */
   let noting = false;
   let startedAt = deps.now();
+  /** The minute as one JSON text, with the debug mode's summary where it is on (`#2276`). */
+  function body(): string {
+    let debug: unknown = null;
+    try {
+      debug = deps.debugSummary ? deps.debugSummary() : null;
+    } catch (_error) {
+      debug = null;
+    }
+    return JSON.stringify(debug ? { v: 1, startedAt, entries, debug } : { v: 1, startedAt, entries });
+  }
   let entries: TraceEntry[] = [];
   /** Putting the wrapped pieces back, newest first; null while stopped. */
   let restore: Array<() => void> | null = null;
@@ -241,7 +256,7 @@ export function createScrollTrace(deps: ScrollTraceDependencies): ScrollTrace {
     if (now - lastAutoAt < SCROLL_TRACE_AUTO_SEND_MS) return;
     lastAutoAt = now;
     try {
-      deps.autoSend(JSON.stringify({ v: 1, startedAt, entries }));
+      deps.autoSend(body());
     } catch (_error) {
       // A report that cannot go changes nothing on the page.
     }
@@ -475,7 +490,7 @@ export function createScrollTrace(deps: ScrollTraceDependencies): ScrollTrace {
   return {
     start,
     stop,
-    report: () => JSON.stringify({ v: 1, startedAt, entries }),
+    report: () => body(),
     noteJumpLost(id: string): void {
       const area = deps.lookup("scroll-area");
       if (!area) return;

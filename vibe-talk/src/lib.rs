@@ -56,6 +56,7 @@ pub mod cache_first;
 pub mod catchup;
 pub mod chain;
 pub mod chat;
+pub mod client_debug;
 pub mod client_settings;
 pub mod clock;
 pub mod config;

@@ -62,6 +62,8 @@ interface FreezeEvent {
   inputs_hidden?: number;
   timer_delay_ms?: number;
   raf_delay_ms?: number;
+  /** What ran in the stall, where the client debug mode is on (`#2276`). */
+  debug?: unknown;
 }
 
 /** What the page was doing, in its own words; the watch maps them to the server's. */
@@ -125,7 +127,22 @@ export interface FreezeWatchDependencies {
    * background, or to be refused. `#2066` (the offline-cache walks count refusals).
    */
   canPost?(): boolean;
+  /**
+   * The owner's client debug mode (`clientdebug.ts`, `#2276`), where the page has one: what ran
+   * in a stall, its summary for a report, and whether a stall's profile is still on its way (a
+   * flush then waits a beat). Each answers null or false while the mode is off, so the watch is
+   * then exactly as it was.
+   */
+  clientDebug?: {
+    attribute(start: number, end: number, entry: unknown, late: (profile: unknown) => void): unknown;
+    summary(): unknown;
+    posted(): void;
+    pending(): boolean;
+  };
 }
+
+/** The most events one report carries detail on: the server's cap (`#2276`). */
+const DETAILED_EVENTS = 10;
 
 /** The watch's commands. */
 export interface FreezeWatch {
@@ -218,12 +235,19 @@ export function createFreezeWatch(deps: FreezeWatchDependencies): FreezeWatch {
     }
   }
 
-  function flushText(text: string, count: number): void {
+  function flushText(text: string, count: number, withDebug = false): void {
     if (sending || count === 0 || !mayPost()) return;
     sending = true;
     lastFlushAt = deps.now();
     void deps.send(text).then((took) => {
       sending = false;
+      if (took && withDebug) {
+        try {
+          deps.clientDebug?.posted();
+        } catch (_error) {
+          // The debug mode's period carries on; the report itself went.
+        }
+      }
       if (took) {
         // Events that arrived while this posted stay: only the posted head goes.
         events = events.slice(count);
@@ -234,13 +258,63 @@ export function createFreezeWatch(deps: FreezeWatchDependencies): FreezeWatch {
     });
   }
 
-  function flush(force = false): void {
-    if (events.length === 0 || sending) return;
-    if (!force && deps.now() - lastFlushAt < FLUSH_QUIET_MS) return;
-    flushText(JSON.stringify({ v: 1, startedAt, events }), events.length);
+  /**
+   * `list` with detail on its longest stalls only, as many as the server takes: what one page
+   * kept is already within it, but a previous page's leavings joined to this page's ring may not
+   * be, and one report over the cap would be refused whole.
+   */
+  function capDetail(list: readonly FreezeEvent[]): FreezeEvent[] {
+    const detailed = list.filter((one) => one.debug !== undefined);
+    if (detailed.length <= DETAILED_EVENTS) return [...list];
+    const keep = new Set(detailed.sort((a, b) => b.dur_ms - a.dur_ms).slice(0, DETAILED_EVENTS));
+    return list.map((one) => (one.debug !== undefined && !keep.has(one) ? { ...one, debug: undefined } : one));
   }
 
-  function record(kind: FreezeKind, durMs: number, extra?: Partial<FreezeEvent>): FreezeEvent {
+  /** The debug mode's say, guarded: watching never breaks the page it watches. */
+  function debugSays<T>(ask: () => T, otherwise: T): T {
+    try {
+      return deps.clientDebug ? ask() : otherwise;
+    } catch (_error) {
+      return otherwise;
+    }
+  }
+
+  function flush(force = false): void {
+    if (events.length === 0 || sending) return;
+    // A stall's profile still being summarised: the next heartbeat posts it with its detail.
+    if (debugSays(() => deps.clientDebug?.pending() === true, false)) return;
+    if (!force && deps.now() - lastFlushAt < FLUSH_QUIET_MS) return;
+    const debug = debugSays(() => deps.clientDebug?.summary() ?? null, null);
+    const sent = capDetail(events);
+    const body = debug ? { v: 1, startedAt, events: sent, debug } : { v: 1, startedAt, events: sent };
+    flushText(JSON.stringify(body), events.length, debug !== null);
+  }
+
+  /** The debug mode's attribution of `event`'s stall over [`start`, `end`], kept on the event. */
+  function attach(event: FreezeEvent, start: number, end: number, entry: unknown): void {
+    if (!deps.clientDebug) return;
+    const debug = debugSays(() => deps.clientDebug?.attribute(start, end, entry, (profile) => {
+      if (!profile || event.debug === null || typeof event.debug !== "object") return;
+      (event.debug as { profile?: unknown }).profile = profile;
+      persist();
+    }) ?? null, null);
+    if (!debug) return;
+    event.debug = debug;
+    // Detail on the longest stalls only, as many as the server takes in one report.
+    const detailed = events.filter((one) => one.debug !== undefined);
+    if (detailed.length > DETAILED_EVENTS) {
+      let shortest = detailed[0];
+      for (const one of detailed) if (shortest === undefined || one.dur_ms < shortest.dur_ms) shortest = one;
+      if (shortest) delete shortest.debug;
+    }
+  }
+
+  function record(
+    kind: FreezeKind,
+    durMs: number,
+    extra?: Partial<FreezeEvent>,
+    stall?: { readonly start: number; readonly end: number; readonly entry: unknown },
+  ): FreezeEvent {
     const t = deps.now();
     const state = deps.state();
     const event: FreezeEvent = {
@@ -262,6 +336,7 @@ export function createFreezeWatch(deps: FreezeWatchDependencies): FreezeWatch {
     };
     events.push(event);
     while (events.length > FREEZE_MAX_EVENTS) events.shift();
+    if (stall) attach(event, stall.start, stall.end, stall.entry);
     persist();
     if (events.length >= FREEZE_MAX_EVENTS) flush();
     return event;
@@ -275,7 +350,9 @@ export function createFreezeWatch(deps: FreezeWatchDependencies): FreezeWatch {
     // Intervals are throttled out of sight, so a hidden gap is the browser's economy, not
     // a freeze: only an in-sight silence counts, and it posts on its own recovery.
     if (!deps.hidden() && silence >= FREEZE_HEARTBEAT_MS + FREEZE_GAP_MS) {
-      record("freeze", silence);
+      // The thread was surely held from when the missed beat was due to the thaw: that is the
+      // stall the debug mode attributes (`#2276`); the quiet before it was ordinary idling.
+      record("freeze", silence, undefined, { start: t - silence + FREEZE_HEARTBEAT_MS, end: t, entry: null });
       flush(true);
     } else if (events.length > 0) {
       // What could not go out (offline, hidden, a read token) retries here: the
@@ -308,7 +385,9 @@ export function createFreezeWatch(deps: FreezeWatchDependencies): FreezeWatch {
         }
       }
       const at = typeof entry.startTime === "number" ? entry.startTime : deps.now();
-      const event = record(loaf ? "loaf" : "longtask", duration, { script });
+      const event = record(loaf ? "loaf" : "longtask", duration, { script }, {
+        start: at, end: at + duration, entry: loaf ? one : null,
+      });
       event.t = at;
       persist();
     }
@@ -390,7 +469,7 @@ export function createFreezeWatch(deps: FreezeWatchDependencies): FreezeWatch {
     } else if (left) {
       sending = true;
       lastFlushAt = deps.now();
-      void deps.send(JSON.stringify({ v: 1, startedAt: left.startedAt, events: left.events })).then((took) => {
+      void deps.send(JSON.stringify({ v: 1, startedAt: left.startedAt, events: capDetail(left.events) })).then((took) => {
         sending = false;
         if (took) persist();
         else {

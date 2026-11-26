@@ -77,7 +77,7 @@ import {childByClass,
   setHiddenIfChanged,
   setTextIfChanged,
   shownNode,} from "../view/dom/index.ts";
-import {SCREEN_TITLES, WELCOME_DISMISSED_KEY, createActionMenu, createChannelDirectoryView, createDeploymentWords, createChannelSelection, createChipsOverComposer, createControlBar, createEarlyTaps, createFreezeWatch, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, createWelcome, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow} from "../view/shell/index.ts";
+import {SCREEN_TITLES, WELCOME_DISMISSED_KEY, createActionMenu, createChannelDirectoryView, createDeploymentWords, createChannelSelection, createChipsOverComposer, createControlBar, createEarlyTaps, createFreezeWatch, createClientDebug, CLIENT_DEBUG_COOKIE, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, createWelcome, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow} from "../view/shell/index.ts";
 import {KEYBOARD_SEND_PARTS,
   NEWLINE_KEYS,
   createComposerBoxes,
@@ -370,6 +370,118 @@ const serverAccess = createServerAccess({
   selectedChannelId: () => selectedChannelId(),
 });
 const { browserPorts, deviceStorage, deviceStorageOnUse, clockOnUse, windowStorage, deviceSettings, credentialStore, token, signedOutByRename, theServer, api, apiDecoded, within } = serverAccess;
+
+// --- what held the main thread, for the log --------------------------------------------------------------------------
+//
+// `#2276 vibe-talk-client-debug-mode`. The owner's switch (Settings › Debug › "Client debug mode", or
+// `?client-debug=1` for one load), off by default. Made this early because the hot paths below are
+// wrapped as its spans where they are destructured; it records nothing until the switch is read
+// (`clientDebug.start()`, beside the freeze watch's start) and is wholly off while the switch is off
+// (web/src/view/shell/clientdebug.ts). What it finds rides the freeze reports and the scroll trace.
+/** The span names the page added to the performance timeline, for clearing only those. */
+const clientDebugMeasures = new Set();
+const clientDebug = createClientDebug({
+  now: () => performance.now(),
+  held: () => deviceSettings().get(DEVICE_SETTINGS.clientDebug),
+  keep: (on) => deviceSettings().keep(DEVICE_SETTINGS.clientDebug, on),
+  query: () => (typeof location !== "undefined" ? location.search : ""),
+  cookieSet: () => document.cookie.split(";").some((pair) => pair.trim() === `${CLIENT_DEBUG_COOKIE}=1`),
+  setCookie: (on) => {
+    // Read by the server for the shell's profiling document policy only.
+    const tail = `; Path=/; SameSite=Strict${location.protocol === "https:" ? "; Secure" : ""}`;
+    document.cookie = on ? `${CLIENT_DEBUG_COOKIE}=1; Max-Age=31536000${tail}` : `${CLIENT_DEBUG_COOKIE}=; Max-Age=0${tail}`;
+  },
+  supportedEntryTypes: () => {
+    const Observer = /** @type {any} */ (globalThis).PerformanceObserver;
+    return Observer && Array.isArray(Observer.supportedEntryTypes) ? Observer.supportedEntryTypes : [];
+  },
+  observe: (type, note, options) => {
+    const Observer = /** @type {any} */ (globalThis).PerformanceObserver;
+    if (typeof Observer !== "function") return null;
+    try {
+      const observer = new Observer((/** @type {any} */ list) => note(list.getEntries()));
+      observer.observe({ type, ...(options || {}) });
+      return () => observer.disconnect();
+    } catch (_error) {
+      return null;
+    }
+  },
+  profilerExists: () => typeof (/** @type {any} */ (globalThis).Profiler) === "function",
+  startProfiler: (sampleInterval, maxBufferSize) => new (/** @type {any} */ (globalThis).Profiler)({ sampleInterval, maxBufferSize }),
+  elementPrototype: () => Element.prototype,
+  nodeCount: () => document.getElementsByTagName("*").length,
+  // `#2282` section 9 item 7: S, the channel's messages held, and D, the list's rows mounted.
+  sizes: () => ({ s: channelStore.current().messages.length, d: el("discord-log").children.length }),
+  measure: (name, start, end) => {
+    clientDebugMeasures.add(name);
+    performance.measure(name, { start, end });
+  },
+  clearMeasures: () => {
+    for (const name of clientDebugMeasures) performance.clearMeasures(name);
+    clientDebugMeasures.clear();
+  },
+  clock: {
+    setTimeout: (run, ms) => browserPorts().clock.setTimeout(run, ms),
+    clearTimeout: (handle) => browserPorts().clock.clearTimeout(handle),
+  },
+  send: (text) => postFreezeReport(text),
+  canPost: () => serverFacts.configApplied() && serverFacts.tokenScope() === "write"
+    && !document.hidden && navigator.onLine !== false,
+});
+
+/**
+ * `storage`, with the characters each read and write moves counted against the running client debug
+ * span (`#2276`): the saved message cache's size, the persistence tax `#2282` section 6 names. One
+ * test per call while the mode is off.
+ *
+ * @param {import("../ports/index.ts").StoragePort} storage
+ * @returns {import("../ports/index.ts").StoragePort}
+ */
+function clientDebugCountedStorage(storage) {
+  return {
+    getItem: (key) => {
+      const value = storage.getItem(key);
+      if (value !== null && clientDebug.enabled()) clientDebug.note("chars", value.length);
+      return value;
+    },
+    setItem: (key, value) => {
+      if (clientDebug.enabled()) clientDebug.note("chars", String(value).length);
+      storage.setItem(key, value);
+    },
+    removeItem: (key) => storage.removeItem(key),
+  };
+}
+
+/**
+ * Post one freeze-report body (`#2066`, `#2276`); true where the server took it. A report whose
+ * debug detail the server refused (a 400) goes once more without it, so a name the page failed to
+ * redact can never wedge the freeze ring behind a report the server will never take.
+ *
+ * @param {string} text
+ * @returns {Promise<boolean>}
+ */
+async function postFreezeReport(text) {
+  const body = JSON.parse(text);
+  try {
+    await api("/api/v1/freeze-report", { method: "POST", body });
+    return true;
+  } catch (error) {
+    const detailed = body && (body.debug || (Array.isArray(body.events) && body.events.some((/** @type {any} */ one) => one && one.debug)));
+    if (!detailed || /** @type {any} */ (error)?.status !== 400) return false;
+    const { debug: _summary, ...plain } = body;
+    plain.events = (plain.events || []).map((/** @type {any} */ one) => {
+      const { debug: _detail, ...rest } = one;
+      return rest;
+    });
+    if (plain.events.length === 0) return false;
+    try {
+      await api("/api/v1/freeze-report", { method: "POST", body: plain });
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+}
 
 
 /**
@@ -2328,7 +2440,7 @@ const gatheringOwner = createReplyGathering({
   timelineRows: () => timelineRows(),
   renderJumpNewest: () => renderJumpNewest(),
   renderReplyCounts: () => renderReplyCounts(),
-  measureReplyArrows: () => measureReplyArrows(),
+  measureReplyArrows: () => clientDebug.span("reply-arrows", () => measureReplyArrows()),
   cardRow: (thread) => cardRow(thread),
   finishPackSlide: () => finishPackSlide(),
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
@@ -2423,7 +2535,9 @@ const replyCounts = createReplyCounts({
   columns: () => columns, layoutShown: () => layoutShown, outbox: () => outbox, outboxDispatch: () => outboxDispatch,
   quoteOwner: () => quoteOwner,
 });
-const { REPLY_BUTTON_TITLE, unansweredRoot, paintThreadBadge, startThread, unansweredThread, heldUnansweredRoot, replyTally, rootThreadOf, unseenReplies, threadOutrunsStore, storeLacksReplies, repliesPartlyHeld, rootReplyState, holdsUnreadReplies, readFilterKeeps, unpackFilter, drawThreadChips, heldReplies, labelReplyButton, drawReplyLabel, renderReplyCounts, nextReplyTarget, labelReplyMarker, replyMarker, jumpToReply, landOnReply } = replyCounts;
+const { REPLY_BUTTON_TITLE, unansweredRoot, paintThreadBadge, startThread, unansweredThread, heldUnansweredRoot, replyTally: replyTallyPass, rootThreadOf, unseenReplies, threadOutrunsStore, storeLacksReplies, repliesPartlyHeld, rootReplyState, holdsUnreadReplies, readFilterKeeps, unpackFilter, drawThreadChips, heldReplies, labelReplyButton, drawReplyLabel, renderReplyCounts, nextReplyTarget, labelReplyMarker, replyMarker, jumpToReply, landOnReply } = replyCounts;
+// The reply tally, as the client debug mode's span (`#2276`, `#2282` section 9 item 1).
+const replyTally = clientDebug.spanned("reply-tally", replyTallyPass);
 
 /** A reply that is sent marks what it answers Done, and the chat service's marker after it:
  * web/src/view/channel's now (`createSentRead`, `#624 voice-page-modularity`). */
@@ -2841,8 +2955,13 @@ const scrollKeeping = createScrollKeeping({
   anchorDebug: (check) => anchorDebug.check(check),
 });
 const {
-  visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, holdingReader, captureScroll, restoreScroll, followIfPinned,
+  visibleList, shownChannelList, scrollAnchor, preservingScroll: preservingScrollPass, preservingCollapse, preservingShrink, preservingShrinkAsync, holdingReader: holdingReaderPass, captureScroll, restoreScroll: restoreScrollPass, followIfPinned: followIfPinnedPass,
 } = scrollKeeping;
+// The scroll owner's holds and writes, as the client debug mode's spans (`#2276`; one test and the call while it is off).
+const preservingScroll = clientDebug.spanned("scroll-hold", preservingScrollPass);
+const holdingReader = clientDebug.spanned("scroll-reader", holdingReaderPass);
+const restoreScroll = clientDebug.spanned("scroll-restore", restoreScrollPass);
+const followIfPinned = clientDebug.spanned("scroll-follow", followIfPinnedPass);
 // The dom layer's focus reveal is the owner's write too, handed in now the owner stands (`#1251`).
 setFocusReveal((element, block, inline) => scrollKeeping.intoView(element, block, inline));
 
@@ -3147,12 +3266,17 @@ const searchRows = createSearchRows({
 });
 const {
   markSearchSoon, markSearchNow, searchParsed, searchTyped, searchIdentity, searchable,
-  applySearch, applySearchFast, searchInAll, renderSearchInAll, renderSearchCount, refreshSearchCount,
+  applySearch: applySearchPass, applySearchFast: applySearchFastPass, searchInAll, renderSearchInAll, renderSearchCount, refreshSearchCount,
   listEmptied, drawSeams, seamsAfterMidnight, openSearchGap, inOpenedGap,
-  rowsChosen, rowDay, markSearchHits, messageMatches, threadsWithHits, rowMatches,
+  rowsChosen, rowDay, markSearchHits: markSearchHitsPass, messageMatches, threadsWithHits, rowMatches,
   linkTerms, threadsWithLinkHits, threadsWithLinks, rowLinkMatch, rowHasLink,
   sayCardCount, openedGaps, placeSeam, seamDrawn, setEntireThreads, entireThreads, renderSearchScope,
 } = searchRows;
+// The search's passes, as the client debug mode's spans (`#2276`): the typing-fast pass inside the key,
+// and the full pass (the settled one runs it, under `search-settled`).
+const applySearch = clientDebug.spanned("search", applySearchPass);
+const applySearchFast = clientDebug.spanned("search-fast", applySearchFastPass);
+const markSearchHits = clientDebug.spanned("search-marks", markSearchHitsPass);
 
 // `#1734 vibe-talk-search-view-scroll-default`. The search identity the reader
 // last landed on: a typed query lands once, when it is first entered (a new
@@ -3194,10 +3318,14 @@ function deferFullSearch(fn) {
     fullSearchTimer = null;
     lastSearchKeyAt = 0;
     searchSettleMs = FULL_SEARCH_PAUSE_MS;
-    fn();
+    clientDebug.span("search-settled", fn);
   }, searchSettleMs);
 }
 function noteSearchScreen() {
+  // As the client debug mode's span (`#2276`, `#2282` section 9 item 5); one test and the call while it is off.
+  return clientDebug.span("search-screen", noteSearchScreenPass);
+}
+function noteSearchScreenPass() {
   const text = el("search-field").value;
   if (!searchTyped(text)) {
     searchScreenIdentity = null;
@@ -4484,7 +4612,7 @@ const pageVisibility = createPageVisibility({
   resumeOutgoingRetries: () => resumeOutgoingRetries(),
   catchUpHiddenArrivals: () => catchUpHiddenArrivals(),
   replyArrowsOwed: () => Boolean(replyArrows().owed),
-  measureReplyArrows: () => measureReplyArrows(),
+  measureReplyArrows: () => clientDebug.span("reply-arrows", () => measureReplyArrows()),
   inOtherColumn: (act) => inOtherColumn(act),
   takeStreamResume: () => hiddenStream.takeResume(),
   pollPaused: () => channelPoll.paused(),
@@ -4533,11 +4661,15 @@ voiceCall().initializePageInstance();
 // refusal — deletes the whole envelope rather than filtering it. Messages that credential can no
 // longer read must not stay on the device.
 const messageCache = createOfflineCache({
-  storage: () => deviceStorageOnUse(),
+  storage: () => clientDebugCountedStorage(deviceStorageOnUse()),
   token: () => token,
   channels: () => channelDirectory.channels(),
   stillToDo: (message, done) => stillToDo(message, /** @type {any} */ (done)),
 }).cache;
+// The saved cache's parse and stringify as separate client debug mode spans (`#2276`, `#2282` section 6),
+// with the characters each moved counted by the storage above.
+messageCache.readMessageCache = clientDebug.spanned("cache-read", messageCache.readMessageCache);
+messageCache.writeMessageCache = clientDebug.spanned("cache-write", messageCache.writeMessageCache);
 
 
 /*
@@ -4652,7 +4784,9 @@ const channelScope = createChannelScope({
   channelContextKey: () => channelContextKey(), threadPresence,
   voiceCall: () => voiceCall(), renderColumns: () => renderColumns(), saveUiState: () => saveUiState(),
 });
-const { syncCanonDismissed, saveChannelScope, hydrateChannelScope, hydrateFromCache, clearChannelScreen, screenBelongsToToken, forgetMessages, noteChannelReadFailure, reconcileChannelSnapshot } = channelScope;
+const { syncCanonDismissed, saveChannelScope: saveChannelScopePass, hydrateChannelScope, hydrateFromCache, clearChannelScreen, screenBelongsToToken, forgetMessages, noteChannelReadFailure, reconcileChannelSnapshot } = channelScope;
+// Saving the channel's rows to the device, as the client debug mode's span (`#2276`, `#2282` section 6).
+const saveChannelScope = clientDebug.spanned("save-scope", saveChannelScopePass);
 
 /** How old what is on screen is, said over the list: web/src/view/channel/freshness.ts (`createFreshness`, #624). */
 const freshnessOwner = createFreshness({
@@ -5881,12 +6015,15 @@ const channelRows = createChannelRows({
   reopenPendingReply: () => reopenPendingReply(),
 });
 const {
-  renderChannelRows, renderChannelRowsNow, dressDoneRows,
+  renderChannelRows: renderChannelRowsPass, renderChannelRowsNow: renderChannelRowsNowPass, dressDoneRows,
   rowMenus, emptyMessage, hiddenEmpty, glom, regroupChannelRows, channelRowFrame,
   discordNode, closeRowMenuOutside, closeRowMenuOnEscape, markReadThroughHere,
   storedSlackOpen, upstreamServiceName, copyUpstreamLink, copyMessageText,
   writeClipboardText, channelSummary,
 } = channelRows;
+// The channel list's redraws, as the client debug mode's spans (`#2276`).
+const renderChannelRows = clientDebug.spanned("rows", renderChannelRowsPass);
+const renderChannelRowsNow = clientDebug.spanned("rows-now", renderChannelRowsNowPass);
 
 /** Walking back through the channel: web/src/view/channel's now (`createOlderPages`, `#624`). */
 const olderPagesOwner = createOlderPages({
@@ -7659,7 +7796,15 @@ const timelineView = createTimelineView({
   windowed: () => { const cfg = windowedConfig(deviceSettings(), document.documentElement.clientWidth < 900); return cfg.windowed ? { prefetchPx: cfg.prefetchPx, rowCap: cfg.rowCap } : null; },
   pinnedIds: () => { const id = jumpAnchor.id(); return id ? [id] : []; },
 });
-const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, rowsAsDrawn, applyTimelinePage, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition } = timelineView;
+const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, rowsAsDrawn, applyTimelinePage: applyTimelinePagePass, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage: foldLiveMessagePass, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta: foldTimelineDeltaPass, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow: appendChannelRowPass, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition: channelReadPositionPass, settleAfterRead: settleAfterReadPass, landedReadPosition } = timelineView;
+// A read's page landing, a live arrival and a poll's delta, as the client debug mode's spans (`#2276`).
+const applyTimelinePage = clientDebug.spanned("timeline-page", applyTimelinePagePass);
+const foldLiveMessage = clientDebug.spanned("live-arrival", foldLiveMessagePass);
+const foldTimelineDelta = clientDebug.spanned("timeline-delta", foldTimelineDeltaPass);
+const appendChannelRow = clientDebug.spanned("append-row", appendChannelRowPass);
+// The read's anchor measure and correction pair (`#2282` section 9 item 6).
+const channelReadPosition = clientDebug.spanned("read-position", channelReadPositionPass);
+const settleAfterRead = clientDebug.spanned("read-settle", settleAfterReadPass);
 /**
  * Walking back for older rows, and for a search (web/src/view/channel `mountOlderWalks`,
  * `#624 voice-page-modularity`): the step-back control, the search's bounded walk, the server
@@ -7974,14 +8119,16 @@ const channelRefresh = createChannelRefresh({
   channelContextKey, readSideColumn, screensView: () => screens.view(),
   discordPollMs: DISCORD_POLL_MS, startChannelStream,
   renderChannelNavigation, applySearch,
-  el, channelStore, viewKey, channelReadPosition: timelineView.channelReadPosition,
-  landedReadPosition: timelineView.landedReadPosition, settleAfterRead: timelineView.settleAfterRead,
+  el, channelStore, viewKey, channelReadPosition,
+  landedReadPosition: timelineView.landedReadPosition, settleAfterRead,
   applyTimelinePage, foldTimelineDelta, holdingScrollTools, noteFreshRead, saveChannelScope,
   renderScrollTools, requestVisibleSummaries, followInOtherColumn, catchUpFromAll, catchUpHeldView,
   readFilterKeeps, hiddenEmpty, hidingRead, timelineRows, syncUnreadReplies, inOtherColumn,
   providerFacts, liveFollow, token,
 });
-const { queueDiscordLoad, finishDiscordLoad, currentDiscordLoad, stopDiscordPolling, scheduleDiscordPoll, pollDiscord, pauseWhileHidden, resumeLiveStream, resumePolling, catchUpHiddenArrivals, landAbandonedTimelineRead } = channelRefresh;
+const { queueDiscordLoad, finishDiscordLoad, currentDiscordLoad, stopDiscordPolling, scheduleDiscordPoll, pollDiscord, pauseWhileHidden, resumeLiveStream, resumePolling, catchUpHiddenArrivals: catchUpHiddenArrivalsPass, landAbandonedTimelineRead } = channelRefresh;
+// The coming-back-into-sight catch-up, as the client debug mode's span (`#2276`, `#2066`'s named follow-up).
+const catchUpHiddenArrivals = clientDebug.spanned("resume-catch-up", catchUpHiddenArrivalsPass);
 /**
  * The live stream's frames as the page takes them (web/src/view/channel `createLiveStream`,
  * `#624 voice-page-modularity`).
@@ -8012,7 +8159,10 @@ const liveStream = createLiveStream({
   followReplyStore, followPlacement, inSideThread, inColumn, el, idsOf, renderOutgoingMessages: () => renderOutgoingMessages(), ownPosts, liveEvents, entryLandingHolds, sideShowing, hiddenEmpty, listStateNewestId: (id) => { listState().newestId = id; }, scrollToNewest, setJumpNewest, renderScrollTools, requestVisibleSummaries, saveChannelScope, mutationRefresh,
   screens, followsNewest,
 });
-const { onStreamFrame, receiveLiveMessage, heldMessage, placesHeld, settleReplays, liveFollowers, refreshAfterLiveMutation } = liveStream;
+const { onStreamFrame: onStreamFramePass, receiveLiveMessage: receiveLiveMessagePass, heldMessage, placesHeld, settleReplays, liveFollowers, refreshAfterLiveMutation } = liveStream;
+// A live frame as the socket hands it over (a live arrival's receive inside it), as the client debug mode's spans (`#2276`).
+const onStreamFrame = clientDebug.spanned("stream-frame", onStreamFramePass);
+const receiveLiveMessage = clientDebug.spanned("live-receive", receiveLiveMessagePass);
 /**
  * Loading what a previous page left unsent (web/src/core/outbox `createOutboxLoads`,
  * `#624 voice-page-modularity`). Entries are stored as `saved.ts` decoded them; this layer filters no fields.
@@ -8155,7 +8305,7 @@ const channelSend = createChannelSend({
   knownWritable: (channel) => knownChannel(channel)?.writable !== false,
   rootThisStarts: (channel, threadId) => (markReadOnReplySwitch.on() ? rootThisStarts(channel, threadId) : null), queueOutgoingMessage,
   channelDrafts: { get: (key) => channelDrafts.get(key), set: (key, text) => channelDrafts.set(key, text), delete: (key) => channelDrafts.delete(key), save: () => channelDrafts.save() },
-  onDraftTyped: (text) => draftSync.noteTyped(mainDraftKey(), text),
+  onDraftTyped: (text) => clientDebug.span("draft-typed", () => draftSync.noteTyped(mainDraftKey(), text)),
   onComposerRestored: () => {
     void offerSyncedDraft(mainDraftKey(), el("channel-compose-text"), el("draft-sync-offer"), el("draft-sync-offer-text"), (text) => {
       channelDrafts.set(channelComposerKey(), text);
@@ -9033,7 +9183,7 @@ application.track(mountComposerGrowListeners({
   storedComposerGrow: () => storedComposerGrow(),
   renderComposerGrow: (on) => renderComposerGrow(on),
   applyComposerGrow: (on, grow) => applyComposerGrow(on, grow),
-  fitGrowingBox: (field) => fitGrowingBox(field),
+  fitGrowingBox: (field) => clientDebug.span("composer-fit", () => fitGrowingBox(field)),
   keepGrowingBoxInView: (field) => keepGrowingBoxInView(field),
   resizeObserver: () => window.ResizeObserver,
 }));
@@ -9092,7 +9242,7 @@ application.track(textSelectionMount);
 // web/src/view/shell/keylisteners.ts (`#624 voice-page-modularity`), mounted here, in the page's order; the page
 // never takes them down, and its `unmount` waits for the ordered boot to have a teardown.
 application.track(mountKeyListeners({
-  onPageKey: (event) => keyTiming.around(event, () => keyDispatch.onPageKey(event)),
+  onPageKey: (event) => keyTiming.around(event, () => clientDebug.span("key", () => keyDispatch.onPageKey(event))),
   onEverywhereKey: (event) => keyDispatch.onEverywhereKey(event),
   onPageBeforeCopy: (event) => highlightCopy.onPageBeforeCopy(event),
   onPageCopy: (event) => highlightCopy.onPageCopy(event),
@@ -9736,6 +9886,8 @@ const scrollTrace = createScrollTrace({
     };
   },
   autoSend: (text) => { void sendScrollTrace(text); },
+  // `#2276 vibe-talk-client-debug-mode`: what held the main thread over the minute, while it is on.
+  debugSummary: () => clientDebug.summary(),
 });
 
 
@@ -9812,14 +9964,9 @@ const freezeWatch = createFreezeWatch({
     }
   },
   replaysWaiting: () => replayLedger.waiting(),
-  send: async (text) => {
-    try {
-      await api("/api/v1/freeze-report", { method: "POST", body: JSON.parse(text) });
-      return true;
-    } catch (_error) {
-      return false;
-    }
-  },
+  send: (text) => postFreezeReport(text),
+  // `#2276 vibe-talk-client-debug-mode`: what ran in each stall, while the owner's switch is on.
+  clientDebug,
   // Never a request to make offline, in the background, or to be refused: the route is
   // WRITE scope, as the draft sync's gate reads the same facts (`#2066`; the offline
   // walks count a refused request against the page).
@@ -9827,6 +9974,15 @@ const freezeWatch = createFreezeWatch({
     && !document.hidden && navigator.onLine !== false,
 });
 freezeWatch.start();
+// The client debug mode's switch, read now that the watch it feeds runs (`#2276`).
+clientDebug.start();
+el("client-debug").checked = Boolean(deviceSettings().get(DEVICE_SETTINGS.clientDebug));
+el("client-debug").addEventListener("change", () => {
+  clientDebug.setOn(el("client-debug").checked);
+  setStatus(el("client-debug").checked
+    ? "Client debug mode on. Sampling starts at the next load."
+    : "Client debug mode off.");
+});
 
 // Drawing the readout and its switch, and keeping it redrawn while it is drawn, are the keyboard owner's
 // (`showKeyboardDebug`, `renderKeyboardDebug`, above).
@@ -10169,7 +10325,7 @@ const listKeepersMount = mountListKeepers({
   holdOverscrollReader: (area) => holdOverscrollReader(area),
   channelContextKey: () => channelContextKey(),
   pinsView: () => pinsView(),
-  measureReplyArrows: () => measureReplyArrows(),
+  measureReplyArrows: () => clientDebug.span("reply-arrows", () => measureReplyArrows()),
 });
 mainFollowState = () => listKeepersMount.followingMain();
 application.track(listKeepersMount);

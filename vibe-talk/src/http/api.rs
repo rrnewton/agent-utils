@@ -2260,6 +2260,17 @@ pub async fn voice_end(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// The requesting browser's class for the client debug mode's log lines (`#2276`): family and
+/// major version from the request's own `User-Agent`, never the string.
+fn client_debug_ua(headers: &axum::http::HeaderMap) -> String {
+    crate::client_debug::ua_class(
+        headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+    )
+}
+
 /// `POST /api/v1/scroll-trace` — the last minute of the page's list scrolls, sent by the owner's
 /// "Send scroll trace" after a jump he could not explain. `#1144 scrollback-typing-jump`.
 ///
@@ -2270,6 +2281,7 @@ pub async fn voice_end(
 pub async fn scroll_trace(
     State(state): State<AppState>,
     _scope: WriteScope,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let report: crate::scroll_trace::TraceReport = serde_json::from_slice(&body).map_err(|_| {
@@ -2301,6 +2313,13 @@ pub async fn scroll_trace(
     for (at, entry) in report.entries.iter().enumerate() {
         tracing::info!("scroll_trace_entry {}", entry.log_fields(at));
     }
+    // `#2276 vibe-talk-client-debug-mode`: what held the main thread over the same minute.
+    if let Some(summary) = &report.debug {
+        tracing::info!(
+            "client_debug_summary route=scroll_trace {}",
+            summary.log_fields(&client_debug_ua(&headers))
+        );
+    }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -2317,6 +2336,7 @@ pub async fn scroll_trace(
 pub async fn page_freeze(
     State(state): State<AppState>,
     _scope: WriteScope,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let report: crate::page_freeze::FreezeReport = serde_json::from_slice(&body).map_err(|_| {
@@ -2350,6 +2370,17 @@ pub async fn page_freeze(
     tracing::warn!("page_freeze_report {}", report.header_fields(day, &totals));
     for (at, event) in report.events.iter().enumerate() {
         tracing::warn!("page_freeze {}", event.log_fields(at));
+        // `#2276 vibe-talk-client-debug-mode`: what code ran in that stall, on its own line
+        // under the event it explains (same `i`), timings and code names only.
+        if let Some(attribution) = &event.debug {
+            tracing::warn!("page_freeze_debug i={at} {}", attribution.log_fields());
+        }
+    }
+    if let Some(summary) = &report.debug {
+        tracing::warn!(
+            "client_debug_summary route=freeze_report {}",
+            summary.log_fields(&client_debug_ua(&headers))
+        );
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }

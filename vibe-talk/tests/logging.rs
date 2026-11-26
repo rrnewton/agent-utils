@@ -689,6 +689,106 @@ async fn a_page_freeze_report_is_counted_by_day_and_a_refused_one_is_none() {
     );
 }
 
+/// `#2276 vibe-talk-client-debug-mode`. The page's EXACT freeze report and scroll trace bodies with
+/// the debug mode on (`tests/fixtures/client_debug_reports.json`, written and checked by the page
+/// module suite from the page's own modules) pass the real router and log their attribution:
+/// timings and code names, the browser class from the request's own `User-Agent`, never the
+/// string. A span name carrying an email, a URL with a query or a Slack-style id refuses the
+/// whole report, and none of it reaches the log.
+#[tokio::test]
+async fn client_debug_detail_rides_the_freeze_report_and_scroll_trace_and_logs_names_only() {
+    const WEBVIEW: &str = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/AP2A; wv) AppleWebKit/537.36 \
+                           (KHTML, like Gecko) Version/4.0 Chrome/131.0.6778.39 Mobile Safari/537.36";
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let bodies: Value = serde_json::from_str(include_str!("fixtures/client_debug_reports.json"))
+        .expect("the fixture is JSON");
+    let post = |uri: &'static str, body: Value| {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+            .header("user-agent", WEBVIEW)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        let router = harness.router.clone();
+        async move {
+            let response = router.oneshot(request).await.expect("router responds");
+            let status = response.status();
+            let _ = response.into_body().collect().await.expect("body");
+            status
+        }
+    };
+    for leak in [
+        "send-owner@example.com",
+        "https://chat.example/archives?token=xoxb-123",
+        "thread-C0123ABCDEF",
+    ] {
+        let mut body = bodies["freeze_report"].clone();
+        body["events"][0]["debug"]["spans"][0]["name"] = json!(leak);
+        assert_eq!(
+            post("/api/v1/freeze-report", body).await,
+            StatusCode::BAD_REQUEST,
+            "{leak}"
+        );
+        let mut body = bodies["scroll_trace"].clone();
+        body["debug"]["spans"][0]["name"] = json!(leak);
+        assert_eq!(
+            post("/api/v1/scroll-trace", body).await,
+            StatusCode::BAD_REQUEST,
+            "{leak}"
+        );
+    }
+    assert_eq!(
+        post("/api/v1/freeze-report", bodies["freeze_report"].clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post("/api/v1/scroll-trace", bodies["scroll_trace"].clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    let text = capture.text();
+    for leak in [
+        "owner@example.com",
+        "token",
+        "C0123ABCDEF",
+        "Mozilla",
+        "Pixel",
+    ] {
+        assert!(!text.contains(leak), "{leak} reached the log: {text}");
+    }
+    let line = |name: &str| -> String {
+        let found: Vec<&str> = text.lines().filter(|l| l.contains(name)).collect();
+        assert_eq!(found.len(), 1, "expected one {name} line: {found:?}");
+        found[0].split(name).nth(1).expect("fields").to_owned()
+    };
+    assert_eq!(
+        line("page_freeze_debug "),
+        "i=0 unattributed_ms=30 open=\"key:0\" spans=\"evt:keydown:1:278:0:-:-:-:-:-,\
+         key:1:250:7:4321:812:140:-:-,evt-run:keydown:1:250:0:-:-:-:-:-,\
+         search-fast:1:235:7:4321:812:140:-:-\" recent=\"rows:50:50\" \
+         frame=blocking:230,render:20,style_layout:15 \
+         scripts=\"event-listener|DOCUMENT.onkeydown|onPageKey|voice.js:4567|250|12\" \
+         profile=samples:4,js:3,interval:20 \
+         self_top=\"applySearchFast@voice.js:1:900:2,onPageKey@voice.js:1:40:1\" \
+         total_top=\"onPageKey@voice.js:1:40:3,applySearchFast@voice.js:1:900:2\""
+    );
+    assert_eq!(
+        line("client_debug_summary route=freeze_report "),
+        "since=0 ua=webview-131 loaf=true longtask=true event=true profiler=true policy=true \
+         sample_ms=20 frames_over_50=1 frames_over_100=1 max_frame_ms=280 \
+         spans=\"evt:keydown:1:280:280,key:1:250:250,evt-run:keydown:1:250:250,\
+         search-fast:1:235:235,rows:1:50:50\" frames=\"1000:280:230:onPageKey@voice.js:4567\""
+    );
+    assert_eq!(
+        line("client_debug_summary route=scroll_trace "),
+        "since=1500 ua=webview-131 loaf=true longtask=true event=true profiler=true policy=true \
+         sample_ms=20 frames_over_50=0 frames_over_100=0 max_frame_ms=0 \
+         spans=\"rows:1:60:60,scroll-follow:1:12:12\" frames=\"\""
+    );
+}
+
 /// `#268 voice-call-drops`. How a call ended is one line of names and numbers: a hang-up at info,
 /// anything that ended the call for the reader at warn, and a refused record is no line at all.
 #[tokio::test]

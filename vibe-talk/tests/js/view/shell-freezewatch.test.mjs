@@ -71,6 +71,8 @@ function makeWatch(overrides = {}) {
     },
     // As the composition root's: never while hidden either.
     canPost: () => state.postable !== false && !state.hidden,
+    // `#2276`: the client debug mode, where a case gives one.
+    ...(state.clientDebug ? { clientDebug: state.clientDebug } : {}),
   });
   /** Move the clock to `to` and run every timer due by then, in due order. */
   const tick = (to) => {
@@ -280,5 +282,96 @@ test("#2066: damaged leavings are dropped, and unknown page words read as other"
   assert.equal(task.channel_view, "none");
   assert.equal(task.reading, "other");
   assert.equal(task.layout, "single");
+  watch.stop();
+});
+
+/** A stand-in client debug mode (`#2276`): every call recorded, answers by hand. */
+function fakeDebug(overrides = {}) {
+  const calls = { attribute: [], posted: 0 };
+  const debug = {
+    calls,
+    pendingNow: false,
+    lates: [],
+    summaryBody: { caps: { loaf: false, longtask: true }, since: 0 },
+    attribute(start, end, entry, late) {
+      calls.attribute.push({ start, end, entry });
+      debug.lates.push(late);
+      return { spans: [{ name: "key", n: 1, ms: Math.round(end - start), reads: 0 }], open: [], recent: [], unattributed_ms: 0 };
+    },
+    summary: () => debug.summaryBody,
+    posted: () => { calls.posted += 1; },
+    pending: () => debug.pendingNow,
+    ...overrides,
+  };
+  return debug;
+}
+
+test("#2276: with the debug mode, a freeze carries what ran in it and its summary rides the report", async () => {
+  const clientDebug = fakeDebug();
+  const { state, watch, beat, settle } = makeWatch({ clientDebug });
+  watch.start();
+  state.now = 250;
+  beat();
+  state.now = 3250;
+  beat();
+  await settle();
+  // From when the missed beat was due (250 + 250) to the thaw: the time the thread was surely held.
+  assert.deepEqual(clientDebug.calls.attribute, [{ start: 500, end: 3250, entry: null }]);
+  assert.equal(state.sent.length, 1);
+  assert.deepEqual(state.sent[0].events[0].debug.spans, [{ name: "key", n: 1, ms: 2750, reads: 0 }]);
+  assert.deepEqual(state.sent[0].debug, clientDebug.summaryBody);
+  assert.equal(clientDebug.calls.posted, 1, "the debug period did not start over after a taken report");
+  watch.stop();
+});
+
+test("#2276: a long frame hands its entry over, and a late profile lands on its event before the flush", async () => {
+  const clientDebug = fakeDebug({ pendingNow: true });
+  const { state, watch, beat, settle } = makeWatch({ clientDebug });
+  watch.start();
+  const loaf = { startTime: 400, duration: 260, scripts: [{ duration: 200, invokerType: "event-listener", invoker: "DIV.onkeydown", sourceFunctionName: "onPageKey" }] };
+  state.observers.get("long-animation-frame")([loaf]);
+  assert.deepEqual(clientDebug.calls.attribute, [{ start: 400, end: 660, entry: loaf }]);
+  // The profile is still on its way: the heartbeat holds the posting.
+  state.now = 6000;
+  beat();
+  await settle();
+  assert.equal(state.sent.length, 0, "posted before the profile came");
+  clientDebug.lates[0]({ samples: 16, js_samples: 15, interval_ms: 16, self_top: [], total_top: [] });
+  clientDebug.pendingNow = false;
+  state.now = 12000;
+  beat();
+  await settle();
+  assert.equal(state.sent.length, 1);
+  assert.equal(state.sent[0].events[0].kind, "loaf");
+  assert.equal(state.sent[0].events[0].debug.profile.samples, 16);
+  watch.stop();
+});
+
+test("#2276: detail stays on the ten longest stalls, in the ring and in what a report carries", async () => {
+  const clientDebug = fakeDebug();
+  const { state, watch } = makeWatch({ clientDebug, postable: false });
+  watch.start();
+  const tasks = Array.from({ length: 14 }, (_, i) => ({ startTime: 1000 * (i + 1), duration: 200 + i * 10 }));
+  state.observers.get("longtask")(tasks);
+  const kept = JSON.parse(state.stored.get(SHELL.FREEZE_STORAGE_KEY)).events;
+  const detailed = kept.filter((one) => one.debug !== undefined).map((one) => one.dur_ms);
+  assert.equal(detailed.length, 10);
+  assert.deepEqual(detailed, [240, 250, 260, 270, 280, 290, 300, 310, 320, 330]);
+  watch.stop();
+});
+
+test("#2276: without the debug mode, or with it off, a report is as it was", async () => {
+  const clientDebug = fakeDebug({ attribute: () => null, summary: () => null });
+  const { state, watch, beat, settle } = makeWatch({ clientDebug });
+  watch.start();
+  state.now = 250;
+  beat();
+  state.now = 3250;
+  beat();
+  await settle();
+  assert.equal(state.sent.length, 1);
+  assert.equal("debug" in state.sent[0], false);
+  assert.equal("debug" in state.sent[0].events[0], false);
+  assert.equal(clientDebug.calls.posted, 0);
   watch.stop();
 });

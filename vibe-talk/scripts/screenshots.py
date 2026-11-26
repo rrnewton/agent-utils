@@ -3902,6 +3902,33 @@ def _act_no_bookmark_stack(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_settings_client_debug(driver: Driver) -> None:
+    """`#2276 vibe-talk-client-debug-mode`: Settings > Debug with the client debug mode switched on.
+
+    A fresh load (the switch is a stored preference, cleared by `load`), Settings, the Debug group
+    unfolded and in the middle of the screen. The switch's place is noted, then it is really
+    clicked on, so the picture shows the switch on and its hint, and the scene's checks hold that
+    turning it on moved nothing on the screen (owner request 370).
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    _unfold(driver, "client-debug")
+    driver.js(
+        "(() => { document.getElementById('client-debug').closest('.toggle')"
+        ".scrollIntoView({ block: 'center' }); return true; })()"
+    )
+    driver.settle(300)
+    driver.js(
+        "(() => { window.__clientDebugBefore = ['client-debug', 'client-debug-hint', 'scroll-trace-send']"
+        ".map((id) => document.getElementById(id).getBoundingClientRect().top); return true; })()"
+    )
+    driver.click("client-debug")
+    driver.page.wait_for_function("() => document.getElementById('client-debug').checked", timeout=5_000)
+    driver.settle(300)
+
+
 def _act_settings_text_size(driver: Driver) -> None:
     """`#230 text-size-buttons`: the Text size group, a − and a + either side of its slider.
 
@@ -8944,6 +8971,32 @@ SCENES: tuple[Scene, ...] = (
                 "const onHead = document.elementFromPoint(head.press[0], head.press[1]); "
                 "return onDisc !== null && d.marker.contains(onDisc) && onHead !== null "
                 "&& head.arrow.contains(onHead); })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="150-settings-client-debug",
+        what="Settings, Debug: the client debug mode switched on, with its hint; switching it moved nothing",
+        act=_act_settings_client_debug,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                "the switch and its hint are on screen, and the switch is on",
+                "document.getElementById('client-debug').checked && ['client-debug', 'client-debug-hint']"
+                ".every((id) => { const b = document.getElementById(id).getBoundingClientRect(); "
+                "return window.__visible(id) && b.top >= 0 && b.bottom <= innerHeight; })",
+            ),
+            (
+                # Owner request 370: nothing moves on its own. Switching the mode on moved nothing.
+                "switching the mode on moved neither the switch, its hint nor the row above (<= 0.5 px)",
+                "['client-debug', 'client-debug-hint', 'scroll-trace-send'].every((id, at) => "
+                "Math.abs(document.getElementById(id).getBoundingClientRect().top "
+                "- window.__clientDebugBefore[at]) <= 0.5)",
+            ),
+            (
+                "the mode is on in the page, and kept on the device",
+                "localStorage.getItem('vibe-talk.voice.client-debug') === '1'",
             ),
         ),
     ),

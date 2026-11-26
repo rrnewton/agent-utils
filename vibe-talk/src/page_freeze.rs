@@ -31,8 +31,10 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-/// The largest request body the route reads: [`MAX_EVENTS`] at every cap fits inside it.
-pub const MAX_BODY_BYTES: usize = 32 * 1_024;
+/// The largest request body the route reads: [`MAX_EVENTS`] at every cap fits inside it, with
+/// the client debug mode's detail on [`crate::client_debug::MAX_DETAILED_EVENTS`] of them and
+/// its summary (`#2276 vibe-talk-client-debug-mode`).
+pub const MAX_BODY_BYTES: usize = 160 * 1_024;
 
 /// The most events one report carries: the page's ring holds no more.
 pub const MAX_EVENTS: usize = 40;
@@ -314,6 +316,10 @@ pub struct FreezeEvent {
     /// How late the first animation frame after the show came (`visible` only).
     #[serde(default)]
     pub raf_delay_ms: Option<u64>,
+    /// What code ran in the stall, where the owner's client debug mode is on (`#2276`):
+    /// named spans, long-frame scripts and the sampler's top frames; timings and code names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<crate::client_debug::EventDebug>,
 }
 
 /// One flush of the page's ring: `POST /api/v1/freeze-report`.
@@ -327,6 +333,10 @@ pub struct FreezeReport {
     pub started_at: f64,
     /// The events, oldest first. At most [`MAX_EVENTS`].
     pub events: Vec<FreezeEvent>,
+    /// The client debug mode's totals since its last report, where it is on (`#2276`). A
+    /// report may carry this alone, with no events: the mode's once-a-minute summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<crate::client_debug::DebugSummary>,
 }
 
 fn check_time(name: &str, value: f64) -> Result<(), String> {
@@ -363,6 +373,20 @@ impl FreezeReport {
         }
         for (at, event) in self.events.iter().enumerate() {
             event.validate(at)?;
+        }
+        let detailed = self
+            .events
+            .iter()
+            .filter(|event| event.debug.is_some())
+            .count();
+        if detailed > crate::client_debug::MAX_DETAILED_EVENTS {
+            return Err(format!(
+                "more than {} events carry debug detail",
+                crate::client_debug::MAX_DETAILED_EVENTS
+            ));
+        }
+        if let Some(summary) = &self.debug {
+            summary.validate()?;
         }
         Ok(())
     }
@@ -405,6 +429,9 @@ impl FreezeEvent {
         }
         if self.script.chars().any(char::is_control) {
             return Err(format!("{} carries a control character", name("script")));
+        }
+        if let Some(debug) = &self.debug {
+            debug.validate(&format!("events[{at}]"))?;
         }
         Ok(())
     }
@@ -527,6 +554,7 @@ mod tests {
             inputs_hidden: Some(0),
             timer_delay_ms: Some(900),
             raf_delay_ms: Some(1_100),
+            debug: None,
         }
     }
 
@@ -535,6 +563,7 @@ mod tests {
             v: 1,
             started_at: 10_000.0,
             events,
+            debug: None,
         }
     }
 
@@ -670,6 +699,82 @@ mod tests {
         assert!(forged
             .log_fields(0)
             .ends_with(r#"script="x\" kind=freeze""#));
+    }
+
+    #[test]
+    fn debug_detail_reads_is_capped_per_report_and_a_full_report_fits_the_body_cap() {
+        use crate::client_debug::fixtures::{full_event_debug, full_summary};
+        use crate::client_debug::MAX_DETAILED_EVENTS;
+        // Every string at its cap in the widest characters, every number at its cap.
+        let widest = FreezeEvent {
+            t: MAX_TIME_MS,
+            dur_ms: MAX_DUR_MS,
+            action_age_ms: Some(MAX_DUR_MS),
+            resume_age_ms: Some(MAX_DUR_MS),
+            timer_delay_ms: Some(MAX_DUR_MS),
+            raf_delay_ms: Some(MAX_DUR_MS),
+            replays_waiting: Some(MAX_QUEUE),
+            inputs_hidden: Some(MAX_QUEUE),
+            script: "\u{10348}".repeat(MAX_SCRIPT_CHARS),
+            channel_view: FreezeChannelView::Threads,
+            ..event(FreezeKind::Longtask)
+        };
+        let mut events = vec![widest; MAX_EVENTS];
+        for one in events.iter_mut().take(MAX_DETAILED_EVENTS) {
+            one.debug = Some(full_event_debug());
+        }
+        let full = FreezeReport {
+            started_at: MAX_TIME_MS,
+            debug: Some(full_summary()),
+            ..report(events)
+        };
+        full.validate().expect("a report at every cap is valid");
+        let bytes = serde_json::to_vec(&full).expect("serializes").len();
+        assert!(
+            bytes <= MAX_BODY_BYTES,
+            "{bytes} bytes overflow the route's cap"
+        );
+        // One detailed event too many is refused.
+        let mut over = full.clone();
+        over.events[MAX_DETAILED_EVENTS].debug = Some(full_event_debug());
+        assert!(over.validate().is_err());
+        // A summary alone, with no events, is the debug mode's minute report.
+        let summary_only = FreezeReport {
+            debug: Some(full_summary()),
+            ..report(Vec::new())
+        };
+        summary_only.validate().expect("valid");
+        // A bad attribution names its event.
+        let mut bad = report(vec![event(FreezeKind::Loaf)]);
+        let mut debug = full_event_debug();
+        debug.spans[0].name = "token=secret".to_owned();
+        bad.events[0].debug = Some(debug);
+        let refused = bad.validate().expect_err("refused");
+        assert!(
+            refused.starts_with("events[0].debug.spans[0].name"),
+            "{refused}"
+        );
+        // The page's exact wire shape reads, and a report without debug serializes as before.
+        let wire = serde_json::json!({
+            "v": 1, "startedAt": 0.0,
+            "events": [{
+                "t": 1.0, "kind": "longtask", "dur_ms": 250,
+                "view": "discord", "screen": "main", "channel_view": "flat",
+                "layout": "single", "reading": "idle", "windowed": false,
+                "visibility": "visible", "action": "key", "action_age_ms": 4,
+                "debug": {"spans": [{"name": "key", "n": 1, "ms": 240}]}
+            }],
+            "debug": {
+                "caps": {"loaf": false, "longtask": true, "profiler": false, "policy": false},
+                "since": 0, "frames_over_50": 0, "frames_over_100": 0, "max_frame_ms": 0
+            }
+        });
+        let parsed: FreezeReport = serde_json::from_value(wire).expect("reads");
+        parsed.validate().expect("valid");
+        let plain =
+            serde_json::to_value(report(vec![event(FreezeKind::Freeze)])).expect("serializes");
+        assert!(plain.get("debug").is_none());
+        assert!(plain["events"][0].get("debug").is_none());
     }
 
     #[test]

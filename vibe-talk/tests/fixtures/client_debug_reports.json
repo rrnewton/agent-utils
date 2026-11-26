@@ -1,0 +1,203 @@
+{
+  "freeze_report": {
+    "v": 1,
+    "startedAt": 500,
+    "events": [
+      {
+        "t": 1000,
+        "kind": "loaf",
+        "dur_ms": 280,
+        "view": "discord",
+        "screen": "main",
+        "channel_view": "flat",
+        "layout": "single",
+        "reading": "idle",
+        "windowed": true,
+        "visibility": "visible",
+        "action": "none",
+        "script": "event-listener DOCUMENT.onkeydown onPageKey",
+        "debug": {
+          "spans": [
+            {
+              "name": "evt:keydown",
+              "n": 1,
+              "ms": 278,
+              "reads": 0
+            },
+            {
+              "name": "key",
+              "n": 1,
+              "ms": 250,
+              "reads": 7,
+              "nodes": 4321,
+              "s": 812,
+              "d": 140
+            },
+            {
+              "name": "evt-run:keydown",
+              "n": 1,
+              "ms": 250,
+              "reads": 0
+            },
+            {
+              "name": "search-fast",
+              "n": 1,
+              "ms": 235,
+              "reads": 7,
+              "nodes": 4321,
+              "s": 812,
+              "d": 140
+            }
+          ],
+          "open": [
+            {
+              "name": "key",
+              "age_ms": 0
+            }
+          ],
+          "recent": [
+            {
+              "name": "rows",
+              "dur_ms": 50,
+              "ago_ms": 50
+            }
+          ],
+          "unattributed_ms": 30,
+          "frame": {
+            "blocking_ms": 230,
+            "render_ms": 20,
+            "style_layout_ms": 15,
+            "scripts": [
+              {
+                "fn": "onPageKey",
+                "src": "voice.js:4567",
+                "invoker_type": "event-listener",
+                "invoker": "DOCUMENT.onkeydown",
+                "dur_ms": 250,
+                "forced_layout_ms": 12
+              }
+            ]
+          },
+          "profile": {
+            "samples": 4,
+            "js_samples": 3,
+            "interval_ms": 20,
+            "self_top": [
+              {
+                "fn": "applySearchFast",
+                "src": "voice.js:1:900",
+                "n": 2
+              },
+              {
+                "fn": "onPageKey",
+                "src": "voice.js:1:40",
+                "n": 1
+              }
+            ],
+            "total_top": [
+              {
+                "fn": "onPageKey",
+                "src": "voice.js:1:40",
+                "n": 3
+              },
+              {
+                "fn": "applySearchFast",
+                "src": "voice.js:1:900",
+                "n": 2
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "debug": {
+      "caps": {
+        "loaf": true,
+        "longtask": true,
+        "event": true,
+        "profiler": true,
+        "policy": true,
+        "sample_ms": 20
+      },
+      "since": 0,
+      "spans": [
+        {
+          "name": "evt:keydown",
+          "n": 1,
+          "total_ms": 280,
+          "max_ms": 280
+        },
+        {
+          "name": "key",
+          "n": 1,
+          "total_ms": 250,
+          "max_ms": 250
+        },
+        {
+          "name": "evt-run:keydown",
+          "n": 1,
+          "total_ms": 250,
+          "max_ms": 250
+        },
+        {
+          "name": "search-fast",
+          "n": 1,
+          "total_ms": 235,
+          "max_ms": 235
+        },
+        {
+          "name": "rows",
+          "n": 1,
+          "total_ms": 50,
+          "max_ms": 50
+        }
+      ],
+      "frames_over_50": 1,
+      "frames_over_100": 1,
+      "max_frame_ms": 280,
+      "frames": [
+        {
+          "t": 1000,
+          "dur_ms": 280,
+          "blocking_ms": 230,
+          "fn": "onPageKey",
+          "src": "voice.js:4567"
+        }
+      ]
+    }
+  },
+  "scroll_trace": {
+    "v": 1,
+    "startedAt": 0,
+    "entries": [],
+    "debug": {
+      "caps": {
+        "loaf": true,
+        "longtask": true,
+        "event": true,
+        "profiler": true,
+        "policy": true,
+        "sample_ms": 20
+      },
+      "since": 1500,
+      "spans": [
+        {
+          "name": "rows",
+          "n": 1,
+          "total_ms": 60,
+          "max_ms": 60
+        },
+        {
+          "name": "scroll-follow",
+          "n": 1,
+          "total_ms": 12,
+          "max_ms": 12
+        }
+      ],
+      "frames_over_50": 0,
+      "frames_over_100": 0,
+      "max_frame_ms": 0,
+      "frames": []
+    }
+  }
+}

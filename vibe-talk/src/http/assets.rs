@@ -272,6 +272,11 @@ struct Entry {
     /// keep their plain URLs and are revalidated instead.
     version: Option<String>,
     etag: HeaderValue,
+    /// Whether this is a [`Role::Shell`]: the one kind of answer the client debug mode changes.
+    shell: bool,
+    /// The shell's tag for its debug variant, the one served with the profiling document policy
+    /// (`#2276`); a different tag, so a cached copy of one is never revalidated as the other.
+    debug_etag: HeaderValue,
 }
 
 /// Every static path and its answer, computed once from [`SOURCES`] for one pair of names.
@@ -401,7 +406,9 @@ impl Site {
                         None,
                     ),
                 };
-                (source.path, Entry::new(source.content_type, body, version))
+                let mut entry = Entry::new(source.content_type, body, version);
+                entry.shell = source.role == Role::Shell;
+                (source.path, entry)
             })
             .collect();
         let hashed = hashed
@@ -433,6 +440,9 @@ impl Site {
             .version
             .as_deref()
             .is_some_and(|version| uri.query() == Some(format!("v={version}").as_str()));
+        if entry.shell && debug_asked(uri, headers) {
+            return Some(respond_debug_shell(entry, headers));
+        }
         Some(respond(entry, named, headers))
     }
 
@@ -491,6 +501,48 @@ fn respond(entry: &Entry, named: bool, headers: &HeaderMap) -> Response {
         .into_response()
 }
 
+/// Whether a shell request asks for the client debug mode: `?client-debug=1`, or the switch's
+/// cookie. See [`crate::client_debug::asked_for`].
+fn debug_asked(uri: &Uri, headers: &HeaderMap) -> bool {
+    crate::client_debug::asked_for(
+        uri.query(),
+        headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    )
+}
+
+/// A shell's answer for a page in the client debug mode (`#2276 vibe-talk-client-debug-mode`):
+/// the same bytes, revalidated as ever, under the shell's debug tag, with the document policy
+/// that lets the page start the JS Self-Profiling API's sampler. Only here: the policy costs the
+/// browser a profiler's readiness, so a page without the switch never gets it. The tag differs
+/// from the plain shell's so a 304 can never keep a policy the switch has since dropped, nor
+/// withhold one it has since asked for: a cache holding one variant is sent the other in full.
+fn respond_debug_shell(entry: &Entry, headers: &HeaderMap) -> Response {
+    let validators = [
+        (header::ETAG, entry.debug_etag.clone()),
+        (header::CACHE_CONTROL, HeaderValue::from_static(REVALIDATE)),
+        (header::VARY, HeaderValue::from_static("accept-encoding")),
+        (
+            header::HeaderName::from_static("document-policy"),
+            HeaderValue::from_static(crate::client_debug::DOCUMENT_POLICY),
+        ),
+    ];
+    if already_held(headers, &entry.debug_etag) {
+        return (StatusCode::NOT_MODIFIED, validators).into_response();
+    }
+    (
+        validators,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(entry.content_type),
+        )],
+        entry.body.clone(),
+    )
+        .into_response()
+}
+
 impl Entry {
     fn new(content_type: &'static str, body: Bytes, version: Option<String>) -> Self {
         // A shell's tag is the hash of the body as GENERATED, so it moves whenever any file the
@@ -498,11 +550,15 @@ impl Entry {
         let tag = version.clone().unwrap_or_else(|| digest(&body));
         let etag = HeaderValue::try_from(format!("W/\"{tag}\""))
             .expect("hex digits in quotes are a valid header value");
+        let debug_etag = HeaderValue::try_from(format!("W/\"{tag}-debug\""))
+            .expect("hex digits and a word in quotes are a valid header value");
         Self {
             content_type,
             body,
             version,
             etag,
+            shell: false,
+            debug_etag,
         }
     }
 }
@@ -819,6 +875,74 @@ mod tests {
         // A page link is not a file reference, and neither is the same path quoted in prose.
         assert!(new.contains(r#"<a href="/a">"/a.js"</a>"#), "{new}");
         assert_ne!(before.entries["/a"].etag, after.entries["/a"].etag);
+    }
+
+    #[test]
+    fn the_debug_shell_alone_carries_the_profiling_policy_under_its_own_tag() {
+        // `#2276 vibe-talk-client-debug-mode`. The switch's cookie (or the one-load flag) gets
+        // the shell with `Document-Policy: js-profiling`; nothing else ever does.
+        let site = site(b"one();");
+        let with_cookie = |cookie: &str, tag: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(cookie).expect("cookie"),
+            );
+            if let Some(tag) = tag {
+                headers.insert(
+                    header::IF_NONE_MATCH,
+                    HeaderValue::from_str(tag).expect("tag"),
+                );
+            }
+            site.answer(&"/a".parse().expect("uri"), &headers)
+                .expect("a static path")
+        };
+        let plain = get(&site, "/a", None);
+        assert!(plain.headers().get("document-policy").is_none());
+        let debug = with_cookie("theme=dark; vibe-talk-client-debug=1", None);
+        assert_eq!(debug.status(), StatusCode::OK);
+        assert_eq!(
+            header_of(&debug, header::HeaderName::from_static("document-policy")),
+            "js-profiling"
+        );
+        assert_eq!(header_of(&debug, header::CACHE_CONTROL), REVALIDATE);
+        let flagged = get(&site, "/a?client-debug=1", None);
+        assert_eq!(
+            header_of(&flagged, header::HeaderName::from_static("document-policy")),
+            "js-profiling"
+        );
+        let plain_tag = header_of(&plain, header::ETAG).to_owned();
+        let debug_tag = header_of(&debug, header::ETAG).to_owned();
+        assert_ne!(plain_tag, debug_tag, "one tag per variant");
+        // Each variant revalidates only as itself: a cache holding the other gets the body.
+        let held = with_cookie("vibe-talk-client-debug=1", Some(&debug_tag));
+        assert_eq!(held.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            header_of(&held, header::HeaderName::from_static("document-policy")),
+            "js-profiling"
+        );
+        assert_eq!(
+            with_cookie("vibe-talk-client-debug=1", Some(&plain_tag)).status(),
+            StatusCode::OK
+        );
+        let switched_off = get(&site, "/a", Some(&debug_tag));
+        assert_eq!(switched_off.status(), StatusCode::OK);
+        assert!(switched_off.headers().get("document-policy").is_none());
+        // Files never carry it, cookie or not.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("vibe-talk-client-debug=1"),
+        );
+        let file = site
+            .answer(&"/a.js".parse().expect("uri"), &headers)
+            .expect("a file");
+        assert!(file.headers().get("document-policy").is_none());
+        // The switch off (`=0`) is the plain shell.
+        assert!(with_cookie("vibe-talk-client-debug=0", None)
+            .headers()
+            .get("document-policy")
+            .is_none());
     }
 
     #[test]
