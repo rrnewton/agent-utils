@@ -1603,9 +1603,16 @@
 
               So the host is small, ordinary type on one line, cut with an ellipsis where it does not fit
               and whole in its tooltip (web/voice.js gives it its `title`), and still plain text, to be
-              selected and copied. The buttons share its row; on a phone, where the three do not fit one
-              line, the two buttons go under the host together. The order is the reading order and Tab's:
-              the server, Expand all, Open help, then the sections.
+              selected and copied. The order is the reading order and Tab's: the server, Expand all,
+              Welcome, Open help, then the sections.
+
+              `#2297 vibe-talk-settings-header-layout`. The owner, 2026-11-26, of the buttons at the end
+              of a phone's row: "I don't think it carefully designed UI would ever have three buttons like
+              that right centered and not filling the column." End alignment is a dialog's actions, not a
+              page's controls. So the server line is a line of its own, and under it the three buttons are
+              one row of equal widths that fills the column, on a phone and on a desk alike (web/voice.css,
+              `.settings-head-actions`). The build sentence that stood beside the host is a short chip
+              there instead, and only while there is an update to take.
 
               `#342 settings-server-hostname`. Which server this is, still FIRST: the owner runs several
               and forgets which one a tab is talking to. Filled by `deploymentOrigin`'s sibling in
@@ -1634,8 +1641,8 @@
               <section class="settings-section" id="settings-server" aria-labelledby="settings-server-title">
                 <h2 id="settings-server-title">Server</h2>
                 <p id="settings-server-host" class="settings-server-host"></p>
-                <!-- `#529 page-build-stale-notice`. Which build of the page this is, and whether the server serves a newer one. -->
-                <p id="settings-page-build" class="hint"></p>
+                <!-- `#2297 vibe-talk-settings-header-layout`. A short status, not a sentence: shown only while the server serves a newer page build; a tap reloads, and both builds are in its tooltip and in Storage and connection. Up to date, the head says nothing about the build. -->
+                <button id="settings-page-update" class="chip settings-update-chip" type="button" hidden>Update available · Reload</button>
                 <!-- `#457 settings-server-side`. Quiet by design: it speaks only while a change is still on its way to the server, or cannot get there. -->
                 <p id="settings-sync-state" class="hint" aria-live="polite" hidden></p>
               </section>
@@ -2860,7 +2867,7 @@
               </section>
 
               <section class="settings-section" id="settings-screen" aria-labelledby="settings-screen-title">
-                <h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen" type="button" aria-expanded="false" aria-controls="fold-settings-screen-body">Screen and keys</button><span class="settings-scope-note">(client side)</span></h2>
+                <h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen" type="button" aria-expanded="false" aria-controls="fold-settings-screen-body">Screen and keys</button></h2>
                 <div class="fold-body" id="fold-settings-screen-body" hidden="until-found">
                   <section class="settings-group">
                     <div class="settings-inline" data-single-setting="text-size">
@@ -3109,6 +3116,8 @@
                   <section class="settings-group">
                     <div class="settings-inline" data-single-setting="token">
                       <p class="hint">Server: <code id="settings-server-url"></code></p>
+                      <!-- `#529 page-build-stale-notice`, moved here by `#2297 vibe-talk-settings-header-layout`: which build of the page this is, and the server's when it serves a newer one. -->
+                      <p id="settings-page-build" class="hint"></p>
                       <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>
                     
                   </div>

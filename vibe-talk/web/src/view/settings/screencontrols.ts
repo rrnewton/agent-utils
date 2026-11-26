@@ -58,6 +58,8 @@ export function mountScreenControls(deps: ScreenControlsDependencies): ScreenCon
   listen<Event>(el("collapsed-lines-larger"), "click", () => deps.stepCollapsedLines(1));
   listen<Event>(el("card-max-lines"), "input", () => deps.cardMaxLinesChanged(value("card-max-lines")));
   listen<Event>(el("page-update"), "click", () => deps.reloadPage());
+  // `#2297 vibe-talk-settings-header-layout`: Settings' own update chip reloads the same way.
+  listen<Event>(el("settings-page-update"), "click", () => deps.reloadPage());
   deps.showPageBuild();
   listen<Event>(el("card-max-lines-smaller"), "click", () => deps.stepCardMaxLines(-1));
   listen<Event>(el("card-max-lines-larger"), "click", () => deps.stepCardMaxLines(1));

@@ -3936,6 +3936,110 @@ def _act_settings_client_debug(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#2297 vibe-talk-settings-header-layout`. A page build no server of this walk serves: what a timeline read
+# names after a deploy, so the page left open knows it is out of date.
+NEWER_PAGE_BUILD = "19fe934a" + "0" * 24
+
+
+def _newer_page_build(route: Route) -> None:
+    """The real server's timeline answer, with the one field a deploy changes: the page build it serves.
+
+    Fetched from the throwaway server through its own route, so every other byte is what it said."""
+    response = route.fetch()
+    try:
+        body = response.json()
+    except ValueError:
+        # Not JSON (an error page, say): passed on as it came, so the scene's own checks say what failed.
+        route.fulfill(response=response)
+        return
+    if isinstance(body, dict) and isinstance(body.get("page_build"), str):
+        body["page_build"] = NEWER_PAGE_BUILD
+    route.fulfill(response=response, json=body)
+
+
+def _unroute_settings_head(driver: Driver) -> None:
+    driver.page.unroute("**/api/v1/client-config", _threaded_config)
+    driver.page.unroute("**/api/v1/channels/*/timeline*", _newer_page_build)
+
+
+def _open_threaded_channel(driver: Driver) -> None:
+    """The channel opened on a server that says it has threads, as the owner's chat service does.
+
+    Then the page's reads of the channel are timeline reads, and a timeline read says which page build the
+    server serves (`#529 page-build-stale-notice`); on the unthreaded throwaway server the page reads the
+    channel through `/page`, which does not, so the page would never hear the server's build at all. The
+    first timeline answer's build is kept on the page as `__serverPageBuild` for the scene's checks."""
+    page = driver.page
+    page.route("**/api/v1/client-config", _threaded_config)
+    with page.expect_response(lambda r: "/timeline" in r.url and r.status == 200) as answer:
+        _act_open_channel(driver)
+    body = cast(object, answer.value.json())
+    build = body.get("page_build") if isinstance(body, dict) else None
+    driver.js(f"(() => {{ window.__serverPageBuild = {json.dumps(build if isinstance(build, str) else '')}; return true; }})()")
+
+
+def _open_settings_head(driver: Driver) -> None:
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.js("(() => { if (window.__visible('status-line')) document.getElementById('dismiss-status').click(); return true; })()")
+    driver.page.wait_for_function(
+        "() => document.getElementById('settings-page-build').textContent.startsWith('This page is build')",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
+def _act_settings_head(driver: Driver) -> None:
+    """`#2297 vibe-talk-settings-header-layout`: the head of Settings on a page that runs the build the
+    server serves (the real server's own answer says so): the server line alone, then Expand all,
+    Welcome and Open help filling the column."""
+    _open_threaded_channel(driver)
+    _open_settings_head(driver)
+
+
+def _act_settings_head_update(driver: Driver) -> None:
+    """`#2297 vibe-talk-settings-header-layout`: the same head after a deploy: the server's timeline answer
+    names a newer page build (that one field changed, every other byte the real server's), and the server
+    line ends in the short Update available chip."""
+    driver.page.route("**/api/v1/channels/*/timeline*", _newer_page_build)
+    _open_threaded_channel(driver)
+    driver.page.wait_for_function("() => window.__visible('page-update')", timeout=15_000)
+    _open_settings_head(driver)
+    driver.page.wait_for_function("() => window.__visible('settings-page-update')", timeout=5_000)
+
+
+# `#2297`: the head's geometry, read once per scene. The row fills the column: each button the same width,
+# and the row's outer edges on the panes' (the column's) edges, within a pixel.
+SETTINGS_HEAD_FILLS_JS = (
+    "(() => { const r = (id) => document.getElementById(id).getBoundingClientRect(); "
+    "const ids = ['fold-settings-all', 'open-welcome', 'open-help']; const b = ids.map(r); "
+    "const panes = r('settings-panes'); const w = b.map((x) => x.width); "
+    "return Math.max(...w) - Math.min(...w) <= 1 && Math.abs(b[0].left - panes.left) <= 1 "
+    "&& Math.abs(b[2].right - panes.right) <= 1 && b.every((x) => Math.abs(x.top - b[0].top) <= 1) "
+    "&& b[0].right <= b[1].left && b[1].right <= b[2].left && b[2].bottom <= panes.top; })()"
+)
+# `#2297` (liaison): "Channel Settings: [channel] ?" is one line; on a phone the ? used to drop to its own line.
+SETTINGS_CHANNEL_ROW_JS = (
+    "(() => { const r = (id) => document.getElementById(id).getBoundingClientRect(); "
+    "const t = r('settings-channels-title'), s = r('settings-channel'), h = r('help-link-channel-alias'), sec = r('settings-channels'); "
+    "const mid = (b) => (b.top + b.bottom) / 2; "
+    "return mid(h) > s.top && mid(h) < s.bottom && mid(t) > s.top && mid(t) < s.bottom "
+    "&& t.right <= s.left && s.right <= h.left && h.right <= sec.right; })()"
+)
+# `#2297` (design review, rule 370): the server line is the chip's 2rem tall with or without the chip, so
+# a chip that comes up while Settings is open moves nothing below it.
+SETTINGS_SERVER_LINE_RESERVED_JS = (
+    "Math.abs(document.getElementById('settings-server').getBoundingClientRect().height "
+    "- 2 * parseFloat(getComputedStyle(document.documentElement).fontSize)) <= 0.5"
+)
+SETTINGS_SERVER_ONE_LINE_JS = (
+    "(() => { const line = document.getElementById('settings-server'); const host = document.getElementById('settings-server-host'); "
+    "const box = line.getBoundingClientRect(); const panes = document.getElementById('settings-panes').getBoundingClientRect(); "
+    "return box.height < 2 * parseFloat(getComputedStyle(host).fontSize) + 24 && box.right <= panes.right + 1 "
+    "&& host.title === location.host && getComputedStyle(host).whiteSpace === 'nowrap'; })()"
+)
+
+
 def _act_settings_text_size(driver: Driver) -> None:
     """`#230 text-size-buttons`: the Text size group, a − and a + either side of its slider.
 
@@ -9189,6 +9293,67 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
+        name="155-settings-head",
+        what="the head of Settings, up to date: the server line alone, then Expand all, Welcome and Open help filling the column",
+        act=_act_settings_head,
+        after=_unroute_settings_head,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            # THE claim (owner request 388): the three buttons are one row of equal widths spanning the column.
+            ("the three buttons are equal widths, and the row spans the column within 1 px", SETTINGS_HEAD_FILLS_JS),
+            ("the server line is one line, its host whole in its tooltip", SETTINGS_SERVER_ONE_LINE_JS),
+            ("the server line is the chip's 2rem tall, chip or no chip, so the chip coming up moves nothing", SETTINGS_SERVER_LINE_RESERVED_JS),
+            ("Channel Settings, its select and its ? are one line, the ? at the row's end", SETTINGS_CHANNEL_ROW_JS),
+            (
+                "the real server reported this page's own build, the head says nothing about it, and Storage and connection names it",
+                "window.__serverPageBuild.length === 32 "
+                "&& document.getElementById('settings-page-build').textContent === `This page is build ${window.__serverPageBuild.slice(0, 8)}.` "
+                "&& !window.__visible('settings-page-update') && document.getElementById('settings-page-update').title === '' "
+                "&& /^This page is build [0-9a-f]{8}\\.$/.test(document.getElementById('settings-page-build').textContent) "
+                "&& !/page is build|now serves|update available/i.test(document.querySelector('.settings-head').innerText)",
+            ),
+            ("no (client side) note on the screen", "!document.getElementById('screen-settings').textContent.includes('client side')"),
+            (
+                "nothing on the settings screen is wider than it",
+                "(() => { const s = document.getElementById('screen-settings'); return s.scrollWidth <= s.clientWidth + 1; })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="156-settings-head-update",
+        what="the head of Settings after a deploy: the server line ends in a short Update available chip, both builds in its tooltip",
+        act=_act_settings_head_update,
+        after=_unroute_settings_head,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                # THE claim: a status, not a sentence, on the server's line.
+                "the update chip is up, on the server's line right after the host, and says it in at most 25 characters",
+                "(() => { const chip = document.getElementById('settings-page-update'); const text = chip.textContent.trim(); "
+                "const host = document.getElementById('settings-server-host').getBoundingClientRect(); const c = chip.getBoundingClientRect(); "
+                "return window.__visible('settings-page-update') && text === 'Update available · Reload' && text.length <= 25 "
+                "&& c.left - host.right >= 4 && c.left - host.right <= 12 && c.top < host.bottom && c.bottom > host.top; })()",
+            ),
+            (
+                "both builds are in its tooltip and in Storage and connection",
+                "(() => { const tip = document.getElementById('settings-page-update').title; "
+                "const line = document.getElementById('settings-page-build').textContent; "
+                "return /^This page is build [0-9a-f]{8}; the server now serves 19fe934a\\. Tap to reload\\.$/.test(tip) "
+                "&& /^This page is build [0-9a-f]{8}; the server now serves 19fe934a\\.$/.test(line); })()",
+            ),
+            ("the three buttons are equal widths, and the row spans the column within 1 px", SETTINGS_HEAD_FILLS_JS),
+            ("the server line is still one line, its host whole in its tooltip", SETTINGS_SERVER_ONE_LINE_JS),
+            ("the server line is the chip's 2rem tall, chip or no chip, so the chip coming up moves nothing", SETTINGS_SERVER_LINE_RESERVED_JS),
+            ("Channel Settings, its select and its ? are one line, the ? at the row's end", SETTINGS_CHANNEL_ROW_JS),
+            (
+                "nothing on the settings screen is wider than it",
+                "(() => { const s = document.getElementById('screen-settings'); return s.scrollWidth <= s.clientWidth + 1; })()",
+            ),
+        ),
+    ),
+    Scene(
         name="45-settings-text-size",
         what="Settings, Text size: a − and a + either side of the slider, one press of + in, the ring on −",
         act=_act_settings_text_size,
@@ -10283,14 +10448,12 @@ SCENES: tuple[Scene, ...] = (
                 "&& h.title === h.textContent && h.textContent === location.host; })()",
             ),
             (
-                # `#372 settings-header-layout`: neither button has a row of its own.
-                "Expand all and Open help share a row above the sections: the host's on a desk, the one under it on a phone",
+                # `#2297 vibe-talk-settings-header-layout` (was `#372`'s row at the end): the buttons share one
+                # row under the host's line, filling the column.
+                "Expand all, Welcome and Open help share one row under the host, filling the column above the sections",
                 "(() => { const r = (id) => document.getElementById(id).getBoundingClientRect(); "
-                "const mid = (b) => (b.top + b.bottom) / 2; "
-                "const host = r('settings-server-host'), all = r('fold-settings-all'), help = r('open-help'), panes = r('settings-panes'); "
-                "const desk = matchMedia('(min-width: 900px) and (pointer: fine)').matches; "
-                "return Math.abs(mid(all) - mid(help)) < 2 && all.right <= help.left && help.bottom <= panes.top "
-                "&& (desk ? Math.abs(mid(host) - mid(all)) < 4 && host.right <= all.left : host.bottom <= all.top + 1); })()",
+                "const host = r('settings-server-host'); "
+                "return host.bottom <= r('fold-settings-all').top + 1 && " + SETTINGS_HEAD_FILLS_JS + "; })()",
             ),
             (
                 "each folded title is a tap target at least 40px tall, with its chevron",

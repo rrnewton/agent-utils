@@ -161,15 +161,6 @@
  * above it says where it starts, which is all a row needs. The border, the fill and the corners
  * move from the group to the section, so a group inside a section draws none of its own.
  */
-/* `#457 settings-server-side`. The one per-device section says so beside its title,
-   small and faint: a fact to notice once, not a thing to read every time. */
-.settings-scope-note {
-  margin-left: 0.45em;
-  font-size: 0.72em;
-  font-weight: 400;
-  opacity: 0.55;
-}
-
 .settings-section {
   margin: 0 0 0.65rem;
   padding: 0.45rem 0.7rem 0.1rem;
@@ -195,27 +186,29 @@
   margin: 0.15rem 0 0.35rem;
 }
 
-/* `#372 settings-header-layout`. The head of the screen is ONE ROW: the server line, then Expand all
-   and Open help at its end. It wraps rather than squeezes: the server line asks for 16rem, so on a
-   phone, where it and the two buttons do not fit one line, the buttons go under it together, still
-   at the row's end, and on a desk all three share the line. */
+/* `#372 settings-header-layout`, laid out again by `#2297 vibe-talk-settings-header-layout`. The head
+   of the screen is two quiet lines: the server line, then Expand all, Welcome and Open help as one
+   row of equal widths that fills the column, on a phone and on a desk alike. The owner, 2026-11-26:
+   three buttons at the end of a row, "not filling the column", is not a carefully designed page. End
+   alignment is a dialog's actions; a page's own controls fill the column they head. */
 .settings-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.4rem 0.75rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.5rem;
   margin: 0 0 0.75rem;
 }
 
 /* The Server section, drawn as a line of the head rather than as a card: its label, then its host,
-   on one baseline. `min-width: 0` lets the host's ellipsis start inside it instead of the line
-   pushing the buttons off the screen. */
+   then the update chip when there is one, on one line. `min-width: 0` lets the host's ellipsis start
+   inside it instead of the line pushing the chip off the screen. The line is the chip's height, 2rem,
+   whether the chip is up or not, so a chip that arrives while Settings is open moves nothing below it
+   (rule 370: nothing moves on its own), and the rows under it stand on whole pixels in both states. */
 #screen-settings #settings-server {
-  flex: 1 1 16rem;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 0.5rem;
   min-width: 0;
+  min-height: 2rem;
   margin: 0;
   padding: 0;
   background: none;
@@ -257,10 +250,32 @@
   vertical-align: bottom;
 }
 
+/* `#2297 vibe-talk-settings-header-layout`. The buttons: equal columns, one per button, spanning the
+   column at the panes' own gap, so on a desk of three panes each button stands over a pane. A label
+   too long for its share is cut, never wrapped or pushed past the edge. */
 .settings-head-actions {
-  display: flex;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 0.5rem;
-  margin-inline-start: auto;
+}
+
+.settings-head-actions > button {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* `#2297 vibe-talk-settings-header-layout`. The update chip, right after the host it is about (not at
+   the line's far end: end alignment is a dialog's actions, ui-rules R1): a status two words long where
+   `#529 page-build-stale-notice` wrote a sentence. Exactly the line's 2rem tall; it never shrinks, and
+   on a phone the host's name gives way to it. */
+#screen-settings .settings-update-chip {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  height: 2rem;
+  white-space: nowrap;
 }
 
 /* A group's own heading, inside a section: what a card's heading used to be, one step quieter.
@@ -402,12 +417,16 @@
 }
 /* The channel selector lives in the Channels header, so the header reads
    "Channel Settings: [All Channels]" and the controls below it are
-   visibly about that channel. */
+   visibly about that channel. `#2297 vibe-talk-settings-header-layout`: one
+   line on a phone too. The row used to wrap, and on a phone its `?` dropped
+   to a line of its own under the title; now the title keeps its width, the
+   `?` keeps its place at the row's end, and the select gives way between
+   them (its text is cut, never the row). */
 .channel-settings-head {
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 .channel-settings-head > h2 {
-  flex: 0 1 auto;
+  flex: 0 0 auto;
 }
 .channel-settings-head > #settings-channel {
   flex: 1 1 9rem;

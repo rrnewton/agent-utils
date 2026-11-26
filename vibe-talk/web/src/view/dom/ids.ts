@@ -664,6 +664,7 @@ export interface ElementById {
   "settings-messages": HTMLElement;
   "settings-messages-title": HTMLHeadingElement;
   "settings-page-build": HTMLParagraphElement;
+  "settings-page-update": HTMLButtonElement;
   "settings-panes": HTMLDivElement;
   "settings-screen": HTMLElement;
   "settings-screen-title": HTMLHeadingElement;

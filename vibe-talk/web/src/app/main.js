@@ -8849,7 +8849,7 @@ const { markSave } = saveTokenButton;
 //
 // Every setting outside Settings' Screen and keys section lives on the server, shared by all the
 // owner's devices; that one section — text size, reading width, the control bar, typing and the
-// keyboard — stays on this device and says "(client side)" beside its title. The full inventory
+// keyboard — stays on this device (its "(client side)" note was dropped by `#2297`). The full inventory
 // and its reasons are in `src/client_settings.rs`; web/src/core/settings/keys.ts names the synced
 // keys, and web/src/core/settings/sync.ts says how the device's replica and the server's document
 // are kept in agreement.

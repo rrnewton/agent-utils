@@ -2190,15 +2190,26 @@ test("`#529 page-build-stale-notice`: a read saying the server serves another pa
   // The same build: nothing shown, and Settings names it.
   assert.equal(page.el("page-update").hidden, true, "the page offered a reload of the build it runs");
   assert.equal(page.el("settings-page-build").textContent, "This page is build aaaaaaaa.");
+  // `#2297 vibe-talk-settings-header-layout`: up to date, the head of Settings says nothing about the build.
+  assert.equal(page.el("settings-page-update").hidden, true, "Settings' head offered an update to the build it runs");
+  assert.equal(page.el("settings-page-update").title, "");
   // A deploy: the next read says another build.
   build = "bbbbbbbb22222222";
   await reReadChannel(page);
   assert.equal(page.el("page-update").hidden, false, "a page older than the server's did not say so");
   assert.match(page.el("page-update").textContent, /New version/);
-  assert.match(page.el("settings-page-build").textContent, /build aaaaaaaa; the server now serves bbbbbbbb/);
+  assert.equal(page.el("settings-page-build").textContent, "This page is build aaaaaaaa; the server now serves bbbbbbbb.");
+  // `#2297`: Settings' head says it in two words, both builds in the chip's tooltip.
+  const update = page.el("settings-page-update");
+  assert.equal(update.hidden, false, "Settings' head did not offer the update");
+  assert.equal(update.textContent, "Update available · Reload");
+  assert.ok(update.textContent.length <= 25, `the update chip says ${update.textContent.length} characters, more than a status`);
+  assert.equal(update.title, "This page is build aaaaaaaa; the server now serves bbbbbbbb. Tap to reload.");
   assert.equal(page.reloads || 0, 0, "the page reloaded by itself");
   await page.el("page-update").click();
   assert.equal(page.reloads, 1, "the chip did not reload the page");
+  await update.click();
+  assert.equal(page.reloads, 2, "Settings' update chip did not reload the page");
   // A page that does not know its own build — loaded without a hashed address — never claims to be old.
   const unknown = newPage(new Map());
   unknown.threadingSupported = true;
@@ -2211,6 +2222,8 @@ test("`#529 page-build-stale-notice`: a read saying the server serves another pa
   await showDiscord(unknown, data.messages);
   await unknown.settle();
   assert.equal(unknown.el("page-update").hidden, true, "a page with no build of its own offered a reload");
+  assert.equal(unknown.el("settings-page-update").hidden, true, "Settings' head offered an update to a page with no build of its own");
+  assert.equal(unknown.el("settings-page-build").textContent, "", "a page with no build of its own named one");
 });
 
 test("`#624 voice-page-modularity`: a page knows its build from the page build's hashed script name as it does from an older ?v= address, and from nothing else", async () => {

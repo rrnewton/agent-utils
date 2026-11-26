@@ -47,15 +47,27 @@ export function mountSettingsReadouts(deps: SettingsReadoutsDependencies): Setti
     deps.lookup("settings-server-host").title = host;
   }
 
-  /** The reload chip shown exactly while this page is out of date, and Settings saying which build it is. */
+  /**
+   * The reload chips shown exactly while this page is out of date, and Settings saying which build it is.
+   *
+   * `#2297 vibe-talk-settings-header-layout`: the head of Settings says it in two words, "Update available
+   * · Reload", on a chip a tap reloads by, and says nothing while the page is up to date; the sentence
+   * naming both builds is the chip's tooltip, and Storage and connection's build line.
+   */
   function renderPageBuild(): void {
     const stale = deps.pageOutOfDate();
-    const chip = deps.lookup("page-update");
-    if (chip.hidden === stale) chip.hidden = !stale;
+    for (const id of ["page-update", "settings-page-update"]) {
+      const chip = deps.lookup(id);
+      if (chip.hidden === stale) chip.hidden = !stale;
+    }
     const short = (build: string): string => build.slice(0, 8);
-    setTextIfChanged(deps.lookup("settings-page-build"), deps.pageBuild === "" ? "" : stale
-      ? `This page is build ${short(deps.pageBuild)}; the server now serves ${short(deps.serverPageBuild)}. Reload to run it.`
-      : `This page is build ${short(deps.pageBuild)}.`);
+    const detail = deps.pageBuild === "" ? "" : stale
+      ? `This page is build ${short(deps.pageBuild)}; the server now serves ${short(deps.serverPageBuild)}.`
+      : `This page is build ${short(deps.pageBuild)}.`;
+    setTextIfChanged(deps.lookup("settings-page-build"), detail);
+    const tip = stale ? `${detail} Tap to reload.` : "";
+    const update = deps.lookup("settings-page-update");
+    if (update.title !== tip) update.title = tip;
   }
 
   /**

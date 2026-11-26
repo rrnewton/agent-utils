@@ -89,9 +89,10 @@ test("`#372 settings-header-layout`: the host's port is its own part, an IPv6 ad
 });
 
 /**
- * What is wrong with the head of Settings against `#372`, as sentences; empty when nothing is: the
- * server line, Expand all and Open help in one row, in that order, before the sections, and neither
- * button standing alone on a line of its own.
+ * What is wrong with the head of Settings against `#372` and `#2297 vibe-talk-settings-header-layout`, as
+ * sentences; empty when nothing is: the server line, then Expand all, Welcome and Open help as one row of
+ * equal columns filling the column, in that order, before the sections; the build said by a short chip in
+ * the server line, never by a sentence in the head.
  */
 function settingsHeadProblems(html, css) {
   const problems = [];
@@ -99,55 +100,101 @@ function settingsHeadProblems(html, css) {
   const settings = code.slice(code.indexOf('id="screen-settings"'), code.indexOf('id="screen-help"'));
   const opens = settings.indexOf('<div class="settings-head">');
   const panes = settings.indexOf('<div class="settings-panes"');
-  if (opens < 0 || panes < 0 || opens > panes) return ["there is no head row above the sections"];
+  if (opens < 0 || panes < 0 || opens > panes) return ["there is no head above the sections"];
   const head = settings.slice(opens, panes);
   const at = (id) => head.indexOf(`id="${id}"`);
-  for (const [id, name] of [["settings-server-host", "the server's host"], ["fold-settings-all", "Expand all"], ["open-help", "Open help"]]) {
-    if (at(id) < 0) problems.push(`${name} is not in the head row`);
+  const buttons = [["fold-settings-all", "Expand all"], ["open-welcome", "Welcome"], ["open-help", "Open help"]];
+  for (const [id, name] of [["settings-server-host", "the server's host"], ...buttons]) {
+    if (at(id) < 0) problems.push(`${name} is not in the head`);
   }
-  if (!(at("settings-server-host") < at("fold-settings-all") && at("fold-settings-all") < at("open-help"))) {
-    problems.push("the head row is not the server, Expand all, then Open help");
+  if (!(at("settings-server-host") < at("fold-settings-all") && at("fold-settings-all") < at("open-welcome")
+    && at("open-welcome") < at("open-help"))) {
+    problems.push("the head is not the server, Expand all, Welcome, then Open help");
   }
-  for (const [id, name] of [["fold-settings-all", "Expand all"], ["open-help", "Open help"]]) {
-    if (new RegExp(`<p\\b[^>]*>\\s*<button id="${id}"`).test(settings)) problems.push(`${name} stands alone on a line of its own`);
-  }
+  const actions = /<div class="settings-head-actions">([\s\S]*?)<\/div>/.exec(head);
+  const inRow = actions ? [...actions[1].matchAll(/<button id="([^"]+)"/g)].map((m) => m[1]) : [];
+  if (inRow.join() !== buttons.map(([id]) => id).join()) problems.push(`the button row holds ${JSON.stringify(inRow)}, not the three buttons alone`);
   if (/tabindex="[1-9]/.test(settings)) problems.push("a positive tabindex reorders the focus");
-  const row = cssRules(css, ".settings-head").join("\n");
-  if (!/display:\s*flex/.test(row)) problems.push("the head is not laid out as a row");
-  if (!/flex-wrap:\s*wrap/.test(row)) problems.push("the head cannot wrap on a phone, so it squeezes or overflows");
-  if (/flex-direction:\s*\w+-reverse|(?:^|[\s;{])order:/.test(row + cssRules(css, ".settings-head-actions").join("\n"))) {
-    problems.push("a rule reorders the head away from the reading order");
+  // The build: a short chip on the server line, hidden until there is an update; no sentence in the head.
+  const server = /<section class="settings-section" id="settings-server"[\s\S]*?<\/section>/.exec(head);
+  const chip = /<button id="settings-page-update" class="chip[^"]*" type="button" hidden>([^<]*)<\/button>/.exec(server ? server[0] : "");
+  if (!chip) problems.push("the server line has no update chip, hidden until there is an update");
+  else if (chip[1].length > 25) problems.push(`the update chip says ${chip[1].length} characters, a sentence rather than a status`);
+  if (at("settings-page-build") >= 0) problems.push("the build sentence is in the head");
+  // The row fills the column in equal columns; nothing pushes it to an end.
+  const row = cssRules(css, ".settings-head-actions").join("\n");
+  if (!/display:\s*grid/.test(row) || !/grid-auto-flow:\s*column/.test(row) || !/grid-auto-columns:\s*minmax\(0,\s*1fr\)/.test(row)) {
+    problems.push("the buttons are not one row of equal columns");
   }
+  const both = row + cssRules(css, ".settings-head").join("\n");
+  if (/margin-(?:inline-start|left):\s*auto|justify-(?:content|self|items):\s*(?:flex-)?end|justify-(?:content|self):\s*(?:center|right)/.test(both)) {
+    problems.push("the buttons are pushed to an end of the column rather than filling it");
+  }
+  if (/max-width|(?:^|[\s;{])width:/.test(row)) problems.push("the button row is held narrower than the column");
+  if (/flex-direction:\s*\w+-reverse|(?:^|[\s;{])order:/.test(both)) problems.push("a rule reorders the head away from the reading order");
+  // The chip: right after the host, and its height reserved on the line, so its arrival moves nothing (rule 370).
+  const line = cssRules(css, "#screen-settings #settings-server").join("\n");
+  const chipRule = cssRules(css, "#screen-settings .settings-update-chip").join("\n");
+  if (!/min-height:\s*2rem/.test(line) || !/(?:^|[\s;{])height:\s*2rem/.test(chipRule)) {
+    problems.push("the server line does not hold the chip's height, so the chip coming up moves everything below it");
+  }
+  if (/margin-(?:inline-start|left):\s*auto/.test(chipRule)) problems.push("the update chip is pushed to the far end of the line, away from the host");
   return problems;
 }
 
-test("`#372 settings-header-layout`: the server line, Expand all and Open help share one row above the sections, in reading order", () => {
+test("`#2297 vibe-talk-settings-header-layout`: the server line, then Expand all, Welcome and Open help in one row of equal columns, above the sections", () => {
   assert.deepStrictEqual(settingsHeadProblems(HTML, CSS_CODE), []);
 });
 
-test("`#372 settings-header-layout`: the check refuses Expand all or Open help on a row of its own, and a reordered head (negative controls)", () => {
+test("`#2297 vibe-talk-settings-header-layout`: the check refuses the end-aligned row, a reordered or split head, and the build sentence back in it (negative controls)", () => {
   const help = '<button id="open-help" class="secondary" type="button">Open help</button>';
   const expand = '<button id="fold-settings-all" class="secondary" type="button">Expand all</button>';
   assert.ok(HTML.includes(help) && HTML.includes(expand), "the buttons' markup moved; update the negative controls");
-  // Open help back at the foot of the screen, in a paragraph of its own, as it was.
+  // The row as `#372` drew it: flex, at the row's end.
+  const ended = CSS_CODE.replace(/(\.settings-head-actions \{)[^}]*\}/, "$1\n  display: flex;\n  gap: 0.5rem;\n  margin-inline-start: auto;\n}");
+  assert.notEqual(ended, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(settingsHeadProblems(HTML, ended), [
+    "the buttons are not one row of equal columns",
+    "the buttons are pushed to an end of the column rather than filling it",
+  ]);
+  const centred = CSS_CODE.replace(/(\.settings-head-actions \{)/, "$1\n  justify-content: center;\n  max-width: 24rem;");
+  assert.deepStrictEqual(settingsHeadProblems(HTML, centred), [
+    "the buttons are pushed to an end of the column rather than filling it",
+    "the button row is held narrower than the column",
+  ]);
+  // Open help out of the head, at the foot of the screen.
   const foot = HTML.replace(help, "").replace(/(\n {10}<\/div>\n {8}<\/section>\n\n {8}<!-- -+ help screen -->)/,
     `<p class="hint">\n  ${help}\n</p>$1`);
   assert.ok(foot.includes(`<p class="hint">\n  ${help}`), "the negative control changed nothing");
   assert.deepStrictEqual(settingsHeadProblems(foot, CSS_CODE), [
-    "Open help is not in the head row",
-    "the head row is not the server, Expand all, then Open help",
-    "Open help stands alone on a line of its own",
+    "Open help is not in the head",
+    "the head is not the server, Expand all, Welcome, then Open help",
+    'the button row holds ["fold-settings-all","open-welcome"], not the three buttons alone',
   ]);
-  // Expand all on a line of its own under the server, as it was.
-  const alone = HTML.replace(expand, `</div><p class="settings-fold-all">${expand}</p><div>`);
-  assert.deepStrictEqual(settingsHeadProblems(alone, CSS_CODE), ["Expand all stands alone on a line of its own"]);
   const swapped = HTML.replace(expand, "\u0000").replace(help, expand).replace("\u0000", help);
-  assert.deepStrictEqual(settingsHeadProblems(swapped, CSS_CODE), ["the head row is not the server, Expand all, then Open help"]);
+  assert.deepStrictEqual(settingsHeadProblems(swapped, CSS_CODE), [
+    "the head is not the server, Expand all, Welcome, then Open help",
+    'the button row holds ["open-help","open-welcome","fold-settings-all"], not the three buttons alone',
+  ]);
   const reversed = CSS_CODE.replace(/(\.settings-head \{)/, "$1\n  flex-direction: row-reverse;");
   assert.deepStrictEqual(settingsHeadProblems(HTML, reversed), ["a rule reorders the head away from the reading order"]);
-  const rigid = CSS_CODE.replace(/(\.settings-head \{[^}]*?)flex-wrap:\s*wrap;/, "$1");
-  assert.notEqual(rigid, CSS_CODE, "the negative control changed nothing");
-  assert.deepStrictEqual(settingsHeadProblems(HTML, rigid), ["the head cannot wrap on a phone, so it squeezes or overflows"]);
+  // The build sentence back beside the host, and the chip gone.
+  const chip = /\s*<button id="settings-page-update"[^>]*>[^<]*<\/button>/.exec(HTML)[0];
+  const sentence = HTML.replace(chip, '\n<p id="settings-page-build" class="hint"></p>').replace(/\s*<p id="settings-page-build" class="hint"><\/p>(?=\s*<\/div>\s*<\/section>)/, "");
+  assert.notEqual(sentence, HTML, "the negative control changed nothing");
+  assert.deepStrictEqual(settingsHeadProblems(sentence, CSS_CODE), [
+    "the server line has no update chip, hidden until there is an update",
+    "the build sentence is in the head",
+  ]);
+  // The chip pushed to the line's end, and the line no longer holding its height (the design review's R1 and R12).
+  const far = CSS_CODE.replace(/(#screen-settings \.settings-update-chip \{)/, "$1\n  margin-inline-start: auto;");
+  assert.notEqual(far, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(settingsHeadProblems(HTML, far), ["the update chip is pushed to the far end of the line, away from the host"]);
+  const jumpy = CSS_CODE.replace(/(#screen-settings #settings-server \{[^}]*?)min-height:\s*2rem;/, "$1");
+  assert.notEqual(jumpy, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(settingsHeadProblems(HTML, jumpy), ["the server line does not hold the chip's height, so the chip coming up moves everything below it"]);
+  const long = HTML.replace(/(<button id="settings-page-update"[^>]*>)[^<]*/, "$1This page is build f2c5af26; reload to run the new one");
+  assert.deepStrictEqual(settingsHeadProblems(long, CSS_CODE), ["the update chip says 54 characters, a sentence rather than a status"]);
 });
 
 test("a token the server accepts leads to the main interface", async () => {
@@ -1433,9 +1480,12 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // whether the Slack app is on this device is the device's own business, so it is one of the
   // per-device choices and is never synced.
   assert.deepStrictEqual(groupsIn("Screen and keys"), ["Debug"]);
-  // `#457 settings-server-side`: the one per-device section says so beside its title.
-  assert.match(HTML, /<h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen"[^>]*>Screen and keys<\/button><span class="settings-scope-note">\(client side\)<\/span><\/h2>/,
-    "Screen and keys does not say (client side) beside its title");
+  // `#2297 vibe-talk-settings-header-layout`: the "(client side)" note `#457 settings-server-side` put
+  // beside this title is gone (the owner, 2026-11-26: prose "in places that a human would never put it");
+  // the section's settings still stay on this device (src/client_settings.rs).
+  assert.match(HTML, /<h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen"[^>]*>Screen and keys<\/button><\/h2>/,
+    "Screen and keys' title carries something beside it");
+  assert.ok(!/\(client side\)|settings-scope-note/.test(HTML_CODE), "a \"(client side)\" note is still on the page");
   assert.deepStrictEqual(groupsIn("Storage and connection"),
     ["Saved messages on this server", "Connection status"]);
   // The per-channel box is its own section, with its `?` beside the section's title.

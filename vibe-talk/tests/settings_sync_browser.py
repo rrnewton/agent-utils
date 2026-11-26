@@ -2,8 +2,9 @@
 """Settings kept on the server, in real Chromium on two devices at once.
 
 `#457 settings-server-side`. Every setting outside Settings' Screen and keys section lives on
-the server, shared by all the owner's devices; that one section stays on the device and says
-"(client side)" beside its title. The fake-DOM suite cannot run two pages against one server,
+the server, shared by all the owner's devices; that one section stays on the device (its
+"(client side)" note was dropped by `#2297 vibe-talk-settings-header-layout`, the owner's "verbose
+prose in places that a human would never put it"). The fake-DOM suite cannot run two pages against one server,
 so this opens two persistent browser contexts — two devices — against one fake API holding one
 settings document, and walks the whole agreement:
 
@@ -12,8 +13,8 @@ settings document, and walks the whole agreement:
   hand -> B changes another setting at its own control's storage -> the change is pushed and A,
   still open, takes it from the live stream: its kept value and its checkbox both move ->
   a Screen and keys choice (text size) changed on A never reaches the server, and the section
-  heading says "(client side)" small beside Screen and keys, with Collapsed message lines
-  sitting under Messages, where it moved so that it syncs.
+  heading is its title alone, with Collapsed message lines sitting under Messages, where it moved
+  so that it syncs.
 
 It serves the checked-out assets and the fake API from one loopback origin. Pass --web-root DIR
 to run the same check against another copy of the page; against one from before the sync it
@@ -332,26 +333,19 @@ def main() -> int:
                       "device A's checkbox did not return to the default on a forget")
                 check(api.value_of(COMBINE) is None, f"the forget was not pushed: {api.document()}")
 
-                # The one per-device section says so, and collapsed lines sits with Messages.
+                # `#2297`: the per-device section's heading is its title alone, and collapsed lines
+                # sits with Messages.
                 placed = page_a.evaluate("""() => {
                     const heading = document.getElementById('settings-screen-title');
-                    const note = heading.querySelector('.settings-scope-note');
                     const sectionOf = (id) => document.getElementById(id)
                         .closest('.settings-section').id;
-                    const style = note ? getComputedStyle(note) : null;
                     return {
-                        note: note ? note.textContent : null,
-                        noteSize: style ? parseFloat(style.fontSize) : null,
-                        headingSize: parseFloat(getComputedStyle(heading).fontSize),
-                        noteOpacity: style ? parseFloat(style.opacity) : null,
+                        heading: heading.textContent.trim(),
                         collapsedIn: sectionOf('collapsed-lines'),
                     };
                 }""")
                 assert isinstance(placed, dict)
-                check(placed["note"] == "(client side)", f"no (client side) beside Screen and keys: {placed}")
-                check(float(placed["noteSize"]) < float(placed["headingSize"]),
-                      f"the (client side) note is not small: {placed}")
-                check(float(placed["noteOpacity"]) < 1, f"the (client side) note is not faint: {placed}")
+                check(placed["heading"] == "Screen and keys", f"Screen and keys' heading carries more than its title: {placed}")
                 check(placed["collapsedIn"] == "settings-messages",
                       f"Collapsed message lines is not under Messages: {placed}")
 
@@ -365,7 +359,7 @@ def main() -> int:
         thread.join()
     print("two devices, one settings document: A seeded the server, B took A's choice on load, "
           "A converged on B's change and B's forget from the stream, text size never left A, and Screen and keys "
-          "says (client side) with Collapsed message lines under Messages")
+          "is its title alone with Collapsed message lines under Messages")
     return 0
 
 

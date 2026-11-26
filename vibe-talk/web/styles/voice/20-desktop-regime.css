@@ -41,8 +41,8 @@
      24rem or more each: two at 900px, three at 1280, four at 1920, and no more than the 125rem the
      screen is held to. Each section is kept whole (`break-inside: avoid`) and the columns are balanced,
      so the sections pack under one another; they fill down a column and on into the next in the
-     markup's order, which is the Tab order. The row naming the server, with Expand all and Open help at
-     its end (`#372 settings-header-layout`), spans them above. */
+     markup's order, which is the Tab order. The head (`#372 settings-header-layout`), the server's line
+     and the buttons filling the column (`#2297 vibe-talk-settings-header-layout`), spans them above. */
   #screen-settings > .settings-column {
     max-width: 125rem;
   }
@@ -55,6 +55,12 @@
 
   .settings-panes > .settings-section {
     break-inside: avoid;
+  }
+
+  /* `#2297 vibe-talk-settings-header-layout`: the head's buttons at the panes' column gap, so where
+     there are three panes each button stands over one. */
+  .settings-head-actions {
+    column-gap: 1rem;
   }
 
   /* THE reading column. Both panes, because the channel is read the same way the transcript is

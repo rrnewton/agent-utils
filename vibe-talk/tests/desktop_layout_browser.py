@@ -20,11 +20,18 @@ API of tests/offline_cache_browser.py from one loopback origin, opened under a l
   Settings, at 1280x800 and 1920x1080 with a mouse and at a 393x852 phone by touch: the host is one
   line of ordinary weight no larger than the page's text, whole in its tooltip, its name cut with an
   ellipsis where it does not fit (on the phone it does not) and its port whole after it, and selected
-  whole it copies whole -> Expand all
-  and Open help share one row, at its end; on a desk that is the host's row, and on the phone the row
-  under it; all of it above the sections, nothing wider than the screen -> Tab from Back goes to Expand
-  all, Open help, then the first section, and the document order is the same -> Expand all still opens
-  everything and reads Fold all, on the same row.
+  whole it copies whole -> `#2297 vibe-talk-settings-header-layout`: Expand all, Welcome and Open help
+  are one row under the host's line, each the same width and the row spanning the column to within a
+  pixel, on the phone and the desks alike; up to date, the head says nothing about the build; all of it
+  above the sections, nothing wider than the screen -> Tab from Back goes to Expand all, Welcome, Open
+  help, then the first section, and the document order is the same -> Expand all still opens
+  everything and reads Fold all, on the same filled row. And "Channel Settings: [channel] ?" is one line,
+  the ? on the select's line at the row's end (on the phone it used to drop to a line of its own).
+
+  `#2297` again, at the phone and 1280x800, against a fake API whose timeline reads name a newer page
+  build, as a deploy's do: the server line ends in the "Update available · Reload" chip, on the host's
+  line, at most 25 characters, both builds in its tooltip; the long host is cut with an ellipsis before
+  it and its port stays whole; the buttons still fill the column -> a tap on the chip reloads the page.
 
   Two columns, at 1920x1080 and 2560x1080 with a mouse, over a channel ending in the agent's long boxed
   replies and the owner's answer, with the thread list empty: every row of Main but the owner's spans
@@ -47,7 +54,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import shutil
 import tempfile
 import threading
 import time
@@ -64,11 +70,15 @@ import browser_waits
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
 
+# `#2297 vibe-talk-settings-header-layout`: the page build a deploy's timeline read would name.
+NEWER_PAGE_BUILD = "19fe934a" + "0" * 24
+
 # A host too long for a phone's line, and loopback to Chromium as every `*.localhost` name is.
 LONG_HOST = "build-host-0042-rack7-8422--dev-proxy.region-two.example.localhost"
 
 # (label, width, height, touch)
 SETTINGS_SIZES = (("laptop-1280", 1280, 800, False), ("desk-1920", 1920, 1080, False), ("phone-393", 393, 852, True))
+UPDATE_SIZES = (("laptop-1280", 1280, 800, False), ("phone-393", 393, 852, True))
 COLUMN_SIZES = (("desk-1920", 1920, 1080), ("wide-2560", 2560, 1080))
 THREAD_SIZE = ("desk-1920", 1920, 1080)
 
@@ -122,6 +132,13 @@ class LongReplyApi(FakeApi):
         self.threads = []
 
 
+class NewerBuildApi(LongReplyApi):
+    """The same channel, read from a server that now serves a newer page build than the page runs."""
+
+    def timeline(self, query: dict[str, list[str]]) -> Json:
+        return {**super().timeline(query), "page_build": NEWER_PAGE_BUILD}
+
+
 HEAD_JS = """() => {
     const box = (id) => { const r = document.getElementById(id).getBoundingClientRect();
         return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height}; };
@@ -145,11 +162,16 @@ HEAD_JS = """() => {
         animations: document.getAnimations().length, userSelect: getComputedStyle(host).userSelect,
     };
     selection.removeAllRanges();
-    const order = ['settings-server-host', 'fold-settings-all', 'open-help', 'settings-panes']
+    const order = ['settings-server-host', 'fold-settings-all', 'open-welcome', 'open-help', 'settings-panes']
         .map((id) => document.getElementById(id));
     const settings = document.getElementById('screen-settings');
     return {
         host: box('settings-server-host'), expand: box('fold-settings-all'), help: box('open-help'),
+        welcome: box('open-welcome'), server: box('settings-server'), chip: box('settings-page-update'),
+        chipShown: document.getElementById('settings-page-update').checkVisibility(),
+        chipText: document.getElementById('settings-page-update').textContent.trim(),
+        chipTitle: document.getElementById('settings-page-update').title,
+        headText: document.querySelector('#screen-settings .settings-head').innerText,
         panes: box('settings-panes'), column: box('screen-settings'),
         hostSize: parseFloat(style.fontSize), hostWeight: Number(style.fontWeight),
         hostLine: parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.25,
@@ -213,26 +235,6 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def unknown_build_root(source: Path, into: Path) -> Path:
-    """The page at `source` served so that it does not know its own build, the state this walk has
-    always measured Settings in: a page build's shell with its script named by the plain /voice.js
-    (the same bytes) rather than by its hash.
-
-    `#676 settings-head-page-build`: once the page knows its build, as production's does, Settings
-    draws "This page is build ..." between the host line and the buttons on a phone, and the head
-    takes three rows, not the two this walk holds it to. That is the production page's bug, fixed
-    after `#624 voice-page-modularity`; until then this keeps the coverage this walk had, and the fix
-    makes it serve the page build as every other walk does.
-    """
-    check((source / "assets.json").is_file(), f"{source} is not a page build (page_sources.served makes one)")
-    shutil.copytree(source, into)
-    shell = (into / "voice.html").read_text()
-    named = re.findall(r'src="/assets/voice\.[0-9a-f]{32}\.js"', shell)
-    check(len(named) == 1, f"the page build's shell does not name its one script by hash: {named}")
-    (into / "voice.html").write_text(shell.replace(named[0], 'src="/voice.js"'))
-    return into.resolve()
-
-
 def main() -> int:
     args = arguments()
     try:
@@ -245,10 +247,14 @@ def main() -> int:
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
     report: list[str] = []
-    with sync_playwright() as playwright, tempfile.TemporaryDirectory(prefix="vibe-talk-unknown-build-") as copy:
-        fixture.WEB_ROOT = unknown_build_root(page_sources.served(args.web_root), Path(copy) / "web")
+    with sync_playwright() as playwright:
+        # The page build, served as the server serves it, so the page knows its build as production's does
+        # (`#676 settings-head-page-build`: the head no longer grows a row for it, `#2297`).
+        fixture.WEB_ROOT = page_sources.served(args.web_root)
         for label, width, height, touch in SETTINGS_SIZES:
             report.append(run(playwright.chromium, args, LongReplyApi(), label, width, height, touch, settings_walk))
+        for label, width, height, touch in UPDATE_SIZES:
+            report.append(run(playwright.chromium, args, NewerBuildApi(), label, width, height, touch, settings_update_walk))
         for label, width, height in COLUMN_SIZES:
             report.append(run(playwright.chromium, args, LongReplyApi(), label, width, height, False, columns_walk))
         from two_column_browser import ColumnsApi
@@ -343,10 +349,9 @@ def mid(box: dict[str, float]) -> float:
     return (box["top"] + box["bottom"]) / 2
 
 
-def settings_walk(desk: Desk) -> None:
-    """`#372 settings-header-layout`: the head of Settings is one quiet row (two on a phone)."""
-    page = desk.page
-    page.click("#open-settings")
+def open_settings_head(desk: Desk) -> None:
+    """Settings opened, its head laid out."""
+    desk.page.click("#open-settings")
     desk.wait_for("() => document.getElementById('screen-settings').checkVisibility()", "Settings did not open")
     desk.wait_for("() => { const h = document.getElementById('settings-server-host'); "
                   "return h && h.textContent !== '' && h.getBoundingClientRect().width > 0 "
@@ -355,7 +360,55 @@ def settings_walk(desk: Desk) -> None:
                   "&& document.getElementById('settings-panes').getBoundingClientRect().width > 0; }",
                   "the Settings head did not lay out")
     desk.settled()
+
+
+# `#2297`: where the button row stands up to date, by size, for the update walk to hold it to.
+UP_TO_DATE_ROW_TOP: dict[str, float] = {}
+
+
+def check_buttons_fill(desk: Desk, when: str) -> None:
+    """`#2297 vibe-talk-settings-header-layout`: Expand all (or Fold all), Welcome and Open help, one row of
+    equal widths under the host's line, spanning the column (the panes' width) to within a pixel."""
+    head = desk.page.evaluate(HEAD_JS)
+    expand, welcome, helps, host, panes = (head[k] for k in ("expand", "welcome", "help", "host", "panes"))
+    widths = [b["width"] for b in (expand, welcome, helps)]
+    desk.check(max(widths) - min(widths) <= 1, f"{when}: the three buttons are not one width: {widths}")
+    desk.check(abs(expand["left"] - panes["left"]) <= 1 and abs(helps["right"] - panes["right"]) <= 1,
+               f"{when}: the button row spans {expand['left']:.1f}-{helps['right']:.1f}, "
+               f"not the column's {panes['left']:.1f}-{panes['right']:.1f}")
+    desk.check(all(abs(mid(b) - mid(expand)) < 1 for b in (welcome, helps))
+               and expand["right"] <= welcome["left"] and welcome["right"] <= helps["left"],
+               f"{when}: Expand all, Welcome and Open help are not one row, in that order: {expand} {welcome} {helps}")
+    desk.check(host["bottom"] <= expand["top"] + 1, f"{when}: the buttons are not under the host's line: {host} {expand}")
+    desk.check(helps["bottom"] <= panes["top"], f"{when}: Open help is not above the sections: {helps} {panes}")
+
+
+CHANNEL_ROW_JS = """() => {
+    const box = (id) => document.getElementById(id).getBoundingClientRect();
+    const title = box('settings-channels-title'), select = box('settings-channel'), help = box('help-link-channel-alias');
+    const section = box('settings-channels');
+    const mid = (b) => (b.top + b.bottom) / 2;
+    return {title: [title.left, title.right, mid(title)], select: [select.left, select.right, select.top, select.bottom],
+        help: [help.left, help.right, mid(help)], section: [section.left, section.right],
+        oneLine: mid(help) > select.top && mid(help) < select.bottom && mid(title) > select.top && mid(title) < select.bottom
+            && title.right <= select.left && select.right <= help.left && help.right <= section.right};
+}"""
+
+
+def check_channel_row(desk: Desk) -> None:
+    """`#2297 vibe-talk-settings-header-layout`: "Channel Settings: [channel] ?" is one line at every size,
+    the `?` on the select's line at the row's end (on a phone it used to drop to a line of its own)."""
+    row = desk.page.evaluate(CHANNEL_ROW_JS)
+    desk.check(bool(row["oneLine"]), f"the Channel Settings row is not one line, title, select, then ?: {row}")
+
+
+def settings_walk(desk: Desk) -> None:
+    """`#372 settings-header-layout` and `#2297`: the head of Settings is two quiet lines, the server's
+    and the buttons filling the column."""
+    page = desk.page
+    open_settings_head(desk)
     head = page.evaluate(HEAD_JS)
+    desk.shot("settings")
     host, expand, helps, panes = head["host"], head["expand"], head["help"], head["panes"]
     phone = desk.width < 900
 
@@ -374,24 +427,23 @@ def settings_walk(desk: Desk) -> None:
     desk.check(head["copied"] == head["location"], f"the host selected whole copies {head['copied']!r} ({head['copyState']})")
     desk.check(host["right"] <= desk.width and host["left"] >= 0, f"the host runs off the screen: {host}")
 
-    # The buttons: one row, at its end, beside the host on a desk and under it on a phone.
-    desk.check(abs(mid(expand) - mid(helps)) < 2 and expand["right"] <= helps["left"],
-               f"Expand all and Open help are not side by side, in that order: {expand} {helps}")
-    if phone:
-        desk.check(host["bottom"] <= expand["top"] + 1, f"on a phone the buttons are not under the host: {host} {expand}")
-    else:
-        desk.check(abs(mid(host) - mid(expand)) < 4 and host["right"] <= expand["left"],
-                   f"on a desk the buttons are not on the host's row: {host} {expand}")
-    desk.check(helps["bottom"] <= panes["top"], f"Open help is not above the sections: {helps} {panes}")
-    desk.check(abs(helps["right"] - panes["right"]) < 2, f"the buttons are not at the row's end: {helps} {panes}")
-    rows = 2 if phone else 1
+    # The buttons: one row of equal widths under the host's line, filling the column, phone and desk alike.
+    check_buttons_fill(desk, "up to date")
+    UP_TO_DATE_ROW_TOP[desk.label] = float(expand["top"])
+    desk.check(abs(head["server"]["height"] - 32) <= 0.5, f"the server line is {head['server']['height']}px, not the chip's 2rem")
+    check_channel_row(desk)
+    # Up to date, and the page knowing its build as production's does: nothing about the build in the head.
+    desk.check(not head["chipShown"] and not re.search(r"page is build|now serves|update available", str(head["headText"]), re.I),
+               f"up to date, the head says something about the build: {head['headText']!r}")
+    rows = 2
     head_height = max(expand["bottom"], helps["bottom"]) - host["top"]
     desk.check(head_height < rows * 52, f"the head takes {head_height:.0f}px, more than {rows} row(s)")
     desk.check(head["overflow"] <= 1 and head["pageOverflow"] <= 0, "something on Settings is wider than the screen")
-    desk.check(bool(head["inOrder"]), "the document order is not the host, Expand all, Open help, the sections")
-    desk.shot("settings")
+    desk.check(bool(head["inOrder"]), "the document order is not the host, Expand all, Welcome, Open help, the sections")
+    widths = "/".join(f"{head[k]['width']:.1f}" for k in ("expand", "welcome", "help"))
     desk.notes.append(f"host {head['hostSize']:.1f}px weight {head['hostWeight']} on one line"
-                      f"{', cut' if head['cut'] else ''}; the head {head_height:.0f}px in {rows} row(s)")
+                      f"{', cut' if head['cut'] else ''}; buttons {widths}px across the {panes['width']:.1f}px column; "
+                      f"the head {head_height:.0f}px in {rows} rows")
 
     # The keys: Tab from Back goes to Expand all, Welcome, Open help, then the first section. Into the screen, that
     # is: the transient status line's X, when it is up, stands between the title bar and the screen.
@@ -415,12 +467,51 @@ def settings_walk(desk: Desk) -> None:
     page.evaluate("() => { document.getElementById('screen-settings').scrollTop = 0; }")
     desk.settled()
     opened = page.evaluate(HEAD_JS)
-    desk.check(abs(mid(opened["expand"]) - mid(opened["help"])) < 2, "Fold all and Open help are no longer side by side")
-    if not phone:
-        desk.check(abs(mid(opened["host"]) - mid(opened["expand"])) < 4, "Fold all left the host's row")
+    check_buttons_fill(desk, "everything open")
     desk.check(opened["overflow"] <= 1, "something on Settings opened is wider than the screen")
     desk.shot("settings-expanded")
-    desk.notes.append("Expand all read Fold all on the same row")
+    desk.notes.append("Expand all read Fold all on the same filled row")
+
+
+def settings_update_walk(desk: Desk) -> None:
+    """`#2297 vibe-talk-settings-header-layout`: after a deploy, the head says so in a short chip on the
+    server's line, the long host cut cleanly before it, and a tap on it reloads the page."""
+    page = desk.page
+    open_settings_head(desk)
+    desk.wait_for("() => document.getElementById('settings-page-update').checkVisibility()",
+                  "a read naming a newer page build did not put the update chip up")
+    desk.settled()
+    head = page.evaluate(HEAD_JS)
+    desk.shot("settings-update")
+    host, chip, server, panes = (head[k] for k in ("host", "chip", "server", "panes"))
+    text = str(head["chipText"])
+    desk.check(text == "Update available · Reload" and len(text) <= 25, f"the update chip says {text!r}")
+    desk.check(chip["left"] >= host["right"] - 0.5 and chip["top"] < host["bottom"] and chip["bottom"] > host["top"],
+               f"the chip is not on the host's line, after it: {host} {chip}")
+    desk.check(chip["right"] <= panes["right"] + 1, f"the chip runs past the column: {chip} {panes}")
+    # Right after the host it is about, at the line's gap (0.5rem), not at the line's far end (ui-rules R1).
+    desk.check(4 <= chip["left"] - host["right"] <= 12, f"the chip is not right after the host: {host} {chip}")
+    # Rule 370: the chip coming up moved nothing below the server line.
+    before = UP_TO_DATE_ROW_TOP.get(desk.label)
+    desk.check(before is not None and abs(head["expand"]["top"] - before) <= 0.5,
+               f"the chip moved the button row: {before} -> {head['expand']['top']}")
+    desk.check(server["height"] <= chip["height"] + 2, f"the server line wraps: {server['height']:.0f}px tall, the chip {chip['height']:.0f}px")
+    title = str(head["chipTitle"])
+    desk.check(bool(re.fullmatch(r"This page is build [0-9a-f]{8}; the server now serves 19fe934a\. Tap to reload\.", title)),
+               f"the chip's tooltip does not name both builds: {title!r}")
+    desk.check(bool(head["ellipsis"]) and bool(head["portWhole"]), "the host is not cut cleanly: an ellipsis, then its port whole")
+    if desk.width < 900:
+        desk.check(bool(head["cut"]), "on a phone the long host was expected to be cut before the chip")
+    check_buttons_fill(desk, "update available")
+    check_channel_row(desk)
+    desk.check(head["overflow"] <= 1 and head["pageOverflow"] <= 0, "something on Settings is wider than the screen")
+    # A tap reloads: a new document, with the marker this one carried gone.
+    page.evaluate("() => { window.__beforeReload = true; }")
+    page.click("#settings-page-update")
+    desk.wait_for("() => document.readyState === 'complete' && window.__beforeReload === undefined",
+                  "a tap on the update chip did not reload the page", 20)
+    desk.notes.append(f"chip {text!r} {chip['width']:.0f}px on the host's line{', host cut' if head['cut'] else ''}; "
+                      "the buttons still fill the column; a tap reloaded")
 
 
 def two_columns(desk: Desk, rows: int) -> None:

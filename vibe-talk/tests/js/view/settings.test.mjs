@@ -191,7 +191,7 @@ test("`#624 voice-page-modularity`: the screen's sliders, steps, reload and grip
   });
   assert.deepStrictEqual(log, ["listen reading-width input", "listen msg-scale input", "listen msg-scale-smaller click",
     "listen msg-scale-larger click", "listen collapsed-lines input", "listen collapsed-lines-smaller click", "listen collapsed-lines-larger click",
-    "listen card-max-lines input", "listen page-update click", "show build", "listen card-max-lines-smaller click",
+    "listen card-max-lines input", "listen page-update click", "listen settings-page-update click", "show build", "listen card-max-lines-smaller click",
     "listen card-max-lines-larger click", "listen quote-read-percent input", "listen quote-read-percent-smaller click",
     "listen quote-read-percent-larger click", "listen mark-read-first-percent change", "listen mark-read-first-percent keydown",
     "listen mark-read-long-words change", "listen mark-read-long-words keydown",
@@ -216,13 +216,15 @@ test("`#624 voice-page-modularity`: the screen's sliders, steps, reload and grip
     fire(`${id}-larger`, "click");
   }
   fire("page-update", "click", { n: "press" });
+  // `#2297 vibe-talk-settings-header-layout`: Settings' own update chip reloads the same way.
+  fire("settings-page-update", "click", { n: "press" });
   fire("width-grip", "pointerdown", { n: "down" });
   fire("width-grip", "pointermove", { n: "move" });
   fire("width-grip", "pointerup", { n: "up" });
   fire("width-grip", "pointercancel", { n: "cancel" });
   fire("width-grip", "keydown", { n: "ArrowLeft" });
   assert.deepStrictEqual(log, ["width 72", "size 110", "lines 5", "card 4", "quote 60", "first 40", "long 250", "blur mark-read-first-percent", "blur mark-read-long-words", "size step -1", "size step 1", "lines step -1", "lines step 1", "card step -1", "card step 1",
-    "quote step -1", "quote step 1", "reload", "grip down down", "grip move move", "grip up", "grip up", "grip key ArrowLeft"]);
+    "quote step -1", "quote step 1", "reload", "reload", "grip down down", "grip move move", "grip up", "grip up", "grip key ArrowLeft"]);
   controls.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
