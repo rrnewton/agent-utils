@@ -6,6 +6,13 @@ work under the shared Cargo lock, and one launch case rebuilt the release
 binaries per test. This target belongs only to these tests. Cargo still
 checks source freshness once in every new test process, including standalone
 pytest runs.
+
+Run as a script, it builds every executable these tests use and prints their
+paths. The validation DAG does that in its own step, ``python.agentctl.build-rust``,
+before either agentctl shard starts (#2306): the release compile of the
+agentctl crate peaks near 3 GiB in one rustc, which a pytest shard's memory cap
+must not have to cover, so each shard's freshness check finds the binaries
+current and its cap measures the Python tests alone.
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ import functools
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -83,3 +91,32 @@ def rust_agentctl_with_fake() -> tuple[Path, Path]:
         env=env,
     )
     return built["agentctl"], built["chat-subscription-fake-plugin"]
+
+
+def main() -> int:
+    """Build every adapter executable above and print where each one is."""
+    try:
+        agentctl = rust_agentctl()
+        launch_agentctl, fake_plugin = rust_agentctl_with_fake()
+    except subprocess.CalledProcessError as error:
+        # The build captures Cargo's output; a DAG step must still show why it failed.
+        # With --message-format json the compiler's own diagnostics arrive on stdout.
+        for line in (error.stdout or "").splitlines():
+            try:
+                message: object = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(message, dict) and message.get("reason") == "compiler-message":
+                body = message.get("message")
+                if isinstance(body, dict) and isinstance(body.get("rendered"), str):
+                    sys.stderr.write(body["rendered"])
+        sys.stderr.write(error.stderr or "")
+        print(f"rust_binary: Cargo exited {error.returncode}", file=sys.stderr)
+        return 1
+    for executable in (agentctl, launch_agentctl, fake_plugin):
+        print(executable, flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

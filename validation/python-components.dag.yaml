@@ -11,10 +11,33 @@ resource_caps:
   lifecycle-io: 13
 
 steps:
+  # #2306: py/tests/rust_binary.py release-builds agentctl (and the fake chat plugin) for the
+  # shards' Rust differential cases. Built inside a shard, that one rustc for the agentctl crate
+  # peaked at 2.69 GiB RSS (cgroup peak 3.02 GiB, cold target, main abd810bd, 2026-11-26), above
+  # the shard's 2.5 GiB cap, so both shards were OOM-killed at their first Rust case from
+  # 2026-11-20 on. This step builds the same target with the same command first; each shard's
+  # own Cargo call then only checks freshness, and the shard caps measure the Python tests alone.
+  # Peak 3.02 GiB + max(25%, 512 MiB) (#818's rule) = 3.78 GiB; the 4 GiB baseline x 1.25 caps
+  # it at 5 GiB, leaving room for the crate's growth (about 11% in lines over the last week).
+  - group: agentctl
+    job: build-rust
+    desc: agentctl Rust adapter executables the agentctl Python shards compare against
+    cmd: python3 py/tests/rust_binary.py
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-agentctl]
+    timeout: 14400
+    cpu_timeout: 3600
+    hint:
+      est_duration_s: 270
+      classification: cpu-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 4294967296
+
   - group: agentctl
     job: shard-0
     desc: agentctl Python tests, shard 1 of 2
     cmd: python3 scripts/run_component_tests.py --component agentctl --shard 0/2 -- -q
+    deps: [agentctl.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-agentctl]
     timeout: 14400
@@ -32,6 +55,7 @@ steps:
     job: shard-1
     desc: agentctl Python tests, shard 2 of 2
     cmd: python3 scripts/run_component_tests.py --component agentctl --shard 1/2 -- -q
+    deps: [agentctl.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-agentctl]
     timeout: 14400
