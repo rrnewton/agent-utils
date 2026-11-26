@@ -470,12 +470,16 @@ class reserve_cores:
             # HARD-pin the whole tree via a transient scope's cgroup cpuset.
             # (sched_setaffinity is escapable because a child can widen its own
             #  mask. Use AllowedCPUs, not process affinity.)
+            # --expand-environment=no (systemd 254+) keeps systemd-run from
+            # expanding ${NAME}, a whole-word $NAME and $$ in the command.
             subprocess.run(["systemd-run", "--user", "--scope", "--collect",
                             f"-pAllowedCPUs={','.join(map(str, cores))}",
+                            "--expand-environment=no",
                             "--", *benchmark_cmd])
 
     The `cpuset-alloc run --cores K -- CMD` CLI
-    (:mod:`dagrun.cpuset_allocator`) wraps exactly this."""
+    (:mod:`dagrun.cpuset_allocator`) wraps exactly this, passing
+    --expand-environment=no only where the installed systemd-run accepts it."""
 
     def __init__(
         self,
