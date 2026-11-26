@@ -450,6 +450,11 @@ def walk_through(walk: Walk) -> None:
     walk.until("() => !document.getElementById('labels-panel').hidden", "the Labels panel did not open")
     walk.check(page.evaluate("() => document.getElementById('labels-button').getAttribute('aria-expanded')") == "true",
                "the Labels button does not say it is open")
+    # The options beyond All/Pinned are drawn from the labels fold, which lands after the
+    # panel opens (`#2283` C3's gate caught the read winning that race under load): wait
+    # for the fold's options, as the filter step below already waits for its narrowing.
+    walk.until("() => document.getElementById('labels-option-kvm') !== null",
+               "the drop-down never drew the labels fold's options")
     option_ids = page.evaluate("() => [...document.querySelectorAll('#labels-listbox .labels-option')].map((li) => li.id)")
     walk.check(option_ids[:3] == ["labels-option-all", "labels-option-pinned", "labels-option-kvm"],
                f"the drop-down order says {option_ids}")
