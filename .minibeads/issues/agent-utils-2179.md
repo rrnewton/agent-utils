@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-transfer-owner-stale-task-scope: transfer-owner refuses on a dead owner''s task_scope'
-status: open
+status: closed
 priority: 2
 issue_type: bug
+assignee: cl-transfer
 labels:
 - wrkslots
 created_at: 2026-11-24T03:20:00-05:00
-updated_at: 2026-11-24T03:20:00-05:00
+updated_at: 2026-11-26T10:10:00-05:00
 ---
 
 # Description
@@ -26,3 +27,7 @@ Transfer must carry or reset task_scope for the new owner so that the loader acc
 # Notes
 
 Field report from a consumer's post-reboot re-bind; the dead owner's scope had been stale for about 61 hours at refusal time.
+
+## Resolution
+
+transfer-owner now replaces a recorded task scope together with the owner. The loader binds a scope to its owner generation, so the existing owner proof decides it: a scope whose owner is provably dead (another boot, an absent PID, a reused PID, a zombie) is rebound to the successor's own scope when the successor's cgroup is a transient scope of the user's systemd manager whose invocation link verifies as --task-scope-unit requires, and is dropped otherwise; the record keeps its owner binding either way. A scope still bound to a live or indeterminate owner refuses, with --reopen too (unless the successor is that owner itself). No persisted field or evidence key changed: an absent task_scope already reads as none in every reader that knows the field. Python (_cmd_transfer_owner) and Rust (transfer_write) behave alike; tests: test_owner_transfer.py (previous-boot scope rebound and later release, scope dropped, reused PID, live owner refused, live reopen refused) and the differential in test_transfer_owner_write_rust.py, plus a Rust unit test for the drop branch.

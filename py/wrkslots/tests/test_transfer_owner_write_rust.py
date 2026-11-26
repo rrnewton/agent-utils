@@ -645,3 +645,194 @@ def test_rebind_clean_filter_hidden_gitignore_edit_refuses(tmp_path: Path) -> No
     assert result.returncode == 1, result.stderr
     assert "clean tree" in result.stderr or "ignore rules" in result.stderr
     assert _active(rust_root)["revision"] == 7
+
+
+# #2179: a task scope recorded with a provably dead owner is rebound to the
+# successor's own verifiable scope, or dropped, identically in both editions;
+# a scope still bound to a live owner refuses in both. The successor is this
+# test process, so whether it has a verifiable scope is the host's answer,
+# read by both editions alike; the Python suite covers each branch with seams.
+
+PREVIOUS_BOOT = "00000000-0000-4000-8000-000000002179"
+
+
+def _scope_cgroup(unit: str) -> str:
+    return f"{wrkslots_cli._systemd_user_manager_cgroup()}/app.slice/{unit}"
+
+
+def _with_task_scope(root: Path) -> dict[str, object]:
+    """Bind the fixture record's owner to the task scope its cgroup names."""
+
+    active = root / "worktrees" / "ACTIVE.node-a.json"
+    document = json.loads(active.read_text())
+    record = document["slots"][0]
+    owner = record["owner"]
+    record["task_scope"] = {
+        "unit": owner["cgroup_path"].rsplit("/", 1)[-1],
+        "invocation_id": "a" * 32,
+        "cgroup_path": owner["cgroup_path"],
+        "boot_id": owner["boot_id"],
+        "leader_pid": owner["pid"],
+        "leader_start_ticks": owner["start_ticks"],
+        "verification": "systemd-runtime-invocation-symlink-v1",
+    }
+    active.write_text(json.dumps(document))
+    return cast(dict[str, object], record["task_scope"])
+
+
+def _scoped_pair(tmp_path: Path, owner: dict[str, object]) -> tuple[Path, Path]:
+    rust_root, oracle_root = _pair(tmp_path, owner)
+    _with_task_scope(rust_root)
+    _with_task_scope(oracle_root)
+    return rust_root, oracle_root
+
+
+def _loads_in_both_editions(root: Path) -> dict[str, object]:
+    """Load the registry with each edition's loader; return the slot record."""
+
+    parsed = subprocess.run(
+        [str(rust_wrkslotsd()), "parse-global", "--root", str(root)],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+    )
+    assert parsed.returncode == 0, parsed.stderr
+    config = wrkslots_cli._load_config(str(root), None)
+    states, _archives = wrkslots_cli._validate_global_state(config)
+    record = wrkslots_cli._find_record(states[0], "slot-a")
+    return wrkslots_cli._record_to_obj(record)
+
+
+def _assert_scope_rebound_or_dropped(root: Path) -> None:
+    record = _loads_in_both_editions(root)
+    owner = cast(dict[str, object], record["owner"])
+    assert owner["pid"] == os.getpid()
+    scope = record.get("task_scope")
+    if scope is not None:
+        scope = cast(dict[str, object], scope)
+        assert scope["leader_pid"] == os.getpid()
+        assert scope["boot_id"] == owner["boot_id"]
+        assert scope["cgroup_path"] == owner["cgroup_path"]
+
+
+def test_transfer_previous_boot_task_scope_matches_python(tmp_path: Path) -> None:
+    owner = _dead_identity()
+    owner["boot_id"] = PREVIOUS_BOOT
+    owner["cgroup_path"] = _scope_cgroup("lane-before-reboot.scope")
+    rust_root, oracle_root = _scoped_pair(tmp_path, owner)
+    assert _python(oracle_root, os.getpid()) == 0
+    result = _rust(rust_root, os.getpid())
+    assert result.returncode == 0, result.stderr
+    assert "task scope lane-before-reboot.scope of the dead owner was" in result.stderr
+    outcome = json.loads(result.stdout)
+    assert outcome["previous_owner_state"] == "dead"
+    assert _active(rust_root) == _active(oracle_root)
+    assert _events(rust_root) == _events(oracle_root)
+    _assert_scope_rebound_or_dropped(rust_root)
+    # The successor can give the transferred generation back.
+    source = tmp_path / "release-notes.md"
+    source.write_text("# Handoff\n\nDone after the reboot.\n")
+    base = dict(
+        project_root=str(rust_root), machine=None, slot="slot-a",
+        agent="agent-slot-a", owner_pid=os.getpid(), expected_generation=1,
+        wait_lock=0.0,
+    )
+    assert wrkslots_cli._cmd_write_handoff(
+        argparse.Namespace(**base, from_file=str(source))
+    ) == 0
+    assert wrkslots_cli._cmd_release(argparse.Namespace(**base)) == 0
+    _loads_in_both_editions(rust_root)
+
+
+def test_transfer_reused_pid_task_scope_matches_python(tmp_path: Path) -> None:
+    sleeper = subprocess.Popen(["sleep", "3600"])
+    try:
+        owner = _live_identity(sleeper.pid)
+        owner["start_ticks"] = cast(int, owner["start_ticks"]) + 1
+        owner["cgroup_path"] = _scope_cgroup("lane-reused-pid.scope")
+        rust_root, oracle_root = _scoped_pair(tmp_path, owner)
+        assert _python(oracle_root, os.getpid()) == 0
+        result = _rust(rust_root, os.getpid())
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["previous_owner_state"] == "dead"
+    assert _active(rust_root) == _active(oracle_root)
+    assert _events(rust_root) == _events(oracle_root)
+    _assert_scope_rebound_or_dropped(rust_root)
+
+
+def test_transfer_live_task_scope_refuses_in_both_editions(tmp_path: Path) -> None:
+    owner = _live_identity(os.getpid())
+    # The same live generation recorded in its scope: a cgroup move never
+    # reads as a reuse, so the owner and its scope are live.
+    owner["cgroup_path"] = _scope_cgroup("lane-live.scope")
+    rust_root, oracle_root = _scoped_pair(tmp_path, owner)
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root, os.getppid())
+    assert "only replaces an owner that is provably dead" in str(caught.value)
+    result = _rust(rust_root, os.getppid())
+    assert result.returncode == 1
+    assert "only replaces an owner that is provably dead" in result.stderr
+    assert _active(rust_root) == _active(oracle_root)
+    assert _active(rust_root)["revision"] == 7
+
+
+def _release_by_live_scoped_owner(
+    root: Path, source_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This live process, placed in a scope, owns the fixture slot and releases it."""
+
+    scoped = _scope_cgroup("lane-released.scope")
+    real_cgroup = wrkslots_cli._read_process_cgroup
+    me = Path("/proc") / str(os.getpid())
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            wrkslots_cli,
+            "_read_process_cgroup",
+            lambda pid_dir: scoped if Path(pid_dir) == me else real_cgroup(pid_dir),
+        )
+        active = root / "worktrees" / "ACTIVE.node-a.json"
+        document = json.loads(active.read_text())
+        document["slots"][0]["owner"] = _live_identity(os.getpid())
+        active.write_text(json.dumps(document))
+        _with_task_scope(root)
+        source_root.mkdir(parents=True, exist_ok=True)
+        source = source_root / "notes.md"
+        source.write_text("# Handoff\n\nReleased, still running.\n")
+        base = dict(
+            project_root=str(root), machine=None, slot="slot-a",
+            agent="agent-slot-a", owner_pid=os.getpid(), expected_generation=1,
+            wait_lock=0.0,
+        )
+        assert wrkslots_cli._cmd_write_handoff(
+            argparse.Namespace(**base, from_file=str(source))
+        ) == 0
+        assert wrkslots_cli._cmd_release(argparse.Namespace(**base)) == 0
+
+
+def test_reopen_of_a_live_task_scope_refuses_in_both_editions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rust_root, oracle_root = _pair(tmp_path, None)
+    _release_by_live_scoped_owner(rust_root, tmp_path / "rust-src", monkeypatch)
+    _release_by_live_scoped_owner(oracle_root, tmp_path / "oracle-src", monkeypatch)
+    reason = "reopen while the released owner still runs"
+    message = "slot slot-a task scope lane-released.scope is still bound to a live owner"
+    with pytest.raises(Exception) as caught:
+        wrkslots_cli._cmd_transfer_owner(
+            argparse.Namespace(
+                project_root=str(oracle_root), machine=None, slot="slot-a",
+                agent="agent-slot-a", to_agent=None, owner_pid=os.getppid(),
+                expected_generation=1, wait_lock=0.0, reopen=True,
+                coordinator_authorized=True, coordinator_pid=os.getpid(),
+                reason=reason,
+            )
+        )
+    assert message in str(caught.value)
+    result = _rust(
+        rust_root, os.getppid(),
+        extra=("--reopen", "--coordinator-authorized",
+               "--coordinator-pid", str(os.getpid()), "--reason", reason),
+    )
+    assert result.returncode == 1
+    assert message in result.stderr

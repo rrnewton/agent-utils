@@ -9725,6 +9725,45 @@ def _task_scope_from_args(
     return scope
 
 
+def _successor_task_scope(successor: ProcessIdentity) -> TaskScopeIdentity | None:
+    """The successor's own live task scope, derived from its process (#2179).
+
+    transfer-owner hands a slot whose recorded task scope belonged to a
+    provably dead owner to a live successor. The old scope cannot stay
+    (the loader requires a scope to match its bound owner), so the slot is
+    rebound to the successor's own scope when the successor's cgroup is a
+    transient scope of this user's systemd manager whose invocation link
+    verifies exactly as ``--task-scope-unit`` does. A successor that runs
+    in no verifiable task scope gets none: the record keeps its owner
+    binding and loses only the stronger scope claim.
+    """
+
+    unit = successor.cgroup_path.rsplit("/", 1)[-1]
+    if not unit.endswith(".scope"):
+        return None
+    try:
+        invocation_id = os.readlink(_systemd_invocation_directory() / f"invocation:{unit}")
+    except (OSError, ValueError):
+        return None
+    try:
+        scope = _task_scope_from_obj(
+            {
+                "unit": unit,
+                "invocation_id": invocation_id,
+                "cgroup_path": successor.cgroup_path,
+                "boot_id": successor.boot_id,
+                "leader_pid": successor.pid,
+                "leader_start_ticks": successor.start_ticks,
+                "verification": "systemd-runtime-invocation-symlink-v1",
+            },
+            "successor task scope",
+        )
+        _verify_task_scope_invocation(scope)
+    except Refusal:
+        return None
+    return scope
+
+
 def _record_to_obj(record: ActiveRecord) -> dict[str, object]:
     value: dict[str, object] = {
         "slot": record.slot,
@@ -50421,7 +50460,9 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     warn and do not refuse: ownership does not touch them and removal still refuses
     them. A released generation is refused for a plain transfer; a coordinator may
     rebind it with ``--reopen --coordinator-authorized``, which starts a new
-    generation and records who authorized it.
+    generation and records who authorized it. A recorded task scope is bound to the
+    recorded owner, so it is replaced only when that owner is provably dead: by the
+    successor's own verifiable task scope, or by none (#2179).
     """
 
     _reset_dead_mount_findings()
@@ -50452,6 +50493,8 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     # re-checked before the write. An outstanding journal defers to the
     # original fully-locked body, whose journal recovery needs the lock.
     captured_notes: list[tuple[str, str]] = []
+    # The task-scope outcome of the build that was written (#2179).
+    scope_note: list[str] = []
 
     def remember_notes(stdout_text: str, stderr_text: str) -> None:
         # Notes accumulate across prevalidation rounds: a dead-mount note
@@ -50513,6 +50556,19 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                     f"--expected-generation {record.generation} --reopen "
                     "--coordinator-authorized --coordinator-pid <pid> --reason <why>'"
                 )
+        if (
+            record.task_scope is not None
+            and record.owner != successor
+            and previous_state != "dead"
+        ):
+            # The loader binds a scope to its owner generation, so the
+            # owner proof is the scope proof (#2179): only a proven-dead
+            # scope (another boot, an absent PID, a reused PID) is rebound.
+            raise Refusal(
+                f"slot {record.slot} task scope {record.task_scope.unit} is still bound to "
+                f"a {previous_state} owner: {detail}; transfer-owner rebinds a task scope "
+                "only when its owner is provably dead"
+            )
         try:
             _assert_caller_process(successor, "owner")
             basis = "caller-ancestry"
@@ -50537,6 +50593,25 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         released: object,
         rename: bool,
     ) -> tuple[ActiveRecord, dict[str, object], str]:
+        # A recorded scope is bound to the owner judge() proved dead, so it
+        # is rebound to the successor's own live scope, or dropped when the
+        # successor runs in none (#2179); an unscoped slot stays unscoped,
+        # and a reopen by the recorded owner itself keeps its own scope.
+        dead_scope = record.task_scope if record.owner != successor else None
+        task_scope = (
+            record.task_scope if dead_scope is None else _successor_task_scope(successor)
+        )
+        scope_note.clear()
+        if dead_scope is not None:
+            scope_note.append(
+                f"NOTE: task scope {dead_scope.unit} of the dead owner was "
+                + (
+                    f"rebound to owner PID {successor.pid}'s own scope {task_scope.unit}"
+                    if task_scope is not None
+                    else f"dropped: owner PID {successor.pid} runs in no verifiable task "
+                    f"scope (control group {successor.cgroup_path})"
+                )
+            )
         if reopen:
             assert coordinator is not None and released is not None
             transferred = dataclasses.replace(
@@ -50545,6 +50620,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                 owner=successor,
                 generation=record.generation + 1,
                 heartbeat_at=_utc_now(),
+                task_scope=task_scope,
             )
             evidence: dict[str, object] = {
                 "owner": _identity_to_obj(successor),
@@ -50567,6 +50643,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                 owner=successor,
                 generation=record.generation + 1,
                 heartbeat_at=_utc_now(),
+                task_scope=task_scope,
             )
             evidence = {
                 "owner": _identity_to_obj(successor),
@@ -50578,7 +50655,9 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             }
             action = "owner-transferred"
         else:
-            transferred = dataclasses.replace(record, owner=successor, heartbeat_at=_utc_now())
+            transferred = dataclasses.replace(
+                record, owner=successor, heartbeat_at=_utc_now(), task_scope=task_scope
+            )
             evidence = {
                 "owner": _identity_to_obj(successor),
                 "previous_owner": None if record.owner is None else _identity_to_obj(record.owner),
@@ -50796,6 +50875,8 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                 "still refuses it",
                 file=sys.stderr,
             )
+    for note in scope_note:
+        print(note, file=sys.stderr)
     if outcome == "reopened":
         print(
             f"reopened slot={final_record.slot} agent={final_record.agent} "

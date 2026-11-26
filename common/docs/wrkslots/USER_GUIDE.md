@@ -1331,6 +1331,15 @@ as `agentctl restore` transfer a slot to a harness it revived inside that slot's
 indeterminate owner is refused. Only the owner and heartbeat change, recorded as an
 `owner-transferred` active-state event that names the previous owner, its state, and the basis.
 
+A slot created, registered, adopted, or imported with `--task-scope-unit` also records the dead
+owner's task scope, which every record binds to its owner generation. The transfer replaces it
+along with the owner. When the successor's own control group is a transient scope of your systemd
+user manager whose invocation link verifies as `--task-scope-unit` requires, that scope is
+recorded, with the successor's PID, start time, boot ID, and cgroup path. Otherwise the record
+keeps no task scope; it stays bound to the successor's process generation and only loses the
+stronger claim. A note on standard error says which happened. A scope still bound to a live or
+indeterminate owner is refused, with `--reopen` too, unless the successor is that owner itself.
+
 Unregistered nested linked worktrees inside the slot (for example under a checkout's `ignored/`)
 do not refuse a transfer: they are listed as warnings in the output and in the event, ownership
 does not touch them, and removal still refuses them. A released, unremoved generation is not

@@ -670,3 +670,284 @@ def test_the_slot_box_is_recognised_only_for_its_own_slot() -> None:
         "/app.slice/app-wrkslots-box-kvm\\x2d20261012.slice/a.scope", "agent", "kvm-20261012"
     )
     assert not cli._cgroup_in_slot_box("/app.slice/herdr-server.service", "agent", "kvm-20261012")
+
+
+# #2179: a recorded task scope belongs to its recorded owner (the loader binds
+# the two), so a transfer from a proven-dead owner rebinds the scope to the
+# successor's own verifiable scope, or drops it; a live scope still refuses.
+# The successor's control group and the systemd invocation links are test
+# seams; boot IDs and process generations are controlled values, never the
+# live host's scopes.
+
+PREVIOUS_BOOT = "00000000-0000-4000-8000-000000002179"
+SUCCESSOR_UNIT = "successor-2179.scope"
+SUCCESSOR_INVOCATION = "c" * 32
+
+
+def _scope_cgroup(unit: str) -> str:
+    return f"{cli._systemd_user_manager_cgroup()}/app.slice/{unit}"
+
+
+def _successor_in_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, invocation_link: bool = True
+) -> Path:
+    """Place this process in SUCCESSOR_UNIT and model the manager's links."""
+
+    real_cgroup = cli._read_process_cgroup
+    me = Path("/proc") / str(os.getpid())
+
+    def cgroup(pid_dir: Path) -> str:
+        return _scope_cgroup(SUCCESSOR_UNIT) if Path(pid_dir) == me else real_cgroup(pid_dir)
+
+    monkeypatch.setattr(cli, "_read_process_cgroup", cgroup)
+    links = tmp_path / "systemd-units"
+    links.mkdir()
+    if invocation_link:
+        (links / f"invocation:{SUCCESSOR_UNIT}").symlink_to(SUCCESSOR_INVOCATION)
+    monkeypatch.setattr(cli, "_systemd_invocation_directory", lambda: links)
+    return links
+
+
+def _bind_recorded_scope(project: Path, owner: cli.ProcessIdentity) -> cli.TaskScopeIdentity:
+    """Record ``owner`` with the task scope that a scoped create binds to it."""
+
+    config = cli._load_config(str(project), "testhost")
+    state = cli._load_active(config)
+    record = state.slots[0]
+    scope = cli._task_scope_from_obj(
+        {
+            "unit": owner.cgroup_path.rsplit("/", 1)[-1],
+            "invocation_id": "a" * 32,
+            "cgroup_path": owner.cgroup_path,
+            "boot_id": owner.boot_id,
+            "leader_pid": owner.pid,
+            "leader_start_ticks": owner.start_ticks,
+            "verification": "systemd-runtime-invocation-symlink-v1",
+        },
+        "test recorded scope",
+    )
+    cli._write_active_state(
+        config,
+        cli._replace_record(state, replace(record, owner=owner, task_scope=scope)),
+        action="test-scope-bound",
+        slot=record.slot,
+    )
+    return scope
+
+
+def _exited_pid() -> int:
+    exited = subprocess.Popen(["sleep", "3600"], text=True)
+    terminate_process(exited)
+    return exited.pid
+
+
+def _main(project: Path, *args: str) -> int:
+    return cli.main(["--project-root", str(project), *args])
+
+
+def _reload_record(project: Path) -> cli.ActiveRecord:
+    """The record as the registry loader rebuilds it from the event log."""
+
+    config = cli._load_config(str(project), "testhost")
+    states, _archives = cli._validate_global_state(config)
+    state = next(item for item in states if item.machine == "testhost")
+    return cli._find_record(state, "slot01")
+
+
+@pytest.mark.ordinary_environment
+def test_transfer_rebinds_a_previous_boot_task_scope_and_the_slot_can_be_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    me = cli._read_process_identity(os.getpid())
+    dead = replace(
+        me,
+        pid=_exited_pid(),
+        boot_id=PREVIOUS_BOOT,
+        cgroup_path=_scope_cgroup("lane-before-reboot.scope"),
+    )
+    old_scope = _bind_recorded_scope(project, dead)
+    _successor_in_scope(monkeypatch, tmp_path)
+    successor = cli._read_process_identity(os.getpid())
+    assert successor.cgroup_path == _scope_cgroup(SUCCESSOR_UNIT)
+
+    rc = _main(
+        project, "--wait-lock", "240", "transfer-owner", "slot01", "--agent", "codex-1",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+    )
+    captured = capsys.readouterr()
+
+    assert rc == 0, captured.err
+    assert "basis=caller-ancestry previous=dead" in captured.out
+    assert (
+        f"task scope {old_scope.unit} of the dead owner was rebound to owner PID "
+        f"{os.getpid()}'s own scope {SUCCESSOR_UNIT}"
+    ) in captured.err
+    record = _reload_record(project)
+    assert record.owner == successor
+    assert record.task_scope == cli.TaskScopeIdentity(
+        unit=SUCCESSOR_UNIT,
+        invocation_id=SUCCESSOR_INVOCATION,
+        cgroup_path=successor.cgroup_path,
+        boot_id=successor.boot_id,
+        leader_pid=successor.pid,
+        leader_start_ticks=successor.start_ticks,
+        verification="systemd-runtime-invocation-symlink-v1",
+    )
+    event = last_active_event(project)
+    assert event["action"] == "owner-transferred"
+    evidence = event["evidence"]
+    assert isinstance(evidence, dict) and evidence["previous_owner_state"] == "dead"
+
+    handoff = tmp_path / "handoff-2179.md"
+    handoff.write_text("# Handoff\n\nDone after the reboot.\n", encoding="utf-8")
+    owner_args = (
+        "slot01", "--agent", "codex-1", "--owner-pid", str(os.getpid()),
+        "--expected-generation", "1",
+    )
+    assert _main(project, "write-handoff", *owner_args, "--from-file", str(handoff)) == 0
+    assert _main(project, "release", *owner_args) == 0, capsys.readouterr().err
+    released = _reload_record(project)
+    assert released.task_scope == record.task_scope
+    events = cli._load_events(cli._load_config(str(project), "testhost"), "testhost")
+    assert cli._owner_release_in_effect(
+        cli._load_config(str(project), "testhost"), released, events
+    ) is not None
+
+
+@pytest.mark.ordinary_environment
+def test_transfer_drops_a_dead_task_scope_when_the_successor_runs_in_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    me = cli._read_process_identity(os.getpid())
+    _bind_recorded_scope(
+        project,
+        replace(
+            me,
+            pid=_exited_pid(),
+            boot_id=PREVIOUS_BOOT,
+            cgroup_path=_scope_cgroup("lane-before-reboot.scope"),
+        ),
+    )
+    # The successor's cgroup looks like a scope, but the manager holds no
+    # invocation link for it, so it is not a verifiable task scope.
+    _successor_in_scope(monkeypatch, tmp_path, invocation_link=False)
+
+    rc = _main(
+        project, "transfer-owner", "slot01", "--agent", "codex-1",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+    )
+    captured = capsys.readouterr()
+
+    assert rc == 0, captured.err
+    assert "lane-before-reboot.scope of the dead owner was dropped" in captured.err
+    record = _reload_record(project)
+    assert record.owner == cli._read_process_identity(os.getpid())
+    assert record.task_scope is None
+    row = active_slots(project)[0]
+    assert isinstance(row, dict) and "task_scope" not in row
+
+
+@pytest.mark.ordinary_environment
+def test_transfer_treats_a_reused_pid_task_scope_as_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    sleeper = subprocess.Popen(["sleep", "3600"], text=True)
+    try:
+        live = cli._read_process_identity(sleeper.pid)
+        # Same boot, same PID, another start time: the recorded generation
+        # exited and the PID now names a different process.
+        _bind_recorded_scope(
+            project,
+            replace(
+                live,
+                start_ticks=live.start_ticks + 1,
+                cgroup_path=_scope_cgroup("lane-reused-pid.scope"),
+            ),
+        )
+        _successor_in_scope(monkeypatch, tmp_path)
+
+        rc = _main(
+            project, "transfer-owner", "slot01", "--agent", "codex-1",
+            "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        )
+        captured = capsys.readouterr()
+    finally:
+        terminate_process(sleeper)
+
+    assert rc == 0, captured.err
+    assert "previous=dead" in captured.out
+    record = _reload_record(project)
+    assert record.task_scope is not None and record.task_scope.unit == SUCCESSOR_UNIT
+    assert record.task_scope.leader_pid == os.getpid()
+
+
+@pytest.mark.ordinary_environment
+def test_transfer_still_refuses_a_task_scope_bound_to_a_live_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    sleeper = subprocess.Popen(["sleep", "3600"], text=True)
+    try:
+        live = cli._read_process_identity(sleeper.pid)
+        # The same live generation, recorded in its scope (a cgroup move
+        # never reads as a reuse).
+        recorded = _bind_recorded_scope(
+            project, replace(live, cgroup_path=_scope_cgroup("lane-live.scope"))
+        )
+        _successor_in_scope(monkeypatch, tmp_path)
+        before = _reload_record(project)
+
+        rc = _main(
+            project, "transfer-owner", "slot01", "--agent", "codex-1",
+            "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        )
+        captured = capsys.readouterr()
+        after = _reload_record(project)
+    finally:
+        terminate_process(sleeper)
+
+    assert rc == 3
+    assert "owner is live" in captured.err
+    assert after == before and after.task_scope == recorded
+
+
+@pytest.mark.ordinary_environment
+def test_reopen_refuses_a_released_generation_whose_task_scope_is_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    _successor_in_scope(monkeypatch, tmp_path)
+    # This live process owns the slot in its scope and releases it.
+    recorded = _bind_recorded_scope(project, cli._read_process_identity(os.getpid()))
+    handoff = tmp_path / "handoff-live.md"
+    handoff.write_text("# Handoff\n\nReleased, still running.\n", encoding="utf-8")
+    owner_args = (
+        "slot01", "--agent", "codex-1", "--owner-pid", str(os.getpid()),
+        "--expected-generation", "1",
+    )
+    assert _main(project, "write-handoff", *owner_args, "--from-file", str(handoff)) == 0
+    assert _main(project, "release", *owner_args) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    before = _reload_record(project)
+
+    rc = _main(
+        project, "transfer-owner", "slot01", "--agent", "codex-1",
+        "--owner-pid", str(os.getppid()), "--expected-generation", "1",
+        "--reopen", "--coordinator-authorized", "--coordinator-pid", str(os.getpid()),
+        "--reason", "reopen while the released owner still runs",
+    )
+    captured = capsys.readouterr()
+
+    assert rc == 3
+    assert (
+        f"slot slot01 task scope {recorded.unit} is still bound to a live owner"
+    ) in captured.err
+    assert _reload_record(project) == before

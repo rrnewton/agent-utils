@@ -59,6 +59,42 @@ fn record_identity(record: &Value) -> Option<Identity> {
     })
 }
 
+/// The unit of the record's task scope, when it records one.
+fn recorded_task_scope_unit(record: &Value) -> Option<String> {
+    let scope = record.get("task_scope")?;
+    if scope.is_null() {
+        return None;
+    }
+    Some(
+        scope
+            .get("unit")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// The successor's own live task scope (#2179), mirroring the Python
+/// `_successor_task_scope`: the successor's cgroup must end in a
+/// transient scope of this user's systemd manager whose invocation
+/// link verifies exactly as `--task-scope-unit` does. Otherwise
+/// `None`: the transferred record keeps its owner binding and loses
+/// only the stronger scope claim.
+fn successor_task_scope(successor: &Identity) -> Option<Value> {
+    let unit = successor.cgroup_path.rsplit('/').next()?;
+    if !unit.ends_with(".scope") {
+        return None;
+    }
+    let uid = rustix::process::getuid().as_raw();
+    let link = Path::new("/run/user")
+        .join(uid.to_string())
+        .join("systemd/units")
+        .join(format!("invocation:{unit}"));
+    let target = std::fs::read_link(&link).ok()?;
+    let invocation_id = target.to_str()?.to_string();
+    crate::adopt_write::verify_task_scope(successor, unit, &invocation_id).ok()
+}
+
 fn systemd_escape(value: &str) -> Option<String> {
     let output = Command::new("systemd-escape")
         .arg("--")
@@ -503,6 +539,16 @@ fn judge_transfer(
             ));
         }
     }
+    if let Some(unit) = recorded_task_scope_unit(record) {
+        // The loader binds a scope to its owner generation, so the
+        // owner proof is the scope proof (#2179): only a proven-dead
+        // scope (another boot, an absent PID, a reused PID) is rebound.
+        if existing.as_ref() != Some(successor) && previous_state != "dead" {
+            return Err(format!(
+                "slot {slot} task scope {unit} is still bound to a {previous_state} owner: {detail}; transfer-owner rebinds a task scope only when its owner is provably dead"
+            ));
+        }
+    }
     let slot_type = record
         .get("slot_type")
         .and_then(Value::as_str)
@@ -681,6 +727,15 @@ pub(crate) fn transfer_owner(
     } else {
         generation
     };
+    // A recorded scope is bound to the owner the judgement proved dead,
+    // so it is rebound to the successor's own live scope, or dropped when
+    // the successor runs in none (#2179); an unscoped slot stays unscoped,
+    // and a reopen by the recorded owner itself keeps its own scope.
+    let recorded_scope_unit =
+        recorded_task_scope_unit(&record).filter(|_| existing.as_ref() != Some(&successor));
+    let successor_scope = recorded_scope_unit
+        .as_ref()
+        .and_then(|_| successor_task_scope(&successor));
     let mut transferred = record.clone();
     if let Some(object) = transferred.as_object_mut() {
         object.insert("owner".to_string(), identity_value(&successor));
@@ -688,6 +743,16 @@ pub(crate) fn transfer_owner(
         if reopen || rename {
             object.insert("agent".to_string(), json!(target_agent));
             object.insert("generation".to_string(), json!(new_generation));
+        }
+        if recorded_scope_unit.is_some() {
+            match &successor_scope {
+                Some(scope) => {
+                    object.insert("task_scope".to_string(), scope.clone());
+                }
+                None => {
+                    object.remove("task_scope");
+                }
+            }
         }
     }
     let previous_digest = canonical_sha256(&record).map_err(|error| error.to_string())?;
@@ -742,6 +807,22 @@ pub(crate) fn transfer_owner(
         eprintln!(
             "WARNING: unregistered nested worktree retained during transfer-owner: {detail}. state: RETAINED -- ownership did not touch it and removal still refuses it"
         );
+    }
+    if let Some(unit) = &recorded_scope_unit {
+        match successor_scope
+            .as_ref()
+            .and_then(|scope| scope.get("unit"))
+            .and_then(Value::as_str)
+        {
+            Some(new_unit) => eprintln!(
+                "NOTE: task scope {unit} of the dead owner was rebound to owner PID {}'s own scope {new_unit}",
+                successor.pid
+            ),
+            None => eprintln!(
+                "NOTE: task scope {unit} of the dead owner was dropped: owner PID {} runs in no verifiable task scope (control group {})",
+                successor.pid, successor.cgroup_path
+            ),
+        }
     }
     append_event(
         &cfg,
@@ -801,7 +882,37 @@ pub(crate) fn transfer_owner(
 
 #[cfg(test)]
 mod tests {
-    use super::{cgroup_in_slot_box, split_status_lines};
+    use super::{cgroup_in_slot_box, split_status_lines, successor_task_scope};
+    use crate::status_state::Identity;
+
+    fn identity_in(cgroup_path: String) -> Identity {
+        Identity {
+            pid: 4242,
+            start_ticks: 99,
+            boot_id: "00000000-0000-4000-8000-000000002179".to_string(),
+            host_id: "host".to_string(),
+            cgroup_path,
+            namespace_pid: None,
+            pidns_inode: None,
+        }
+    }
+
+    // #2179: a successor in no verifiable task scope gets none, so the
+    // dead owner's scope is dropped rather than carried.
+    #[test]
+    fn successor_without_a_verifiable_scope_has_none() {
+        let uid = rustix::process::getuid().as_raw();
+        let manager = format!("/user.slice/user-{uid}.slice/user@{uid}.service");
+        assert!(
+            successor_task_scope(&identity_in(format!("{manager}/app.slice/a.service"))).is_none()
+        );
+        assert!(successor_task_scope(&identity_in("/".to_string())).is_none());
+        // A scope-shaped cgroup whose invocation link the manager never made.
+        assert!(successor_task_scope(&identity_in(format!(
+            "{manager}/app.slice/wrkslots-test-2179-never-started.scope"
+        )))
+        .is_none());
+    }
 
     #[test]
     fn status_lines_split_blocking_from_ignored_candidates() {
