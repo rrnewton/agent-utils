@@ -3887,10 +3887,8 @@ mod tests {
 
     #[test]
     fn memory_stat_sample_reads_anon_and_shmem_from_a_fake_cgroup() {
-        let base = std::env::temp_dir().join(format!(
-            "dagrun-memory-stat-test-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("dagrun-memory-stat-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let child = base.join(sanitize("g.mem"));
         fs::create_dir_all(&child).unwrap();
@@ -3901,7 +3899,11 @@ mod tests {
         // Missing memory.stat: no sample, never a zero.
         assert_eq!(cg.memory_stat_sample("g.mem"), None);
 
-        fs::write(child.join("memory.stat"), "anon 1048576\nfile 2097152\nshmem 262144\n").unwrap();
+        fs::write(
+            child.join("memory.stat"),
+            "anon 1048576\nfile 2097152\nshmem 262144\n",
+        )
+        .unwrap();
         assert_eq!(
             cg.memory_stat_sample("g.mem"),
             Some(MemoryStatSample {
@@ -3956,14 +3958,7 @@ mod tests {
             })
         );
         // Signs, separators, fractions, overflow and a bare key are refused per field.
-        for bad in [
-            "+5",
-            "-5",
-            "1_000",
-            "1.5",
-            "0x10",
-            "9223372036854775808",
-        ] {
+        for bad in ["+5", "-5", "1_000", "1.5", "0x10", "9223372036854775808"] {
             assert_eq!(
                 parse_memory_stat_anon_shmem(&format!("anon {bad}\nshmem 3\n")),
                 Some(MemoryStatSample {

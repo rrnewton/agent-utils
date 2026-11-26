@@ -5625,7 +5625,10 @@ mod tests {
             false,
         );
         assert_eq!(sampled.anon_bytes, Some(100));
-        assert_eq!(sampled.shmem_bytes, None, "an absent counter stays unmeasured");
+        assert_eq!(
+            sampled.shmem_bytes, None,
+            "an absent counter stays unmeasured"
+        );
         sampled.observe(
             Some(MemoryStatSample {
                 anon_bytes: Some(80),
@@ -5686,9 +5689,15 @@ mod tests {
     fn mem_sample_interval_is_the_shorter_of_the_guard_and_trace_ticks() {
         assert_eq!(mem_sample_interval_ms(None), 1000);
         assert_eq!(mem_sample_interval_ms(Some(Duration::from_millis(50))), 50);
-        assert_eq!(mem_sample_interval_ms(Some(Duration::from_millis(250))), 250);
+        assert_eq!(
+            mem_sample_interval_ms(Some(Duration::from_millis(250))),
+            250
+        );
         assert_eq!(mem_sample_interval_ms(Some(Duration::from_secs(10))), 1000);
-        assert_eq!(mem_sample_interval_ms(Some(Duration::from_secs_f64(0.3))), 300);
+        assert_eq!(
+            mem_sample_interval_ms(Some(Duration::from_secs_f64(0.3))),
+            300
+        );
     }
 
     #[test]
@@ -8778,10 +8787,8 @@ int main(void) {
         after_exit: Option<MemoryStatSample>,
         wait_for_sample: bool,
     ) -> RunResult {
-        let dir = std::env::temp_dir().join(format!(
-            "dagrun-memstat-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dagrun-memstat-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sampled = dir.join("sampled");
