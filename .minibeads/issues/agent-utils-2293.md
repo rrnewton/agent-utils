@@ -1,0 +1,30 @@
+---
+title: 'vibe-talk-read-modes-held-walk-thread-option-timeout: the held walk waits out ten wall-clock seconds for the thread option under load, on unmodified main'
+status: open
+priority: 1
+issue_type: bug
+assignee: mu-statesync
+labels:
+- vibe-talk
+created_at: 2026-11-26T10:18:00-05:00
+updated_at: 2026-11-26T10:18:00-05:00
+---
+
+# Description
+
+`vibe-talk.check.read-modes-browser` times out in `held_walk` at `vibe-talk/tests/read_modes_browser.py:882`: `Page.wait_for_function: Timeout 10000ms exceeded` waiting for the `thread:spaces/A/threads/canary` option of `#thread-select` after pointerdown. Reproduced on unmodified main with no server change involved: the check serves its timeline from an in-process fake API, so no Rust server code runs in it.
+
+Evidence (2026-11-26, host load1 in parentheses, one run at a time, direct `tests/read_modes_browser.py` with the gate's page build): on `afb8ecaa` 5/5 passed (123.64, 126.03, 132.40, 129.83, 130.57); on main `a724562b` 2/3 passed (139.73, 145.53) and the third failed at the same line and wait (149.73). The S3 gate and its exclusive rerun failed the same wait on `afb8ecaa`; S3 landed under a logged waiver for exactly this proof. The wait is a fixed ten wall-clock seconds for a fetch-plus-render to complete — under a hot host that is a wall-clock verdict, which owner rule 346 forbids in gating checks.
+
+# Design
+
+Make the held walk's thread-option wait condition-based end to end, in the pattern of the returned behaviour-only checks: wait on the state that proves the thread list landed (the directory read's own completion the page already tracks), with a generous hang backstop only, never a ten-second wall-clock pass/fail on load. If that cannot be made robust on a hot machine (>75% CPU on 316 hardware threads), disable the step from gating with this issue as its tracker until it can. Either way the proof bar is repeated passes alone and on main at comparable load, with load1 recorded per run.
+
+# Acceptance Criteria
+
+- `read_modes_browser.py` (held walk included) passes repeatedly alone on the fixed tree and on main at comparable host load, with no wall-clock pass/fail wait remaining in the held walk's thread-option path (hang backstops excepted).
+- The step returns to (or stays in) gating only on that proof; if disabled instead, the disable names this issue and the step's solo runs are recorded here.
+
+# Notes
+
+Filed from the #2280 S3 gate on `afb8ecaa` (ticket 1795702247402631538, read-modes the only functional red; landed under waiver as `dce61a5b`). Related: `#2077 vibe-talk-browser-checks-hot-host`, `#1250 vibe-talk-timing-robust` (the behaviour-only return pattern), `#2280 vibe-talk-state-sync-audit` (the gate that surfaced it). No server change is wanted for this issue; the check's fake API is the whole of its read path.
