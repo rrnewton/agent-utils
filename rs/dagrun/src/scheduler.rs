@@ -167,9 +167,9 @@ impl SampledMemoryMax {
 /// Nominal spacing of the monitor's memory samples, in whole milliseconds (rounded).
 ///
 /// The monitor reads `memory.stat` on every tick it takes: the 1 s guard tick, and the trace
-/// tick when `--profile-timeseries` asks for a shorter one. The Python build rounds the same
-/// way, so both write the same cell for the same interval.
+/// tick when `--profile-timeseries` asks for a shorter one.
 fn mem_sample_interval_ms(profile_timeseries_interval: Option<Duration>) -> u64 {
+    // The other engine rounds the same way, so both write the same cell for the same interval.
     let interval = profile_timeseries_interval
         .map_or(MONITOR_INTERVAL, |interval| interval.min(MONITOR_INTERVAL));
     (interval.as_secs_f64() * 1000.0).round() as u64

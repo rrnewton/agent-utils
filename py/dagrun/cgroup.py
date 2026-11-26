@@ -310,7 +310,7 @@ def parse_memory_stat_anon_shmem(text: str) -> MemoryStatSample | None:
     Keys match whole (``anon_thp``/``shmem_thp`` are other counters), the first occurrence is
     the reading, and the scan stops once both are seen. Returns ``None`` when neither counter
     is present and parseable; a present counter whose value is not a plain decimal that fits an
-    i64 stays ``None`` in its own field, never 0. Same rule as the Rust build."""
+    i64 stays ``None`` in its own field, never 0."""
     anon: int | None = None
     shmem: int | None = None
     seen_anon = seen_shmem = False

@@ -224,10 +224,10 @@ pub struct MemoryStatSample {
 /// the other keys are different counters and are not matched). Returns `None` when neither
 /// counter is present and parseable. A present counter whose value is not a plain decimal that
 /// fits an `i64` stays `None` in its own field rather than becoming zero; signs, separators and
-/// overflow are refused so the Python build, which shares this rule, reads the same file the
-/// same way. The scan stops once both counters have been seen, so a sample costs at most one
-/// pass over the file however many counters a kernel adds.
+/// overflow are refused. The scan stops once both counters have been seen, so a sample costs at
+/// most one pass over the file however many counters a kernel adds.
 pub fn parse_memory_stat_anon_shmem(text: &str) -> Option<MemoryStatSample> {
+    // The other engine shares this rule exactly, so both read the same file the same way.
     fn byte_count(value: &str) -> Option<i64> {
         if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
             return None;
