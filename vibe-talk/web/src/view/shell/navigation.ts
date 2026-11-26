@@ -486,14 +486,14 @@ export interface PageNavigation {
   onMessageLinkTap(ref: MessageLinkRef, event: {
     ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; button?: number;
     preventDefault?: () => void; stopPropagation?: () => void;
-  } | null): void;
+  } | null, shortKind?: string | null, from?: Element | null): void;
   linkJumpSpot(): NavLinkSpot;
   withLinkJumps(levels: string[]): string[];
   arriveOnChannel(channel: string): void;
   arriveAtPlace(place: NavChannelPlace): void;
   jumpToDocumentLink(key: string, from?: Element | null): void;
   documentBack(): void;
-  jumpToMessageLink(ref: MessageLinkRef): Promise<void>;
+  jumpToMessageLink(ref: MessageLinkRef, from?: Element | null): Promise<void>;
   /** `#2080 vibe-talk-summary-link-stays-in-view`: jump without leaving the view on screen
    * where that view can show the message (a summary's citation tap). */
   jumpToMessageInPlace(ref: MessageLinkRef): Promise<void>;
@@ -928,6 +928,19 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       deps.settleFocus();
       return true;
     }
+    // `#2273`: a link jump on top is undone as the browser's Back undoes it — its level
+    // closed, its history entry gone back through, the reader put back on its spot —
+    // not walked past as a visited place, which left the jump standing and the reader
+    // wherever the place's own entry put them.
+    if (step < 0) {
+      const levels = backLevels();
+      if (levels[levels.length - 1] === "jump") {
+        closeBackLevel("jump");
+        scheduleBackSync();
+        deps.settleFocus();
+        return true;
+      }
+    }
     notePlace();
     const here = deps.visitKey(currentPlace());
     // Passed over: what cannot be shown now, and the place the reader is at (`Visits.walk`).
@@ -1291,7 +1304,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
         kid.addEventListener("click", deps.inThisColumn((event: Event) => onMessageLinkTap(ref, event as {
           ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; button?: number;
           preventDefault?: () => void; stopPropagation?: () => void;
-        }, shortKind)));
+        }, shortKind, kid)));
         if (!keepsInApp(ref)) continue;
         const href = String(kid.getAttribute("href") || "");
         kid.setAttribute("data-in-app", "");
@@ -1307,21 +1320,22 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
 
   /**
    * A tap on a link to a message: a jump, when the link is this app's and nothing asks for another
-   * tab. Otherwise the browser follows the address, as for any link.
+   * tab. Otherwise the browser follows the address, as for any link. `from` is the link tapped:
+   * the row holding it is the reader's spot (`#2273`), as a document link's is (`#1082`).
    */
   function onMessageLinkTap(ref: MessageLinkRef, event: {
     ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; button?: number;
     preventDefault?: () => void; stopPropagation?: () => void;
-  } | null, shortKind?: string | null): void {
+  } | null, shortKind?: string | null, from?: Element | null): void {
     if (!keepsInApp(ref)) return;
     if (event && (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || (event.button || 0) > 0)) return;
     if (event && typeof event.preventDefault === "function") event.preventDefault();
     if (event && typeof event.stopPropagation === "function") event.stopPropagation();
     if (shortKind === "thread" || shortKind === "email") {
-      void deps.guardQuietly(jumpToShortRef)(shortKind, ref);
+      void deps.guardQuietly(jumpToShortRef)(shortKind, ref, from ?? null);
       return;
     }
-    void deps.guardQuietly(jumpToMessageLink)(ref);
+    void deps.guardQuietly(jumpToMessageLink)(ref, from ?? null);
   }
 
   /**
@@ -1352,13 +1366,13 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     deps.revealRow(first, false);
   }
 
-  async function jumpToShortRef(kind: string, ref: MessageLinkRef): Promise<void> {
+  async function jumpToShortRef(kind: string, ref: MessageLinkRef, from: Element | null = null): Promise<void> {
     if (deps.screens().screen() !== "main" || deps.screens().view() !== "discord") return undefined;
     const here = String(deps.selectedChannelId() || "");
     if (kind === "thread" && ref.thread) {
       const now = ref.channel === here ? channelPlace() : null;
       if (now && now.layout === "two") {
-        const spot = linkJumpSpot();
+        const spot = tapSpot(from);
         const under = linkJumps.top();
         if (under && under.landed === null) under.landed = screenLevelsNow();
         const jump: NavLinkJump = { spot, below: backLevels(), landed: null };
@@ -1384,7 +1398,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       }
       // One column, from All, Main or another thread (or another channel): the thread
       // view itself, root highlighted, with the message jump's Back level.
-      const spot = linkJumpSpot();
+      const spot = tapSpot(from);
       await deps.inColumn(deps.mainColumn(), async () => {
         await jumpFromSpot(ref, spot);
         await highlightThreadRoot(ref.channel);
@@ -1392,20 +1406,46 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       return undefined;
     }
     if (kind === "email" && ref.message && ref.channel === here && deps.rowHolding(ref.message)) {
-      const target = ref.message;
-      deepLinks.setFocus({ provider: String(deps.providerNameOf(ref.channel) || ref.service).toLowerCase(), channel: ref.channel, message: target, thread: ref.thread });
-      await deps.seekMessage(target, () => landOnDeepLink(target), () => false);
-      return undefined;
+      return jumpToHeldMessage(ref, tapSpot(from));
     }
     if (kind === "email") {
-      const spot = linkJumpSpot();
+      const spot = tapSpot(from);
       return deps.inColumn(deps.mainColumn(), () => jumpFromSpot(ref, spot, { view: "flat", center: true }));
     }
-    return jumpToMessageLink(ref);
+    return jumpToMessageLink(ref, from);
   }
 
   // The jumps taken by links: one owner in `core/navigation` (`createLinkJumps`).
   const linkJumps: NavLinkJumps = deps.createLinkJumps();
+
+  /**
+   * `#2273 vibe-talk-cross-view-back-lands-wrong`: an `:email:` short reference to a
+   * message the list on screen already draws lands it where it is, in the column it
+   * was tapped in — and is still a link jump, with the reader's spot and a Back level
+   * of its own, as every other link's landing is. Landing it without one left the
+   * level of an EARLIER jump on top, so Back undid that one and put the reader on its
+   * spot: an unrelated older message, "Back where you were".
+   */
+  async function jumpToHeldMessage(ref: MessageLinkRef, spot: NavLinkSpot): Promise<void> {
+    const target = ref.message as string;
+    const under = linkJumps.top();
+    // A jump still under way when this one is taken: what it had opened by now is its own.
+    if (under && under.landed === null) under.landed = screenLevelsNow();
+    const jump: NavLinkJump = { spot, below: backLevels(), landed: null };
+    const ticket = linkJumps.take(jump);
+    scheduleBackSync();
+    try {
+      deepLinks.setFocus({ provider: String(deps.providerNameOf(ref.channel) || ref.service).toLowerCase(), channel: ref.channel, message: target, thread: ref.thread });
+      // A Back while the walk is under way ends it: nothing lands over the place put back.
+      await deps.seekMessage(target, () => linkJumps.current(ticket) && landOnDeepLink(target), () => false);
+    } finally {
+      // Landed, or given up: what is open now is the jump's, and what opens after is over it.
+      if (jump.landed === null && linkJumps.holds(jump)) {
+        jump.landed = screenLevelsNow();
+        scheduleBackSync();
+      }
+    }
+  }
 
   /** Where the reader is, to come back to: the place, the column, and the message their eye is on. */
   function linkJumpSpot(): NavLinkSpot {
@@ -1425,6 +1465,16 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
   /** The levels a Back would close, with the jumps taken by links among them (`LinkJumps.levels`). */
   function withLinkJumps(levels: string[]): string[] {
     return linkJumps.levels(levels);
+  }
+
+  /**
+   * Where to come back to from a link tapped at `from` (`#2273`): the row holding it, at its
+   * height now, as for a document link — so Back puts back the very message the reader
+   * tapped in, whatever changed above it while they were away (a Linked mark moved off a
+   * row there, say); without a link to measure, the eye's anchor (`linkJumpSpot`).
+   */
+  function tapSpot(from: Element | null): NavLinkSpot {
+    return from ? documentLinkSpot(from) : linkJumpSpot();
   }
 
   /**
@@ -1526,10 +1576,10 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
    * and the jump is a level from the start, so its entry is pushed in the tap's own task and a Back
    * at any point undoes it.
    */
-  async function jumpToMessageLink(ref: MessageLinkRef): Promise<void> {
+  async function jumpToMessageLink(ref: MessageLinkRef, from: Element | null = null): Promise<void> {
     if (deps.screens().screen() !== "main" || deps.screens().view() !== "discord") return undefined;
     // Where the reader is, in the column the link was tapped in; the jump itself is the left column's.
-    const spot = linkJumpSpot();
+    const spot = tapSpot(from);
     return deps.inColumn(deps.mainColumn(), () => jumpFromSpot(ref, spot));
   }
 
@@ -1731,7 +1781,11 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     // re-assert would put the row the reader is leaving back on screen over the place
     // the return puts back, one frame after it. Ended now, in the tap's own task,
     // before any wait the return makes; the jump landed in the left column.
-    if (deps.leaveLanding) deps.inColumn(deps.mainColumn(), () => deps.leaveLanding?.());
+    if (deps.leaveLanding) {
+      deps.inColumn(deps.mainColumn(), () => deps.leaveLanding?.());
+      // ...and a jump that landed where it was tapped, in the right column (`#2273`), ends there too.
+      if (jump.spot.column === "side" && deps.sideShowing()) deps.inColumn(deps.sideColumn(), () => deps.leaveLanding?.());
+    }
     linkJumps.returnStarted();
     void deps.guardQuietly(returnToLinkSpot)(jump.spot).finally(() => {
       linkJumps.returnEnded();

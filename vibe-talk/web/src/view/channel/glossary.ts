@@ -63,6 +63,8 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
   // opened the popover: the full-screen glossary opens at that term and gives the focus back there.
   let popoverTerm: string | null = null;
   let popoverOpener: HTMLElement | null = null;
+  /** The message the popover's source line names, where it names one (`#2273`). */
+  let popoverSource: MessageLinkRef | null = null;
 
   const wtf = () => deps.byId("selection-chip-wtf");
   const popover = () => deps.byId("glossary-popover");
@@ -108,6 +110,7 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     // `#2233`. A source links only where it is checked to be an in-app message address or a document
     // key (`glossarySourceTarget`); anything else (a `javascript:` address included) shows no line.
     const target = glossarySourceTarget(source);
+    popoverSource = source && target && target.kind === "message" ? target.ref : null;
     if (source && target) {
       link.textContent = String(source.label ?? "") || "source";
       if (target.kind === "document") {
@@ -376,6 +379,17 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
       event.preventDefault();
       closePopover();
       deps.openDocument(key);
+      return;
+    }
+    // `#2273 vibe-talk-cross-view-back-lands-wrong`: a message source is the app's own link
+    // jump, as the glossary panel's is, with the reader's spot and a Back level; followed
+    // as an address it reloaded the page on that message instead. A modified click (a new
+    // tab) is still the browser's.
+    const ref = popoverSource;
+    if (ref && !(event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || (event.button || 0) > 0)) {
+      event.preventDefault();
+      closePopover();
+      deps.jumpToMessage(ref);
     }
   });
   listen<KeyboardEvent>(document, "keydown", (event) => {

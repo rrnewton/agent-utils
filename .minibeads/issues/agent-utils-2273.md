@@ -36,3 +36,13 @@ Step 3, fix: Back from a cross-view jump returns to the view it left, on the row
 # Notes
 
 Owner request 377 (2026-11-25 8:21 PM ET): Back after a citation jump from a thread reply into All landed on an unrelated older message in another thread instead of the reply the reader came from. Owner-UI fast-track, owner tier.
+
+## Root cause (2026-11-25)
+
+Reproduced on a local server (real server binary, fake chat upstream). The message ids in the owner's links decode to a reply at 7:52 PM, its citation target `899` the day before at 4:10 PM, and the landing message 19 minutes older than `899`; the page's own reports for those minutes all say All. So the reader was in All throughout, and the citation was an `:email:` short reference to a message All already drew. (A link copied with Copy vibe-talk link always names a reply's thread, which made the start look like a thread view.)
+
+- `jumpToShortRef` (`web/src/view/shell/navigation.ts`), the `:email:` branch for a message the list on screen already draws (`rowHolding`), landed it with `seekMessage` + `landOnDeepLink` but took no link jump: no spot, no history entry. Back then closed the level below, an EARLIER link or citation jump the reader had never gone back from, and `returnToLinkSpot` put the reader on that jump's spot: an unrelated older message in another thread, with the status "Back where you were." Captured: popstate to the depth-0 entry, the one list write `restoreScroll` < `putBackOnSpot`, the reader's row 5089 px off on a phone and 3633 px on a desk.
+- Checked and ruled out: coming back into a thread does run the thread's own first-unread entry landing (`payThreadEntry`), but the return's put-back comes after it and wins; the 9 px a desk walk first showed was a five-row thread whose reader stood within the newest line's slack, so Back took them to the newest line by design.
+- Found on the way: the keyboard Back (Ctrl/Cmd+[, `placeFromKeyboard`) walked back a visited place instead of undoing a link jump on top: the thread came back with the jump still standing, "Here is the linked message" (in the first probe the row also stood 51 px off).
+- Audit (every entry point that lands on a message): the glossary popover's message source followed its address (a full page load on that message) instead of the app's link jump the glossary panel takes.
+- Found in the matrix: Back restored the eye's anchor row (the row at the top of the screen), not the row holding the tapped link, so a Linked mark moving off a row between them shifted the linking row by the mark's height (39 px). A message link or short ref now takes the tapped row as its spot, as a document link already did (`#1082`).

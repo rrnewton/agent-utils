@@ -395,6 +395,18 @@ test("`#2233 vibe-talk-glossary-popup`: THE CONTROL (the code before): without t
   assert.equal(control.tab(), "discord", "the old code switched to Documents after all, so the test cannot tell the fix from it");
 });
 
+test("`#2273 vibe-talk-cross-view-back-lands-wrong`: the popover's message source jumps in the app (a Back level), never reloading the page on its address", async () => {
+  const page = await glossaryPage(PHONE, { arrange: (p) => { p.enableHistory(); } });
+  await tapDefinedTerm(page, "runner");
+  assert.equal(page.el("glossary-popover-source").hidden, false, "fixture: the defined term's popup shows no source");
+  assert.equal(page.el("glossary-popover-link").textContent, "the second message");
+  await tapPopoverSource(page);
+  assert.equal(page.el("glossary-popover").hidden, true, "the source tap left the popover up");
+  await untilDeepLink(page, () => rowWithId(page, "1000000000000000002")?.getAttribute("data-landed") === "true");
+  assert.equal(rowWithId(page, "1000000000000000002")?.getAttribute("data-landed"), "true",
+    "the message source did not land its message in the app");
+});
+
 test("`#2233 vibe-talk-glossary-popup`: a source jump taken with Discuss open beneath leaves Discuss open", async () => {
   const page = await glossaryPage(PHONE, { arrange: (p) => { p.enableHistory(); p.discussAvailable = true; } });
   await page.el("discuss-open").click();

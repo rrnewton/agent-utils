@@ -382,6 +382,86 @@ test("`#2261 vibe-talk-summary-link-back-race`: Back ends the undone jump's land
   assert.ok(plain.calls.some((call) => Array.isArray(call) && call[0] === "restore"), "unwired, Back no longer returned");
 });
 
+/** A row stand-in the spot can name and `putBackOnSpot` can find again (`data-context-id`). */
+const rowNamed = (id) => ({ getAttribute: (name) => (name === "data-context-id" ? id : null), className: "" });
+const settle = async () => { for (let i = 0; i < 30; i += 1) await Promise.resolve(); };
+const restores = (calls) => calls.filter((call) => Array.isArray(call) && call[0] === "restore").map((call) => call[1]);
+
+test("`#2273 vibe-talk-cross-view-back-lands-wrong`: a held :email: short ref is a jump of its own, so Back undoes it, not an earlier jump", async () => {
+  const state = freshState();
+  state.selection = { view: "flat", threadId: null, origin: null };
+  state.landSeek = true;
+  state.row = { className: "" };
+  const earlier = rowNamed("m10");
+  const eye = rowNamed("m30");
+  state.listRows = [earlier, eye];
+  const { nav, calls } = makeNavigation(state);
+  // An unrelated earlier jump, taken from m10 and never gone back from.
+  state.capture = { pinned: false, anchor: earlier, top: 300 };
+  await nav.jumpToMessageInPlace({ service: "discord", channel: "C1", message: "m20", thread: null });
+  assert.deepStrictEqual(nav.backLevels(), ["jump"]);
+  // The reader moves on to m30, whose `:email:` reference names m44, already drawn.
+  state.capture = { pinned: false, anchor: eye, top: 120 };
+  nav.onMessageLinkTap({ service: "discord", channel: "C1", message: "m44", thread: null }, null, "email");
+  await settle();
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "seek").map((call) => call[1]),
+    ["m20", "m44"], "the held message was not landed where it is");
+  assert.deepStrictEqual(nav.backLevels(), ["jump", "jump"], "the held short ref took no Back level of its own");
+  calls.length = 0;
+  nav.returnFromLinkJump();
+  await settle();
+  assert.deepStrictEqual(restores(calls).map((place) => [place.anchor, place.top]), [[eye, 120]],
+    "Back did not put the reader back on the row they tapped the short ref on");
+  assert.deepStrictEqual(nav.backLevels(), ["jump"], "Back undid more than the short ref's jump");
+  // The earlier jump is still there for the next Back.
+  calls.length = 0;
+  nav.returnFromLinkJump();
+  await settle();
+  assert.deepStrictEqual(restores(calls).map((place) => [place.anchor, place.top]), [[earlier, 300]]);
+});
+
+test("`#2273`: the keyboard Back (Ctrl/Cmd+[) undoes a link jump on top, as the browser's Back does", async () => {
+  const state = freshState();
+  state.selection = { view: "thread", threadId: "T1", origin: "flat" };
+  state.landSeek = true;
+  state.row = { className: "" };
+  const eye = rowNamed("m30");
+  state.listRows = [eye];
+  state.capture = { pinned: false, anchor: eye, top: 120 };
+  const { nav, calls } = makeNavigation(state);
+  nav.notePlace();
+  // From the thread, a link to a main message lands it in All: another place, noted as visited.
+  await nav.jumpToMessageInView({ service: "discord", channel: "C1", message: "m44", thread: null }, "flat");
+  state.selection = { view: "flat", threadId: null, origin: null };
+  nav.notePlace();
+  calls.length = 0;
+  assert.equal(nav.placeFromKeyboard(-1), true);
+  await settle();
+  assert.deepStrictEqual(restores(calls).map((place) => [place.anchor, place.top]), [[eye, 120]],
+    "Ctrl+[ walked back a visited place instead of undoing the jump");
+  assert.ok(!nav.backLevels().includes("jump"), "the jump was left standing after Ctrl+[");
+});
+
+test("`#2273`: a link tapped in a message comes back to the row holding it, at its height, not to the eye's anchor", async () => {
+  const state = freshState();
+  state.selection = { view: "flat", threadId: null, origin: null };
+  state.landSeek = true;
+  state.row = { className: "" };
+  const eye = rowNamed("m10");
+  const tapped = { ...rowNamed("m30"), getBoundingClientRect: () => ({ top: 200 }) };
+  const link = { getAttribute: () => null, getBoundingClientRect: () => ({ top: 210 }), parentElement: tapped };
+  state.listRows = [eye, tapped];
+  state.capture = { pinned: false, anchor: eye, top: 120 };
+  const { nav, calls } = makeNavigation(state);
+  nav.onMessageLinkTap({ service: "discord", channel: "C1", message: "m44", thread: null }, null, null, link);
+  await settle();
+  calls.length = 0;
+  nav.returnFromLinkJump();
+  await settle();
+  assert.deepStrictEqual(restores(calls).map((place) => [place.anchor, place.top]), [[tapped, 200]],
+    "Back did not put back the row the link was tapped in");
+});
+
 test("`#2147 vibe-talk-linked-jump-centers-target`: every linked-message jump lands centred", async () => {
   for (const take of ["link", "inPlace", "inView"]) {
     const state = freshState();

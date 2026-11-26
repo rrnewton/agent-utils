@@ -1,0 +1,20 @@
+steps:
+  # `#2273 vibe-talk-cross-view-back-lands-wrong` against the real server binary: link
+  # jumps thread->All, All->thread, thread->thread and All->All (an `:email:` short ref
+  # to a message already drawn, with an unrelated earlier jump on the stack), each
+  # undone by the browser's Back, the system Back and the keyboard Back; the view and
+  # the reader's row come back within 0.5 px, traced frame by frame, phone and desk.
+  - group: check
+    job: cross-view-back-browser
+    desc: Back after a link jump returns to the view and the row it left (thread/All x thread/All, three Back means, real server, fake chat upstream) in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/cross_view_back_browser.py --schemes light
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 600
+    cpu_timeout: 240
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
