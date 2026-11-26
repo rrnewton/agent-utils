@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-eden-census-skips-owner-default-instance: never query the default Eden instance in the host cap census'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-edencensus
 labels:
 - wrkslots
 created_at: 2026-11-26T21:35:00+00:00
-updated_at: 2026-11-26T21:35:00+00:00
+updated_at: 2026-11-26T22:32:00+00:00
+closed_at: 2026-11-26T22:32:00+00:00
 ---
 
 # Description
@@ -75,3 +76,18 @@ Follow-up (not in this fix): make the reserve configurable with a new
 integer, minimum 0). That is a persisted-config field, so it waits
 until pinned older readers accept it; this fix keeps the reserve a
 constant and adds no config key.
+
+## Resolution
+
+Landed as 2d9212a2 on main (gated 6c1f8f76, owner-tier gate pass,
+replayed over unrelated main commits). The census queries only state
+dirs named `.eden-state` (`eden.split_managed_config_dirs`), and
+`eden.checkouts_by_state_dir` refuses an unmanaged dir before any eden
+call; it stays fail-closed for managed dirs. The default instance is
+never invoked or read: it counts as `eden.DEFAULT_INSTANCE_RESERVE`
+(3) inside the report's `outer`, the refusal names the reserve, and
+unmanaged dirs are listed in `unmanaged_state_dirs`. Removal's `eden
+du` passes the slot's `--config-dir`. Tests run every stubbed eden
+runner through a fake owner guard that fails any call naming the
+default instance or lacking `--config-dir`. No config key was added
+(see the follow-up above).
