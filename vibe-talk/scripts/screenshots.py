@@ -5999,6 +5999,18 @@ SPLIT_KEYS_JS = (
 
 # What every split state must show: the panes inside the panel, the panel not scrolling, the
 # composer whole, and the summary pane standing above the timeline.
+# `#2263` (liaison): at least two lines of the Latest answer's own text show, on a phone.
+SPLIT_LATEST_LINES_JS = (
+    "(() => { if (window.innerWidth >= 900) return true; const box = document.getElementById('discuss-latest'); "
+    "if (!box || box.hidden) return false; const b = box.getBoundingClientRect(); "
+    "const head = box.querySelector('.discuss-qa > summary').getBoundingClientRect(); "
+    "const agent = box.querySelector('.discuss-agent'); const label = agent.querySelector('.discuss-turn-label'); "
+    "const top = Math.max(head.bottom, label.getBoundingClientRect().bottom, b.top); "
+    "const bottom = Math.min(b.bottom, agent.getBoundingClientRect().bottom); "
+    "const cs = getComputedStyle(agent.querySelector('li') || agent); let lh = parseFloat(cs.lineHeight); "
+    "if (!isFinite(lh)) lh = 1.2 * parseFloat(cs.fontSize); return (bottom - top) / lh >= 2; })()"
+)
+
 SPLIT_PANES_JS = (
     "(() => { const p = document.getElementById('discuss-panel').getBoundingClientRect(); "
     "const inside = (el) => { if (!el || el.hidden) return true; const r = el.getBoundingClientRect(); "
@@ -6097,6 +6109,14 @@ def _act_discuss_split_collapsed(driver: Driver) -> None:
     """Collapsed to its header row, then a new earlier summary arrives: the header says so
     and stays collapsed; a follow-up after it stands in the Latest block."""
     _act_discuss_split(driver)
+    # The reader's own collapse (on a phone's half sheet the timeline already stands collapsed
+    # by default beside the Latest pair: open it, then collapse it, so the choice is the reader's).
+    if driver.js("document.getElementById('discuss-timeline-section').getAttribute('data-collapsed')") == "true":
+        driver.click("discuss-timeline-fold")
+        driver.page.wait_for_function(
+            "() => document.getElementById('discuss-timeline-section').getAttribute('data-collapsed') === 'false'",
+            timeout=10_000,
+        )
     driver.click("discuss-timeline-fold")
     driver.page.wait_for_function(
         "() => document.getElementById('discuss-timeline-section').getAttribute('data-collapsed') === 'true'",
@@ -11054,6 +11074,7 @@ SCENES: tuple[Scene, ...] = (
              "&& document.querySelector('#discuss-latest > details.discuss-qa').open "
              "&& document.getElementById('discuss-latest').textContent.includes('When does it ship?')"),
             ("the timeline header counts its rows", "/· \\d+/.test(document.getElementById('discuss-timeline-count').textContent)"),
+            ("on a phone at least two lines of the Latest answer show", SPLIT_LATEST_LINES_JS),
             ("no fixture refusal is showing for Discuss",
              "!document.getElementById('discuss-panel').textContent.includes('not served by this check') "
              "&& !document.getElementById('discuss-panel').textContent.includes('not_found')"),
@@ -11114,6 +11135,7 @@ SCENES: tuple[Scene, ...] = (
              "return r.top >= p.top - 1 && r.bottom <= p.bottom + 1 && r.bottom <= vh + 1; }); })()"),
             ("composing on a phone, the Summarize bar stands aside",
              "document.querySelector('.discuss-ask').getBoundingClientRect().height === 0"),
+            ("at least two lines of the Latest answer show with the keyboard up", SPLIT_LATEST_LINES_JS),
             ("the Latest pair keeps a readable height inside the panel",
              "(() => { const p = document.getElementById('discuss-panel').getBoundingClientRect(); "
              "const l = document.getElementById('discuss-latest').getBoundingClientRect(); "

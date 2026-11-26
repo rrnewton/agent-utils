@@ -318,14 +318,16 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (px: number | null) => (px === null ? null : String(px)),
     refused: { value: null },
   } satisfies DeviceSetting<number | null>,
-  /** `#2263`. Whether the Discuss timeline stands collapsed to its one header row. Per device; a
-   * refused read is expanded. Collapsing never forgets the kept height. */
+  /** `#2263`. Whether the reader collapsed the Discuss timeline to its one header row ("1") or
+   * opened it ("0"); no entry is no choice yet, where the panel's default stands (collapsed on a
+   * phone's half sheet beside a Latest pair, open elsewhere). Per device; a refused read is no
+   * choice. Collapsing never forgets the kept height. */
   discussTimelineCollapsed: {
     key: "vibe-talk.voice.discuss-timeline-collapsed",
-    read: (raw: string | null) => raw === "1",
-    write: (collapsed: boolean) => (collapsed ? "1" : null),
-    refused: { value: false },
-  } satisfies DeviceSetting<boolean>,
+    read: (raw: string | null): boolean | null => (raw === "1" ? true : raw === "0" ? false : null),
+    write: (collapsed: boolean | null) => (collapsed === null ? null : collapsed ? "1" : "0"),
+    refused: { value: null },
+  } satisfies DeviceSetting<boolean | null>,
   /** `#1344 discuss-panel-resize` (owner reply 417). Whether the phone's Discuss sheet stands at
    * full height: half until the reader maximizes it, and the choice sticks across close/reopen.
    * Per device; a refused read is half. */

@@ -117,8 +117,8 @@ export interface TimelineSplitDependencies {
   maybe(id: string): HTMLElement | null;
   storedHeight?(): number | null;
   keepHeight?(px: number | null): void;
-  storedCollapsed?(): boolean;
-  keepCollapsed?(collapsed: boolean): void;
+  storedCollapsed?(): boolean | null;
+  keepCollapsed?(collapsed: boolean | null): void;
 }
 
 export interface TimelineSplit {
@@ -133,8 +133,10 @@ export interface TimelineSplit {
   drawHead(scope: string, rows: number, summaries: number): void;
   /** Take the timeline's reading row before a redraw; the returned call puts it back. */
   holdTimelineRow(scope: string): () => void;
-  /** Put the Latest block at its top when the pair shown is a new one. */
+  /** A new Latest pair lands on its answer's first text line; null: no Latest pair stands. */
   showLatest(key: string | null): void;
+  /** Restate the fold after the sheet or the layout changed (the half-sheet default). */
+  restate(): void;
   /** Wire the boundary (header drag, grip keys, fold button). */
   mount(listen: (el: HTMLElement, type: string, handler: (event: never) => void) => void): void;
 }
@@ -142,6 +144,13 @@ export interface TimelineSplit {
 export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSplit {
   let kept: number | null = null;
   let folded = false;
+  // The reader's own fold choice (null: none yet). Without one the default stands: collapsed
+  // on a phone's half sheet while a Latest pair stands there (the Latest pair has the room;
+  // liaison, 2026-11-25), open everywhere else.
+  let chosenFold: boolean | null = null;
+  // Where the Latest block was last put by `alignLatest`, so a resize re-aligns it only while
+  // the reader has not scrolled it since.
+  let latestAligned: number | null = null;
   // The scope the timeline was last drawn for: the first draw of a scope stands at its
   // newest end (next to Latest); every later draw keeps the reader's row.
   let drawnScope: string | null = null;
@@ -224,6 +233,23 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
     }
   }
 
+  /** Whether the panel stands as a phone's half sheet (the stylesheet's phone regime). */
+  function phoneHalf(): boolean {
+    const panel = el("discuss-panel");
+    if (panel === null || panel.getAttribute("data-sheet") !== "half") return false;
+    try {
+      const query = (globalThis as unknown as { matchMedia?: (q: string) => { matches: boolean } }).matchMedia;
+      if (typeof query !== "function") return false;
+      return !query("(min-width: 900px) and (pointer: fine)").matches;
+    } catch {
+      return false;
+    }
+  }
+
+  function defaultFold(): boolean {
+    return phoneHalf() && latestShown !== null;
+  }
+
   function drawHeadText(): void {
     const count = el("discuss-timeline-count");
     if (count !== null) count.textContent = headRows > 0 ? ` · ${headRows}` : "";
@@ -237,6 +263,24 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
   }
 
   function setCollapsed(collapsed: boolean, keep: boolean): void {
+    if (keep) chosenFold = collapsed;
+    showFold(collapsed);
+    if (keep) {
+      try {
+        deps.keepCollapsed?.(collapsed);
+      } catch {
+        // Storage refused: the fold holds until a reload.
+      }
+    }
+  }
+
+  /** The fold in force: the reader's choice, else the default for where the panel stands. */
+  function restate(): void {
+    const want = chosenFold ?? defaultFold();
+    if (want !== folded) showFold(want);
+  }
+
+  function showFold(collapsed: boolean): void {
     folded = collapsed;
     const section = el("discuss-timeline-section");
     if (section !== null) section.setAttribute("data-collapsed", collapsed ? "true" : "false");
@@ -251,18 +295,11 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
       if (bottomOnExpand) {
         bottomOnExpand = false;
         const box = el("discuss-timeline");
-        if (box !== null && typeof box.scrollHeight === "number") box.scrollTop = box.scrollHeight;
+        if (box !== null) alignNewest(box);
       }
     }
     drawHeadText();
     stateGrip();
-    if (keep) {
-      try {
-        deps.keepCollapsed?.(collapsed);
-      } catch {
-        // Storage refused: the fold holds until a reload.
-      }
-    }
   }
 
   function applyStored(): void {
@@ -273,13 +310,12 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
       px = null;
     }
     setHeight(px, false);
-    let c = false;
     try {
-      c = deps.storedCollapsed?.() ?? false;
+      chosenFold = deps.storedCollapsed?.() ?? null;
     } catch {
-      c = false;
+      chosenFold = null;
     }
-    setCollapsed(c, false);
+    showFold(chosenFold ?? defaultFold());
   }
 
   function drawHead(scope: string, rows: number, summaries: number): void {
@@ -294,6 +330,43 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
     stateGrip();
   }
 
+  function top(node: SplitElement): number | null {
+    if (typeof node.getBoundingClientRect !== "function") return null;
+    try {
+      return node.getBoundingClientRect().top;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The timeline's first draw (and its first opening): the newest history next to Latest, with a
+   * WHOLE row at the top: the newest row whose top the pane can scroll to, so no row stands
+   * with its first line cut off (liaison, 2026-11-25). With nothing measured, the foot.
+   */
+  function alignNewest(box: SplitElement): void {
+    const max = (box.scrollHeight ?? 0) - (box.clientHeight ?? 0);
+    const boxTop = top(box);
+    if (boxTop === null) {
+      if (typeof box.scrollHeight === "number") box.scrollTop = box.scrollHeight;
+      return;
+    }
+    if (max <= 0) {
+      box.scrollTop = 0;
+      return;
+    }
+    const base = box.scrollTop ?? 0;
+    let target = 0;
+    for (const row of Array.from((box.children ?? []) as ArrayLike<SplitElement>)) {
+      if (!row.getAttribute?.("data-entry-key")) continue;
+      const rowTop = top(row);
+      if (rowTop === null) continue;
+      const offset = rowTop - boxTop + base;
+      if (offset <= max + 0.5) target = offset;
+    }
+    box.scrollTop = Math.max(0, Math.round(target));
+  }
+
   function holdTimelineRow(scope: string): () => void {
     const box = el("discuss-timeline");
     const first = drawnScope !== scope;
@@ -301,21 +374,10 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
     if (box === null) return () => {};
     if (first) {
       return () => {
-        if (folded) {
-          bottomOnExpand = true;
-        } else if (typeof box.scrollHeight === "number") {
-          box.scrollTop = box.scrollHeight;
-        }
+        if (folded) bottomOnExpand = true;
+        else alignNewest(box);
       };
     }
-    const top = (node: SplitElement): number | null => {
-      if (typeof node.getBoundingClientRect !== "function") return null;
-      try {
-        return node.getBoundingClientRect().top;
-      } catch {
-        return null;
-      }
-    };
     const rows = (): SplitElement[] => Array.from((box.children ?? []) as ArrayLike<SplitElement>);
     // The folds the reader opened, per row and inside it: a redraw draws every row folded, and
     // a row that closed under the reader would move everything below it.
@@ -373,24 +435,51 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
   }
 
   /**
-   * A new pair stands with its answer's start in view (just under the pair's sticky header):
-   * the answer is what is new, and a short Latest block (a phone with its keyboard up) would
-   * otherwise show only the question just typed. A pair that fits whole shows whole.
+   * A new Latest pair lands on its answer's first text line, just under the pair's sticky
+   * header (which carries the question): the answer is what is new, and a short Latest block
+   * (a phone's half sheet, the keyboard up) would otherwise show the labels and the question
+   * just typed. The "Discuss" label scrolls off above; a pair that fits whole shows whole.
    */
-  function showLatest(key: string | null): void {
-    if (key === latestShown) return;
-    latestShown = key;
+  function alignLatest(): void {
     const box = el("discuss-latest");
     if (box === null) return;
     box.scrollTop = 0;
-    const answer = box.querySelector?.(".discuss-agent") as SplitElement | null | undefined;
+    latestAligned = 0;
+    const label = box.querySelector?.(".discuss-agent .discuss-turn-label") as SplitElement | null | undefined;
     const header = box.querySelector?.(".discuss-qa > summary") as SplitElement | null | undefined;
-    if (!answer || typeof answer.getBoundingClientRect !== "function" || typeof box.getBoundingClientRect !== "function") return;
+    if (!label || typeof label.getBoundingClientRect !== "function" || typeof box.getBoundingClientRect !== "function") return;
     try {
-      const offset = answer.getBoundingClientRect().top - box.getBoundingClientRect().top - (rectHeight(header ?? null) ?? 0);
-      if (offset > 0) box.scrollTop = offset;
+      const offset = label.getBoundingClientRect().bottom - box.getBoundingClientRect().top - (rectHeight(header ?? null) ?? 0);
+      if (offset > 0) box.scrollTop = Math.round(offset);
+      latestAligned = box.scrollTop ?? 0;
     } catch {
       // Nothing measured: the pair stands from its top.
+    }
+  }
+
+  function showLatest(key: string | null): void {
+    const changed = key !== latestShown;
+    latestShown = key;
+    restate();
+    if (changed && key !== null) alignLatest();
+    if (key === null) latestAligned = null;
+  }
+
+  /**
+   * The Latest block changes height when the keyboard comes or goes, or the panes move: put it
+   * back on the answer's first line, unless the reader scrolled it since it was put there.
+   */
+  function watchLatest(): void {
+    const box = el("discuss-latest");
+    const Observer = (globalThis as unknown as { ResizeObserver?: new (cb: () => void) => { observe(target: unknown): void } }).ResizeObserver;
+    if (box === null || typeof Observer !== "function") return;
+    try {
+      new Observer(() => {
+        if (latestAligned === null || box.hidden === true) return;
+        if (Math.abs((box.scrollTop ?? 0) - latestAligned) < 1) alignLatest();
+      }).observe(box);
+    } catch {
+      // No observer: the pair keeps where it was put.
     }
   }
 
@@ -465,6 +554,7 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
 
   function mount(listen: (el: HTMLElement, type: string, handler: (event: never) => void) => void): void {
     mountComposing(listen);
+    watchLatest();
     const head = deps.maybe("discuss-timeline-head");
     const fold = deps.maybe("discuss-timeline-fold");
     const grip = deps.maybe("discuss-split");
@@ -565,6 +655,7 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
     drawHead,
     holdTimelineRow,
     showLatest,
+    restate,
     mount,
   };
 }

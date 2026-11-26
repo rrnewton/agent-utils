@@ -167,6 +167,35 @@ GEOMETRY = """() => {
   return out;
 }"""
 
+# How much of the Latest answer's own text shows: the part of the answer below its "Discuss"
+# label and below the pair's sticky header, inside the block, in lines of the answer's text.
+LATEST_LINES = """() => {
+  const box = document.getElementById('discuss-latest');
+  if (!box || box.hidden) return null;
+  const b = box.getBoundingClientRect();
+  const head = box.querySelector('.discuss-qa > summary').getBoundingClientRect();
+  const agent = box.querySelector('.discuss-agent');
+  const label = agent.querySelector('.discuss-turn-label');
+  const textTop = label.getBoundingClientRect().bottom;
+  const top = Math.max(head.bottom, textTop, b.top);
+  const bottom = Math.min(b.bottom, agent.getBoundingClientRect().bottom);
+  const line = agent.querySelector('li') || agent;
+  const cs = getComputedStyle(line);
+  let lh = parseFloat(cs.lineHeight);
+  if (!isFinite(lh)) lh = 1.2 * parseFloat(cs.fontSize);
+  return { visible: bottom - top, lineHeight: lh, lines: (bottom - top) / lh,
+           labelOff: label.getBoundingClientRect().bottom <= head.bottom + 1,
+           question: box.querySelector('.discuss-qa > summary').textContent };
+}"""
+
+# Whether the timeline's top row stands whole (no first line cut off at the pane's top).
+TOP_ROW_WHOLE = """() => {
+  const t = document.getElementById('discuss-timeline');
+  const b = t.getBoundingClientRect();
+  const row = [...t.children].find((r) => r.getBoundingClientRect().bottom > b.top + 1);
+  return !row || row.getBoundingClientRect().top >= b.top - 1;
+}"""
+
 PANES_FIT = """() => {
   const panel = document.getElementById('discuss-panel');
   const p = panel.getBoundingClientRect();
@@ -285,6 +314,16 @@ class Walk:
             held)
         check(value is not None, f"{self.tag}: the summary row being read is gone: {held}")
         return float(value)
+
+    def latest_lines(self, what: str, question: str) -> None:
+        """Liaison: at least two lines of the answer's own text show in Latest, the question
+        stays in its header, and its "Discuss" label has scrolled off above."""
+        state = self.page.evaluate(LATEST_LINES)
+        check(state is not None, f"{self.tag}: {what}: no Latest pair")
+        self.sidecar[f"latest_lines_{what.replace(' ', '_')}"] = state
+        check(float(state["lines"]) >= 2, f"{self.tag}: {what}: under two lines of the answer show in Latest: {state}")
+        check(question in str(state["question"]), f"{self.tag}: {what}: the Latest header lost the question: {state}")
+        check(bool(state["labelOff"]), f"{self.tag}: {what}: Latest did not land on the answer's first line: {state}")
 
     def kept(self) -> object:
         return self.page.evaluate(f"localStorage.getItem({json.dumps(HEIGHT_KEY)})")
@@ -494,6 +533,7 @@ class Walk:
             " return { latest: l.height, composerIn: f.bottom <= vh + 1 && s.bottom <= vh + 1 && f.top >= p.top,"
             "  askHidden: document.querySelector('.discuss-ask').getBoundingClientRect().height === 0 }; })()")
         check(state["latest"] >= 40, f"{self.tag}: keyboard up: the Latest pair has no room: {state}")
+        self.latest_lines("keyboard up", "Is anything blocked?")
         check(state["composerIn"], f"{self.tag}: keyboard up: the composer is not whole in view: {state}")
         check(state["askHidden"], f"{self.tag}: keyboard up: the Summarize bar still takes the room: {state}")
         self.latest_scrolls_to_end("keyboard up")
@@ -513,22 +553,37 @@ def walk(page: Page, phone: bool, shots: Path | None, tag: str) -> None:
         drive.ask("Who reviews the fix?")
         drive.ask("When does it ship?")
         drive.fits("the default panel")
+        if phone:
+            # The phone's half sheet: a Latest pair stands, so the timeline is collapsed by
+            # default (no choice kept) and the answer has the room.
+            check(page.evaluate("document.getElementById('discuss-timeline-section').getAttribute('data-collapsed')") == "true"
+                  and page.evaluate(f"localStorage.getItem({json.dumps(COLLAPSED_KEY)})") is None,
+                  f"{tag}: the half sheet did not collapse the timeline by default beside a Latest pair")
+            drive.latest_lines("half sheet default", "When does it ship?")
         check(int(page.evaluate("document.querySelectorAll('#discuss-timeline > details').length")) == 3,
               f"{tag}: the timeline does not hold the pair, the earlier summary and the pair before Latest")
         check(page.evaluate("document.querySelector('#discuss-latest > details').open"), f"{tag}: Latest is not open")
         drive.latest_scrolls_to_end("default")
         drive.shot("default")
-        # The roomy layout for the boundary: the desk's docked column, the phone's full sheet.
+        # The roomy layout for the boundary: the desk's docked column, the phone's full sheet,
+        # where the timeline stands open by default with a whole row at its top.
         page.click("#discuss-dock-toggle" if not phone else "#discuss-full-toggle")
         page.wait_for_function(
             "() => document.getElementById('screen-main').getAttribute('data-discuss') === 'docked'" if not phone else
             "() => document.getElementById('discuss-panel').getAttribute('data-sheet') === 'full'")
+        page.wait_for_function(
+            "() => document.getElementById('discuss-timeline-section').getAttribute('data-collapsed') === 'false'")
+        check(bool(page.evaluate(TOP_ROW_WHOLE)), f"{tag}: the timeline's top row stands with its first line cut off")
         drive.boundary()
         drive.keys()
         drive.collapse_and_hint()
         if phone:
             page.click("#discuss-full-toggle")
             page.wait_for_function("() => document.getElementById('discuss-panel').getAttribute('data-sheet') === 'half'")
+            # The reader opened the timeline above: that choice wins on the half sheet too.
+            check(page.evaluate("document.getElementById('discuss-timeline-section').getAttribute('data-collapsed')") == "false"
+                  and page.evaluate(f"localStorage.getItem({json.dumps(COLLAPSED_KEY)})") == "0",
+                  f"{tag}: the reader's open timeline did not stay open on the half sheet")
             drive.fits("the half sheet")
             drive.composing_blur()
             drive.keyboard_open()

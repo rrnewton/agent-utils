@@ -1777,6 +1777,29 @@ stay its owner's (#1524). The pane itself already ends above the
   background: var(--panel);
 }
 
+/* Its one line keeps the question in view (the block stands on the answer's first line). */
+#discuss-latest > .discuss-qa > summary > .discuss-collapsible-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A follow-up answer's own headings read as part of the answer, not as page headings: at
+ * the browser's h2 size the first one alone filled a short Latest block. */
+.discuss-qa-body h1,
+.discuss-qa-body h2,
+.discuss-qa-body h3,
+.discuss-qa-body h4 {
+  margin: 0.35rem 0 0.15rem;
+  font-size: 1.05rem;
+  line-height: 1.3;
+}
+
+.discuss-qa-body ul,
+.discuss-qa-body ol {
+  margin: 0.2rem 0;
+}
+
 /* An open summary search shrinks the summary pane rather than push the composer out. */
 #discuss-panel > #discuss-search:not([hidden]) {
   flex: 0 1000 auto;
@@ -1812,6 +1835,15 @@ stay its owner's (#1524). The pane itself already ends above the
 
   #screen-main:not([data-discuss]) > #discuss-panel > #discuss-search:not([hidden]) {
     max-height: calc((100vh - 6rem) * 0.4);
+  }
+}
+
+/* A phone's half sheet with a Latest pair: the Latest pair has the room (liaison), so the
+ * summary may go down to its header row there (the timeline's default there is collapsed,
+ * view/catchup/split.ts). Not with the keyboard up, where the short-pane rules below hold. */
+@media (not ((min-width: 900px) and (pointer: fine))) and (min-height: 601px) {
+  #discuss-panel[data-sheet="half"]:has(> #discuss-latest:not([hidden])) > #discuss-current-section {
+    min-height: 2.75rem;
   }
 }
 

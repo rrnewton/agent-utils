@@ -3240,7 +3240,7 @@ test("split: a record ending on a follow-up draws that pair open in Latest and t
     assert.equal(latest.children.length, 1);
     const pair = latest.children[0];
     assert.equal(pair.open, true, "the Latest pair is not open");
-    assert.match(pair.children[0].textContent, /^Latest follow-up · /);
+    assert.match(pair.children[0].textContent, /^Latest .* — newest question$/, "the Latest header does not carry the question");
     assert.match(pair.children[1].textContent, /You\s*newest question/);
     assert.match(pair.children[1].textContent, /Discuss\s*newest answer/);
     const rows = [...fx.els["discuss-timeline"].children];
@@ -3264,4 +3264,43 @@ test("split: a record ending on a follow-up draws that pair open in Latest and t
     assert.equal(latest.hidden, true, "Latest still stands after a summary");
     assert.equal(fx.els["discuss-timeline"].children.length, 4);
   } finally { fx.restore(); }
+});
+
+test("split: on a phone's half sheet a Latest pair collapses the timeline by default; the reader's own choice wins and is kept (#2263)", () => {
+  const savedMatch = globalThis.matchMedia;
+  globalThis.matchMedia = () => ({ matches: false });
+  try {
+    const fx = splitFixture({ collapsed: null });
+    fx.els["discuss-panel"].setAttribute("data-sheet", "half");
+    fx.split.applyStored();
+    fx.split.showLatest(null);
+    assert.equal(fx.split.collapsed(), false, "no Latest pair, yet the timeline collapsed");
+    fx.split.showLatest("turn:1:you");
+    assert.equal(fx.split.collapsed(), true, "a Latest pair on the half sheet did not collapse the timeline");
+    assert.deepEqual(fx.kept.collapsedKeeps, [], "the default was kept as if it were the reader's choice");
+    // The full sheet keeps the open default; back on the half sheet it collapses again.
+    fx.els["discuss-panel"].setAttribute("data-sheet", "full");
+    fx.split.restate();
+    assert.equal(fx.split.collapsed(), false, "the full sheet collapsed the timeline by default");
+    fx.els["discuss-panel"].setAttribute("data-sheet", "half");
+    fx.split.restate();
+    assert.equal(fx.split.collapsed(), true);
+    // The reader opens it: that wins, is kept, and survives the next Latest pair and a reload.
+    fx.split.setCollapsed(false, true);
+    fx.split.showLatest("turn:2:you");
+    assert.equal(fx.split.collapsed(), false, "a new Latest pair overrode the reader's choice");
+    assert.deepEqual(fx.kept.collapsedKeeps, [false]);
+    fx.split.applyStored();
+    assert.equal(fx.split.collapsed(), false, "the reader's choice did not survive a reload");
+    // A desk (the stylesheet's desk regime) never takes the half-sheet default.
+    globalThis.matchMedia = () => ({ matches: true });
+    const desk = splitFixture({ collapsed: null });
+    desk.els["discuss-panel"].setAttribute("data-sheet", "half");
+    desk.split.applyStored();
+    desk.split.showLatest("turn:1:you");
+    assert.equal(desk.split.collapsed(), false, "a desk took the phone's half-sheet default");
+  } finally {
+    if (savedMatch === undefined) delete globalThis.matchMedia;
+    else globalThis.matchMedia = savedMatch;
+  }
 });

@@ -158,7 +158,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["discussDockedHeight", "vibe-talk.voice.discuss-docked-height", 50, [[65, "65"], [20, "20"]], 50],
     // `#2263 vibe-talk-discuss-split-pane`: the timeline pane's kept px (null: the default share) and fold.
     ["discussTimelineHeight", "vibe-talk.voice.discuss-timeline-height", null, [[180, "180"], [48, "48"], [null, null]], null],
-    ["discussTimelineCollapsed", "vibe-talk.voice.discuss-timeline-collapsed", false, [[true, "1"], [false, null]], false],
+    ["discussTimelineCollapsed", "vibe-talk.voice.discuss-timeline-collapsed", null, [[true, "1"], [false, "0"], [null, null]], null],
     ["discussFolds", "vibe-talk.voice.discuss-folds", null, [[{ record: "chan-1||1700000000000", open: ["Beta"] }, "{\"record\":\"chan-1||1700000000000\",\"open\":[\"Beta\"]}"], [null, null]], null],
     ["discussPanel", "vibe-talk.voice.discuss-panel", null, [[{ open: true, channelId: "chan-1", threadId: null, view: "flat" }, "{\"open\":true,\"channelId\":\"chan-1\",\"threadId\":null,\"view\":\"flat\"}"], [{ open: false, channelId: "chan-1", threadId: "t9", view: "main" }, "{\"open\":false,\"channelId\":\"chan-1\",\"threadId\":\"t9\",\"view\":\"main\"}"], [null, null]], null],
     ["discussCoverage", "vibe-talk.voice.discuss-coverage", {}, [[{ "chan-1:main": { ranges: [{ start: 100, end: 200 }] } }, "{\"chan-1:main\":{\"ranges\":[{\"start\":100,\"end\":200}]}}"]], {}],

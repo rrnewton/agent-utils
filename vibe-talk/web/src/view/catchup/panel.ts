@@ -180,13 +180,14 @@ export interface DiscussPanelDependencies {
   keepMode?(mode: DiscussLayoutMode): void;
   /**
    * `#2263 vibe-talk-discuss-split-pane`. The timeline pane's kept height (CSS px; null is
-   * the stylesheet's default share) and whether it stands collapsed, as last left on this
-   * device. Absent in a host that keeps nothing, where the choices last the session.
+   * the stylesheet's default share) and whether the reader collapsed it (null: no choice yet,
+   * the panel's default stands), as last left on this device. Absent in a host that keeps
+   * nothing, where the choices last the session.
    */
   storedTimelineHeight?(): number | null;
   keepTimelineHeight?(px: number | null): void;
-  storedTimelineCollapsed?(): boolean;
-  keepTimelineCollapsed?(collapsed: boolean): void;
+  storedTimelineCollapsed?(): boolean | null;
+  keepTimelineCollapsed?(collapsed: boolean | null): void;
   /**
    * `#1497 discuss-fold-state-persist`. The one kept fold entry on this device
    * and its keep, handed in where the page keeps them (the device settings, as
@@ -1317,6 +1318,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     sheetFull = full;
     panel().setAttribute("data-sheet", full ? "full" : "half");
     drawHeaderToggles();
+    // `#2263`: the timeline's default fold differs on a phone's half sheet.
+    split.restate();
     if (keep) {
       try {
         deps.keepSheetFull?.(full);
@@ -1819,13 +1822,14 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     label.className = "discuss-collapsible-label";
     // `#2137`: the folded header carries the verbatim question, so the
     // pair can be told apart from a summary without opening it. `#2263`: the
-    // Latest pair stands open, its question right below, so its header is one
-    // short line.
-    label.textContent = latest
-      ? `Latest follow-up · ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"}`
-      : opening !== undefined && opening.kind === "turn" && opening.speaker === "you" && opening.text !== ""
-        ? `Follow-up question ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"} — ${opening.text}`
-        : `Follow-up question ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"}`;
+    // Latest pair's header is one sticky line that keeps the question in view
+    // while the block stands on the answer's first line.
+    const name = latest ? "Latest" : "Follow-up question";
+    const asked = opening !== undefined && opening.kind === "turn" && opening.speaker === "you" ? opening.text : "";
+    label.textContent = asked !== ""
+      ? `${name} ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"} — ${asked}`
+      : `${name} ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"}`;
+    if (latest) label.setAttribute("title", label.textContent);
     summary.appendChild(label);
     details.appendChild(summary);
     const body = document.createElement("div");

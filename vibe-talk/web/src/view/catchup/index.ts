@@ -190,8 +190,8 @@ export interface DiscussViewDependencies {
   /** `#2263 vibe-talk-discuss-split-pane`. The timeline pane's kept height and collapse, forwarded to the panel. */
   storedTimelineHeight?(): number | null;
   keepTimelineHeight?(px: number | null): void;
-  storedTimelineCollapsed?(): boolean;
-  keepTimelineCollapsed?(collapsed: boolean): void;
+  storedTimelineCollapsed?(): boolean | null;
+  keepTimelineCollapsed?(collapsed: boolean | null): void;
   /** `#1497 discuss-fold-state-persist`. The kept Discuss folds, forwarded to the panel. */
   storedFolds?(): DiscussFoldState | null;
   keepFolds?(state: DiscussFoldState): void;
