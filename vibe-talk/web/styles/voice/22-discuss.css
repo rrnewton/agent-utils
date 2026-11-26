@@ -977,7 +977,7 @@
     width: calc((100% - var(--channel-pane-end)) / 2 - 1.2rem);
   }
 
-  body:has(#screen-main[data-discuss="docked"][data-columns="two"]:not([hidden])) #status-line {
+  :root[data-discuss="docked"][data-screen="main"] #frame-body[data-columns="two"] #status-line {
     inset-inline-end: calc(50% + var(--channel-pane-end) / 2);
   }
 

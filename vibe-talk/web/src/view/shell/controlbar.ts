@@ -228,6 +228,14 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     // open, and over the channel only: a pin is a channel message, and the call's transcript
     // has none to filter to. Its panel goes with the button.
     deps.el("labels-button").hidden = deps.el("search-field").hidden || deps.view() !== "discord";
+    // `#2283 vibe-talk-root-has-rules`. The same fact on the screen, beside the button's
+    // own `hidden`: the searching layout reads it there instead of re-searching the
+    // screen for the button on every toggle.
+    try {
+      deps.el("screen-main").toggleAttribute("data-labels", !deps.el("labels-button").hidden);
+    } catch {
+      // A host without the screen keeps the button's own drawing.
+    }
     if (deps.el("labels-button").hidden) deps.el("labels-panel").hidden = true;
     // `#211 link-filter`. Beside Pinned while the bar is open, and over the call view as well: it
     // filters what the search filters, and a turn can hold a link as a channel message can.

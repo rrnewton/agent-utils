@@ -98,6 +98,13 @@ export function createSearchOpenControl(deps: SearchOpenDependencies): SearchOpe
     deps.holdingReader(() => {
       if (open) deps.el("screen-main").setAttribute("data-searching", "");
       else deps.el("screen-main").removeAttribute("data-searching");
+      // `#2283 vibe-talk-root-has-rules`. The same fact on the frame, for the status
+      // pill's raise, which stands outside the screen it used to search for this.
+      try {
+        deps.el("frame-body").toggleAttribute("data-searching", open);
+      } catch {
+        // A host without the frame keeps the screen's own mark.
+      }
     });
     deps.renderControlBar();
     // The pill shares the line the bar grows along, and gives way to it.

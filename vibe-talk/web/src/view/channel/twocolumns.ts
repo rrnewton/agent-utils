@@ -472,6 +472,15 @@ export function createTwoColumns(deps: TwoColumnsDependencies): TwoColumns {
     if (screen.getAttribute("data-columns") !== want) {
       if (want) screen.setAttribute("data-columns", want);
       else screen.removeAttribute("data-columns");
+      // `#2283 vibe-talk-root-has-rules`. The same fact on the frame, for the status
+      // pill's offset in two columns, which stands outside the screen.
+      try {
+        const frame = deps.leftEl("frame-body");
+        if (want) frame.setAttribute("data-columns", want);
+        else frame.removeAttribute("data-columns");
+      } catch {
+        // A host without the frame keeps the screen's own mark.
+      }
     }
     // The call's view is one list. Two columns, or the thread list, wait behind it, as they were.
     if (deps.view() === "discord") {

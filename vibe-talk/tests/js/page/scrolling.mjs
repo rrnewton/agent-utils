@@ -2839,7 +2839,7 @@ test("the jump is the FIRST thing in the chip row, drawn at its left end with th
   // takes the auto margin from the jump beside it, so the two stand together at the left.
   const afterNewest = tools.slice(tools.indexOf("</button>") + "</button>".length);
   assert.equal(/\bid="([^"]+)"/.exec(afterNewest)[1], "jump-bookmark", "the bookmark's jump is not the next chip after Newest");
-  assert.match(cssBlock("#jump-newest:has(+ #jump-bookmark:not([hidden]))"), /margin-inline-end:\s*0/);
+  assert.match(cssBlock("#scroll-tools[data-bookmark] #jump-newest"), /margin-inline-end:\s*0/);
   assert.match(cssBlock("#jump-bookmark"), /margin-inline-end:\s*auto/);
   assert.match(cssBlock("#jump-bookmark::after"), /inset:\s*min\(0px,\s*calc\(\(100% - 2\.75rem\) \/ 2\)\)/);
   assert.match(cssBlock('#jump-bookmark[data-direction="down"] .bookmark-arrow'), /rotate\(180deg\)/);

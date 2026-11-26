@@ -396,7 +396,7 @@
    reader's row +23 px until the answer stood the chips again. Settled with no chip the
    reservation is released under the scroll owner's hold and the signpost returns in the same
    mutation, exactly where it stood before. */
-#screen-main:has(> #channel-freshness-anchor .search-bucket-chip:not([hidden])) #search-screen-sep,
+#screen-main[data-buckets] #search-screen-sep,
 #screen-main[data-searching][data-bucket-head] #search-screen-sep {
   display: none;
 }

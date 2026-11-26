@@ -1914,6 +1914,13 @@ function placePostCard() {
   else card.removeAttribute("data-screen");
   markCardBesideReply();
   card.hidden = !shown || place === "none";
+  // `#2283 vibe-talk-root-has-rules`. The card standing in the channel's pane, on the
+  // frame beside the card's own `hidden` and place, for the status pill's raise.
+  try {
+    deps.leftEl("frame-body").toggleAttribute("data-post-card", shown && place === "channel");
+  } catch {
+    // A host without the frame keeps the card's own drawing.
+  }
   if (moving) deps.cardMovedUnderLists(deps.heightUnderLists() - under);
   holdDraftRoom(shown);
   if (coming) deps.cardCameUnderLists(gap);

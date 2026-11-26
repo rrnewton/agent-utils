@@ -48,7 +48,7 @@
    collapsed line itself (`Search the server`, #server-line) is a control at the
    foot too, and the pill centred on the pane covered its label, so the wait
    covers the whole section while it stands. */
-#frame-body:has(#server-search:not([hidden])) #status-line {
+#frame-body[data-server-search] #status-line {
   visibility: hidden;
 }
 

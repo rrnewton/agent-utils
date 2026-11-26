@@ -2779,3 +2779,104 @@ test("`#2277 vibe-talk-key-scroll-freezes-11-26`: every var() of a geometry prop
   assert.ok(checked > 20, `the census read only ${checked} declarations: the walk is broken`);
   assert.deepStrictEqual(offenders, [], "a rule reads or sets a geometry property on an element the page does not write it on");
 });
+
+test("`#2283 vibe-talk-root-has-rules`: no :has() anchored at the root, the body or the main frame looks past a direct child", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const styles = join(import.meta.dirname, "../../../web/styles");
+  const manifest = JSON.parse(readFileSync(join(styles, "voice.json"), "utf8"));
+  const css = manifest.parts.map((part) => readFileSync(join(styles, part), "utf8")).join("\n").replace(/\/\*[\s\S]*?\*\//g, " ");
+  const HIGH = new Set([":root", "html", "body", "#frame-body", "#screen-main", "#dock"]);
+  /** A selector list (or a :has argument list) split at its top-level commas. */
+  const splitTop = (list) => {
+    const parts = [];
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i] === "(" || list[i] === "[") depth += 1;
+      else if (list[i] === ")" || list[i] === "]") depth -= 1;
+      else if (list[i] === "," && depth === 0) { parts.push(list.slice(start, i)); start = i + 1; }
+    }
+    parts.push(list.slice(start));
+    return parts.map((one) => one.trim()).filter(Boolean);
+  };
+  /** The text inside the parentheses opening at `open`, and where they close. */
+  const balanced = (text, open) => {
+    let depth = 0;
+    for (let i = open; i < text.length; i++) {
+      if (text[i] === "(") depth += 1;
+      else if (text[i] === ")") { depth -= 1; if (depth === 0) return [text.slice(open + 1, i), i]; }
+    }
+    return [text.slice(open + 1), text.length];
+  };
+  /** The compound carrying the :has at `at` (the element before a wrapping :not, where there is one). */
+  const anchorOf = (selector, at) => {
+    let end = at;
+    const head = selector.slice(0, at).trimEnd();
+    if (head.endsWith(":not(")) end = head.length - ":not(".length;
+    let i = end - 1;
+    let depth = 0;
+    while (i >= 0) {
+      const ch = selector[i];
+      if (ch === ")" || ch === "]") depth += 1;
+      else if (ch === "(" || ch === "[") { depth -= 1; if (depth < 0) break; }
+      else if (depth === 0 && (ch === " " || ch === ">" || ch === "+" || ch === "~" || ch === ",")) break;
+      i -= 1;
+    }
+    return selector.slice(i + 1, end).trim();
+  };
+  /** The anchor's element part: its id, :root, or its tag, with classes, attributes and pseudos off. */
+  const baseOf = (anchor) => {
+    if (anchor.includes(":root")) return ":root";
+    const id = /#([\w-]+)/.exec(anchor);
+    if (id) return `#${id[1]}`;
+    const tag = /^([a-zA-Z][\w-]*)/.exec(anchor);
+    return tag ? tag[1] : anchor;
+  };
+  /** One :has alternative is a direct child only: `> compound`, nothing past it. */
+  const isDirectChild = (alternative) => {
+    const one = alternative.trim();
+    if (!one.startsWith(">")) return false;
+    const rest = one.slice(1).trim();
+    let depth = 0;
+    for (let i = 0; i < rest.length; i++) {
+      const ch = rest[i];
+      if (ch === "(" || ch === "[") depth += 1;
+      else if (ch === ")" || ch === "]") depth -= 1;
+      else if (depth === 0 && (ch === " " || ch === ">" || ch === "+" || ch === "~")) return false;
+    }
+    return rest.length > 0;
+  };
+  const offenders = [];
+  let scanned = 0;
+  const walk = (text) => {
+    let i = 0;
+    while (i < text.length) {
+      const open = text.indexOf("{", i);
+      if (open < 0) break;
+      const head = text.slice(i, open).trim();
+      let depth = 1;
+      let j = open + 1;
+      while (j < text.length && depth > 0) { if (text[j] === "{") depth += 1; else if (text[j] === "}") depth -= 1; j++; }
+      const body = text.slice(open + 1, j - 1);
+      if (head.startsWith("@media") || head.startsWith("@supports") || head.startsWith("@layer") || head.startsWith("@container")) walk(body);
+      else if (!head.startsWith("@") && head.includes(":has(")) {
+        for (const selector of splitTop(head)) {
+          let at = selector.indexOf(":has(");
+          while (at >= 0) {
+            scanned += 1;
+            const [arg, close] = balanced(selector, at + 4);
+            if (HIGH.has(baseOf(anchorOf(selector, at))) && !splitTop(arg).every(isDirectChild)) {
+              offenders.push(selector);
+            }
+            at = selector.indexOf(":has(", close + 1);
+          }
+        }
+      }
+      i = j;
+    }
+  };
+  walk(css);
+  assert.ok(scanned > 50, `the walk read only ${scanned} :has() rules: it is broken`);
+  assert.deepStrictEqual(offenders, [], "a root-anchored :has() searches past a direct child: name the state on its anchor from its one owner instead (#2283)");
+});

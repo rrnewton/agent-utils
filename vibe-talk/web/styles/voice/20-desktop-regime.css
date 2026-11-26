@@ -1200,7 +1200,7 @@
   }
 
   /* The transient status speaks over the left column, where its chips are, not across the divider. */
-  body:has(#screen-main[data-columns="two"]:not([hidden])) #status-line {
+  :root[data-screen="main"] #frame-body[data-columns="two"] #status-line {
     inset-inline: 0 50%;
   }
 

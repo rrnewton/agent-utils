@@ -377,6 +377,13 @@ export function createReadingBookmark(deps: ReadingBookmarkDependencies): Readin
       }
     }
     if (chip.hidden === (direction !== null)) chip.hidden = direction === null;
+    // `#2283 vibe-talk-root-has-rules`. The chip standing, on its row beside its own
+    // `hidden`: Newest's corner reads the row's mark instead of its next sibling.
+    try {
+      leftEl("scroll-tools").toggleAttribute("data-bookmark", direction !== null);
+    } catch {
+      // A host without the row keeps the chip's own drawing.
+    }
     if (direction === null) return;
     if (chip.getAttribute("data-direction") !== direction) {
       chip.setAttribute("data-direction", direction);

@@ -1115,6 +1115,13 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     (list.parentNode as HTMLElement).append(mount);
     mount.append(deps.leftEl("reply-compose"));
     mount.hidden = false;
+    // `#2283 vibe-talk-root-has-rules`. A reply open in the stream, on the frame beside
+    // the mount's own `hidden`, for the status pill's raise.
+    try {
+      deps.leftEl("frame-body").setAttribute("data-reply-open", "");
+    } catch {
+      // A host without the frame keeps the mount's own drawing.
+    }
     // One box on the page: the columns' own boxes, both, while the reply's is open.
     for (const id of ["channel-composer", "side-composer"]) deps.leftEl(id).hidden = true;
     renderReplyingMarks();
@@ -1220,6 +1227,11 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     replyState.docked = false;
     replyState.focusTaken = false;
     for (const id of ["column-reply", "side-reply"]) deps.leftEl(id).hidden = true;
+    try {
+      deps.leftEl("frame-body").removeAttribute("data-reply-open");
+    } catch {
+      // A host without the frame keeps the mounts' own drawing.
+    }
     // Home, out of sight: the left column's place, hidden.
     deps.leftEl("column-reply").append(deps.leftEl("reply-compose"));
     // The right column's place goes home from over the cards.

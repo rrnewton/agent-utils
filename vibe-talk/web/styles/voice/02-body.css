@@ -1203,7 +1203,7 @@
    foot are all as they always were, and no Send measured against them moves. The raise is
    not kept while a draft's card stands in the pane or the search bar is open, where the
    pill's ordinary standing is measured against controls of its own. */
-#frame-body:has(#pane-discord:not([hidden])):not(:has(#pane-discord > #post-confirm:not([hidden]))):not(:has(#screen-main[data-searching])):not(:has(#column-reply:not([hidden]))):not(:has(#side-reply:not([hidden]))) #status-line {
+:root[data-pane="discord"] #frame-body:not([data-post-card]):not([data-searching]):not([data-reply-open]) #status-line {
   translate: 0 -2.4rem;
 }
 

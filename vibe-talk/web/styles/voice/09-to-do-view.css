@@ -485,7 +485,7 @@ li[data-labels-below] > .meta > .label-chips {
 /* `#240 reading-bookmark`. The jump to the bookmark stands DIRECTLY RIGHT of the jump to the newest
    message, the pair a reader goes between, so while it is up it takes the auto margin and the jump
    beside it gives it up. In the accent, as the line it goes to is; its arrow points toward it. */
-#jump-newest:has(+ #jump-bookmark:not([hidden])) {
+#scroll-tools[data-bookmark] #jump-newest {
   margin-inline-end: 0;
 }
 
@@ -1499,7 +1499,7 @@ li[data-labels-below] > .meta > .label-chips {
 
 /* The two-row phone bar is taller: the chips stand under its foot. */
 @media (max-width: 480px) {
-  #screen-main[data-searching]:has(> #channel-freshness-anchor #search-float > #labels-button:not([hidden])) #search-bucket-row:not([hidden]) {
+  #screen-main[data-searching][data-labels] #search-bucket-row:not([hidden]) {
     top: calc(var(--search-bar) / 2 + var(--toggle-hit) + 11px);
   }
 }
@@ -1511,7 +1511,7 @@ li[data-labels-below] > .meta > .label-chips {
 }
 
 @media (max-width: 480px) {
-  #screen-main[data-link-kinds][data-searching]:has(> #channel-freshness-anchor #search-float > #labels-button:not([hidden])) #search-bucket-row:not([hidden]) {
+  #screen-main[data-link-kinds][data-searching][data-labels] #search-bucket-row:not([hidden]) {
     top: calc(var(--search-bar) / 2 + 2 * var(--toggle-hit) + 14px);
   }
 }
@@ -1573,7 +1573,7 @@ li[data-labels-below] > .meta > .label-chips {
    bar also stands: the two-row bar's second row is its room too, so its
    chips (Unpack, Main, order) stay tappable under it. */
 @media (max-width: 480px) {
-  #screen-main[data-searching]:has(#labels-button:not([hidden])) #side-heading {
+  #screen-main[data-searching][data-labels] #side-heading {
     margin-top: calc(var(--toggle-hit) + 7px);
   }
 }
@@ -1818,7 +1818,7 @@ li[data-labels-below] > .meta > .label-chips {
    above (the kinds row, and the narrow phone's author disc under it or the
    kinds) starts from that foot, not the one-line bar's. */
 @media (max-width: 480px) {
-  #screen-main[data-searching][data-link-kinds]:has(#labels-button:not([hidden])) #scroll-area {
+  #screen-main[data-searching][data-link-kinds][data-labels] #scroll-area {
     --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 7px + var(--kinds-gap) + var(--toggle-hit));
   }
 }
@@ -1828,7 +1828,7 @@ li[data-labels-below] > .meta > .label-chips {
     --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 7px + var(--kinds-gap) + var(--toggle-hit));
   }
 
-  #screen-main[data-searching][data-link-kinds]:has(#labels-button:not([hidden])) #scroll-area {
+  #screen-main[data-searching][data-link-kinds][data-labels] #scroll-area {
     --hang-foot: calc(var(--float-line) + var(--search-bar) / 2 + var(--toggle-hit) + 7px + 2 * (var(--kinds-gap) + var(--toggle-hit)));
   }
 }

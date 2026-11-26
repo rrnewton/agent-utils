@@ -2752,7 +2752,7 @@ test("`#605 server-side-search`: a pause in the typing searches the server's cop
   assert.equal(page.el("server-detail").hidden, true);
   // `#1813`: while the section stands at the foot, the status pill waits rather
   // than cover the collapsed line's label (the wait `#1786` gave its details).
-  assert.match(cssBlock("#frame-body:has(#server-search:not([hidden])) #status-line"), /visibility:\s*hidden/,
+  assert.match(cssBlock("#frame-body[data-server-search] #status-line"), /visibility:\s*hidden/,
     "the status pill still covers the Search the server line");
   assert.deepStrictEqual(page.el("server-hits").children, [], "a snippet was drawn at the foot");
   const placed = page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit"));

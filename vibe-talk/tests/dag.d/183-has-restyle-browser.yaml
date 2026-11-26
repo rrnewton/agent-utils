@@ -1,0 +1,16 @@
+steps:
+  - group: check
+    job: has-restyle-browser
+    desc: a small show or hide restyles only its neighbourhood (#2283) — one hidden toggle of each control the page toggles while typing and scrolling, and the page's own typing and scroll passes, counted from the trace's style-recalc element counts (never wall time) in current Chromium at 412x915 by touch and 1280x800 with 260 rows
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/has_restyle_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

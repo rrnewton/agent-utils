@@ -861,9 +861,17 @@ function reserveHeadRoom(loadedHits: number): void {
 /** `#1913`: take the bucket chips down while a new query's answer is pending, so the previous
  * query's counts never stand for the words now in the field. One hidden write per chip; the
  * fresh counts are drawn by `renderServerSearch` when the debounced answer lands. */
+/** `#2283 vibe-talk-root-has-rules`. Any bucket chip standing, named on the screen beside
+ * the row's own `hidden` writes (its only writers, here): the separator's rule reads it
+ * there instead of re-searching the freshness anchor for a chip on every toggle. */
+function markBuckets(on: boolean): void {
+  el("screen-main").toggleAttribute("data-buckets", on);
+}
+
 function hideBucketChips(): void {
   const row = el("search-bucket-row");
   if (!row.hidden) row.hidden = true;
+  markBuckets(false);
   for (const def of searchBucketDefs) {
     const chip = bucketChip(def.id);
     if (!chip) continue;
@@ -1478,6 +1486,9 @@ function renderServerSearch() {
   const serverSearch = serverSearchNow();
   const section = el("server-search");
   const wanted = serverSearch.key !== "";
+  // `#2283 vibe-talk-root-has-rules`. The server search section standing, on the frame
+  // beside its own `hidden` below, for the status pill's place.
+  el("frame-body").toggleAttribute("data-server-search", wanted);
   // `#2256`: the server's line appearing at the foot lands below the row being read, held.
   if (section.hidden === wanted) {
     if (wanted) holdingHeadChange(() => { section.hidden = false; });
@@ -1489,6 +1500,7 @@ function renderServerSearch() {
     clearServerHits();
     const rowOff = el("search-bucket-row");
     if (!rowOff.hidden) rowOff.hidden = true;
+    markBuckets(false);
     // `#2256`: no words, no room: a cleared or closed search releases the reservation (held), so
     // the next search's first key decides it afresh and a reopened search brings no stale band.
     const mainOff = el("screen-main");
@@ -1596,6 +1608,7 @@ function renderServerSearch() {
   // reader's place through `preservingScroll` below). (`#1852`: Whole
   // threads moved to the search bar, so the row carries buckets alone.)
   if (bucketRow.hidden === anyChip) bucketRow.hidden = !anyChip;
+  markBuckets(anyChip);
   // `#1901 vibe-talk-search-late-hits-shift-anchor`: a late round (a gated
   // second page, a Search-further-back grow) inserts its hits above the
   // reader's anchor with scrollTop unchanged, shifting what they read down
