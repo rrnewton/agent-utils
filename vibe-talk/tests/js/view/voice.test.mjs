@@ -199,6 +199,11 @@ test("`#624 voice-page-modularity`: the read-aloud controls reach the act each n
     onReadGripUp: (...args) => log.push(`grip up ${args.length}`),
     onReadGripKey: (event) => log.push(`grip key ${event.key}`),
     moveReadSteer: (offset) => log.push(`home ${offset}`),
+    onReadResizeDown: (event) => log.push(`resize down ${event.n}`),
+    onReadResizeMove: (event) => log.push(`resize move ${event.n}`),
+    onReadResizeUp: (...args) => log.push(`resize up ${args.length}`),
+    onReadResizeKey: (event) => log.push(`resize key ${event.key}`),
+    setReadSteerWidth: (px) => log.push(`width ${px}`),
     placeReadSteer: (...args) => log.push(`place ${args.length}`),
     autoplayOn: () => autoplaying,
     setAutoplay: (on) => { autoplaying = on; log.push(`autoplay ${on}`); },
@@ -217,6 +222,9 @@ test("`#624 voice-page-modularity`: the read-aloud controls reach the act each n
     "listen read-section-prev click", "listen read-section-next click", "listen read-steer-grip pointerdown",
     "listen read-steer-grip pointermove", "listen read-steer-grip pointerup", "listen read-steer-grip pointercancel",
     "listen read-steer-grip lostpointercapture", "listen read-steer-grip keydown", "listen read-steer-grip dblclick",
+    "listen read-steer-resize pointerdown", "listen read-steer-resize pointermove", "listen read-steer-resize pointerup",
+    "listen read-steer-resize pointercancel", "listen read-steer-resize lostpointercapture", "listen read-steer-resize keydown",
+    "listen read-steer-resize dblclick",
     "listen read-autoplay click", "listen window resize", "listen read-aloud click", "listen read-aloud-stop click",
     "listen read-aloud-stop click", "listen document focusin"], "a listener was added out of the page's order");
   // `#1967 vibe-talk-reader-pause-on-any-composer`: focus in a reply composer holds the read; any other focus does not.
@@ -245,10 +253,16 @@ test("`#624 voice-page-modularity`: the read-aloud controls reach the act each n
   for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) fire("read-steer-grip", type, { n: 3 });
   fire("read-steer-grip", "keydown", { key: "Home" });
   fire("read-steer-grip", "dblclick");
+  fire("read-steer-resize", "pointerdown", { n: 1 });
+  fire("read-steer-resize", "pointermove", { n: 2 });
+  for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) fire("read-steer-resize", type, { n: 3 });
+  fire("read-steer-resize", "keydown", { key: "ArrowRight" });
+  fire("read-steer-resize", "dblclick");
   fire("read-autoplay", "click");
   fire("window", "resize", { n: 4 });
   assert.deepStrictEqual(log, ["pace -1", "pace 1", "pace box 0", "pace box 0", "pace box 0", "pace 1", "pace -1", "block -1", "block 1",
     "section -1", "section 1", "grip down 1", "grip move 2", "grip up 0", "grip up 0", "grip up 0", "grip key Home", "home null",
+    "resize down 1", "resize move 2", "resize up 0", "resize up 0", "resize up 0", "resize key ArrowRight", "width null",
     "autoplay true", "place 0"]);
   log.length = 0;
   // Read: the mode with nothing playing; Stop while a read is fetched; Pause or Resume while one plays or is held.
