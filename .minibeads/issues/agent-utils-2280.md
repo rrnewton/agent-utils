@@ -8,7 +8,7 @@ labels:
 - vibe-talk
 - cache
 created_at: 2026-11-26T03:45:00-05:00
-updated_at: 2026-11-26T10:27:32-05:00
+updated_at: 2026-11-26T13:03:00-05:00
 ---
 
 # Description
@@ -42,3 +42,5 @@ This issue audits whether the principle holds everywhere in code, not only in th
 Owner request 381, part A. Owning lane: mu-statesync. Related: `#1227 poll-storm-stale-thread` (page reads must never start an upstream read; server-scheduled refresh with live events), `#2278` (server side of the same night's report; owns the background-refresh budget fix — coordinate before touching it), `#2277 vibe-talk-key-scroll-freezes-11-26` (client freezes from the same report), `#624 voice-page-modularity` (closed; the refactor the owner asked about). Survey first: the table goes to the coordinator before any gate.
 
 S3 waiver landing (2026-11-26): `afb8ecaa` (recap/digest held-copy answers and the recent-window retry) landed as `dce61a5b441abe28ebe64880365265994db88860` with `land-main --no-gate-evidence` under coordb's waiver at about 10:1x AM ET. The full gate and exclusive rerun were red only on `read-modes-browser`, reproduced on unmodified main and filed as `#2293`; every other step on the full gate but the discuss OOM `NO_RESULT` was green. Approved by coordb. The landing was already complete when the liaison's refusal of that shortcut arrived; the liaison then chose to keep `dce61a5b` only on conditions (a) #2293's read-modes disable or fix itself lands behind a passing gate, and (b) a full owner gate on main's tip (S3 included) is all green with nothing S3 touches red — failing that, `dce61a5b` is reverted at once. No deploy until both conditions hold.
+
+S3 closed out (2026-11-26): S3 is landed as dce61a5b441abe28ebe64880365265994db88860 and both keep conditions hold. (a) The read-modes disable (05418230, disabled-optin under #2293) landed gated as d7ce9c3bc4d89c785e18d779fce85c564296a814: its full gate was 215/217 ok with the only reds being vibe-talk.test.page-1/page-3 CPU timeouts, which passed on an exclusive rerun. (b) A full owner gate on main tip 6a13675b (S3 and the disable included), ticket 1795711962290625226-51c51066, finished PARTIAL/exit 0 with every selected node passed and every vibe-talk step green; the only non-passing steps were python.agentctl.shard-0/1 as learned-cap NO_RESULT, reproduced on the exclusive rerun 1795715632490275083-d99614f9 (ledger pass) and reproduced identically without S3, now tracked as #2306. The liaison accepted the NO_RESULT naming and ruled that (b) holds for S3. Coordb deployed S3; it has been live and clean since about 11:27 AM ET. What remains of this issue: S1 (cold first-open shows an immediate loading/empty state instead of waiting) is still held for the owner's answer in the request-381 thread and has not been started.
