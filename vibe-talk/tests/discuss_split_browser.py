@@ -167,8 +167,9 @@ GEOMETRY = """() => {
   return out;
 }"""
 
-# How much of the Latest answer's own text shows: the part of the answer below its "Discuss"
-# label and below the pair's sticky header, inside the block, in lines of the answer's text.
+# How much of the Latest answer's body text shows: WHOLE lines of its text (list items and
+# paragraphs; its headings and its "Discuss" label do not count) inside the block and below the
+# pair's sticky header.
 LATEST_LINES = """() => {
   const box = document.getElementById('discuss-latest');
   if (!box || box.hidden) return null;
@@ -176,14 +177,21 @@ LATEST_LINES = """() => {
   const head = box.querySelector('.discuss-qa > summary').getBoundingClientRect();
   const agent = box.querySelector('.discuss-agent');
   const label = agent.querySelector('.discuss-turn-label');
-  const textTop = label.getBoundingClientRect().bottom;
-  const top = Math.max(head.bottom, textTop, b.top);
-  const bottom = Math.min(b.bottom, agent.getBoundingClientRect().bottom);
-  const line = agent.querySelector('li') || agent;
-  const cs = getComputedStyle(line);
-  let lh = parseFloat(cs.lineHeight);
-  if (!isFinite(lh)) lh = 1.2 * parseFloat(cs.fontSize);
-  return { visible: bottom - top, lineHeight: lh, lines: (bottom - top) / lh,
+  const top = Math.max(head.bottom, b.top);
+  const bottom = b.bottom;
+  const texts = [...agent.querySelectorAll('li, p')];
+  let lines = 0;
+  let lh = 0;
+  for (const el of texts) {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    let h = parseFloat(cs.lineHeight);
+    if (!isFinite(h)) h = 1.2 * parseFloat(cs.fontSize);
+    lh = lh || h;
+    const shown = Math.min(r.bottom, bottom) - Math.max(r.top, top);
+    if (shown > 0) lines += Math.floor((shown + 0.5) / h);
+  }
+  return { lines, lineHeight: lh, textBlocks: texts.length,
            labelOff: label.getBoundingClientRect().bottom <= head.bottom + 1,
            question: box.querySelector('.discuss-qa > summary').textContent };
 }"""
@@ -316,12 +324,12 @@ class Walk:
         return float(value)
 
     def latest_lines(self, what: str, question: str) -> None:
-        """Liaison: at least two lines of the answer's own text show in Latest, the question
+        """Liaison: at least two whole text lines of the answer's body show in Latest, the question
         stays in its header, and its "Discuss" label has scrolled off above."""
         state = self.page.evaluate(LATEST_LINES)
         check(state is not None, f"{self.tag}: {what}: no Latest pair")
         self.sidecar[f"latest_lines_{what.replace(' ', '_')}"] = state
-        check(float(state["lines"]) >= 2, f"{self.tag}: {what}: under two lines of the answer show in Latest: {state}")
+        check(int(state["lines"]) >= 2, f"{self.tag}: {what}: under two whole text lines of the answer show in Latest: {state}")
         check(question in str(state["question"]), f"{self.tag}: {what}: the Latest header lost the question: {state}")
         check(bool(state["labelOff"]), f"{self.tag}: {what}: Latest did not land on the answer's first line: {state}")
 
@@ -516,7 +524,7 @@ class Walk:
         self.fits("after blur")
         self.shot("after-blur")
 
-    def keyboard_open(self) -> None:
+    def keyboard_open(self, question: str = "Is anything blocked?") -> None:
         page = self.page
         page.locator("#discuss-followup").click()
         page.wait_for_function("() => document.activeElement === document.getElementById('discuss-followup')")
@@ -533,7 +541,7 @@ class Walk:
             " return { latest: l.height, composerIn: f.bottom <= vh + 1 && s.bottom <= vh + 1 && f.top >= p.top,"
             "  askHidden: document.querySelector('.discuss-ask').getBoundingClientRect().height === 0 }; })()")
         check(state["latest"] >= 40, f"{self.tag}: keyboard up: the Latest pair has no room: {state}")
-        self.latest_lines("keyboard up", "Is anything blocked?")
+        self.latest_lines("keyboard up", question)
         check(state["composerIn"], f"{self.tag}: keyboard up: the composer is not whole in view: {state}")
         check(state["askHidden"], f"{self.tag}: keyboard up: the Summarize bar still takes the room: {state}")
         self.latest_scrolls_to_end("keyboard up")
@@ -542,7 +550,7 @@ class Walk:
         page.wait_for_function(f"() => window.visualViewport.height === {closed}")
 
 
-def walk(page: Page, phone: bool, shots: Path | None, tag: str) -> None:
+def walk(page: Page, phone: bool, shots: Path | None, tag: str, whole: bool = True) -> None:
     instance = Instance()
     try:
         drive = Walk(page, instance, phone, shots, tag)
@@ -560,6 +568,12 @@ def walk(page: Page, phone: bool, shots: Path | None, tag: str) -> None:
                   and page.evaluate(f"localStorage.getItem({json.dumps(COLLAPSED_KEY)})") is None,
                   f"{tag}: the half sheet did not collapse the timeline by default beside a Latest pair")
             drive.latest_lines("half sheet default", "When does it ship?")
+            if not whole:
+                # The other theme's phone corner: the two-lines bar at the half-sheet default
+                # (above) and with the keyboard up, nothing else again.
+                drive.keyboard_open("When does it ship?")
+                drive.write_sidecar()
+                return
         check(int(page.evaluate("document.querySelectorAll('#discuss-timeline > details').length")) == 3,
               f"{tag}: the timeline does not hold the pair, the earlier summary and the pair before Latest")
         check(page.evaluate("document.querySelector('#discuss-latest > details').open"), f"{tag}: Latest is not open")
@@ -598,16 +612,17 @@ def main() -> int:
     args = parser.parse_args()
     if args.screenshots is not None:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    corners = [("desktop-dark", 1280, 800, 1.0, False, "dark"),
-               ("phone-light", 412, 915, 2.6, True, "light")]
+    corners = [("desktop-dark", 1280, 800, 1.0, False, "dark", True),
+               ("phone-light", 412, 915, 2.6, True, "light", True),
+               ("phone-dark", 412, 915, 2.6, True, "dark", False)]
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
-        for tag, width, height_px, scale, touch, scheme in corners:
+        for tag, width, height_px, scale, touch, scheme, whole in corners:
             context = browser.new_context(
                 viewport={"width": width, "height": height_px}, device_scale_factor=scale,
                 has_touch=touch, is_mobile=touch, color_scheme="dark" if scheme == "dark" else "light")
             browser_waits.hot_host_timeouts(context)
-            walk(context.new_page(), touch, args.screenshots, tag)
+            walk(context.new_page(), touch, args.screenshots, tag, whole)
             context.close()
         browser.close()
     print("discuss split browser: held summary, drag, keys, collapse hint, reload, Latest to its end, blur holds, keyboard up passed")

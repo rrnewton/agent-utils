@@ -1885,8 +1885,10 @@ stay its owner's (#1524). The pane itself already ends above the
  * press that took the focus away has ended): the Summarize bar steps aside until then, and
  * the composer, no longer stacked over that bar, stands in its own place. Only what stands
  * BELOW the panes steps aside, so its return on blur only takes room from the panes' feet and
- * never moves a summary row (the liaison's "nothing jumps"); the scope line above the summary
- * stays. Only the follow-up composer's own focus does this; the bar's own fields keep it. */
+ * never moves a summary row (the liaison's "nothing jumps"); the scope and status lines above
+ * the summary always stay. With the keyboard up the summary pane gives way from its foot (its
+ * top and its rows stay where they are; the short-pane rules below). Only the follow-up
+ * composer's own focus does this; the bar's own fields keep it. */
 @media not ((min-width: 900px) and (pointer: fine)) {
   #discuss-panel[data-composing="true"] > .discuss-ask {
     display: none;
@@ -1895,17 +1897,14 @@ stay its owner's (#1524). The pane itself already ends above the
   #discuss-panel[data-composing="true"] .discuss-compose {
     position: static;
   }
-}
 
-/* With the keyboard really up as well (the viewport short), the scope line above the summary
- * steps aside too: there a blur also takes the keyboard down, so the whole sheet changes size
- * anyway, while a composer focused at full height (a hardware keyboard) keeps it and its blur
- * moves no summary row. */
-@media (not ((min-width: 900px) and (pointer: fine))) and (max-height: 600px) {
-  #discuss-panel[data-composing="true"] > #discuss-scope {
+  /* Its "Draft saved" line under the composer steps aside too (liaison): below the panes, so
+   * nothing above moves when it returns. */
+  #discuss-panel[data-composing="true"] > #discuss-draft-note {
     display: none;
   }
 }
+
 
 /* A short pane (a phone with its keyboard up): the summary and the timeline may give
  * way entirely, so the Latest pair and the composer keep the room. */
