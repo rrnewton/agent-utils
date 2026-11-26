@@ -48,3 +48,5 @@ Related work already landed: #2242 vibe-talk-documents-reader-toolbar (the reade
 # Notes
 
 Owner-UI fast-track (owner-priority gate, deployed on landing). Reproduce and test only on a local server from the worktree build with fixture data; never the live instance.
+
+Step A (one page index space for document reads: navigator and body taps seek in the page's block space on both voices; the device voice speaks the page's own texts) landed as caf7a08b on a green owner gate on the same tree (e5dd9542, 2026-11-25 9:02 PM ET) whose selection ran the scrubber, read, control-bar and read-aloud-blocks browser checks; deployed the same evening with a clean 15-minute watch. Steps B, C and D follow.
