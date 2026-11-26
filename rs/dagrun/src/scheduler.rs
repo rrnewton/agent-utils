@@ -134,22 +134,45 @@ struct TimeseriesSnapshot {
 /// cgroup v2 has no anon/shmem high-water counter, so these sampled maxima are lower bounds
 /// on the true peaks, never high-water marks. A field stays `None` until a sample actually
 /// lands, so "not measured" never serializes as zero.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SampledMemoryMax {
     anon_bytes: Option<i64>,
     shmem_bytes: Option<i64>,
 }
 
 impl SampledMemoryMax {
-    fn observe(&mut self, sample: Option<MemoryStatSample>) {
+    /// Fold one sample into the maxima.
+    ///
+    /// `after_exit` is set for a reading taken once the step's leader has been seen to exit.
+    /// Its `anon` is DROPPED: the kernel frees a process's anonymous memory as it exits, so
+    /// what is left is the residue of a dead tree, not demand, and a step too short to get a
+    /// periodic sample would otherwise record that residue (about 0) as its measured peak.
+    /// `shmem` is kept: tmpfs pages stay charged to the step's cgroup after its processes are
+    /// gone, so a final reading still sees what the step left there.
+    fn observe(&mut self, sample: Option<MemoryStatSample>, after_exit: bool) {
         let Some(sample) = sample else { return };
-        if let Some(v) = sample.anon_bytes {
+        if let (Some(v), false) = (sample.anon_bytes, after_exit) {
             self.anon_bytes = Some(self.anon_bytes.map_or(v, |cur| cur.max(v)));
         }
         if let Some(v) = sample.shmem_bytes {
             self.shmem_bytes = Some(self.shmem_bytes.map_or(v, |cur| cur.max(v)));
         }
     }
+
+    fn any(&self) -> bool {
+        self.anon_bytes.is_some() || self.shmem_bytes.is_some()
+    }
+}
+
+/// Nominal spacing of the monitor's memory samples, in whole milliseconds (rounded).
+///
+/// The monitor reads `memory.stat` on every tick it takes: the 1 s guard tick, and the trace
+/// tick when `--profile-timeseries` asks for a shorter one. The Python build rounds the same
+/// way, so both write the same cell for the same interval.
+fn mem_sample_interval_ms(profile_timeseries_interval: Option<Duration>) -> u64 {
+    let interval = profile_timeseries_interval
+        .map_or(MONITOR_INTERVAL, |interval| interval.min(MONITOR_INTERVAL));
+    (interval.as_secs_f64() * 1000.0).round() as u64
 }
 
 #[derive(Default)]
@@ -4096,11 +4119,15 @@ fn run_step(ctx: StepCtx) {
     let (monitor_stop, monitor_stop_rx) = std::sync::mpsc::channel();
     let thread_peak = Arc::new(Mutex::new(None::<i64>));
     let sampled_memory = Arc::new(Mutex::new(SampledMemoryMax::default()));
+    // Set once the leader's exit has been observed, BEFORE the reap; the monitor reads it after
+    // each memory sample so a reading of the dead tree is never taken for running demand.
+    let step_exited = Arc::new(AtomicBool::new(false));
     let cpu_exceeded = Arc::new(AtomicBool::new(false));
     let termination_culprit = Arc::new(Mutex::new(None::<Culprit>));
     let monitor: Option<thread::JoinHandle<()>> = if boxed || cpu_budget > 0 {
         let peak = Arc::clone(&thread_peak);
         let mmem = Arc::clone(&sampled_memory);
+        let mexited = Arc::clone(&step_exited);
         let cpu_flag = Arc::clone(&cpu_exceeded);
         let cg = cgroups.clone();
         let t = tag.clone();
@@ -4182,9 +4209,13 @@ fn run_step(ctx: StepCtx) {
                     }
                     if boxed {
                         if let Some(manager) = cg.as_ref() {
+                            let sample = manager.memory_stat_sample(&t);
+                            // Read the flag AFTER the sample: the main thread sets it before
+                            // its reap, so a reading that saw the tree being killed sees it set.
+                            let after_exit = mexited.load(Ordering::SeqCst);
                             mmem.lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .observe(manager.memory_stat_sample(&t));
+                                .observe(sample, after_exit);
                         }
                     }
                     if trace_due {
@@ -4354,6 +4385,9 @@ fn run_step(ctx: StepCtx) {
 
     // A real exit was uncounted atomically with its observation above. A fabricated killed status
     // deliberately stays counted until `retire`, because no exit was observed.
+    // From here on a memory sample reads a tree that has exited (or is being reaped), not a
+    // running step: the monitor checks this after each read, before it folds the reading in.
+    step_exited.store(true, Ordering::SeqCst);
 
     // Reap the whole tree (cgroup.kill + killpg) so orphan grandchildren die now and the readers
     // see EOF; then stop the monitor and join the reader threads.
@@ -4396,14 +4430,15 @@ fn run_step(ctx: StepCtx) {
         );
     }
 
-    // One final memory sample before cleanup destroys the counters, mirroring the final
-    // thread-count sample above; a periodic deadline can miss a short final phase.
+    // One final memory sample before cleanup destroys the counters. The tree is dead by now,
+    // so only its shmem counts (see `SampledMemoryMax::observe`): tmpfs pages the step left
+    // behind are still charged here, while its anonymous memory went with its processes.
     if boxed {
         if let Some(manager) = cgroups.as_ref() {
             sampled_memory
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .observe(manager.memory_stat_sample(&tag));
+                .observe(manager.memory_stat_sample(&tag), true);
         }
     }
 
@@ -4485,8 +4520,6 @@ fn run_step(ctx: StepCtx) {
     let sampled_memory = *sampled_memory
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mem_sample_interval = profile_timeseries_interval
-        .map_or(MONITOR_INTERVAL, |interval| interval.min(MONITOR_INTERVAL));
     let cpu_timed_out = cpu_exceeded.load(Ordering::Relaxed);
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -4575,8 +4608,8 @@ fn run_step(ctx: StepCtx) {
     );
     row.insert(
         "mem_sample_interval_ms".into(),
-        if sampled_memory.anon_bytes.is_some() || sampled_memory.shmem_bytes.is_some() {
-            mem_sample_interval.as_millis().to_string()
+        if sampled_memory.any() {
+            mem_sample_interval_ms(profile_timeseries_interval).to_string()
         } else {
             String::new()
         },
@@ -5580,19 +5613,82 @@ mod tests {
     #[test]
     fn sampled_memory_max_keeps_maxima_and_never_invents_zero() {
         let mut sampled = SampledMemoryMax::default();
-        sampled.observe(None);
-        assert_eq!(sampled.anon_bytes, None);
-        assert_eq!(sampled.shmem_bytes, None);
-        sampled.observe(Some(MemoryStatSample {
-            anon_bytes: Some(100),
-            shmem_bytes: Some(40),
-        }));
-        sampled.observe(Some(MemoryStatSample {
-            anon_bytes: Some(80),
-            shmem_bytes: Some(64),
-        }));
+        sampled.observe(None, false);
+        sampled.observe(None, true);
+        assert_eq!(sampled, SampledMemoryMax::default());
+        assert!(!sampled.any());
+        sampled.observe(
+            Some(MemoryStatSample {
+                anon_bytes: Some(100),
+                shmem_bytes: None,
+            }),
+            false,
+        );
+        assert_eq!(sampled.anon_bytes, Some(100));
+        assert_eq!(sampled.shmem_bytes, None, "an absent counter stays unmeasured");
+        sampled.observe(
+            Some(MemoryStatSample {
+                anon_bytes: Some(80),
+                shmem_bytes: Some(64),
+            }),
+            false,
+        );
         assert_eq!(sampled.anon_bytes, Some(100));
         assert_eq!(sampled.shmem_bytes, Some(64));
+        // A real zero is a reading, and it is kept as one.
+        let mut zero = SampledMemoryMax::default();
+        zero.observe(
+            Some(MemoryStatSample {
+                anon_bytes: Some(0),
+                shmem_bytes: Some(0),
+            }),
+            false,
+        );
+        assert_eq!(zero.anon_bytes, Some(0));
+        assert_eq!(zero.shmem_bytes, Some(0));
+    }
+
+    #[test]
+    fn sampled_memory_after_exit_keeps_shmem_and_drops_the_dead_tree_anon() {
+        // A step too short for any periodic sample gets only the post-exit reading. Its anon is
+        // what a dead tree leaves, not demand, so it must stay unmeasured rather than read 0.
+        let mut short = SampledMemoryMax::default();
+        short.observe(
+            Some(MemoryStatSample {
+                anon_bytes: Some(0),
+                shmem_bytes: Some(4096),
+            }),
+            true,
+        );
+        assert_eq!(short.anon_bytes, None);
+        assert_eq!(short.shmem_bytes, Some(4096));
+        // After a running reading, a larger post-exit anon still cannot raise the maximum.
+        let mut long = SampledMemoryMax::default();
+        long.observe(
+            Some(MemoryStatSample {
+                anon_bytes: Some(100),
+                shmem_bytes: Some(10),
+            }),
+            false,
+        );
+        long.observe(
+            Some(MemoryStatSample {
+                anon_bytes: Some(999),
+                shmem_bytes: Some(50),
+            }),
+            true,
+        );
+        assert_eq!(long.anon_bytes, Some(100));
+        assert_eq!(long.shmem_bytes, Some(50));
+    }
+
+    #[test]
+    fn mem_sample_interval_is_the_shorter_of_the_guard_and_trace_ticks() {
+        assert_eq!(mem_sample_interval_ms(None), 1000);
+        assert_eq!(mem_sample_interval_ms(Some(Duration::from_millis(50))), 50);
+        assert_eq!(mem_sample_interval_ms(Some(Duration::from_millis(250))), 250);
+        assert_eq!(mem_sample_interval_ms(Some(Duration::from_secs(10))), 1000);
+        assert_eq!(mem_sample_interval_ms(Some(Duration::from_secs_f64(0.3))), 300);
     }
 
     #[test]
@@ -8607,6 +8703,196 @@ int main(void) {
 
         fn kill_all_remaining(&self) -> i64 {
             0
+        }
+    }
+
+    /// Serves scripted `memory.stat` readings: `running` until the step is reaped (`kill`),
+    /// then `after_exit`, the way a real cgroup's anon drops as its processes die. The first
+    /// running reading creates `sampled`, which the step waits for, so the run is guaranteed one
+    /// periodic sample without any wall-clock assumption.
+    struct MemoryStatCgroups {
+        running: Option<MemoryStatSample>,
+        after_exit: Option<MemoryStatSample>,
+        sampled: std::path::PathBuf,
+        killed: AtomicBool,
+    }
+
+    impl CgroupManager for MemoryStatCgroups {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn prepare_command(
+            &self,
+            _tag: &str,
+            cmd: &str,
+            _mem_max: Option<i64>,
+            _cpu_count: Option<i64>,
+        ) -> String {
+            cmd.to_string()
+        }
+
+        fn kill(&self, _tag: &str) -> bool {
+            self.killed.store(true, Ordering::SeqCst);
+            true
+        }
+
+        fn cleanup(&self, _tag: &str) {}
+
+        fn oom_kills(&self, _tag: &str) -> i64 {
+            0
+        }
+
+        fn peak_bytes(&self, _tag: &str) -> Option<i64> {
+            Some(1 << 30)
+        }
+
+        fn memory_stat_sample(&self, _tag: &str) -> Option<MemoryStatSample> {
+            if self.killed.load(Ordering::SeqCst) {
+                return self.after_exit;
+            }
+            let _ = std::fs::write(&self.sampled, b"1");
+            self.running
+        }
+
+        fn cpu_stats(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
+            None
+        }
+
+        fn cpu_pressure(&self, _tag: &str) -> Option<BTreeMap<String, f64>> {
+            None
+        }
+
+        fn thread_count(&self, _tag: &str) -> Option<i64> {
+            None
+        }
+
+        fn kill_all_remaining(&self) -> i64 {
+            0
+        }
+    }
+
+    fn memory_stat_run(
+        name: &str,
+        running: Option<MemoryStatSample>,
+        after_exit: Option<MemoryStatSample>,
+        wait_for_sample: bool,
+    ) -> RunResult {
+        let dir = std::env::temp_dir().join(format!(
+            "dagrun-memstat-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sampled = dir.join("sampled");
+        // Wait on the EVENT (the fake served a running sample), with a generous bound so a
+        // broken sampler fails the step instead of hanging the test.
+        let cmd = if wait_for_sample {
+            format!(
+                "i=0; while [ ! -e '{}' ]; do i=$((i+1)); [ $i -gt 6000 ] && exit 3; \
+                 sleep 0.05; done",
+                sampled.display()
+            )
+        } else {
+            "true".to_string()
+        };
+        let cfg = DagConfig {
+            steps: vec![step("g", "mem", &cmd, &[], 0.0, &[])],
+            ..Default::default()
+        };
+        let manager = Arc::new(MemoryStatCgroups {
+            running,
+            after_exit,
+            sampled,
+            killed: AtomicBool::new(false),
+        });
+        let result = run_dag_boxed_limited(&cfg, 1, 1, false, 0, Some(manager));
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn profile_row_records_running_anon_and_final_shmem_maxima() {
+        let result = memory_stat_run(
+            "running",
+            Some(MemoryStatSample {
+                anon_bytes: Some(100),
+                shmem_bytes: Some(10),
+            }),
+            // After the reap: a dead tree's anon must not count (999 would win a plain max),
+            // while tmpfs pages it left behind still do.
+            Some(MemoryStatSample {
+                anon_bytes: Some(999),
+                shmem_bytes: Some(50),
+            }),
+            true,
+        );
+        assert!(result.ok, "{:?}", result.outcomes);
+        assert_eq!(profile_cell(&result, "g.mem", "peak_bytes"), "1073741824");
+        assert_eq!(
+            profile_cell(&result, "g.mem", "anon_sampled_max_bytes"),
+            "100"
+        );
+        assert_eq!(
+            profile_cell(&result, "g.mem", "shmem_sampled_max_bytes"),
+            "50"
+        );
+        assert_eq!(
+            profile_cell(&result, "g.mem", "mem_sample_interval_ms"),
+            "1000"
+        );
+    }
+
+    #[test]
+    fn a_step_shorter_than_one_tick_records_its_shmem_but_not_a_dead_tree_anon() {
+        // No running reading at all, so only the post-reap reading lands: its shmem is
+        // evidence, its anon (0 here) is the residue of a dead tree and must stay blank.
+        let result = memory_stat_run(
+            "short",
+            None,
+            Some(MemoryStatSample {
+                anon_bytes: Some(0),
+                shmem_bytes: Some(4096),
+            }),
+            false,
+        );
+        assert!(result.ok, "{:?}", result.outcomes);
+        assert_eq!(profile_cell(&result, "g.mem", "anon_sampled_max_bytes"), "");
+        assert_eq!(
+            profile_cell(&result, "g.mem", "shmem_sampled_max_bytes"),
+            "4096"
+        );
+        assert_eq!(
+            profile_cell(&result, "g.mem", "mem_sample_interval_ms"),
+            "1000"
+        );
+    }
+
+    #[test]
+    fn profile_row_leaves_unmeasured_memory_samples_blank_never_zero() {
+        // No readable memory.stat at all: three blanks, not three zeros.
+        let none = memory_stat_run("none", None, None, false);
+        assert!(none.ok, "{:?}", none.outcomes);
+        for column in [
+            "anon_sampled_max_bytes",
+            "shmem_sampled_max_bytes",
+            "mem_sample_interval_ms",
+        ] {
+            assert_eq!(profile_cell(&none, "g.mem", column), "", "{column}");
+        }
+        // Unboxed: the columns are present and blank.
+        let cfg = DagConfig {
+            steps: vec![step("g", "mem", "true", &[], 0.0, &[])],
+            ..Default::default()
+        };
+        let unboxed = run_dag_boxed_limited(&cfg, 1, 1, false, 0, None);
+        assert!(unboxed.ok);
+        for column in [
+            "anon_sampled_max_bytes",
+            "shmem_sampled_max_bytes",
+            "mem_sample_interval_ms",
+        ] {
+            assert_eq!(profile_cell(&unboxed, "g.mem", column), "", "{column}");
         }
     }
 

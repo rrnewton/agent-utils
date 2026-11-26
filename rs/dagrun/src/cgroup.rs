@@ -220,19 +220,40 @@ pub struct MemoryStatSample {
 
 /// Parse the `anon` and `shmem` counters from cgroup-v2 `memory.stat` text.
 ///
-/// Returns `None` when neither counter is present and parseable. A present counter with a
-/// malformed value stays `None` in its own field rather than becoming zero.
+/// Both are byte counts (the kernel writes `<key> <bytes>` per line; `anon_thp`, `shmem_thp` and
+/// the other keys are different counters and are not matched). Returns `None` when neither
+/// counter is present and parseable. A present counter whose value is not a plain decimal that
+/// fits an `i64` stays `None` in its own field rather than becoming zero; signs, separators and
+/// overflow are refused so the Python build, which shares this rule, reads the same file the
+/// same way. The scan stops once both counters have been seen, so a sample costs at most one
+/// pass over the file however many counters a kernel adds.
 pub fn parse_memory_stat_anon_shmem(text: &str) -> Option<MemoryStatSample> {
+    fn byte_count(value: &str) -> Option<i64> {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        value.parse().ok()
+    }
     let mut sample = MemoryStatSample::default();
+    let (mut seen_anon, mut seen_shmem) = (false, false);
     for line in text.lines() {
         let mut parts = line.split_whitespace();
         let (Some(key), Some(value)) = (parts.next(), parts.next()) else {
             continue;
         };
         match key {
-            "anon" => sample.anon_bytes = value.parse().ok(),
-            "shmem" => sample.shmem_bytes = value.parse().ok(),
+            "anon" if !seen_anon => {
+                seen_anon = true;
+                sample.anon_bytes = byte_count(value);
+            }
+            "shmem" if !seen_shmem => {
+                seen_shmem = true;
+                sample.shmem_bytes = byte_count(value);
+            }
             _ => {}
+        }
+        if seen_anon && seen_shmem {
+            break;
         }
     }
     (sample.anon_bytes.is_some() || sample.shmem_bytes.is_some()).then_some(sample)
@@ -3899,7 +3920,69 @@ mod tests {
                 shmem_bytes: Some(2),
             })
         );
+        // Disabled manager: never a sample, even with a readable file.
+        cg.enabled = false;
+        fs::write(child.join("memory.stat"), "anon 1\nshmem 2\n").unwrap();
+        assert_eq!(cg.memory_stat_sample("g.mem"), None);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn memory_stat_parse_matches_whole_keys_and_refuses_non_decimal_values() {
+        // The real file's layout: anon_thp/shmem_thp are different counters and must not be
+        // read as anon/shmem, wherever they appear.
+        let real = "anon_thp 4194304\nanon 1048576\nfile 2097152\nkernel 65536\n\
+                    shmem_thp 0\nshmem 262144\nfile_mapped 0\n";
+        assert_eq!(
+            parse_memory_stat_anon_shmem(real),
+            Some(MemoryStatSample {
+                anon_bytes: Some(1048576),
+                shmem_bytes: Some(262144),
+            })
+        );
+        // One counter missing: the other still counts, the missing one stays unmeasured.
+        assert_eq!(
+            parse_memory_stat_anon_shmem("anon 0\nfile 7\n"),
+            Some(MemoryStatSample {
+                anon_bytes: Some(0),
+                shmem_bytes: None,
+            })
+        );
+        assert_eq!(
+            parse_memory_stat_anon_shmem("file 7\nshmem 9"),
+            Some(MemoryStatSample {
+                anon_bytes: None,
+                shmem_bytes: Some(9),
+            })
+        );
+        // Signs, separators, fractions, overflow and a bare key are refused per field.
+        for bad in [
+            "+5",
+            "-5",
+            "1_000",
+            "1.5",
+            "0x10",
+            "9223372036854775808",
+        ] {
+            assert_eq!(
+                parse_memory_stat_anon_shmem(&format!("anon {bad}\nshmem 3\n")),
+                Some(MemoryStatSample {
+                    anon_bytes: None,
+                    shmem_bytes: Some(3),
+                }),
+                "anon value {bad:?} must not parse"
+            );
+        }
+        assert_eq!(parse_memory_stat_anon_shmem("anon\nshmem\n"), None);
+        assert_eq!(parse_memory_stat_anon_shmem(""), None);
+        // The first occurrence of a key is the reading; a later duplicate does not replace it.
+        assert_eq!(
+            parse_memory_stat_anon_shmem("anon 1\nshmem 2\nanon 99\n"),
+            Some(MemoryStatSample {
+                anon_bytes: Some(1),
+                shmem_bytes: Some(2),
+            })
+        );
     }
 
     #[test]

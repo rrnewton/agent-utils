@@ -75,10 +75,14 @@ pub const CSV_COLUMNS: [&str; 15] = [
 ///   `memory_events_oom_group_kill` preserves kernels' group-kill counter; at a delegated
 ///   boundary it can be the only durable kill signal.
 /// * `anon_sampled_max_bytes` and `shmem_sampled_max_bytes` are SAMPLED maxima of the
-///   instantaneous `memory.stat` `anon` and `shmem` counters, taken on the scheduler monitor
-///   cadence recorded in `mem_sample_interval_ms`. cgroup v2 exposes no anon/shmem high-water
-///   counter, so each is a LOWER BOUND on the true peak, never a high-water mark. Blank means
-///   not measured (unboxed, or no readable sample); it is never written as zero for that case.
+///   instantaneous `memory.stat` `anon` and `shmem` byte counters, taken on the scheduler
+///   monitor cadence recorded in `mem_sample_interval_ms` (whole milliseconds). cgroup v2
+///   exposes no anon/shmem high-water counter, so each is a LOWER BOUND on the true peak, never
+///   a high-water mark. `anon` comes only from readings taken while the step ran; `shmem` also
+///   from one reading after it exits, because tmpfs pages stay charged to the step's cgroup.
+///   They sit beside `peak_bytes` (`memory.peak`), which also counts reclaimable page cache.
+///   Blank means not measured (unboxed, no readable sample, or a step that ended before its
+///   first reading); it is never written as zero for that case.
 pub const STEP_PROFILE_COLUMNS: [&str; 62] = [
     "timestamp",
     "machine_id",
