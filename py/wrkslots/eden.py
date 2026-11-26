@@ -24,6 +24,19 @@ from pathlib import Path
 #: separately, never counted here.
 HOST_CAP = 3
 
+#: Name of the daemon state dir wrkslots gives each Eden slot
+#: (``<slot>/.eden-state``). Only state dirs with this name are
+#: instances wrkslots manages, and only those are ever queried by the
+#: host cap census (#2313).
+MANAGED_STATE_DIR_NAME = ".eden-state"
+
+#: Outer checkouts assumed for the user's default Eden instance (#2313).
+#: The census never invokes eden against that instance and never reads
+#: its files (the owner's rule: agents never touch it); it counts as
+#: this fixed reserve against the host cap instead, at the owner's
+#: per-host cap for that instance.
+DEFAULT_INSTANCE_RESERVE = 3
+
 #: Fixed markers stored in the git-shaped fields of an Eden row. The
 #: live Eden facts (state dir, revision, targets) are always queried
 #: from the daemon, never trusted from these markers.
@@ -107,6 +120,34 @@ def discover_config_dirs(
     return tuple(sorted(merged))
 
 
+def is_managed_state_dir(config_dir: str) -> bool:
+    """Whether ``config_dir`` is a wrkslots slot's own daemon state dir (#2313).
+
+    Judged by name alone, with no filesystem access, so deciding never
+    touches an instance wrkslots does not manage.
+    """
+
+    return os.path.basename(os.path.normpath(config_dir)) == MANAGED_STATE_DIR_NAME
+
+
+def split_managed_config_dirs(
+    config_dirs: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split state dirs into (managed, unmanaged) (#2313).
+
+    Unmanaged dirs (the user's default instance, or any instance another
+    tool runs) are never queried; callers report them by path only.
+    """
+
+    managed: list[str] = []
+    unmanaged: list[str] = []
+    for config_dir in config_dirs:
+        (managed if is_managed_state_dir(config_dir) else unmanaged).append(
+            config_dir
+        )
+    return tuple(managed), tuple(unmanaged)
+
+
 def parse_mount_list(stdout: str) -> tuple[str, ...]:
     """Mount paths from ``eden list`` output, one per line."""
 
@@ -118,16 +159,26 @@ def parse_mount_list(stdout: str) -> tuple[str, ...]:
 def checkouts_by_state_dir(
     runner: Runner, config_dirs: Sequence[str]
 ) -> tuple[tuple[str, str], ...]:
-    """Every Eden mount on the host with the state dir that lists it.
+    """Every Eden mount of the managed state dirs, with the dir that lists it.
 
     Deduplicated by mount path; the first state dir that lists a mount
     owns it. Fail-closed: a state dir whose daemon cannot be queried
     raises, so an uncertain count never reads as room under the cap.
+    Only wrkslots-managed state dirs may be queried (#2313): an
+    unmanaged dir raises before any eden call, so the user's default
+    instance is never invoked; callers filter with
+    :func:`split_managed_config_dirs` first.
     """
 
+    managed, unmanaged = split_managed_config_dirs(config_dirs)
+    if unmanaged:
+        raise EdenError(
+            "refusing to query Eden state dirs wrkslots does not manage: "
+            + ", ".join(unmanaged)
+        )
     pairs: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for config_dir in config_dirs:
+    for config_dir in managed:
         rc, stdout, stderr = runner(
             ["eden", "--config-dir", config_dir, "list"]
         )
@@ -161,9 +212,9 @@ def not_mounted_mounts(stdout: str) -> tuple[str, ...]:
 
 
 def count_checkouts(runner: Runner, config_dirs: Sequence[str]) -> tuple[str, ...]:
-    """All Eden mounts on the host, deduplicated by mount path.
+    """All Eden mounts of the managed state dirs, deduplicated by mount path.
 
-    Fail-closed like :func:`checkouts_by_state_dir`.
+    Fail-closed and managed-only like :func:`checkouts_by_state_dir`.
     """
 
     return tuple(mount for mount, _state in checkouts_by_state_dir(runner, config_dirs))
@@ -219,23 +270,30 @@ def assert_under_cap(
     mounts: Sequence[str],
     cap: int = HOST_CAP,
     in_image: Sequence[str] = (),
+    reserve: int = 0,
 ) -> None:
     """Refuse when the host already holds ``cap`` OUTER checkouts.
 
     ``mounts`` is the outer list; ``in_image`` mounts never count
     against the cap and are named in the refusal so flooding cannot
-    hide behind them.
+    hide behind them. ``reserve`` outer checkouts are assumed for the
+    user's default Eden instance, which is never queried (#2313).
     """
 
-    if len(mounts) >= cap:
+    if len(mounts) + reserve >= cap:
         extra = (
             f"; in-image not counted: {len(in_image)}: " + ", ".join(in_image)
             if in_image
             else ""
         )
+        reserved = (
+            f" + {reserve} reserved for the default Eden instance"
+            if reserve
+            else ""
+        )
         raise EdenError(
-            f"host Eden cap reached: {len(mounts)} outer checkout(s) "
-            f"at cap {cap}: " + ", ".join(mounts) + extra
+            f"host Eden cap reached: {len(mounts)} outer checkout(s)"
+            f"{reserved} at cap {cap}: " + ", ".join(mounts) + extra
         )
 
 
@@ -800,7 +858,11 @@ def remove_sequence(
     if rc != 0:
         return (f"eden list failed after remove: {stderr.strip()}",)
     mounts_after = parse_mount_list(stdout)
-    rc, stdout, stderr = runner(["eden", "du", "--json", mount])
+    # Always the slot's own instance: without --config-dir eden resolves
+    # through the user's default instance, which is never touched (#2313).
+    rc, stdout, stderr = runner(
+        ["eden", "--config-dir", config_dir, "du", "--json", mount]
+    )
     orphaned_after = orphaned_before
     if rc == 0:
         try:

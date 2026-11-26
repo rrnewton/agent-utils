@@ -3047,11 +3047,16 @@ the run book.
 The host cap counts only OUTER Eden checkouts (checkouts inside a
 worktrees image are bounded by the image instead). It is
 `configuration.eden_host_cap` (default 3, minimum 1; count a large
-number as unlimited). A host that already runs several outer
-checkouts on the default daemon refuses at the default: raise the
-cap in your own project's configuration only, never by editing
-another project's. The cap counts checkouts across every daemon
-config dir and refuses closed when a daemon cannot be queried.
+number as unlimited). The census queries only the daemons wrkslots
+manages (each slot's own `.eden-state` dir, in any project on the
+host) and refuses closed when one of them cannot be queried. It
+never runs eden against the user's default instance, nor reads its
+files: that instance counts as a fixed reserve of 3 outer checkouts
+(reported as `default_instance_reserve` in the `eden` status
+object, inside `outer`), so the default cap of 3 leaves no room:
+raise the cap in your own project's configuration only, never by
+editing another project's. Other daemons wrkslots does not manage
+are named in `unmanaged_state_dirs` and not counted.
 
 With a worktrees image, `configuration.worktrees_image.eden_backing_repo`
 names the in-image backing repositories `create --eden` may clone

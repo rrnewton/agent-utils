@@ -173,21 +173,74 @@ def test_eden_checkout_rejects_wrong_markers() -> None:
         wrkslots_cli._checkout_from_obj(bad, "row.checkouts[0]")
 
 
+def _default_instance_violation(argv: Sequence[str]) -> str | None:
+    """Why an eden call would touch the default instance, or None (#2313).
+
+    The consumer's owner-checkout guard refuses any eden call against the
+    user's default instance (``~/local/.eden``, ``~/.eden``, or its real
+    path such as ``/data/users/<u>/.eden``), and an eden call with no
+    ``--config-dir`` resolves through that instance. Matching any path
+    component named ``.eden`` catches every spelling; a slot's own
+    ``.eden-state`` is a different component.
+    """
+
+    if not argv or argv[0] != "eden":
+        return None
+    if len(argv) < 3 or argv[1] != "--config-dir":
+        return f"eden call without --config-dir: {list(argv)}"
+    for item in argv[1:]:
+        if ".eden" in Path(item).parts:
+            return f"eden call names the default instance: {list(argv)}"
+    return None
+
+
+def _fail_on_default_instance(argv: Sequence[str]) -> None:
+    violation = _default_instance_violation(argv)
+    if violation is not None:
+        pytest.fail(violation)
+
+
+def _guarded(runner: eden.Runner) -> eden.Runner:
+    """``runner`` behind a fake owner guard that FAILS default-instance calls."""
+
+    def run(argv: Sequence[str]) -> tuple[int, str, str]:
+        _fail_on_default_instance(argv)
+        return runner(argv)
+
+    return run
+
+
 def _fake_runner(table: dict[str, tuple[int, str, str]]) -> eden.Runner:
     def run(argv: Sequence[str]) -> tuple[int, str, str]:
         return table[argv[2]]
 
-    return run
+    return _guarded(run)
+
+
+def test_fake_owner_guard_catches_every_default_instance_spelling() -> None:
+    for argv in (
+        ["eden", "list"],
+        ["eden", "du", "--json", "/m/one"],
+        ["eden", "--config-dir", "/home/u/local/.eden", "list"],
+        ["eden", "--config-dir", "/home/u/.eden", "list"],
+        ["eden", "--config-dir", "/data/users/u/.eden/", "list"],
+        ["eden", "--config-dir", "/s/.eden-state", "info", "/home/u/local/.eden/clients/x"],
+    ):
+        assert _default_instance_violation(argv) is not None, argv
+    assert _default_instance_violation(
+        ["eden", "--config-dir", "/slots/s1/.eden-state", "list"]
+    ) is None
+    assert _default_instance_violation(["sl", "root"]) is None
 
 
 def test_cap_counts_every_config_dir_and_dedupes() -> None:
     runner = _fake_runner(
         {
-            "/state-a": (0, "/m/one\n/m/two\n", ""),
-            "/state-b": (0, "/m/two\n/m/three\n", ""),
+            "/a/.eden-state": (0, "/m/one\n/m/two\n", ""),
+            "/b/.eden-state": (0, "/m/two\n/m/three\n", ""),
         }
     )
-    mounts = eden.count_checkouts(runner, ("/state-a", "/state-b"))
+    mounts = eden.count_checkouts(runner, ("/a/.eden-state", "/b/.eden-state"))
     assert mounts == ("/m/one", "/m/two", "/m/three")
     with pytest.raises(eden.EdenError, match="cap reached"):
         eden.assert_under_cap(mounts)
@@ -195,9 +248,36 @@ def test_cap_counts_every_config_dir_and_dedupes() -> None:
 
 
 def test_cap_refuses_when_a_daemon_cannot_be_queried() -> None:
-    runner = _fake_runner({"/state-a": (1, "", "daemon down")})
+    runner = _fake_runner({"/a/.eden-state": (1, "", "daemon down")})
     with pytest.raises(eden.EdenError, match="cannot list"):
-        eden.count_checkouts(runner, ("/state-a",))
+        eden.count_checkouts(runner, ("/a/.eden-state",))
+
+
+def test_census_refuses_an_unmanaged_state_dir_before_any_eden_call() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        return (0, "", "")
+
+    for unmanaged in ("/home/u/local/.eden", "/opt/tool/state"):
+        with pytest.raises(eden.EdenError, match="does not manage"):
+            eden.checkouts_by_state_dir(runner, ("/a/.eden-state", unmanaged))
+    assert calls == []
+
+
+def test_managed_split_is_by_name_only() -> None:
+    dirs = (
+        "/slots/s1/.eden-state",
+        "/slots/s2/.eden-state/",
+        "/home/u/local/.eden",
+        "/data/users/u/.eden",
+        "/opt/tool/eden-state",
+    )
+    assert eden.split_managed_config_dirs(dirs) == (
+        ("/slots/s1/.eden-state", "/slots/s2/.eden-state/"),
+        ("/home/u/local/.eden", "/data/users/u/.eden", "/opt/tool/eden-state"),
+    )
 
 
 def test_config_dir_discovery_from_daemons() -> None:
@@ -355,10 +435,14 @@ def test_remove_sequence_cleans_and_stops() -> None:
         return (0, "", "")
 
     problems = eden.remove_sequence(
-        runner, "/slot/.eden-state", "/slot/checkout", ("/slot/buck",), (), 10
+        _guarded(runner), "/slot/.eden-state", "/slot/checkout", ("/slot/buck",), (), 10
     )
     assert problems == ()
     assert any("stop" in call for call in calls)
+    # du asks the slot's own instance, never the default one (#2313).
+    assert (
+        "eden", "--config-dir", "/slot/.eden-state", "du", "--json", "/slot/checkout"
+    ) in calls
     # The slot's own daemon unit is stopped, disabled and verified
     # gone (#1702); no other unit and no shared daemon is named.
     unit = eden.unit_name("/slot/.eden-state")
@@ -806,6 +890,7 @@ class _StubEdenDaemon:
     cloned_mount: str | None = None
 
     def __call__(self, argv: Sequence[str]) -> tuple[int, str, str]:
+        _fail_on_default_instance(argv)
         self.calls.append(tuple(argv))
         if argv[0] == "sl":
             return (0, f"{self.discovery_root or self.cloned_mount or ''}\n", "")
@@ -995,6 +1080,8 @@ def _eden_project(tmp_path: Path) -> Path:
         "heartbeat_ttl_seconds: 60\n"
         "liveness_command: live.py\n"
         f"eden_mount_root: {tmp_path}/eden-mounts\n"
+        # Room above the default instance's fixed reserve (#2313).
+        "eden_host_cap: 10\n"
     )
     return root
 
@@ -1100,6 +1187,51 @@ def test_successful_eden_create_registers_and_clears_its_journal(
     assert state.slots[0].checkouts[0].vcs == "eden"
     assert sorted(config.control.glob("CREATE.*.journal")) == []
     assert daemon.daemon_writes() == []
+
+
+def test_eden_create_counts_the_reserve_with_only_unmanaged_instances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only unmanaged instances run: create proceeds under the cap (#2313).
+
+    The default instance (home and real-path spellings) and another
+    tool's instance are never invoked; the default counts as the fixed
+    reserve, so at cap reserve+1 the first create fits and the second
+    refuses naming the reserve.
+    """
+
+    root = _eden_project(tmp_path)
+    config_path = root / ".wrkslots.yml"
+    config_path.write_text(
+        config_path.read_text().replace(
+            "eden_host_cap: 10", f"eden_host_cap: {eden.DEFAULT_INSTANCE_RESERVE + 1}"
+        )
+    )
+    daemon = _StubEdenDaemon([])
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", daemon)
+    unmanaged_only = _HOST_CMDLINES[:3]
+    real = wrkslots_cli._eden_cap_report
+    monkeypatch.setattr(
+        wrkslots_cli,
+        "_eden_cap_report",
+        lambda config: real(config, cmdlines=unmanaged_only),
+    )
+
+    assert wrkslots_cli._cmd_create(_eden_create_args(root)) == 0
+
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    assert [record.slot for record in wrkslots_cli._load_active(config).slots] == [
+        "eden-a"
+    ]
+    with pytest.raises(
+        wrkslots_cli.Refusal, match="1 outer checkout.*reserved for the default Eden"
+    ):
+        wrkslots_cli._cmd_create(
+            _eden_create_args(root, slot="eden-b", agent="agent-eden-b", task="task-2")
+        )
+    listed = sorted({call[2] for call in daemon.calls if call[3:4] == ("list",)})
+    slot_state = str(wrkslots_cli._slot_directory(config, "eden-a", "agent") / ".eden-state")
+    assert listed == [slot_state]
 
 
 # ------------------- absent-batch journal release (#1554)
@@ -1215,6 +1347,7 @@ class _StubEdenRemoval:
         self.live = True
 
     def __call__(self, argv: Sequence[str]) -> tuple[int, str, str]:
+        _fail_on_default_instance(argv)
         self.calls.append(tuple(argv))
         if argv[0] == "sl":
             if "status" in argv:
@@ -1615,20 +1748,23 @@ def test_eden_cap_report_counts_both(tmp_path: Path) -> None:
     config = _image_config(tmp_path)
     image = config.control / ".slots-image"
     runner = _fake_runner(
-        {"/state-a": (0, f"/host/one\n{image}/s1/checkout\n", "")}
+        {"/a/.eden-state": (0, f"/host/one\n{image}/s1/checkout\n", "")}
     )
 
     report = wrkslots_cli._eden_cap_report(
-        config, runner=runner, cmdlines=(), known=("/state-a",)
+        config, runner=runner, cmdlines=(), known=("/a/.eden-state",)
     )
 
+    # "outer" counts the default instance's fixed reserve (#2313).
     assert report == {
         "cap": 3,
-        "outer": 1,
+        "outer": 1 + eden.DEFAULT_INSTANCE_RESERVE,
         "in_image": 1,
-        "total": 2,
+        "total": 2 + eden.DEFAULT_INSTANCE_RESERVE,
         "outer_mounts": ["/host/one"],
         "in_image_mounts": [f"{image}/s1/checkout"],
+        "default_instance_reserve": eden.DEFAULT_INSTANCE_RESERVE,
+        "unmanaged_state_dirs": [],
     }
 
 
@@ -1655,21 +1791,22 @@ def test_partition_counts_an_outside_mount_by_its_in_image_state_dir(
 
 
 def test_checkouts_by_state_dir_pairs_and_dedupes() -> None:
+    a, b = "/a/.eden-state", "/b/.eden-state"
     runner = _fake_runner(
         {
-            "/state-a": (0, "/m/one\n/m/two\n", ""),
-            "/state-b": (0, "/m/two\n/m/three\n", ""),
+            a: (0, "/m/one\n/m/two\n", ""),
+            b: (0, "/m/two\n/m/three\n", ""),
         }
     )
 
-    pairs = eden.checkouts_by_state_dir(runner, ("/state-a", "/state-b"))
+    pairs = eden.checkouts_by_state_dir(runner, (a, b))
 
     assert pairs == (
-        ("/m/one", "/state-a"),
-        ("/m/two", "/state-a"),
-        ("/m/three", "/state-b"),
+        ("/m/one", a),
+        ("/m/two", a),
+        ("/m/three", b),
     )
-    assert eden.count_checkouts(runner, ("/state-a", "/state-b")) == (
+    assert eden.count_checkouts(runner, (a, b)) == (
         "/m/one",
         "/m/two",
         "/m/three",
@@ -1688,18 +1825,105 @@ def test_eden_cap_report_counts_an_outside_mount_with_slot_state_in_image(
     outside_mount = str(tmp_path / "eden-mounts" / "validate" / "s1")
     runner = _fake_runner(
         {
-            "/state-a": (0, "/host/one\n", ""),
+            "/a/.eden-state": (0, "/host/one\n", ""),
             str(slot_state): (0, f"{outside_mount}\n", ""),
         }
     )
 
     report = wrkslots_cli._eden_cap_report(
-        config, runner=runner, cmdlines=(), known=("/state-a", str(slot_state))
+        config, runner=runner, cmdlines=(), known=("/a/.eden-state", str(slot_state))
     )
 
     assert report["outer_mounts"] == ["/host/one"]
     assert report["in_image_mounts"] == [outside_mount]
-    assert (report["outer"], report["in_image"], report["total"]) == (1, 1, 2)
+    reserve = eden.DEFAULT_INSTANCE_RESERVE
+    assert (report["outer"], report["in_image"], report["total"]) == (
+        1 + reserve, 1, 2 + reserve
+    )
+
+
+#: Running daemons as a host with the user's default instance shows them:
+#: the default daemon (under its home spelling and its real path), another
+#: tool's instance, and one wrkslots slot daemon (#2313).
+_HOST_CMDLINES = (
+    "/usr/local/libexec/eden/edenfs --edenfs --edenDir /home/u/local/.eden --foreground",
+    "/usr/local/libexec/eden/edenfs --edenfs --edenDir=/data/users/u/.eden",
+    "/usr/local/libexec/eden/edenfs --edenfs --edenDir /opt/tool/eden-state",
+    "/usr/local/libexec/eden/edenfs --edenfs --edenDir /slots/s1/.eden-state",
+)
+
+
+def test_eden_cap_report_never_invokes_the_default_instance(tmp_path: Path) -> None:
+    config = _image_config(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def daemon(argv: Sequence[str]) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        assert argv[2] == "/slots/s1/.eden-state"
+        return (0, "/host/s1\n", "")
+
+    report = wrkslots_cli._eden_cap_report(
+        config, runner=_guarded(daemon), cmdlines=_HOST_CMDLINES, known=()
+    )
+
+    assert calls == [("eden", "--config-dir", "/slots/s1/.eden-state", "list")]
+    assert report["outer_mounts"] == ["/host/s1"]
+    assert report["outer"] == 1 + eden.DEFAULT_INSTANCE_RESERVE
+    assert report["default_instance_reserve"] == eden.DEFAULT_INSTANCE_RESERVE
+    assert report["unmanaged_state_dirs"] == [
+        "/data/users/u/.eden",
+        "/home/u/local/.eden",
+        "/opt/tool/eden-state",
+    ]
+
+
+def test_eden_cap_report_stays_fail_closed_for_a_managed_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _image_config(tmp_path)
+    runner = _fake_runner({"/slots/s1/.eden-state": (1, "", "daemon down")})
+
+    with pytest.raises(eden.EdenError, match="cannot list.*s1/.eden-state"):
+        wrkslots_cli._eden_cap_report(
+            config, runner=runner, cmdlines=_HOST_CMDLINES, known=()
+        )
+
+    real = wrkslots_cli._eden_cap_report
+    monkeypatch.setattr(
+        wrkslots_cli,
+        "_eden_cap_report",
+        lambda config: real(config, runner=runner, cmdlines=_HOST_CMDLINES),
+    )
+    with pytest.raises(wrkslots_cli.Refusal, match="cannot list"):
+        wrkslots_cli._assert_eden_host_cap(config)
+
+
+def test_known_config_dirs_never_name_the_default_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    (home / "local" / ".eden" / "clients").mkdir(parents=True)
+    (home / ".eden").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    config = _image_config(tmp_path)
+    slot_state = config.worktrees / "s1" / ".eden-state"
+    slot_state.mkdir(parents=True)
+
+    known = wrkslots_cli._eden_known_config_dirs(config)
+
+    assert known == (str(slot_state),)
+    assert all(eden.is_managed_state_dir(item) for item in known)
+
+
+def test_cap_counts_the_default_instance_reserve() -> None:
+    reserve = eden.DEFAULT_INSTANCE_RESERVE
+    eden.assert_under_cap((), reserve + 1, (), reserve)
+    eden.assert_under_cap(("/host/one",), reserve + 2, (), reserve)
+    with pytest.raises(eden.EdenError) as caught:
+        eden.assert_under_cap(("/host/one",), reserve + 1, (), reserve)
+    message = str(caught.value)
+    assert f"+ {reserve} reserved for the default Eden instance" in message
+    assert f"at cap {reserve + 1}" in message and "/host/one" in message
 
 
 def test_slot_view_accepts_an_eden_slot_without_git_directories(
@@ -1926,6 +2150,8 @@ def _eden_project_with_mount(tmp_path: Path) -> tuple[Path, Path]:
         "heartbeat_ttl_seconds: 60\n"
         "liveness_command: live.py\n"
         f"eden_mount_root: {mount_root}\n"
+        # Room above the default instance's fixed reserve (#2313).
+        "eden_host_cap: 10\n"
     )
     return root, mount_root
 

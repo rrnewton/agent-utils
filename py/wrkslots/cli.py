@@ -47353,7 +47353,8 @@ def _assert_eden_discovery(mount: str, runner: eden.Runner | None = None) -> Non
 
 
 def _eden_known_config_dirs(config: Config) -> tuple[str, ...]:
-    known = [str(Path.home() / "local" / ".eden")]
+    # Only slot state dirs: the user's default instance is never queried (#2313).
+    known: list[str] = []
     for state_dir in sorted(config.worktrees.glob("*/.eden-state")):
         known.append(str(state_dir))
     validate_dir = _validate_slots_directory(config)
@@ -47419,20 +47420,28 @@ def _eden_cap_report(
         cmdlines = read_cmdlines
     if known is None:
         known = _eden_known_config_dirs(config)
-    dirs = eden.discover_config_dirs(cmdlines, known)
-    pairs = eden.checkouts_by_state_dir(runner, dirs)
+    # Census only wrkslots-managed instances; the default instance and
+    # other unmanaged ones are never invoked, only named, and the default
+    # counts as a fixed reserve inside "outer" (#2313).
+    managed, unmanaged = eden.split_managed_config_dirs(
+        eden.discover_config_dirs(cmdlines, known)
+    )
+    pairs = eden.checkouts_by_state_dir(runner, managed)
     outer, in_image = eden.partition_checkouts(
         [mount for mount, _state in pairs],
         _eden_image_roots(config),
         state_dirs=dict(pairs),
     )
+    reserve = eden.DEFAULT_INSTANCE_RESERVE
     return {
         "cap": config.eden_host_cap,
-        "outer": len(outer),
+        "outer": len(outer) + reserve,
         "in_image": len(in_image),
-        "total": len(outer) + len(in_image),
+        "total": len(outer) + reserve + len(in_image),
         "outer_mounts": list(outer),
         "in_image_mounts": list(in_image),
+        "default_instance_reserve": reserve,
+        "unmanaged_state_dirs": list(unmanaged),
     }
 
 
@@ -47538,7 +47547,8 @@ def _assert_eden_host_cap(config: Config) -> None:
         report = _eden_cap_report(config)
         outer = cast("list[str]", report["outer_mounts"])
         in_image = cast("list[str]", report["in_image_mounts"])
-        eden.assert_under_cap(outer, config.eden_host_cap, in_image)
+        reserve = cast("int", report["default_instance_reserve"])
+        eden.assert_under_cap(outer, config.eden_host_cap, in_image, reserve)
     except eden.EdenError as exc:
         raise Refusal(str(exc)) from exc
 
@@ -68278,7 +68288,9 @@ def _finish_remove_paths(
                 if rc != 0:
                     raise Refusal(f"Eden redirect list failed: {stderr.strip()}")
                 targets = tuple(item.target for item in eden.parse_redirections(out))
-                rc, out, _e = _eden_runner(["eden", "du", "--json", str(mount)])
+                rc, out, _e = _eden_runner(
+                    ["eden", "--config-dir", config_dir, "du", "--json", str(mount)]
+                )
                 orphaned_before = eden.parse_orphaned_bytes(out) if rc == 0 else 0
             _unmount_eden_peer_group(
                 str(mount),
