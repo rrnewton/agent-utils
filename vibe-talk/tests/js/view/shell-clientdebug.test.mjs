@@ -210,7 +210,7 @@ test("#2276: a stall names the spans in it, the ones open at its start, the last
 });
 
 test("#2276: a long span says the sizes it ran at, and counted cache characters ride the span that read them", () => {
-  const { state, debug, spanAt } = makeDebug({ held: true, profilerExists: false, sizes: { s: 812, d: 140 } });
+  const { state, debug, spanAt } = makeDebug({ held: true, profilerExists: false, sizes: { s: 812, d: 140, src: "canon" } });
   debug.start();
   // A save that reads 400 000 and writes 410 000 characters, its cache read and write nested in it.
   state.now = 100;
@@ -224,14 +224,42 @@ test("#2276: a long span says the sizes it ran at, and counted cache characters 
   spanAt("key", 210, 215);
   const got = debug.attribute(100, 220, null, () => {});
   assert.deepEqual(got.spans, [
-    { name: "save-scope", n: 1, ms: 100, reads: 0, nodes: 4321, s: 812, d: 140 },
-    { name: "cache-write", n: 1, ms: 50, reads: 0, nodes: 4321, s: 812, d: 140, chars: 410000 },
-    { name: "cache-read", n: 1, ms: 35, reads: 0, nodes: 4321, s: 812, d: 140, chars: 400000 },
+    { name: "save-scope", n: 1, ms: 100, reads: 0, nodes: 4321, s: 812, s_src: "canon", d: 140 },
+    { name: "cache-write", n: 1, ms: 50, reads: 0, nodes: 4321, s: 812, s_src: "canon", d: 140, chars: 410000 },
+    { name: "cache-read", n: 1, ms: 35, reads: 0, nodes: 4321, s: 812, s_src: "canon", d: 140, chars: 400000 },
     { name: "key", n: 1, ms: 5, reads: 0 },
   ]);
   // Off, a note counts nothing and costs one test.
   debug.setOn(false);
   debug.note("chars", 5);
+});
+
+test("#2276: a tally stands for every call of per-row work in one record, and is the bare call while off", () => {
+  const { state, debug, proto } = makeDebug({ held: true, profilerExists: false });
+  debug.start();
+  state.now = 100;
+  debug.span("rows-dress", () => {
+    const labels = debug.tally("label-measure");
+    for (let i = 0; i < 4; i += 1) {
+      state.now += 10; // the dress itself
+      labels.run(() => { proto.getBoundingClientRect(); state.now += 5; });
+    }
+    labels.close();
+    debug.note("rows", 4);
+  });
+  const got = debug.attribute(100, state.now, null, () => {});
+  assert.deepEqual(got.spans, [
+    { name: "rows-dress", n: 1, ms: 60, reads: 4, nodes: 4321, rows: 4 },
+    // One record for the four calls: their count, total time and layout reads.
+    { name: "label-measure", n: 4, ms: 20, reads: 4 },
+  ]);
+  assert.equal(debug.summary().spans.find((one) => one.name === "label-measure").n, 4, "the summary counts every call");
+  debug.setOn(false);
+  let ran = 0;
+  const off = debug.tally("label-measure");
+  assert.equal(off.run(() => { ran += 1; return "x"; }), "x");
+  off.close();
+  assert.equal(ran, 1);
 });
 
 test("#2276: a long frame's detail is capped and carries no URL query, hash, foreign id or src", () => {
@@ -400,7 +428,7 @@ const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "fixtu
 
 /** The freeze report and scroll trace the page's own modules send for one scripted stall. */
 async function pageBodies() {
-  const { state, debug, tick, spanAt, settle } = makeDebug({ held: true, sizes: { s: 812, d: 140 } });
+  const { state, debug, tick, spanAt, settle } = makeDebug({ held: true, sizes: { s: 812, d: 140, src: "canon" } });
   debug.start();
   state.profilers[0].trace = {
     resources: ["https://host.example/assets/voice.0123456789abcdef0123456789abcdef.js?token=x"],

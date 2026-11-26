@@ -84,7 +84,7 @@ export type { PageVisibility, PageVisibilityDependencies } from "./visibility.ts
 export { FREEZE_GAP_MS, FREEZE_HEARTBEAT_MS, FREEZE_LONG_TASK_MS, FREEZE_MAX_EVENTS, FREEZE_STORAGE_KEY, createFreezeWatch } from "./freezewatch.ts";
 export type { FreezeWatch, FreezeWatchDependencies, FreezeWatchState } from "./freezewatch.ts";
 export { CLIENT_DEBUG_COOKIE, CLIENT_DEBUG_FLAG, CLIENT_DEBUG_KEY, DEBUG_SAMPLE_MS, codeName, createClientDebug, invokerName, looksLikeId, srcName, summariseProfile } from "./clientdebug.ts";
-export type { ClientDebug, ClientDebugCaps, ClientDebugDependencies, ProfilerLike } from "./clientdebug.ts";
+export type { ClientDebug, ClientDebugCaps, ClientDebugDependencies, DebugTally, ProfilerLike } from "./clientdebug.ts";
 export { createChannelSelection } from "./channelselection.ts";
 export type { ChannelSelection, ChannelSelectionDependencies, NavigationLike } from "./channelselection.ts";
 export { createDeploymentWords } from "./deployment.ts";

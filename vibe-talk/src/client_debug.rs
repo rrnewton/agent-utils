@@ -301,12 +301,36 @@ pub struct SpanTime {
     /// The list's rows mounted (`D`, `list.children.length`) at the same moment.
     #[serde(default)]
     pub d: Option<u64>,
+    /// Where `s` was counted: the channel's store, or the message rows drawn.
+    #[serde(default)]
+    pub s_src: Option<SizeSource>,
     /// Characters of saved message cache they read or wrote, in all.
     #[serde(default)]
     pub chars: Option<u64>,
     /// Rows they dressed, in all.
     #[serde(default)]
     pub rows: Option<u64>,
+}
+
+/// Where a span's `S` was counted (`#2276` follow-up): a threaded provider's reads land in the
+/// channel's store (`canon.messages.length`); an unthreaded channel's pages are drawn without it,
+/// so there `S` is the message rows drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizeSource {
+    /// The channel's store (`canon.messages.length`).
+    Canon,
+    /// The message rows drawn in the list.
+    Drawn,
+}
+
+impl SizeSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Canon => "canon",
+            Self::Drawn => "drawn",
+        }
+    }
 }
 
 /// A span still running when a stall began: the likeliest code to have held the thread.
@@ -566,7 +590,7 @@ impl EventDebug {
     }
 
     /// The attribution's log fields: open spans as `name:age`, spans as
-    /// `name:n:ms:reads:nodes:S:D:chars:rows`, recent ends as `name:dur:ago`, scripts as
+    /// `name:n:ms:reads:nodes:S:S-source:D:chars:rows`, recent ends as `name:dur:ago`, scripts as
     /// `type|invoker|fn|src|dur|forced`, profile frames as `fn@src:n`, each list quoted; `-`
     /// for what was not sent. The alphabet of [`is_code_name`] has none of `,` `|` `@` `"` `=`,
     /// so no name can pass for a separator or a field.
@@ -579,13 +603,14 @@ impl EventDebug {
                 let or_dash =
                     |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |n| n.to_string());
                 format!(
-                    "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                     span.name,
                     span.n,
                     span.ms,
                     span.reads,
                     or_dash(span.nodes),
                     or_dash(span.s),
+                    span.s_src.map_or("-", SizeSource::as_str),
                     or_dash(span.d),
                     or_dash(span.chars),
                     or_dash(span.rows)
@@ -772,6 +797,7 @@ pub(crate) mod fixtures {
                     reads: MAX_COUNT,
                     nodes: Some(MAX_NODES),
                     s: Some(MAX_COUNT),
+                    s_src: Some(SizeSource::Drawn),
                     d: Some(MAX_COUNT),
                     chars: Some(MAX_COUNT),
                     rows: Some(MAX_COUNT),
@@ -874,7 +900,7 @@ mod tests {
         let wire = serde_json::json!({
             "spans": [
                 {"name": "key", "n": 1, "ms": 180, "reads": 2},
-                {"name": "search-fast", "n": 2, "ms": 150, "reads": 0, "nodes": 5400, "s": 812, "d": 140},
+                {"name": "search-fast", "n": 2, "ms": 150, "reads": 0, "nodes": 5400, "s": 812, "s_src": "canon", "d": 140},
                 {"name": "save-scope", "n": 1, "ms": 40, "reads": 0, "chars": 900000}
             ],
             "open": [{"name": "key", "age_ms": 3}],
@@ -898,8 +924,8 @@ mod tests {
         debug.validate("events[0]").expect("valid");
         assert_eq!(
             debug.log_fields(),
-            "unattributed_ms=40 open=\"key:3\" spans=\"key:1:180:2:-:-:-:-:-,search-fast:2:150:0:5400:812:140:-:-,\
-             save-scope:1:40:0:-:-:-:900000:-\" \
+            "unattributed_ms=40 open=\"key:3\" spans=\"key:1:180:2:-:-:-:-:-:-,search-fast:2:150:0:5400:812:canon:140:-:-,\
+             save-scope:1:40:0:-:-:-:-:900000:-\" \
              recent=\"rows:12:30\" frame=blocking:250,render:30,style_layout:12 \
              scripts=\"event-listener|DIV#discord-log.onkeydown|applySearchFast|voice.js:45678|180|20\" \
              profile=samples:30,js:25,interval:10 self_top=\"drawSeams@voice.js:9:12\" \

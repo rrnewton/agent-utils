@@ -179,6 +179,7 @@ test("`#2279`: the phone's long-press sheet offers Label…, which opens the sam
   await label.click();
   await page.settle();
   assert.equal(page.el("label-picker").hidden, false, "Label… did not open the picker");
+  assert.equal(page.el("label-picker-input").getAttribute("aria-disabled"), "false", "online, the field looked inactive");
   void messages;
 });
 
@@ -188,6 +189,7 @@ test("`#2279`: offline, the picker writes nothing and says so, as Pin does", asy
   await page.setOnline(false);
   await openPicker(page, channelRow(page, id));
   assert.match(page.el("label-picker-note").textContent, /^Offline — labels can be added or removed once the connection is back\./);
+  assert.equal(page.el("label-picker-input").getAttribute("aria-disabled"), "true", "offline, the field still invited typing");
   await typeAndEnter(page, "#perf");
   assert.equal(page.labelCalls.filter((call) => call.method !== "GET").length, 0, "a label was sent while offline");
   assert.deepStrictEqual(chipTexts(channelRow(page, id)), [], "an offline label was shown as made");

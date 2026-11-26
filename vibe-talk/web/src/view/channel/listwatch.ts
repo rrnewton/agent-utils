@@ -9,6 +9,11 @@ import { createListening } from "../dom/index.ts";
 import type { SizeWatcher, SizeWatching } from "../dom/index.ts";
 
 export interface ListWatchDependencies extends SizeWatching {
+  /**
+   * `#2276 vibe-talk-client-debug-mode`: the debug mode's span helper, where the page wires one
+   * (absent, or the mode off: just the call). A thin wrap around existing calls, nothing more.
+   */
+  debugSpan?<T>(name: string, fn: () => T): T;
   /** An element of the page by id, in the column the code is working in, and in the left column. */
   byId(id: string): HTMLElement;
   leftById(id: string): HTMLElement;
@@ -67,7 +72,9 @@ export function mountListWatch(deps: ListWatchDependencies): ListWatch {
   // has nothing left to say, so it takes itself away rather than waiting to be tapped — and since
   // `#207 scrollback-jump` it is offered the moment they scroll far enough up the history to want it.
   // Only the jump, not every chip: this runs on every scroll event. See `renderJumpNewest`.
-  listen(deps.byId("scroll-area"), "scroll", () => {
+  // `#2276`: the whole chain one scroll event runs, as the debug mode's span.
+  const span = <T>(name: string, fn: () => T): T => (deps.debugSpan ? deps.debugSpan(name, fn) : fn());
+  listen(deps.byId("scroll-area"), "scroll", () => span("scroll-chain", () => {
     // `#245 done-feedback`. In this pass, so the chips keep off the message box in the frame it moved
     // in. `#2277 vibe-talk-key-scroll-freezes-11-26`: measured first and written after the jump's own
     // reads, so nothing this pass writes is laid out again inside it before the jump has read the foot.
@@ -101,7 +108,7 @@ export function mountListWatch(deps: ListWatchDependencies): ListWatch {
     // for every row that has already been asked about, and a scroll that reveals nothing new issues
     // nothing.
     deps.requestVisibleSummaries();
-  });
+  }));
   // `#207 scrollback-jump`. How far the list runs below the reader also changes WITHOUT a scroll, and
   // the listener above never hears of it: the window resized or turned, the reading column dragged
   // narrower, a row or the chips' room growing or shrinking below the reader. A reader 40px

@@ -342,7 +342,8 @@ test("the floating chips keep their height clear above the composer, and never s
   // The edge is measured where it moves: on a scroll, a change of the list's geometry, and the room.
   // Both in the lists' watch (web/src/view/channel `mountListWatch`, `#624 voice-page-modularity`).
   // `#2277`: measured before the jump reads the foot, and stood after it, in the same pass.
-  assert.match(PAGE_CODE, /listen\(deps\.byId\("scroll-area"\), "scroll", \(\) => \{[^}]*?const chipsTop = measure\(\);\s*deps\.renderJumpNewest\(\);\s*stand\(chipsTop\);/,
+  // `#2276`: the chain may run inside the client debug mode's span; the order inside is the same.
+  assert.match(PAGE_CODE, /listen\(deps\.byId\("scroll-area"\), "scroll", \(\) => (?:span\("scroll-chain", \(\) => )?\{[^}]*?const chipsTop = measure\(\);\s*deps\.renderJumpNewest\(\);\s*stand\(chipsTop\);/,
     "a scroll moves the box under the chips and nothing moves them");
   // In the same deferred decision as the jump, after the task the browser reported the sizes in; what else that
   // decision redraws after it (`#261 two-column-connectors`' links) may follow.

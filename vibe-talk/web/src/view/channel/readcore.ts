@@ -134,6 +134,12 @@ export interface TimelineAbandonedRead {
 /** What the timeline view asks of the page: the legacy names, each asked as it is needed. */
 export interface TimelineViewDependencies {
   el(id: string): HTMLElement;
+  /**
+   * `#2276 vibe-talk-client-debug-mode`: the debug mode's span helper, where the page wires one
+   * (absent, or the mode off: just the call). A thin wrap around existing calls, nothing more.
+   */
+  debugSpan?<T>(name: string, fn: () => T): T;
+
   selection(): TimelineSelection & { view: string; threadId: string | null };
   timelineRows(): TimelineRows;
   olderPages(): TimelineOlderPages;
@@ -402,6 +408,8 @@ const REPLY_JUMP_PAGES = 5;
 /** The timeline view over `deps`: reads drawn, pages folded, the walk back walked. */
 export function createTimelineView(deps: TimelineViewDependencies): TimelineView {
   const el = deps.el;
+  // `#2276`: the debug mode's span helper, or the plain call where the page wires none.
+  const span = <T>(name: string, fn: () => T): T => (deps.debugSpan ? deps.debugSpan(name, fn) : fn());
   const selection = deps.selection;
   const timelineRows = deps.timelineRows;
   const olderPages = deps.olderPages;
@@ -1282,8 +1290,8 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
   const incoming = selection().view === "threads" ? payload.threads || [] : payload.messages || [];
   // Into the channel's store, and this view back out of it: what the reader sees is the store's
   // projection, so a row another view corrected or the stream delivered is here too.
-  if (!saved && !delta) foldTimelinePage(payload, older, selection().view, selection().threadId, held);
-  const merged = (rows || projectView() || []) as Message[];
+  if (!saved && !delta) span("page-fold", () => foldTimelinePage(payload, older, selection().view, selection().threadId, held));
+  const merged = (rows || span("page-project", () => projectView()) || []) as Message[];
   if (selection().view === "threads") timelineRows().threads = merged as unknown as ThreadSummary[];
   else timelineRows().messages = merged;
   // Retain the oldest cursor when a refresh retained the history already walked back to.
@@ -1323,7 +1331,9 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
     const list = el("discord-log");
     const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
     const groups = glom(shown);
-    if (!renderWindowed(list, groups)) patchRows(list, groups, (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
+    span("page-draw", () => {
+      if (!renderWindowed(list, groups)) patchRows(list, groups, (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
+    });
     el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
   }

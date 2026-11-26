@@ -76,6 +76,15 @@ type ChannelRow = HTMLElement & {
 /** What drawing a row asks of the page. */
 export interface ChannelRowsDependencies extends ChannelRenderPassDependencies {
   byId(id: string): HTMLElement;
+  /**
+   * `#2276 vibe-talk-client-debug-mode`: the debug mode's span helper, where the page wires one
+   * (absent, or the mode off: just the call). A thin wrap around existing calls, nothing more.
+   */
+  debugSpan?<T>(name: string, fn: () => T): T;
+  /** `#2276`: an aggregated span for per-row work (absent: just the calls). */
+  debugTally?(name: string): { run<T>(fn: () => T): T; close(): void };
+  /** `#2276`: count rows dressed against the running span (absent: nothing). */
+  debugNote?(counter: "rows", n: number): void;
   inThisColumn<A extends unknown[]>(fn: (...args: A) => void): (...args: A) => void;
   threadOf(message: unknown): string | null;
   heldThreads(): Array<{ root?: { id?: unknown } | null; reply_count?: number } | null>;
@@ -179,6 +188,8 @@ export interface ChannelRows {
 /** No menu open, nothing drawn. */
 export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
   const el = deps.byId;
+  // `#2276`: the debug mode's hooks, or the plain call where the page wires none.
+  const span = <T>(name: string, fn: () => T): T => (deps.debugSpan ? deps.debugSpan(name, fn) : fn());
 
   // `#1836`: rows first measured while their list is hidden have no layout
   // yet; when a list gains size, measure what stands in it. Placement follows
@@ -1087,15 +1098,24 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     // `#299 all-thread-strip`. All's rows are drawn in the left column only, never on the right.
     const inAll = deps.drawingAll();
     deps.markListView();
-    for (const row of [...rows, ...deps.byId("pinned-log").children]) {
-      deps.dressChannelRow(row as HTMLElement, { tally, answered, viewing,
-        inMain: deps.selectionView() === "main" && mainList.has(row), inAll: inAll && mainList.has(row) });
-      // `#1836`: the row is laid out now; place its labels (header or inline).
-      measureLabelRow(row as HTMLElement);
-      // The linked message's mark is drawn as a row is built; a row kept or put back by a view
-      // (`#1229 keyed-row-patching`) is not built again, so the pass draws the mark on it here.
-      deps.drawLinkedMark(row as HTMLElement);
-    }
+    // `#2276`: the dress loop as one span, its rows counted, and the per-row label measure as one
+    // aggregated span inside it (#2282's B1 suspect).
+    span("rows-dress", () => {
+      const labels = deps.debugTally ? deps.debugTally("label-measure") : null;
+      const dressed = [...rows, ...deps.byId("pinned-log").children];
+      for (const row of dressed) {
+        deps.dressChannelRow(row as HTMLElement, { tally, answered, viewing,
+          inMain: deps.selectionView() === "main" && mainList.has(row), inAll: inAll && mainList.has(row) });
+        // `#1836`: the row is laid out now; place its labels (header or inline).
+        if (labels) labels.run(() => measureLabelRow(row as HTMLElement));
+        else measureLabelRow(row as HTMLElement);
+        // The linked message's mark is drawn as a row is built; a row kept or put back by a view
+        // (`#1229 keyed-row-patching`) is not built again, so the pass draws the mark on it here.
+        deps.drawLinkedMark(row as HTMLElement);
+      }
+      labels?.close();
+      deps.debugNote?.("rows", dressed.length);
+    });
     // `#214 reply-arrow` and `#215 reply-coalesce`. Each reply's gutter, from the rows now around it
     // and the speakers just decided for them.
     deps.renderReplyLinks();

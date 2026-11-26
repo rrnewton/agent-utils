@@ -149,6 +149,9 @@ export function createLabelPicker(deps: LabelPickerDependencies): LabelPicker {
   function draw(): void {
     if (!opened) return;
     const input = el("label-picker-input") as HTMLInputElement;
+    // Offline nothing can be written: the field looks inactive so it does not invite typing,
+    // and says so to assistive technology (`#2276` review of the offline picker).
+    input.setAttribute("aria-disabled", deps.online() ? "false" : "true");
     const typed = input.value.trim();
     const checked = typed ? checkLabelName(typed) : null;
     el("label-picker-error").textContent = checked && checked.error !== undefined ? checked.error : "";

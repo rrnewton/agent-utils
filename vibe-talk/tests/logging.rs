@@ -765,9 +765,9 @@ async fn client_debug_detail_rides_the_freeze_report_and_scroll_trace_and_logs_n
     };
     assert_eq!(
         line("page_freeze_debug "),
-        "i=0 unattributed_ms=30 open=\"key:0\" spans=\"evt:keydown:1:278:0:-:-:-:-:-,\
-         key:1:250:7:4321:812:140:-:-,evt-run:keydown:1:250:0:-:-:-:-:-,\
-         search-fast:1:235:7:4321:812:140:-:-\" recent=\"rows:50:50\" \
+        "i=0 unattributed_ms=30 open=\"key:0\" spans=\"evt:keydown:1:278:0:-:-:-:-:-:-,\
+         key:1:250:7:4321:812:canon:140:-:-,evt-run:keydown:1:250:0:-:-:-:-:-:-,\
+         search-fast:1:235:7:4321:812:canon:140:-:-\" recent=\"rows:50:50\" \
          frame=blocking:230,render:20,style_layout:15 \
          scripts=\"event-listener|DOCUMENT.onkeydown|onPageKey|voice.js:4567|250|12\" \
          profile=samples:4,js:3,interval:20 \

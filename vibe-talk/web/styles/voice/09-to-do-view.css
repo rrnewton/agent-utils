@@ -1187,6 +1187,12 @@ li[data-labels-below] > .meta > .label-chips {
   box-sizing: border-box;
 }
 
+/* Offline: greyed so it does not invite typing (nothing can be written until the connection is back). */
+.label-picker-input[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .label-picker-list {
   list-style: none;
   margin: 0;

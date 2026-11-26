@@ -1590,6 +1590,25 @@ test("`#624 voice-page-modularity`: watching the lists answers a scroll at once,
   split.unmount();
 });
 
+test("`#2276` the scroll chain runs as one debug span where the page wires one, in the same order", () => {
+  const { mountListWatch } = CHANNEL_VIEW;
+  const log = [];
+  const listeners = [];
+  const area = { id: "scroll-area", children: [], addEventListener: (type, listener) => listeners.push({ type, listener }), removeEventListener: () => {} };
+  const watch = mountListWatch({
+    byId: () => area, leftById: () => area, canWatchSizes: () => false, sizeWatcher: () => null, afterThisTask: () => {},
+    placeChipsOverComposer: () => log.push("chips"), renderJumpNewest: () => log.push("jump"),
+    replyBackOffered: () => false, replyReturnRow: () => null, dropReplyBack: () => {}, rowOnScreen: () => false,
+    renderScrollTools: () => {}, maybeLoadOlder: () => log.push("older"), maybeLoadOlderTurns: () => log.push("older turns"),
+    requestVisibleSummaries: () => log.push("summaries"), fitGrowingBoxes: () => {}, scheduleColumnLinks: () => {},
+    fitOverscroll: () => {}, sideShowing: () => false, renderSideJumpNewest: () => {},
+    debugSpan: (name, fn) => { log.push(`open ${name}`); const answer = fn(); log.push(`close ${name}`); return answer; },
+  });
+  for (const one of listeners.filter((each) => each.type === "scroll")) one.listener({});
+  assert.deepStrictEqual(log, ["open scroll-chain", "chips", "jump", "older", "older turns", "summaries", "close scroll-chain"]);
+  watch.unmount();
+});
+
 test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line as the dock grows, keep the right column's reader on its foot only where nothing else holds it, measure the arrows once per burst, and stop", () => {
   const { mountListKeepers, createUnderLists } = CHANNEL_VIEW;
   const log = [];
@@ -4830,4 +4849,34 @@ test("`#624` channel rows: the render pass runs its acts in order, held where th
   rows.renderChannelRows();
   assert.deepStrictEqual(calls, ["hold", "pinned", "arrange", "mark", "dress", "links", "outgoing", "runs", "bookmark"],
     "the render pass did not run held, in its order");
+});
+
+test("`#2276` channel rows: with the debug hooks the dress loop is one span, its rows counted and the label measure tallied once", () => {
+  const { createChannelRows } = CHANNEL_VIEW;
+  const calls = [];
+  const rowAt = (n) => ({ n, getAttribute: () => null, classList: { contains: () => false }, querySelectorAll: () => [] });
+  const lists = { "discord-log": { children: [rowAt(1), rowAt(2), rowAt(3)] }, "pinned-log": { children: [rowAt(4)] }, "settings-channel": { value: "c1" } };
+  const nothing = () => {};
+  const rows = createChannelRows({
+    byId: (id) => lists[id], side: () => true, quickReplyHolds: () => false, filterChanging: () => false, currentFilterHold: () => null,
+    holdingRows: (act) => act(), syncPinnedList: nothing, arrangeChannelRows: nothing, selectedChannelId: () => "c1",
+    answeredBy: () => new Set(), noteAuthor: () => false, keepSeenAuthors: nothing, settingsChannelValue: () => "c1",
+    renderIdentityList: nothing, replyTally: () => ({}), drawingAll: () => false, markListView: nothing,
+    dressChannelRow: (row) => calls.push(`dress ${row.n}`), selectionView: () => "main", drawLinkedMark: nothing,
+    renderReplyLinks: nothing, renderOutgoingMessages: nothing, renderNoiseCount: nothing, applyReadRuns: nothing,
+    rowsChosen: () => true, drawSeams: nothing, placeBookmarkLine: nothing, paintSideThreadCard: nothing, paintThreadCard: nothing,
+    leftEl: (id) => lists[id], openThreadChoice: () => null, paintAllThreadFocus: nothing, dressedAfter: () => true,
+    dressUnpackedRows: nothing, paintReadingCards: nothing, mainRowsOnScreen: () => false, renderSideCards: nothing,
+    replyState: () => ({ docked: null, pending: null }), placeInlineReply: nothing, reopenPendingReply: nothing,
+    debugSpan: (name, fn) => { calls.push(`open ${name}`); const answer = fn(); calls.push(`close ${name}`); return answer; },
+    debugTally: (name) => ({ run: (fn) => { calls.push(`tally ${name}`); return fn(); }, close: () => calls.push(`close tally ${name}`) }),
+    debugNote: (counter, n) => calls.push(`note ${counter} ${n}`),
+  });
+  rows.renderChannelRows();
+  const loop = calls.slice(calls.indexOf("open rows-dress"), calls.indexOf("close rows-dress") + 1);
+  assert.deepStrictEqual(loop, [
+    "open rows-dress",
+    "dress 1", "tally label-measure", "dress 2", "tally label-measure", "dress 3", "tally label-measure", "dress 4", "tally label-measure",
+    "close tally label-measure", "note rows 4", "close rows-dress",
+  ]);
 });

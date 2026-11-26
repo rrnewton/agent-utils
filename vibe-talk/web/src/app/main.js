@@ -421,7 +421,17 @@ const clientDebug = createClientDebug({
   elementPrototype: () => Element.prototype,
   nodeCount: () => document.getElementsByTagName("*").length,
   // `#2282` section 9 item 7: S, the channel's messages held, and D, the list's rows mounted.
-  sizes: () => ({ s: channelStore.current().messages.length, d: el("discord-log").children.length }),
+  // S counts the channel's store where the provider has threads (Slack: reads land in the canon), and
+  // the message rows drawn where it has none (an unthreaded channel's /page reads are drawn without the
+  // store); `src` names which, so a log line never passes one off as the other.
+  sizes: () => {
+    const list = el("discord-log");
+    const d = list.children.length;
+    if (providerFacts.threading()) return { s: channelStore.current().messages.length, d, src: "canon" };
+    let drawn = 0;
+    for (const row of list.children) drawn += idsOf(row).length;
+    return { s: drawn, d, src: "drawn" };
+  },
   measure: (name, start, end) => {
     clientDebugMeasures.add(name);
     performance.measure(name, { start, end });
@@ -5928,6 +5938,10 @@ const { answeredBy, dressChannelRow, dressUnpackedRows } = rowDress;
 // its menu, marking read through it, copying, and the channel summary line. Opening a reply
 // stays the page's and is handed in.
 const channelRows = createChannelRows({
+  // `#2276`: the client debug mode's hooks inside the redraw (the dress loop, rows dressed, the label measure).
+  debugSpan: (name, fn) => clientDebug.span(name, fn),
+  debugTally: (name) => clientDebug.tally(name),
+  debugNote: (counter, n) => clientDebug.note(counter, n),
   byId: el,
   inThisColumn,
   threadOf,
@@ -6013,12 +6027,12 @@ const channelRows = createChannelRows({
   dressChannelRow: (row, pass) => dressChannelRow(row, pass),
   selectionView: () => selection().view,
   drawLinkedMark: (row) => linkedMark.drawOn(row),
-  renderReplyLinks: () => renderReplyLinks(),
+  renderReplyLinks: () => clientDebug.span("reply-links", () => renderReplyLinks()),
   renderOutgoingMessages: () => renderOutgoingMessages(),
   renderNoiseCount: () => noiseSettings.renderCount(),
-  applyReadRuns: () => applyReadRuns(),
+  applyReadRuns: () => clientDebug.span("read-runs", () => applyReadRuns()),
   rowsChosen: () => rowsChosen(),
-  drawSeams: (list) => drawSeams(list),
+  drawSeams: (list) => clientDebug.span("seams", () => drawSeams(list)),
   placeBookmarkLine: () => placeBookmarkLine(),
   paintSideThreadCard: (tally) => paintSideThreadCard(tally),
   paintThreadCard: (card, choice, tally) => paintThreadCard(card, /** @type {any} */ (choice), tally),
@@ -7773,6 +7787,8 @@ const replayLedger = createReplayLedger();
  * @type {import("../view/channel/index.ts").TimelineView}
  */
 const timelineView = createTimelineView({
+  // `#2276`: the client debug mode's spans inside a read's landing (fold, projection, draw).
+  debugSpan: (name, fn) => clientDebug.span(name, fn),
   el, selection, timelineRows, olderPages, loadState, listState, entryState, doneState,
   selectedChannelId, channelContextKey, channelStore, providerFacts, messageCache,
   restoreSavedBookmark, noteServerThreadHuesIn, knownChannel, viewKey,
@@ -7783,7 +7799,11 @@ const timelineView = createTimelineView({
   settleReplays: (read, answer) => settleReplays(read, answer), setStatus,
   liveSeen: (channel) => liveEvents.seen(channel), liveNews: (channel) => liveEvents.news(channel),
   readsAsked: () => readOrder.asked(), readOrderNow: () => readOrder.now(), sentNumberOf, refreshFailed, within,
-  clock: clockOnUse(), streamAttached: () => liveFollow.attached(), discordNode, threadCards, glom, idsOf, rowMessages, hiddenEmpty,
+  clock: clockOnUse(), streamAttached: () => liveFollow.attached(), discordNode,
+  // `#2276`: a landing's thread-card rebuild and row grouping, as the client debug mode's spans.
+  threadCards: (threads) => clientDebug.span("thread-cards", () => threadCards(threads)),
+  glom: (messages) => clientDebug.span("glom", () => glom(/** @type {any} */ (messages))),
+  idsOf, rowMessages, hiddenEmpty,
   hidingRead, readFilterKeeps, gatheredParent, observeOutgoingMessages: (messages) => observeOutgoingMessages(messages), noteArchived,
   noteFreshRead, noteChannelReadFailure, renderChannelLoading, backgroundRead,
   renderChannelNavigation, renderChannelSeam, renderOlderControl: () => renderOlderControl(), renderScrollTools,
@@ -10310,6 +10330,8 @@ const sizeWatching = {
   sizeWatcher: (report) => new window.ResizeObserver(() => report()),
 };
 application.track(mountListWatch({
+  // `#2276`: one scroll event's whole chain, as the client debug mode's span.
+  debugSpan: (name, fn) => clientDebug.span(name, fn),
   ...sizeWatching,
   byId: (id) => el(id),
   leftById: (id) => leftEl(id),

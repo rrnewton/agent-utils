@@ -85,6 +85,10 @@ interface SpanRecord {
   /** The channel's messages held (`S`) and the list's rows mounted (`D`) at its end, for a long one. */
   readonly s?: number | null;
   readonly d?: number | null;
+  /** Where `S` was counted: the channel's store (`canon`), or the message rows drawn (`drawn`). */
+  readonly sSrc?: "canon" | "drawn" | null;
+  /** How many calls this record stands for: 1 for a span, more for a tally (`tally`). */
+  readonly count?: number;
   /** Characters of saved cache read or written inside it, and rows it dressed (`note`). */
   readonly chars?: number;
   readonly rows?: number;
@@ -146,7 +150,7 @@ export interface ClientDebugDependencies {
    * The sizes a long span ran at (`#2282` section 9 item 7): the channel's messages held (`S`,
    * `canon.messages.length`) and the list's rows mounted (`D`, `list.children.length`).
    */
-  sizes?(): { readonly s: number; readonly d: number };
+  sizes?(): { readonly s: number; readonly d: number; readonly src?: "canon" | "drawn" };
   /** Add a span to the browser's performance timeline (`performance.measure`), and clear them. */
   measure?(name: string, start: number, end: number): void;
   clearMeasures?(): void;
@@ -176,6 +180,13 @@ export interface ClientDebug {
   /** Count `n` cache characters or dressed rows against the innermost running span, while on. */
   note(counter: "chars" | "rows", n: number): void;
   /**
+   * An aggregated span for work called once per row inside a loop (`measureLabelRow`): each
+   * `run` is timed, and `close` keeps ONE record named `name` standing for all the calls (their
+   * count, total time and layout reads), placed at the first call's start. While off: `run` is
+   * the call and `close` does nothing.
+   */
+  tally(name: string): DebugTally;
+  /**
    * What ran in a stall over [`start`, `end`] (with its long-frame entry, where it is one), or
    * null while the mode is off. The profiler's summary comes later, through `late`.
    */
@@ -189,6 +200,15 @@ export interface ClientDebug {
   /** What the browser offers. */
   caps(): ClientDebugCaps;
 }
+
+/** An aggregated span's handle (`ClientDebug.tally`). */
+export interface DebugTally {
+  run<T>(fn: () => T): T;
+  close(): void;
+}
+
+/** The tally while the mode is off: the call, and nothing kept. */
+const OFF_TALLY: DebugTally = { run: <T>(fn: () => T): T => fn(), close: () => undefined };
 
 /** The code-name alphabet's complement: what never rides. */
 const NOT_CODE = /[^A-Za-z0-9_$.#:/<>()[\] -]/gu;
@@ -380,12 +400,13 @@ export function createClientDebug(deps: ClientDebugDependencies): ClientDebug {
     ringAt = (ringAt + 1) % DEBUG_SPAN_RING;
     const dur = record.end - record.start;
     const total = totals.get(record.name);
+    const calls = record.count ?? 1;
     if (total) {
-      total.n += 1;
+      total.n += calls;
       total.total += dur;
       if (dur > total.max) total.max = dur;
     } else {
-      totals.set(record.name, { n: 1, total: dur, max: dur });
+      totals.set(record.name, { n: calls, total: dur, max: dur });
     }
     if (record.page && dur >= DEBUG_SLOW_SPAN_MS) slow = true;
   }
@@ -395,7 +416,7 @@ export function createClientDebug(deps: ClientDebugDependencies): ClientDebug {
     const end = deps.now();
     const dur = end - start;
     let nodes: number | null = null;
-    let sizes: { readonly s: number; readonly d: number } | null = null;
+    let sizes: { readonly s: number; readonly d: number; readonly src?: "canon" | "drawn" } | null = null;
     if (dur >= DEBUG_NODES_SPAN_MS) {
       try {
         nodes = deps.nodeCount ? deps.nodeCount() : null;
@@ -410,7 +431,8 @@ export function createClientDebug(deps: ClientDebugDependencies): ClientDebug {
     }
     keepRecord({
       name, start, end, reads: spanReads, nodes, page: true,
-      s: sizes ? sizes.s : null, d: sizes ? sizes.d : null, chars: open.chars, rows: open.rows,
+      s: sizes ? sizes.s : null, d: sizes ? sizes.d : null, sSrc: sizes?.src ?? null,
+      chars: open.chars, rows: open.rows,
     });
     if (deps.measure && dur >= 1) {
       try {
@@ -441,6 +463,34 @@ export function createClientDebug(deps: ClientDebugDependencies): ClientDebug {
 
   function spanned<A extends unknown[], R>(name: string, fn: (...args: A) => R): (...args: A) => R {
     return (...args: A): R => (on ? span(name, () => fn(...args)) : fn(...args));
+  }
+
+  function tally(name: string): DebugTally {
+    if (!on) return OFF_TALLY;
+    let first: number | null = null;
+    let total = 0;
+    let calls = 0;
+    let tallyReads = 0;
+    return {
+      run<T>(fn: () => T): T {
+        if (!on) return fn();
+        const start = deps.now();
+        const reads0 = reads;
+        if (first === null) first = start;
+        try {
+          return fn();
+        } finally {
+          total += deps.now() - start;
+          calls += 1;
+          tallyReads += reads - reads0;
+        }
+      },
+      close(): void {
+        if (!on || first === null || calls === 0) return;
+        keepRecord({ name, start: first, end: first + total, reads: tallyReads, nodes: null, page: true, count: calls });
+        first = null;
+      },
+    };
   }
 
   function note(counter: "chars" | "rows", n: number): void {
@@ -572,7 +622,7 @@ export function createClientDebug(deps: ClientDebugDependencies): ClientDebug {
     const hi = Math.max(start, end);
     const inWindow = new Map<string, {
       n: number; ms: number; reads: number; nodes: number | null; longest: number;
-      s: number | null; d: number | null; chars: number; rows: number;
+      s: number | null; d: number | null; sSrc: "canon" | "drawn" | null; chars: number; rows: number;
     }>();
     const covered: Array<[number, number]> = [];
     const open: Array<{ name: string; age: number }> = [];
@@ -587,8 +637,8 @@ export function createClientDebug(deps: ClientDebugDependencies): ClientDebug {
       if (one.end > lo && one.start < hi) {
         const from = Math.max(lo, one.start);
         const to = Math.min(hi, one.end);
-        const kept = inWindow.get(one.name) ?? { n: 0, ms: 0, reads: 0, nodes: null, longest: -1, s: null, d: null, chars: 0, rows: 0 };
-        kept.n += 1;
+        const kept = inWindow.get(one.name) ?? { n: 0, ms: 0, reads: 0, nodes: null, longest: -1, s: null, d: null, sSrc: null, chars: 0, rows: 0 };
+        kept.n += one.count ?? 1;
         kept.ms += to - from;
         kept.reads += one.reads;
         kept.chars += one.chars ?? 0;
@@ -598,6 +648,7 @@ export function createClientDebug(deps: ClientDebugDependencies): ClientDebug {
           kept.nodes = one.nodes;
           kept.s = one.s ?? null;
           kept.d = one.d ?? null;
+          kept.sSrc = one.sSrc ?? null;
         }
         inWindow.set(one.name, kept);
         if (one.page) covered.push([from, to]);
@@ -621,6 +672,7 @@ export function createClientDebug(deps: ClientDebugDependencies): ClientDebug {
           name: codeName(name), n: kept.n, ms: whole(kept.ms), reads: kept.reads,
           ...(kept.nodes !== null ? { nodes: whole(kept.nodes) } : {}),
           ...(kept.s !== null ? { s: whole(kept.s) } : {}),
+          ...(kept.s !== null && kept.sSrc !== null ? { s_src: kept.sSrc } : {}),
           ...(kept.d !== null ? { d: whole(kept.d) } : {}),
           ...(kept.chars > 0 ? { chars: kept.chars } : {}),
           ...(kept.rows > 0 ? { rows: kept.rows } : {}),
@@ -834,6 +886,7 @@ export function createClientDebug(deps: ClientDebugDependencies): ClientDebug {
     span,
     spanned,
     note,
+    tally,
     attribute,
     summary,
     posted,
