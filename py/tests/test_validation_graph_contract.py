@@ -940,8 +940,9 @@ def test_no_result_steps_make_validate_partial_never_ok(
 
     for runner_code in (3, 0):
         def capture(command: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
-            env = kw["env"]  # type: ignore[assignment]
-            Path(env[validate.DAGRUN_NO_RESULT_FILE_ENV]).write_text(  # type: ignore[attr-defined,index]
+            env = kw["env"]
+            assert isinstance(env, dict)
+            Path(env[validate.DAGRUN_NO_RESULT_FILE_ENV]).write_text(
                 "g.fail\n", encoding="utf-8"
             )
             return subprocess.CompletedProcess(command, runner_code)
