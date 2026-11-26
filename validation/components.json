@@ -537,6 +537,7 @@
         "py/wrkslots/tests/test_sandbox_cpu_quotas.py",
         "py/wrkslots/tests/test_sandbox_gate_deny.py",
         "py/wrkslots/tests/test_sandbox_root_spec.py",
+        "py/wrkslots/tests/test_sandbox_scope_fallback.py",
         "py/wrkslots/tests/test_sandbox_show_config_rust.py",
         "py/wrkslots/tests/test_schema_skew.py",
         "py/wrkslots/tests/test_scoped_journal_episodes.py",

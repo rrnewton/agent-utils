@@ -405,7 +405,16 @@ pub(crate) fn place_in_scope_argv(unit: &str, slice_unit: &str, pid: u32) -> Vec
 
 /// The fallback when the D-Bus path is unavailable, mirroring
 /// Python `run`'s `systemd-run --scope` argv (the PID differs).
-pub(crate) fn scope_fallback_argv(unit: &str, slice_unit: &str, argv: &[String]) -> Vec<String> {
+/// `no_expand` is Python's `systemd_run_no_expand_args()`: the
+/// `--expand-environment=no` option when the installed systemd-run
+/// accepts it, so the boxed command (often shell text) is not
+/// expanded by systemd-run (#2316).
+pub(crate) fn scope_fallback_argv(
+    unit: &str,
+    slice_unit: &str,
+    no_expand: &[String],
+    argv: &[String],
+) -> Vec<String> {
     let mut fallback = vec![
         "systemd-run".to_string(),
         "--user".to_string(),
@@ -414,8 +423,9 @@ pub(crate) fn scope_fallback_argv(unit: &str, slice_unit: &str, argv: &[String])
         "--collect".to_string(),
         format!("--unit={unit}"),
         format!("--slice={slice_unit}"),
-        "--".to_string(),
     ];
+    fallback.extend(no_expand.iter().cloned());
+    fallback.push("--".to_string());
     fallback.extend(argv.iter().cloned());
     fallback
 }
@@ -954,8 +964,24 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
         let bus = place_in_scope_argv("u.scope", "wrkslots.slice", 42);
         assert_eq!(bus[0], "busctl");
         assert!(bus.contains(&"StartTransientUnit".to_string()));
-        let fallback = scope_fallback_argv("u.scope", "wrkslots.slice", &["/bin/true".to_string()]);
+        let fallback =
+            scope_fallback_argv("u.scope", "wrkslots.slice", &[], &["/bin/true".to_string()]);
         assert_eq!(fallback[6], "--slice=wrkslots.slice");
+        assert_eq!(fallback[7..], ["--", "/bin/true"]);
+        let literal = scope_fallback_argv(
+            "u.scope",
+            "wrkslots.slice",
+            &["--expand-environment=no".to_string()],
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo ${HOME}".to_string(),
+            ],
+        );
+        assert_eq!(
+            literal[7..],
+            ["--expand-environment=no", "--", "sh", "-c", "echo ${HOME}"]
+        );
         let root = root_helper_argv("/usr/bin/python3", "sandbox.py");
         assert_eq!(root[5], "-B");
     }

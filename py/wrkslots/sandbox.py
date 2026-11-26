@@ -3894,6 +3894,50 @@ def scope_in_place_available() -> bool:
     return result.returncode == 0
 
 
+#: The option that makes ``systemd-run`` pass a command's arguments through byte for byte (#2316).
+NO_EXPAND_ENVIRONMENT = "--expand-environment=no"
+
+_NO_EXPAND_SUPPORTED: bool | None = None
+
+
+def systemd_run_no_expand_args() -> list[str]:
+    """The arguments to put before ``--`` when ``systemd-run`` starts a command this process did
+    not write: ``[NO_EXPAND_ENVIRONMENT]`` when the installed ``systemd-run`` accepts it, else
+    nothing.
+
+    ``systemd-run --scope`` in newer systemd expands ``${NAME}`` anywhere in an argument, a
+    whole-word ``$NAME`` and ``$$`` (to ``$``) in the command line, from the caller's environment,
+    so a boxed shell command would run rewritten. systemd before 254 refuses the option, and its
+    scopes never expanded, so there the argv stays as it was after one note on stderr. Asked once
+    per process with ``systemd-run --expand-environment=no --version``, which needs no bus and
+    starts no unit."""
+
+    global _NO_EXPAND_SUPPORTED
+    if _NO_EXPAND_SUPPORTED is None:
+        try:
+            probe = subprocess.run(
+                ["systemd-run", NO_EXPAND_ENVIRONMENT, "--version"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            supported = probe.returncode == 0
+            if not supported:
+                print(
+                    f"wrkslots run: note: this systemd-run refuses {NO_EXPAND_ENVIRONMENT} "
+                    "(systemd older than 254), so it is left out; scopes there do not expand "
+                    "${...} in arguments (#2316)",
+                    file=sys.stderr,
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            # Not runnable: the launch itself fails and says so.
+            supported = False
+        _NO_EXPAND_SUPPORTED = supported
+    return [NO_EXPAND_ENVIRONMENT] if _NO_EXPAND_SUPPORTED else []
+
+
 def place_in_scope(unit: str, slice_unit: str) -> bool:
     """Move THIS process into a new transient scope without forking.
 
@@ -4051,6 +4095,8 @@ def run(
         "--collect",
         f"--unit={unit_name}",
         f"--slice={slot_slice}",
+        # The boxed command is the caller's, often shell text: it must arrive unexpanded.
+        *systemd_run_no_expand_args(),
         "--",
         *argv,
     ]
