@@ -38,3 +38,7 @@ On main after #2200 the thread view already starts with only "this thread" on an
 # Notes
 
 Owner-UI fast-track (rule 286); issue number pre-assigned by the coordinator. Related: #2250 vibe-talk-all-view-search-both-buckets-default, #2200 vibe-talk-search-tab-counts-match-cards, #1797 vibe-talk-search-bucket-toggles, #1608 agent-transcripts-timeline (the Transcripts view and its bucket), #2153 vibe-talk-transcript-view-reload-and-scroll, #2249 vibe-talk-search-signpost-hidden-while-reserved (the head reservation the widened row must not move).
+
+## Resolution
+
+Part (a) landed as 0e76dc9d (search names the view it searches; a thread view searches its thread with offers for main and the other threads; Back from a searched thread searches the view it lands on; a thread's None match makes no reach claim; scenes 126-128) on a green owner gate on the same tree (c7c40c2f, 2026-11-25 8:06 PM ET), after a first gate on the same change went red on cargo fmt and strict mypy in its test and scene code. Evidence: answer moment max dy 0.0 in all 8 traces; the cache-only server guard shows zero upstream calls with a negative control. Deployed the same evening; the 15-minute post-deploy watch was clean. Part (b), retiring the Search transcripts field, waits on the owner's decision and stays open here.
