@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-headless-serve-muse-argv: the serve transport passes exec-only flags to muse serve (it exits 2)'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - headless
 assignee: cl-museserve
 created_at: 2026-11-25T12:55:00-05:00
-updated_at: 2026-11-25T12:55:00-05:00
+updated_at: 2026-11-26T17:27:00-05:00
+closed_at: 2026-11-26T17:27:00-05:00
 ---
 
 # Description
@@ -38,3 +39,19 @@ The adapter (`rs/agentctl/src/headless/muse.rs`) keeps `--model`, drops `--effor
 # Notes
 
 Reported by a consumer's lead from a bounded repro on their host, now cleaned up. Related: #1234 headless-muse (the adapter), #1216 agentctl-effort-option (effort always set by agentctl), #2248 agentctl-headless-wrapper-keeps-harness-stderr.
+
+## Resolution
+
+Landed as 9d3819a1 (gated as bc3bfe08: a full gate with no failed steps; the two agentctl Python shards gave no result on a learned memory cap, #2306, which the lead coordinator waived for this Rust and docs change).
+
+- `muse serve` gets an argv built from an allowlist: serve's own options, the muse launcher options, and the base `--trust-workspace --disable-request-user-input`.
+  - Repeated options are deduplicated; a single-valued option keeps its last value.
+  - Exec-only and unknown options (`--reasoning-effort`, `--json`, `--approval-judge` and others) are left off the command line. They are named once in an `error` event of class `harness_arguments`.
+- Approval flags become the wire approval mode on `session/start`:
+  - `--yolo` and `--disable-approval` select `allowAll`, and `--yolo` also adds `--disable-sandbox`.
+  - `--approval-mode on-request|untrusted|never` selects `onRequest|promptUnmatched|allowAll`.
+  - Otherwise the mode is `onRequest` when the wrapper answers approvals, else `denyUnmatched`.
+  - A resumed session gets `session/setApprovalMode` once it opens.
+- The declared effort travels on the wire: `session/setReasoningEffort` once the session opens, and `turn/start.reasoningEffort` on each turn as before. A refused setting is logged as an `error` event of class `session_config`, and the wrapper keeps running.
+- The exec transport is unchanged.
+- Persisted format: two new `error` classes; an older agentctl shows them as plain errors.
