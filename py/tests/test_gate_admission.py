@@ -1469,6 +1469,101 @@ def test_a_preflight_refusal_on_issue_parse_or_rustfmt_names_the_fix(tmp_path: P
     assert row["failed_steps"] == ["repository.format.rust", "repository.hygiene.issue-parse"]
 
 
+def _gated_repo(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """A one-commit checkout to run gates in, and their environment (#2311)."""
+    root = tmp_path / "gated"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    _write(root / "a.txt", "a\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "base")
+    env = {**_env(tmp_path), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    return root, env
+
+
+def _gate_in(root: Path, env: dict[str, str], script: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([PY, str(GATE), "--", PY, "-c", script], cwd=root, env=env,
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_a_head_moved_mid_run_records_the_run_invalid(tmp_path: Path) -> None:
+    """#2311: a commit made while the command runs leaves a row that names
+    the head the run started on, says invalid, and records both heads; the
+    command's exit 0 becomes MIDRUN_CHANGE_EXIT and the last line says so."""
+    root, env = _gated_repo(tmp_path)
+    start = _git(root, "rev-parse", "HEAD").strip()
+    done = _gate_in(root, env, (
+        "import subprocess\n"
+        "subprocess.run(['git', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty',"
+        " '-m', 'mid-run'], check=True)\n"
+        "print('[a.step] ✓ PASS x'); print('validate: OK')\n"))
+    end = _git(root, "rev-parse", "HEAD").strip()
+    assert start != end
+    assert done.returncode == 66, done.stdout
+    last = done.stdout.strip().splitlines()[-1]
+    assert last.startswith("gate: INVALID: HEAD moved"), done.stdout
+    assert start[:12] in last and end[:12] in last
+    [row] = _ledger_rows(tmp_path)
+    assert row["verdict"] == "invalid" and row["exit_code"] == 66
+    assert row["head_sha"] == start == row["head_sha_at_start"]
+    assert row["head_sha_at_end"] == end
+    assert "HEAD moved" in str(row["invalid_reason"])
+
+
+def test_an_edit_mid_run_records_the_run_invalid_and_keeps_a_failing_exit(tmp_path: Path) -> None:
+    """#2311: an uncommitted edit or a new untracked file changes the tree the
+    run tested; a command that failed keeps its own exit status."""
+    root, env = _gated_repo(tmp_path)
+    head = _git(root, "rev-parse", "HEAD").strip()
+    edit = _gate_in(root, env, "open('a.txt', 'w').write('edited\\n'); print('validate: OK')")
+    assert edit.returncode == 66, edit.stdout
+    added = _gate_in(root, env, (
+        "open('new.txt', 'w').write('new\\n')\n"
+        "print('[b.step] ✗ FAIL y'); print('validate: FAILED'); raise SystemExit(3)\n"))
+    assert added.returncode == 3, added.stdout
+    assert "gate: INVALID: working tree changed" in added.stdout.strip().splitlines()[-1]
+    rows = _ledger_rows(tmp_path)
+    assert [row["verdict"] for row in rows] == ["invalid", "invalid"]
+    for row in rows:
+        assert row["head_sha"] == head == row["head_sha_at_start"] == row["head_sha_at_end"]
+        assert row["tree_at_start"] and row["tree_at_end"]
+        assert row["tree_at_start"] != row["tree_at_end"]
+        assert "working tree changed" in str(row["invalid_reason"])
+    assert rows[1]["failed_steps"] == ["b.step"] and rows[1]["exit_code"] == 3
+    stats = subprocess.run([PY, str(GATE), "stats"], cwd=root, env=env, capture_output=True, text=True)
+    assert "2 run(s) invalid" in stats.stdout, stats.stdout
+    assert "0 first-run gate(s)" in stats.stdout, stats.stdout
+
+
+def test_an_unchanged_run_records_its_start_head_and_tree(tmp_path: Path) -> None:
+    """#2311: an honest run keeps its verdict and records what it tested;
+    output the command leaves in ignored paths changes nothing."""
+    root, env = _gated_repo(tmp_path)
+    _write(root / ".gitignore", "target/\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "ignore target")
+    head = _git(root, "rev-parse", "HEAD").strip()
+    done = _gate_in(root, env, (
+        "import os; os.makedirs('target', exist_ok=True); open('target/out', 'w').write('x')\n"
+        "print('[a.step] ✓ PASS x'); print('validate: OK')\n"))
+    assert done.returncode == 0, done.stdout
+    assert "INVALID" not in done.stdout
+    [row] = _ledger_rows(tmp_path)
+    assert row["verdict"] == "pass" and row["invalid_reason"] is None
+    assert row["head_sha"] == head == row["head_sha_at_start"] == row["head_sha_at_end"]
+    assert row["tree_at_start"] == row["tree_at_end"] == _git(root, "rev-parse", "HEAD^{tree}").strip()
+
+
+def test_midrun_change_treats_an_unreadable_side_as_unknown() -> None:
+    gate = _gate_module()
+    assert gate.midrun_change(("a" * 40, "t1"), ("a" * 40, "t1")) is None
+    assert gate.midrun_change((None, None), ("b" * 40, "t2")) is None
+    assert gate.midrun_change(("a" * 40, None), ("a" * 40, "t2")) is None
+    both = gate.midrun_change(("a" * 40, "t1" * 6), ("b" * 40, "t2" * 6))
+    assert both is not None and "HEAD moved" in both and "working tree changed" in both
+
+
 def _hold(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = _env(tmp_path)
     env.pop("GATE_HOLD_NOW", None)

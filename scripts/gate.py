@@ -335,6 +335,17 @@ CPU cap (default 48 CPUs) and nice 10, through `_contained_command`, with
 VALIDATE_MAX_CPUS/GOMAXPROCS capped the same way, so a lane's selected
 checks before queueing cannot burn the host either.
 
+Mid-run change (#2311): at admission, just before the command starts, the
+gate records HEAD and the working-tree hash (staged, unstaged and untracked,
+the hash validate.py uses), and reads both again when the command ends. If
+either moved, the run did not test the tree its row would name: the row's
+verdict is `invalid` whatever the command's exit, its head_sha is the head the
+run started on, both heads and both trees are recorded with the reason, the
+gate's last output line says INVALID, and gate.py exits MIDRUN_CHANGE_EXIT
+(the command's own non-zero exit is kept). Landing tooling never accepts an
+invalid row; gate the final tree again. Every row records head_sha_at_start
+and tree_at_start.
+
 Admission hold (#1370 gate-hold-covers-local-preflight): an operator who
 needs the host quiet (a CPU-measured reading, 2026-11-12 7:26-8:01 AM ET,
 when preflight dagrun scopes still ran 7:43-7:54 inside the old
@@ -527,6 +538,10 @@ PREFLIGHT_FIX_HINTS = {
 
 #: Exit status for a run refused by the preflight (EX_DATAERR).
 PREFLIGHT_EXIT = 65
+
+#: Exit status for a run whose HEAD or working tree changed while its command
+#: ran and whose command itself exited 0 (#2311): its row is `invalid`.
+MIDRUN_CHANGE_EXIT = 66
 
 DEFAULT_BLACKOUT_CONFIG = Path("~/.local/etc/agent-utils/gate.toml")
 
@@ -2730,6 +2745,32 @@ def _working_tree_hash(root: Path) -> str | None:
         return None
 
 
+def _tree_identity(root: Path) -> tuple[str | None, str | None]:
+    """(HEAD, working-tree hash) of the checkout at `root`, None for either
+    git cannot give (#2311)."""
+
+    try:
+        done = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=False)
+        head = done.stdout.strip() if done.returncode == 0 and done.stdout.strip() else None
+    except OSError:
+        head = None
+    return head, _working_tree_hash(root)
+
+
+def midrun_change(start: tuple[str | None, str | None],
+                  end: tuple[str | None, str | None]) -> str | None:
+    """Why the checkout a run started on is not the one it ended on, or None
+    (#2311). A side git could not read is unknown, never a change."""
+
+    reasons = []
+    if start[0] and end[0] and start[0] != end[0]:
+        reasons.append(f"HEAD moved {start[0][:12]} -> {end[0][:12]}")
+    if start[1] and end[1] and start[1] != end[1]:
+        reasons.append(f"working tree changed {start[1][:12]} -> {end[1][:12]}")
+    return "; ".join(reasons) or None
+
+
 def _is_full_gate(command: list[str]) -> bool:
     """Whether `command` is a full validation gate (#1262): a validate.py
     run that is not a step-selected, list-only, or self-test invocation."""
@@ -3266,6 +3307,10 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     log_dir = gate_log_dir(run_id)
     print(f"gate: step logs kept in {log_dir} (recorded in the ledger, #2078)", flush=True)
     rss_peak_gib = 0.0
+    # #2311: the checkout this run tests, read again when it ends.
+    identity_at_start = _tree_identity(Path.cwd())
+    base_ref = command[command.index("--base") + 1] if "--base" in command[:-1] else None
+    base_sha_at_start = _git_rev_parse(base_ref) if base_ref else None
     try:
         for sig in _ABORT_SIGNALS:
             signal.signal(sig, _raise_aborted)
@@ -3315,6 +3360,10 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         finished = time.time()
+        identity_at_end = _tree_identity(Path.cwd())
+        invalid_reason = midrun_change(identity_at_start, identity_at_end)
+        if invalid_reason and rc == 0:
+            rc = MIDRUN_CHANGE_EXIT
         # #2062 decay: the run's measured peak is the only peak the
         # next need estimate may read back. Prefer the scope cgroup's
         # memory.peak (every child at once); fall back to the sampled
@@ -3363,7 +3412,9 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                        memory_waiting=memory_ever, memory_wait_s=memory_wait_s,
                        memory_class=mem_cls, memory_need_gib=mem_need,
                        log_path=str(log_dir),
-                       memory_peak_gib=mem_peak_gib, memory_peak_source=mem_peak_source)
+                       memory_peak_gib=mem_peak_gib, memory_peak_source=mem_peak_source,
+                       identity_at_start=identity_at_start, identity_at_end=identity_at_end,
+                       base_sha_at_start=base_sha_at_start, invalid_reason=invalid_reason)
         # #2114: say at once when nothing red is news, so the
         # coordinator can waive without a solo rerun; name expired
         # entries that matched, so they get renewed or removed.
@@ -3375,6 +3426,11 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             print(f"gate: warning: known-red entries for {', '.join(_expired)} have EXPIRED; "
                   "they no longer label a failure known-red — renew or remove them "
                   "in validation/known-red.toml (#2114)", flush=True)
+    if invalid_reason:
+        # Last, so `tail -1 LOG` shows it (#2311).
+        print(f"gate: INVALID: {invalid_reason} while the command ran, so this run tested "
+              "neither tree; its ledger row is invalid and no landing may use it; "
+              f"gate the final tree again (exit {rc}, #2311)", flush=True)
     return rc
 
 
@@ -3465,6 +3521,10 @@ def _record_ledger(
     memory_peak_gib: float | None = None,
     memory_peak_source: str | None = None,
     incomplete_steps: set[str] | None = None,
+    identity_at_start: tuple[str | None, str | None] | None = None,
+    identity_at_end: tuple[str | None, str | None] | None = None,
+    base_sha_at_start: str | None = None,
+    invalid_reason: str | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
@@ -3481,6 +3541,11 @@ def _record_ledger(
         verdict = "aborted" if aborted else {"OK": "pass", "PASS": "pass", "PARTIAL": "partial", "FAILED": "fail", "FAIL": "fail"}.get(
             verdict_word or "", "pass" if rc == 0 else "fail"
         )
+        if invalid_reason:
+            # #2311: the run tested neither the start tree nor the end tree.
+            verdict = "invalid"
+        start_head, start_tree = identity_at_start or (None, None)
+        end_head, end_tree = identity_at_end or (None, None)
         if kind is None:
             # A shared-class rerun (#1260) is still a rerun in the ledger.
             kind = "exclusive-rerun" if (args.cls == "exclusive" or rerun_flag) else "gate"
@@ -3491,7 +3556,14 @@ def _record_ledger(
             "finished_utc": _utc(finished),
             "base": base,
             "base_sha": _git_rev_parse(base) if base else None,
-            "head_sha": _git_rev_parse("HEAD"),
+            # #2311: the head the run started on, when it was read.
+            "head_sha": start_head or _git_rev_parse("HEAD"),
+            "head_sha_at_start": start_head,
+            "tree_at_start": start_tree,
+            "head_sha_at_end": end_head,
+            "tree_at_end": end_tree,
+            "base_sha_at_start": base_sha_at_start,
+            "invalid_reason": invalid_reason,
             "selection": "selected" if "--selected" in " ".join(command) else "full",
             "kind": kind,
             "steps": len(passed_steps) + len(failed_steps),
@@ -3867,7 +3939,10 @@ def show_stats(args: argparse.Namespace) -> int:
         ).timestamp() >= since
     ]
     aborted = [row for row in rows if row.get("verdict") == "aborted"]
-    gates = [row for row in rows if row.get("kind") == "gate" and row.get("verdict") != "aborted"]
+    # #2311: a run whose tree changed mid-run tested nothing; counted apart.
+    invalid = [row for row in rows if row.get("verdict") == "invalid"]
+    gates = [row for row in rows if row.get("kind") == "gate"
+             and row.get("verdict") not in ("aborted", "invalid")]
     reruns = [row for row in rows if row.get("kind") == "exclusive-rerun"]
     passed = sum(1 for row in gates if row.get("verdict") == "pass")
     partial = sum(1 for row in gates if row.get("verdict") == "partial")
@@ -3887,6 +3962,9 @@ def show_stats(args: argparse.Namespace) -> int:
         print(f"gate stats: {len(owners)} owner-priority run(s) (#1180 fast-track)")
     if aborted:
         print(f"gate stats: {len(aborted)} run(s) aborted by a signal (not counted as first runs)")
+    if invalid:
+        print(f"gate stats: {len(invalid)} run(s) invalid: HEAD or tree changed mid-run "
+              "(not counted as first runs, #2311)")
     refused = sum(1 for row in rows if row.get("kind") == "preflight-refused")
     skipped = sum(1 for row in rows if row.get("preflight") == "skipped: --skip-preflight")
     if refused or skipped:
