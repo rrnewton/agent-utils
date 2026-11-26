@@ -234,14 +234,15 @@ export function createTimelineSplit(deps: TimelineSplitDependencies): TimelineSp
     }
   }
 
-  /** Whether the panel stands as a phone's half sheet (the stylesheet's phone regime). */
+  /** Whether the panel stands as a phone's half sheet. The stylesheet decides the regime and says
+   * so in `--discuss-half-sheet` (22-discuss.css); the script only reads it. */
   function phoneHalf(): boolean {
     const panel = el("discuss-panel");
     if (panel === null || panel.getAttribute("data-sheet") !== "half") return false;
     try {
-      const query = (globalThis as unknown as { matchMedia?: (q: string) => { matches: boolean } }).matchMedia;
-      if (typeof query !== "function") return false;
-      return !query("(min-width: 900px) and (pointer: fine)").matches;
+      const read = (globalThis as unknown as { getComputedStyle?: (node: unknown) => { getPropertyValue(name: string): string } }).getComputedStyle;
+      if (typeof read !== "function") return false;
+      return read.call(globalThis, panel).getPropertyValue("--discuss-half-sheet").trim() === "1";
     } catch {
       return false;
     }

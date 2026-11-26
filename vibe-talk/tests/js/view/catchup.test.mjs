@@ -3267,8 +3267,13 @@ test("split: a record ending on a follow-up draws that pair open in Latest and t
 });
 
 test("split: on a phone's half sheet a Latest pair collapses the timeline by default; the reader's own choice wins and is kept (#2263)", () => {
-  const savedMatch = globalThis.matchMedia;
-  globalThis.matchMedia = () => ({ matches: false });
+  // The stylesheet's phone regime, as 22-discuss.css says it: `--discuss-half-sheet: 1` on the
+  // half sheet, nothing on a desk. The script reads that and decides nothing itself.
+  const savedStyle = globalThis.getComputedStyle;
+  let phone = true;
+  globalThis.getComputedStyle = (node) => ({
+    getPropertyValue: (name) => (name === "--discuss-half-sheet" && phone && node.getAttribute("data-sheet") === "half" ? " 1" : ""),
+  });
   try {
     const fx = splitFixture({ collapsed: null });
     fx.els["discuss-panel"].setAttribute("data-sheet", "half");
@@ -3293,14 +3298,14 @@ test("split: on a phone's half sheet a Latest pair collapses the timeline by def
     fx.split.applyStored();
     assert.equal(fx.split.collapsed(), false, "the reader's choice did not survive a reload");
     // A desk (the stylesheet's desk regime) never takes the half-sheet default.
-    globalThis.matchMedia = () => ({ matches: true });
+    phone = false;
     const desk = splitFixture({ collapsed: null });
     desk.els["discuss-panel"].setAttribute("data-sheet", "half");
     desk.split.applyStored();
     desk.split.showLatest("turn:1:you");
     assert.equal(desk.split.collapsed(), false, "a desk took the phone's half-sheet default");
   } finally {
-    if (savedMatch === undefined) delete globalThis.matchMedia;
-    else globalThis.matchMedia = savedMatch;
+    if (savedStyle === undefined) delete globalThis.getComputedStyle;
+    else globalThis.getComputedStyle = savedStyle;
   }
 });

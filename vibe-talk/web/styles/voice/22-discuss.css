@@ -50,6 +50,11 @@
   :root:has(#screen-main > #discuss-panel:not([hidden])[data-sheet="half"]) {
     --channel-pane-bottom: var(--discuss-docked-height, 50dvh);
   }
+  /* `#2263`: the split's half-sheet default (timeline collapsed beside a Latest pair) reads the
+   * regime from here, so which regime is in force stays the stylesheet's alone. */
+  #discuss-panel[data-sheet="half"] {
+    --discuss-half-sheet: 1;
+  }
 }
 
 /* `#2233 vibe-talk-glossary-popup`: the full-screen glossary (#glossary-panel) is drawn by these same
