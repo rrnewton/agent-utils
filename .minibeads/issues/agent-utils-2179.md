@@ -7,7 +7,7 @@ assignee: cl-transfer
 labels:
 - wrkslots
 created_at: 2026-11-24T03:20:00-05:00
-updated_at: 2026-11-26T10:10:00-05:00
+updated_at: 2026-11-26T11:15:00-05:00
 ---
 
 # Description
@@ -31,3 +31,5 @@ Field report from a consumer's post-reboot re-bind; the dead owner's scope had b
 ## Resolution
 
 transfer-owner now replaces a recorded task scope together with the owner. The loader binds a scope to its owner generation, so the existing owner proof decides it: a scope whose owner is provably dead (another boot, an absent PID, a reused PID, a zombie) is rebound to the successor's own scope when the successor's cgroup is a transient scope of the user's systemd manager whose invocation link verifies as --task-scope-unit requires, and is dropped otherwise; the record keeps its owner binding either way. A scope still bound to a live or indeterminate owner refuses, with --reopen too (unless the successor is that owner itself). No persisted field or evidence key changed: an absent task_scope already reads as none in every reader that knows the field. Python (_cmd_transfer_owner) and Rust (transfer_write) behave alike; tests: test_owner_transfer.py (previous-boot scope rebound and later release, scope dropped, reused PID, live owner refused, live reopen refused) and the differential in test_transfer_owner_write_rust.py, plus a Rust unit test for the drop branch.
+
+Landed as c98e82e4 (gated tree f0394ff9, replayed onto main from base b3a314d1). Gate evidence: full owner gate 1795706257236807480-7ae4ff24 had 74 of 75 steps green; the red step, rust.wrkslots.test, was a CPU-TIMEOUT with no assertion failure, and the test in flight was one this change does not reach (see #2300). The exclusive rerun of rust.wrkslots.test on the same tree, 1795708440456636001-d02f6f78, passed.
