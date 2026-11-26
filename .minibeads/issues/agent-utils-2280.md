@@ -8,7 +8,7 @@ labels:
 - vibe-talk
 - cache
 created_at: 2026-11-26T03:45:00-05:00
-updated_at: 2026-11-26T03:45:00-05:00
+updated_at: 2026-11-26T10:27:32-05:00
 ---
 
 # Description
@@ -40,3 +40,5 @@ This issue audits whether the principle holds everywhere in code, not only in th
 # Notes
 
 Owner request 381, part A. Owning lane: mu-statesync. Related: `#1227 poll-storm-stale-thread` (page reads must never start an upstream read; server-scheduled refresh with live events), `#2278` (server side of the same night's report; owns the background-refresh budget fix — coordinate before touching it), `#2277 vibe-talk-key-scroll-freezes-11-26` (client freezes from the same report), `#624 voice-page-modularity` (closed; the refactor the owner asked about). Survey first: the table goes to the coordinator before any gate.
+
+S3 waiver landing (2026-11-26): `afb8ecaa` (recap/digest held-copy answers and the recent-window retry) landed as `dce61a5b441abe28ebe64880365265994db88860` with `land-main --no-gate-evidence` under coordb's waiver at about 10:1x AM ET. The full gate and exclusive rerun were red only on `read-modes-browser`, reproduced on unmodified main and filed as `#2293`; every other step on the full gate but the discuss OOM `NO_RESULT` was green. Approved by coordb. The landing was already complete when the liaison's refusal of that shortcut arrived; the liaison then chose to keep `dce61a5b` only on conditions (a) #2293's read-modes disable or fix itself lands behind a passing gate, and (b) a full owner gate on main's tip (S3 included) is all green with nothing S3 touches red — failing that, `dce61a5b` is reverted at once. No deploy until both conditions hold.
