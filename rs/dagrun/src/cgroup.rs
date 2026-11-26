@@ -130,6 +130,15 @@ pub trait CgroupManager: Send + Sync {
     /// [`CgroupManager::applied_memory_max`] is a censored observation — the step used all it was
     /// allowed — so read the two together before treating this as an observed maximum.
     fn peak_bytes(&self, tag: &str) -> Option<i64>;
+    /// Instantaneous anonymous/shared-memory counters from the step cgroup's `memory.stat`.
+    ///
+    /// cgroup v2 has no anon or shmem high-water counter, so callers that need a peak sample
+    /// this repeatedly and retain the maximum. DEFAULTS TO `None`, DELIBERATELY: an
+    /// implementation that cannot answer has not measured either counter, and that must not
+    /// be recorded as zero demand.
+    fn memory_stat_sample(&self, _tag: &str) -> Option<MemoryStatSample> {
+        None
+    }
     /// The step cgroup's owned memory events as counter -> value.
     ///
     /// These are per-step deltas without subtraction: the child cgroup is created for the step
@@ -194,6 +203,39 @@ pub struct PreparedDelegation {
     pub command: String,
     /// Root to export through [`DELEGATED_CGROUP_ENV`], absent when delegation failed.
     pub root: Option<PathBuf>,
+}
+
+/// One instantaneous `memory.stat` reading of non-reclaimable memory classes.
+///
+/// Either field is `None` when that counter is absent or unparseable. A manager returns `None`
+/// for the whole sample when `memory.stat` cannot be read at all, so a caller can distinguish
+/// "not measured" from a real zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryStatSample {
+    /// Anonymous memory (`anon`), in bytes.
+    pub anon_bytes: Option<i64>,
+    /// Shared memory (`shmem`, including tmpfs), in bytes.
+    pub shmem_bytes: Option<i64>,
+}
+
+/// Parse the `anon` and `shmem` counters from cgroup-v2 `memory.stat` text.
+///
+/// Returns `None` when neither counter is present and parseable. A present counter with a
+/// malformed value stays `None` in its own field rather than becoming zero.
+pub fn parse_memory_stat_anon_shmem(text: &str) -> Option<MemoryStatSample> {
+    let mut sample = MemoryStatSample::default();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(key), Some(value)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        match key {
+            "anon" => sample.anon_bytes = value.parse().ok(),
+            "shmem" => sample.shmem_bytes = value.parse().ok(),
+            _ => {}
+        }
+    }
+    (sample.anon_bytes.is_some() || sample.shmem_bytes.is_some()).then_some(sample)
 }
 
 /// Shell prologue that migrates the step's bash leader into `child` before it forks anything.
@@ -2985,6 +3027,14 @@ impl CgroupManager for Cgroups {
         read_trim(&child, "memory.peak").and_then(|s| s.parse().ok())
     }
 
+    fn memory_stat_sample(&self, tag: &str) -> Option<MemoryStatSample> {
+        let child = self.child(tag)?;
+        if !self.enabled {
+            return None;
+        }
+        parse_memory_stat_anon_shmem(&read_trim(&child, "memory.stat")?)
+    }
+
     fn cpu_stats(&self, tag: &str) -> Option<BTreeMap<String, i64>> {
         let child = self.child(tag)?;
         if !self.enabled {
@@ -3812,6 +3862,44 @@ mod tests {
             assert_eq!(cg.peak_bytes("g.j"), None);
             assert_eq!(cg.kill_all_remaining(), 0);
         }
+    }
+
+    #[test]
+    fn memory_stat_sample_reads_anon_and_shmem_from_a_fake_cgroup() {
+        let base = std::env::temp_dir().join(format!(
+            "dagrun-memory-stat-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let child = base.join(sanitize("g.mem"));
+        fs::create_dir_all(&child).unwrap();
+        let mut cg = Cgroups::disabled(Containment::Full);
+        cg.root = Some(base.clone());
+        cg.enabled = true;
+
+        // Missing memory.stat: no sample, never a zero.
+        assert_eq!(cg.memory_stat_sample("g.mem"), None);
+
+        fs::write(child.join("memory.stat"), "anon 1048576\nfile 2097152\nshmem 262144\n").unwrap();
+        assert_eq!(
+            cg.memory_stat_sample("g.mem"),
+            Some(MemoryStatSample {
+                anon_bytes: Some(1048576),
+                shmem_bytes: Some(262144),
+            })
+        );
+
+        // Unparseable text: still no sample, never zero.
+        fs::write(child.join("memory.stat"), "anon nope\nshmem nope\n").unwrap();
+        assert_eq!(cg.memory_stat_sample("g.mem"), None);
+        assert_eq!(
+            parse_memory_stat_anon_shmem("anon 1\nshmem 2\n"),
+            Some(MemoryStatSample {
+                anon_bytes: Some(1),
+                shmem_bytes: Some(2),
+            })
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

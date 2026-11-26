@@ -74,7 +74,12 @@ pub const CSV_COLUMNS: [&str; 15] = [
 ///   independently owned event from being attributed again to its outer scheduler.
 ///   `memory_events_oom_group_kill` preserves kernels' group-kill counter; at a delegated
 ///   boundary it can be the only durable kill signal.
-pub const STEP_PROFILE_COLUMNS: [&str; 59] = [
+/// * `anon_sampled_max_bytes` and `shmem_sampled_max_bytes` are SAMPLED maxima of the
+///   instantaneous `memory.stat` `anon` and `shmem` counters, taken on the scheduler monitor
+///   cadence recorded in `mem_sample_interval_ms`. cgroup v2 exposes no anon/shmem high-water
+///   counter, so each is a LOWER BOUND on the true peak, never a high-water mark. Blank means
+///   not measured (unboxed, or no readable sample); it is never written as zero for that case.
+pub const STEP_PROFILE_COLUMNS: [&str; 62] = [
     "timestamp",
     "machine_id",
     "container_class",
@@ -136,6 +141,9 @@ pub const STEP_PROFILE_COLUMNS: [&str; 59] = [
     "memory_events_oom",
     "memory_events_oom_kill",
     "memory_events_oom_group_kill",
+    "anon_sampled_max_bytes",
+    "shmem_sampled_max_bytes",
+    "mem_sample_interval_ms",
 ];
 
 /// Stable columns for an opt-in per-step CPU/thread time series.

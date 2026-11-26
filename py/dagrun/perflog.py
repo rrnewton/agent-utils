@@ -199,6 +199,12 @@ STEP_PROFILE_COLUMNS = [
     *ENRICHMENT_COLUMNS,
     # Run-overlap and applied-cap provenance (appended; blank when unavailable).
     *CENSORING_COLUMNS,
+    # Sampled maxima of instantaneous memory.stat anon/shmem (appended;
+    # blank when not measured, never zero for that case). These are
+    # lower bounds sampled on the monitor cadence in
+    # mem_sample_interval_ms, not kernel high-water marks.
+    "anon_sampled_max_bytes", "shmem_sampled_max_bytes",
+    "mem_sample_interval_ms",
 ]
 
 #: Fixed prefix for the opt-in interval-level trace. The first nine fields are the same run

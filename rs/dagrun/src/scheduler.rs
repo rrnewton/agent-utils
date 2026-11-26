@@ -45,7 +45,8 @@ use crate::attribution::{
     TestEvent, STEP_NONCE_ENV, TEST_COUNTS_PATH_ENV,
 };
 use crate::cgroup::{
-    delegated_cgroup_root, CgroupManager, DELEGATED_CGROUP_ENV, DELEGATED_UNBOXED_ENV,
+    delegated_cgroup_root, CgroupManager, MemoryStatSample, DELEGATED_CGROUP_ENV,
+    DELEGATED_UNBOXED_ENV,
 };
 pub use dagrun_model::check::steps_violating_run_timeout;
 pub use dagrun_model::clock::monotonic_now_ns;
@@ -126,6 +127,29 @@ struct TimeseriesSnapshot {
     user_usec: Option<i64>,
     system_usec: Option<i64>,
     throttled_usec: Option<i64>,
+}
+
+/// Running maxima of instantaneous `memory.stat` anon/shmem samples.
+///
+/// cgroup v2 has no anon/shmem high-water counter, so these sampled maxima are lower bounds
+/// on the true peaks, never high-water marks. A field stays `None` until a sample actually
+/// lands, so "not measured" never serializes as zero.
+#[derive(Clone, Copy, Default)]
+struct SampledMemoryMax {
+    anon_bytes: Option<i64>,
+    shmem_bytes: Option<i64>,
+}
+
+impl SampledMemoryMax {
+    fn observe(&mut self, sample: Option<MemoryStatSample>) {
+        let Some(sample) = sample else { return };
+        if let Some(v) = sample.anon_bytes {
+            self.anon_bytes = Some(self.anon_bytes.map_or(v, |cur| cur.max(v)));
+        }
+        if let Some(v) = sample.shmem_bytes {
+            self.shmem_bytes = Some(self.shmem_bytes.map_or(v, |cur| cur.max(v)));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -4071,10 +4095,12 @@ fn run_step(ctx: StepCtx) {
     // reads do not accumulate sampling drift. The poll remains interruptible for prompt teardown.
     let (monitor_stop, monitor_stop_rx) = std::sync::mpsc::channel();
     let thread_peak = Arc::new(Mutex::new(None::<i64>));
+    let sampled_memory = Arc::new(Mutex::new(SampledMemoryMax::default()));
     let cpu_exceeded = Arc::new(AtomicBool::new(false));
     let termination_culprit = Arc::new(Mutex::new(None::<Culprit>));
     let monitor: Option<thread::JoinHandle<()>> = if boxed || cpu_budget > 0 {
         let peak = Arc::clone(&thread_peak);
+        let mmem = Arc::clone(&sampled_memory);
         let cpu_flag = Arc::clone(&cpu_exceeded);
         let cg = cgroups.clone();
         let t = tag.clone();
@@ -4152,6 +4178,13 @@ fn run_step(ctx: StepCtx) {
                         if monitor_due || trace_due {
                             let mut p = peak.lock().unwrap();
                             *p = Some(p.map_or(n, |cur| cur.max(n)));
+                        }
+                    }
+                    if boxed {
+                        if let Some(manager) = cg.as_ref() {
+                            mmem.lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .observe(manager.memory_stat_sample(&t));
                         }
                     }
                     if trace_due {
@@ -4363,6 +4396,17 @@ fn run_step(ctx: StepCtx) {
         );
     }
 
+    // One final memory sample before cleanup destroys the counters, mirroring the final
+    // thread-count sample above; a periodic deadline can miss a short final phase.
+    if boxed {
+        if let Some(manager) = cgroups.as_ref() {
+            sampled_memory
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .observe(manager.memory_stat_sample(&tag));
+        }
+    }
+
     // TEST-LEVEL ATTRIBUTION, derived from the step's own output stream. Computed here, after the
     // readers have finished or been abandoned, so every byte the step managed to emit has been
     // seen. The verdict is only reported for a step that did NOT finish cleanly: naming a culprit
@@ -4438,6 +4482,11 @@ fn run_step(ctx: StepCtx) {
         }
     }
     let thread_peak = *thread_peak.lock().unwrap();
+    let sampled_memory = *sampled_memory
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mem_sample_interval = profile_timeseries_interval
+        .map_or(MONITOR_INTERVAL, |interval| interval.min(MONITOR_INTERVAL));
     let cpu_timed_out = cpu_exceeded.load(Ordering::Relaxed);
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -4509,6 +4558,28 @@ fn run_step(ctx: StepCtx) {
     row.insert(
         "thread_peak".into(),
         thread_peak.map(|t| t.to_string()).unwrap_or_default(),
+    );
+    row.insert(
+        "anon_sampled_max_bytes".into(),
+        sampled_memory
+            .anon_bytes
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+    row.insert(
+        "shmem_sampled_max_bytes".into(),
+        sampled_memory
+            .shmem_bytes
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
+    row.insert(
+        "mem_sample_interval_ms".into(),
+        if sampled_memory.anon_bytes.is_some() || sampled_memory.shmem_bytes.is_some() {
+            mem_sample_interval.as_millis().to_string()
+        } else {
+            String::new()
+        },
     );
     // Run-overlap + applied-cap provenance. Offsets share one monotonic run origin, so two rows of
     // the same run_id overlap iff their [started, finished] intervals do.
@@ -5505,6 +5576,24 @@ fn run_dag_boxed_deadline_limited_with_cpu_and_resource_caps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampled_memory_max_keeps_maxima_and_never_invents_zero() {
+        let mut sampled = SampledMemoryMax::default();
+        sampled.observe(None);
+        assert_eq!(sampled.anon_bytes, None);
+        assert_eq!(sampled.shmem_bytes, None);
+        sampled.observe(Some(MemoryStatSample {
+            anon_bytes: Some(100),
+            shmem_bytes: Some(40),
+        }));
+        sampled.observe(Some(MemoryStatSample {
+            anon_bytes: Some(80),
+            shmem_bytes: Some(64),
+        }));
+        assert_eq!(sampled.anon_bytes, Some(100));
+        assert_eq!(sampled.shmem_bytes, Some(64));
+    }
 
     #[test]
     fn complete_capture_counts_tests_independently_of_console_verbosity() {
