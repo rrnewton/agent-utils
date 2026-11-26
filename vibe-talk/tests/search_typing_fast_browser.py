@@ -425,7 +425,7 @@ def head_room_walk(walk: Walk) -> None:
     def first_key(where: str) -> None:
         clear()
         row_id = page.evaluate(PARK_JS, where)
-        walk.check(row_id is not None, f"no {where} row to read")
+        walk.check(isinstance(row_id, str), f"no {where} row to read: {row_id}")
         page.wait_for_function("() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))")
         seen = page.evaluate(HEAD_KEY_JS, ["routine", row_id])
         walk.check(seen["atKey"]["head"] is True,
@@ -559,6 +559,59 @@ HEAD_TOP_JS = """async () => {
 }"""
 
 
+# `#2258`: same head reader, sampled through the server's answer and 30 frames past it: the
+# count redraw's thread-view parking must not move the row being read when the first result
+# sits wholly above the panel (a server hit inserted above the reader), and no settled frame
+# may leave the first result straddling the chip panel's bottom.
+THREAD_PARK_JS = """async () => {
+    const area = document.getElementById('scroll-area');
+    const line = document.getElementById('server-line');
+    area.scrollTop = 0;
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const view = area.getBoundingClientRect();
+    const row = [...document.querySelectorAll('#discord-log > li[data-id]')]
+        .find((one) => one.getClientRects().length && one.getBoundingClientRect().top >= view.top);
+    const before = row.getBoundingClientRect().top;
+    const field = document.getElementById('search-field');
+    field.value = 'lantern';
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    const answered = () => !/Searching/.test(line.textContent || '');
+    let frames = 0; let past = 0; let worst = 0; let straddle = 0;
+    while (frames < 6000 && past < 30) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        frames += 1;
+        if (row.isConnected && row.getClientRects().length)
+            worst = Math.max(worst, Math.abs(row.getBoundingClientRect().top - before));
+        const panel = document.getElementById('search-bucket-row');
+        const first = [...document.querySelectorAll('#discord-log > li[data-id]')]
+            .find((one) => one.getClientRects().length);
+        if (answered() && panel && !panel.hidden && first) {
+            past += 1;
+            const r = first.getBoundingClientRect(); const pb = panel.getBoundingClientRect().bottom;
+            if (r.top < pb - 1 && r.bottom > pb) straddle = Math.max(straddle, pb - r.top);
+        }
+    }
+    return { worst: Math.round(worst * 10) / 10, straddle: Math.round(straddle * 10) / 10,
+             frames, answered: answered() };
+}"""
+
+
+def park_walk(walk: Walk, total: int) -> None:
+    page = walk.page
+    open_search(walk, total)
+    page.evaluate("""() => { const p = document.getElementById('thread-select');
+        p.value = 'thread:spaces/A/threads/lantern'; p.dispatchEvent(new Event('change', { bubbles: true })); }""")
+    walk.until("() => document.getElementById('thread-select').value === 'thread:spaces/A/threads/lantern'"
+               " && [...document.querySelectorAll('#discord-log > li[data-id]')].filter((r) => r.getClientRects().length).length === 4",
+               "the lantern thread's own view did not open with its four messages")
+    seen = page.evaluate(THREAD_PARK_JS)
+    walk.check(seen["answered"] and seen["worst"] <= 1,
+               f"park: the head row moved {seen['worst']} px through the answer: {seen}")
+    walk.check(seen["straddle"] <= 1,
+               f"park: the first result stayed under the chip panel by {seen['straddle']} px after the answer: {seen}")
+    walk.shot("park-head")
+
+
 def head_reader_walk(walk: Walk, total: int) -> None:
     """`#2262 vibe-talk-search-head-room-two-columns`: a reader at the very top of the lantern thread's
     own view (at desktop size the thread fits on the screen, so the reader is at its head and at its
@@ -601,6 +654,7 @@ def main() -> int:
     sessions = (
         (walk_through, "typing bounded per key, chips follow the query"),
         (head_reader_walk, "a reader at the head of a thread that fits keeps the head row"),
+        (park_walk, "the answer's parking does not move the head reader"),
     )
     with sync_playwright() as playwright:
         for label, width, height, touch, scheme in runs:

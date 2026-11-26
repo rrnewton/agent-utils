@@ -31,3 +31,8 @@ Found while tracing #2251 vibe-talk-search-scope (scene "search scope thread"), 
 # Notes
 
 Owner-UI (owner 370), small follow-up asked for by the owner side on 2026-11-25. Goes to the lane that owns #2256 and #2257, after #2257. Related: #2200 (thread-view parking), #2251 vibe-talk-search-scope, #2230 vibe-talk-reading-row-stays-put.
+
+Stack notes (from #2262 (b) tracing, 2026-11-25, tip page build ec27ce01; scroll-writer probes at desk and phone size):
+- desk 1280x800, lantern thread view, reader at scrollTop 0, key 'lantern': at the key, placeFilterAnchor nudge 0 -> 59 (head row kept, 0.2 px); at the answer, renderServerSearch preservingScroll writeHold 59 -> 125 (server hit row 151 inserted above the head row; row held), then renderSearchCount (refreshSearchCount <- renderServerSearch) intoView of the current hit (row 151) -> 49: head row +75.9 px.
+- phone 412x915 (1 in ~3 runs): applySearch -> renderSearchCount intoView 106 -> 96, markSearchNow redraw preservingScroll restores 96 -> 106 (same task); at the server ask, refreshSearchCount <- renderServerSearch intoView -> 96, scroll event painted at 96 (one frame, +9.6 px) before the answer's hold 96 -> 162 and intoView -> 68.
+- Fix landed here: park only when the first result's rect straddles the panel's bottom, and only once per search and row (parkedFor keyed by search key + row id, cleared when the search closes).

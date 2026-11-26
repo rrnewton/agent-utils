@@ -421,6 +421,11 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
   // The one parsed query drives it, so a plain word and a `label:` search
   // (group-expanded in `applySearch`) behave the same.
   let entireThreadsOn = false;
+  // `#2258`: the search key + row the thread-view parking already parked
+  // this search; a later pass (the server ask, the answer) never parks it
+  // again, because an intervening redraw's scroll restore undoes the
+  // parking and the re-park paints a one-frame move of the reader's row.
+  let parkedFor = "";
 
   /** Every thread (by `threadOf`) holding a held message that matches. */
   function entireThreadHits(node: unknown): Set<string> {
@@ -850,15 +855,25 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     // stands below the chip panel. The thread header stands over the
     // list there, and both the carried scroll and the entry's own
     // landing can leave results under the panel (only their last lines
-    // showing), so this is checked on every pass: while the first shown
-    // row's top is above the panel's bottom, it is landed through the
-    // scroll owner, whose margin parks it below the panel.
+    // showing), so this is checked on every pass.
+    // `#2258`: park only when the panel actually covers part of the row
+    // (its rect straddles the panel's bottom), and only once per search
+    // and row. A row wholly above the screen (a server hit inserted
+    // above the reader) is not covered; parking it moved the row being
+    // read at the answer. Re-parking after a redraw's scroll restore
+    // undid the first park painted a one-frame move at the server ask.
+    if (!searchField.open()) parkedFor = "";
     if (deps.selectionView() === "thread" && deps.intoView && searchField.open()) {
       const panel = el("search-bucket-row");
       const first = [...el("discord-log").children].find((row) => isMessageRow(row) && rowShown(row));
-      if (first && panel && !panel.hidden &&
-        first.getBoundingClientRect().top < panel.getBoundingClientRect().bottom - 1) {
-        deps.intoView(first, "start");
+      if (first && panel && !panel.hidden) {
+        const rect = first.getBoundingClientRect();
+        const panelBottom = panel.getBoundingClientRect().bottom;
+        const key = `${deps.searchKey()}|${first.getAttribute("data-id") || ""}`;
+        if (rect.top < panelBottom - 1 && rect.bottom > panelBottom && key !== parkedFor) {
+          parkedFor = key;
+          deps.intoView(first, "start");
+        }
       }
     }
     const left = deps.mainColumnRecord().searched;
