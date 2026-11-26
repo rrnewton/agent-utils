@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-cross-view-back-lands-wrong: Back after a citation jump from a thread into All returns to the message and view it came from'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - owner-ui
 - ui
 created_at: 2026-11-25T20:30:00-05:00
-updated_at: 2026-11-25T20:30:00-05:00
+updated_at: 2026-11-25T23:05:00-05:00
+closed_at: 2026-11-25T23:05:00-05:00
 ---
 
 # Description
@@ -46,3 +47,13 @@ Reproduced on a local server (real server binary, fake chat upstream). The messa
 - Found on the way: the keyboard Back (Ctrl/Cmd+[, `placeFromKeyboard`) walked back a visited place instead of undoing a link jump on top: the thread came back with the jump still standing, "Here is the linked message" (in the first probe the row also stood 51 px off).
 - Audit (every entry point that lands on a message): the glossary popover's message source followed its address (a full page load on that message) instead of the app's link jump the glossary panel takes.
 - Found in the matrix: Back restored the eye's anchor row (the row at the top of the screen), not the row holding the tapped link, so a Linked mark moving off a row between them shifted the linking row by the mark's height (39 px). A message link or short ref now takes the tapped row as its spot, as a document link already did (`#1082`).
+
+## Resolution
+
+Landed as 116f5bb6 (gated tree cc420875 on base d3d15491). The owner gate's only red step was the desk screenshot walk, which failed at scene 82 (the jump-to-unread chip, a path this change does not touch) after the browser was closed under host contention. The solo rerun of that step on the same tree passed. Under the flake rule, scene 82 run alone on landed main 116f5bb6 passed 5 of 5 (both themes each run, load1 81 to 100) and 3 of 3 on the control d3d15491 (load1 95 to 102); the cause is the `#2175` family (the browser closed under host contention: 360 s wall, 114 s CPU), not this change. Deployed the same evening (live since 10:57 PM ET); the post-deploy watch was clean (startup probe passed, no app errors or panics, no restarts).
+
+What changed: the `:email:` short reference to a message already drawn now takes a link jump of its own (`jumpToHeldMessage`), so Back undoes it and not an earlier jump; a message link or short ref takes the tapped row as its Back spot; the keyboard Back (Ctrl/Cmd+[) undoes a link jump on top; the glossary popover's message source is the app's link jump instead of a page load.
+
+Evidence (local server, fake chat upstream): `tests/cross_view_back_browser.py` (thread to All, All to thread, thread to thread, All to All with an unrelated earlier jump; browser, system and keyboard Back; 412x915 and 1280x800, light and dark) passed 48 of 48 on the fix, max drift 0.005 px over at least 50 frames, and failed 24 of 48 on main (every All to All walk, 2656 px off on the phone and 1980 px on the desk; every keyboard Back left the jump standing). Three shell-navigation unit tests and one glossary page test fail on main and pass on the fix. None of the runs was at the hot level (load1 77 to 157).
+
+Audit of every entry point that lands the reader on a message: all take a Back level except the scroll tools (Newest, bookmark, jump to unread, jump to reading, Back to reply), local search (filters in place) and the page's opening deep link, which correctly take none. Not changed, by design or for the owner's decision: the reply arrow and the reply-count circle land on another message with no Back level (their designed way back is the Back to reply chip, `#204`); proposed as a follow-up. The Linked message bubble after Back stays with the jump's target (`#2270`).
