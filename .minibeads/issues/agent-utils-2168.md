@@ -1,13 +1,13 @@
 ---
 title: 'wrkslots-declared-submodules-as-expected-nested: remove and retire should accept declared submodules as expected nested checkouts'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 - lifecycle
 created_at: 2026-11-23T14:00:00+00:00
-updated_at: 2026-11-23T14:00:00+00:00
+updated_at: 2026-11-26T12:00:00+00:00
 ---
 
 # Description
@@ -27,3 +27,7 @@ Remove and retire treat a nested checkout as expected when the declared checkout
 # Notes
 
 Whether current main already changes this behaviour is checked before the fix and recorded in the resolution.
+
+## Resolution
+
+[watermelon-full-preview] Landed as bce0b640. Current main still refused declared submodules placed as linked worktrees of the primary repository, so the fix was needed. In `_nested_module_repository_checkouts`, a module repository whose recorded worktree now belongs to another repository is never skipped unseen: it is read despite the path fence (git-dir plus scratch work tree, remote authority via GIT_DIR/GIT_WORK_TREE overrides) and judged as its own candidate under a distinct name by the existing salvage machinery — private history, index trees (main, linked-worktree and staged-only content, computed from copied indexes and kept as salvage parents), and untracked state — fail-closed on any git failure, unreadable index, or stale lock. Declaration is tested along the whole .gitmodules chain. Retire shares remove's salvage path, so this covers retire through the same code; dedicated retire tests and full Python/Rust parity for this judgment are follow-up #2184 wrkslots-private-module-retire-and-rust-parity (Rust has no twin of this judgment; its remove refuses these salvage corners explicitly). No new persisted field. Four cold reviews drove the design; every probe is a permanent hermetic test.
