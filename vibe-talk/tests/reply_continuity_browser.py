@@ -559,8 +559,21 @@ def reply_case(walk: Walk, index: int, y: float, case: str, scale: int) -> None:
     # `#2063 vibe-talk-quote-reply-view-stability`: the row never moves to show the box. Where
     # the box drawn under it would sit below the foot (low on screen, a tall row), it stands
     # docked at the foot instead, over the rows where they were.
-    walk.check(abs(moved_row["top"] - row["top"]) <= 1,
-               f"{case}: the row moved from {row['top']:.1f} to {moved_row['top']:.1f} to show the box")
+    # `#2395 vibe-talk-reply-box-covers-last-card`: except over the row itself. Where the box docked
+    # at the foot would stand over the row being answered and the row fits wholly above it, Reply
+    # makes ONE move: the list up by exactly that overlap, the row's foot just above the box (the
+    # gap a box keeps under its row). A row taller than that room (the tall case) is not moved.
+    lifted = row["top"] - moved_row["top"]
+    if lifted > 1:
+        walk.check(case != "tall", f"{case}: a row taller than the room above the box moved {lifted:.1f}px")
+        gap = mount["top"] - moved_row["bottom"]
+        walk.check(UNDER_PX[0] - 1 <= gap <= UNDER_PX[1] + 1,
+                   f"{case}: lifted {lifted:.1f}px, the row's foot is {gap:.1f}px above the box, not just above it")
+    else:
+        walk.check(abs(moved_row["top"] - row["top"]) <= 1,
+                   f"{case}: the row moved from {row['top']:.1f} to {moved_row['top']:.1f} to show the box")
+    walk.check(moved_row["bottom"] <= mount["top"] + 0.5 or moved_row["top"] < mount["top"] and case == "tall",
+               f"{case}: the box stands over the row it answers: row {moved_row}, box {mount}")
     walk.check(mount["bottom"] <= after.number("foot") + 1, f"{case}: the box is under the foot of the list: {mount}")
     if case == "middle":
         above, now_above = before.box("above"), after.box("above")
@@ -576,7 +589,10 @@ def reply_case(walk: Walk, index: int, y: float, case: str, scale: int) -> None:
     back = walk.measure(index)
     walk.check(abs(back.box("row")["top"] - moved_row["top"]) <= 1,
                f"{case}: Cancel moved the row from {moved_row['top']:.1f} to {back.box('row')['top']:.1f}")
-    walk.check(abs(back.number("listTop") - list_top) <= 1, f"{case}: Cancel came back to {back.number('listTop')}, not {list_top}")
+    # Where Reply made its one move (`#2395`), Cancel keeps the row where the reader now sees it:
+    # the list stays up by that move.
+    kept_top = list_top + (lifted if lifted > 1 else 0)
+    walk.check(abs(back.number("listTop") - kept_top) <= 1, f"{case}: Cancel came back to {back.number('listTop')}, not {kept_top}")
     walk.check(back.found["composer"] is True, f"{case}: Cancel did not bring the channel's box back")
     walk.notes.append(f"{scale}% {case}: the box {mount['top'] - moved_row['bottom']:.1f}px under the row, the row "
                       f"{row['top']:.1f} -> {moved_row['top']:.1f} ({moved:+.1f})")

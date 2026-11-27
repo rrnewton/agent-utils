@@ -1,0 +1,21 @@
+steps:
+  # `#2395 vibe-talk-reply-box-covers-last-card`: Reply never puts its box over the row it answers.
+  # The last card (plain and promoted, the list at its end and short of it) stands wholly above the
+  # box after one move; a card with room under it does not move; the card below stays offered; the
+  # phone keyboard up keeps the box off the row; no drift after the open, and an arrival moves
+  # nothing. Geometry only, no wall-clock budget. Phone (touch, dark) and desk (light).
+  - group: check
+    job: reply-box-clear-browser
+    desc: Reply never puts its box over the row it answers, the last card moved once to clear it and a card with room left still, in current Chromium at 412x915 by touch and 1280x800 (#2395)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/reply_box_clear_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 600
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

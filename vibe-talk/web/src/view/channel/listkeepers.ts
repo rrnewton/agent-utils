@@ -408,9 +408,16 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       note(area.scrollTop > 0 && atBottom(area, FOLLOW_REST_PX), footing ? footing.context : contextOf());
     }, { passive: true });
     mainFollowNow = () => !footStale && footing !== null && footing.foot && footing.context === contextOf();
+    // `#2395 vibe-talk-reply-box-covers-last-card`: a reply's box open in the stream (its mount drawn,
+    // in either column) holds the foot keeper: the room the box keeps under its row is not chased to
+    // the foot, and the row being answered stays where Reply left it.
+    const inlineReplyOpen = () => ["column-reply", "side-reply"].some((id) => {
+      const mount = leftEl(id) as HTMLElement | null | undefined;
+      return Boolean(mount) && !(mount as HTMLElement).hidden;
+    });
     const free = () => screens.screen() === "main" && screens.view() === "discord" && writingIn(area)
       && !entryLandingHolds() && heldFilterRow() === null && !searchWalkAnchored() && !quickReplyHolds(area)
-      && !(deps.jumpAnchorHolds && deps.jumpAnchorHolds());
+      && !(deps.jumpAnchorHolds && deps.jumpAnchorHolds()) && !inlineReplyOpen();
     const mainFootKeeper = watch(() => {
       // The view switched since this note was seeded: re-take it from where the reader
       // stands in the list now shown, and follow nothing on this pass (`invalidateDock`).

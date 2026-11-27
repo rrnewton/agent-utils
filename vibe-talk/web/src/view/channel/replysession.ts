@@ -739,6 +739,12 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     deps.fitGrowingBox(deps.el("reply-text"));
     // `#846 draft-chip-honest`. Its draft is on screen now, and the box at the foot stands aside for it.
     renderDraftChip();
+    // `#2395`: the box at its opened height, docked at the foot, never over the row it answers. Not
+    // for a Quote reply: its words are in the box, read where they were selected, and the post being
+    // quoted stays pixel-still (`#2063`, the owner's own ask for exactly that act).
+    if (!block && footDock && replyState.list && replyState.target) {
+      keepAnsweredRowClear(replyState.list, String(replyState.target.id), footDock.mount, replyPane());
+    }
     if (!focus) return;
     // The box came up to be written in: it takes the focus, the caret under a quote or after a draft.
     // Without moving either list, which has rules of its own about where the reader is.
@@ -1129,6 +1135,11 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     // `#304 back-gesture-in-app`. A reply open in the stream is a level of its own.
     deps.scheduleBackSync();
     placeInlineReply();
+    // `#2395 vibe-talk-reply-box-covers-last-card`: held AGAIN, now that the column's own box is
+    // hidden and the reply's box stands in the stream under the row. Hiding the column's box grows
+    // the list's frame, and at the list's end the browser's clamp put every row that much lower;
+    // the room the reply's box keeps under its row is what lets this hold put it back.
+    holdRowAt(listPane(list as HTMLElement) as { scroller(): HTMLElement }, list as HTMLElement, id, top);
     // `#2063 vibe-talk-quote-reply-view-stability`. The post being answered stays pixel-still:
     // opening the box never scrolls the list. Where the box drawn under its row would sit below
     // the foot of the column, it is docked to that foot instead (an overlay at the foot, the
@@ -1136,8 +1147,71 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     // row. Only for a box drawn under its row: one at the list's foot needs no dock.
     if (!anchorsSupported() || replyState.anchor === null) return;
     const pane = replyPane();
-    if (mount.getBoundingClientRect().bottom > pane.foot()) dockReplyAtFoot(mount, pane);
+    if (mount.getBoundingClientRect().bottom > pane.foot()) {
+      // `#2395`: the gap the box keeps under its row in the stream, measured before it is docked.
+      const row = deps.rowIn(list as HTMLElement, id);
+      answeredGap = row && deps.shownNode(row) ? Math.max(0, mount.getBoundingClientRect().top - row.getBoundingClientRect().bottom) : 0;
+      dockReplyAtFoot(mount, pane);
+    }
   }
+
+  /**
+   * `#2395 vibe-talk-reply-box-covers-last-card`. The owner, 2026-11-27: "clicking reply on a main
+   * channel message ... put me in the reply box but with bad scroll so my reply box is COVERING half
+   * of the message I was replying too". The box docked at the foot (`dockReplyAtFoot`) stood over
+   * the very row it answers whenever that row ended less than a box's height above the foot: the
+   * last card, read anywhere short of the list's very end. So, at the moment Reply opens (the
+   * reader's own act), ONE move: the list goes up by exactly what the box would cover, the row's
+   * foot just above the box, and the box goes back under its row. A row taller than the room above
+   * the box is not moved at all (`#2063`: it could not be shown whole, and a long post being quoted
+   * stays pixel-still). Where the box covers nothing, nothing moves (`#2063` stands).
+   */
+  function keepAnsweredRowClear(list: HTMLElement, id: string, mount: HTMLElement,
+    pane: { scroller(): HTMLElement; head(): number; foot(): number }): void {
+    const found = deps.rowIn(list, id);
+    if (!found || !deps.shownNode(found)) return;
+    const row = found.getBoundingClientRect();
+    // Where the docked box's head stands at its opened height: its foot is the pane's foot.
+    const boxTop = pane.foot() - mount.getBoundingClientRect().height;
+    const covered = row.bottom + answeredGap - boxTop;
+    if (covered <= 0.5) return;
+    if (row.top - covered >= pane.head() - 0.5) {
+      deps.nudge(pane.scroller(), covered);
+      // Lifted the whole overlap, the box now stands exactly where its row puts it: handed back to
+      // the row, it can never stand over it, whatever comes up at the foot after (the scroll tools).
+      releaseFootDock();
+      return;
+    }
+    // A row taller than the room above the box cannot be shown whole however the list moves, and is
+    // not moved for its body. But its top (its header and first lines), on screen before Reply,
+    // stays on screen above the box: the list goes up by what the box would cover of that top, never
+    // past the head; a top already clear of the box is not moved (liaison 1068).
+    if (row.top < pane.head() - 0.5) return;
+    const topCovered = answeredTopFoot(found, row) + answeredGap - boxTop;
+    if (topCovered <= 0.5) return;
+    const lift = Math.min(topCovered, row.top - pane.head());
+    if (lift > 0.5) deps.nudge(pane.scroller(), lift);
+  }
+
+  /**
+   * `#2395`: where the answered row's top ends, in viewport px: its header and its first two lines
+   * (the body's own line height), or the whole row where it is shorter than that.
+   */
+  function answeredTopFoot(found: HTMLElement, row: DOMRect): number {
+    const meta = typeof found.querySelector === "function" ? found.querySelector(".meta") as HTMLElement | null : null;
+    const head = meta && meta.getClientRects().length ? meta.getBoundingClientRect().bottom : row.top;
+    const style = typeof getComputedStyle === "function" ? getComputedStyle(found) : null;
+    const line = style ? Number.parseFloat(style.lineHeight) : Number.NaN;
+    const lines = Number.isFinite(line) && line > 0 ? line : Number.parseFloat(style ? style.fontSize : "") * 1.4 || 20;
+    return Math.min(row.bottom, head + 2 * lines);
+  }
+
+
+  /**
+   * `#2395`: the room the reply's box keeps between it and the row it answers when it stands in the
+   * stream, in CSS px, measured as the box is docked: what a docked box leaves above it too.
+   */
+  let answeredGap = 0;
 
   /**
    * The reply's box held at the foot of its column (`dockReply`, `#2063`): the mount it stands
