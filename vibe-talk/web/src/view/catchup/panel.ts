@@ -2670,10 +2670,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const count = answer.window?.count ?? answer.unread_ids.length;
         // `#1761`: a window cut short of the thread's start says so, visibly —
         // never a partial window presented as the whole.
-        // `#2301` item 9 (R5): the status is short, and why it is the newest part only, and what to
+        // `#2301` item 9 (R5): the status is short ("older not fetched"), and why, and what to
         // do about it, is behind its (i).
         if (answer.window?.truncated === true) {
-          sayStatus(`Read ${unread} unread of ${count} · newest part only`, DISCUSS_NEWEST_ONLY_DETAIL);
+          sayStatus(`Read ${unread} unread of ${count} · older not fetched`, DISCUSS_NEWEST_ONLY_DETAIL);
         } else {
           sayStatus(`Read ${unread} unread of ${count}`);
         }

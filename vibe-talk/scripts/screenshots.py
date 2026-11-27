@@ -10733,7 +10733,7 @@ SCENES: tuple[Scene, ...] = (
         profiles=MATRIX_PROFILES,
         expect=(
             ("the Discuss panel is open", "window.__visible('discuss-panel')"),
-            ("the status is short and its (i) stands", "/newest part only$/.test(window.__text('discuss-status') || '') && window.__visible('discuss-status-info')"),
+            ("the status is short and its (i) stands", "/older not fetched$/.test(window.__text('discuss-status') || '') && window.__visible('discuss-status-info')"),
             ("the (i) opened the explanation", "window.__visible('discuss-status-detail') && document.getElementById('discuss-status-info').getAttribute('aria-expanded') === 'true'"),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),

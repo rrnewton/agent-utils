@@ -841,7 +841,7 @@ test("catchup: a cut-short window says it covers the newest part only and what t
     await flush();
     // `#2301 vibe-talk-ui-review-findings-11-26` item 9 (R5): the status is short, and the
     // explanation is one tap away behind its (i), closed until pressed.
-    assert.equal(fx.els["discuss-status"].textContent, "Read 2 unread of 99 · newest part only");
+    assert.equal(fx.els["discuss-status"].textContent, "Read 2 unread of 99 · older not fetched");
     const info = fx.els["discuss-status-info"];
     const detail = fx.els["discuss-status-detail"];
     assert.equal(info.hidden, false, "the (i) is not up beside a status that needs explaining");
