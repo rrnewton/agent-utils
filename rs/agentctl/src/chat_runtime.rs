@@ -9735,6 +9735,8 @@ impl BridgeState {
             "count": bare_refs.count,
             "recent": bare_refs.recent,
         });
+        // Requests reminded and still unanswered (#2331 chat-headless-reply-reminders).
+        status["reply_reminders"] = self.reminder_status(records.iter().map(|(record, _)| record));
         Ok(status).map(|mut status| {
             if let Some(object) = status.as_object_mut() {
                 object.insert("slack_format".to_owned(), Value::from(slack_format));

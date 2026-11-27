@@ -308,6 +308,50 @@ then start again from that time",
         Ok((record, value))
     }
 
+    /// What `chat status` shows of reply reminders (#2331): each request a reminder named that
+    /// still holds no reply and is still open, newest reminder first, with its reply ID and when
+    /// it was reminded; whether a reminder waits for the queue to settle it; and a problem with
+    /// the record, if any. With no record, nothing was ever reminded.
+    pub(super) fn reminder_status<'a>(
+        &self,
+        records: impl Iterator<Item = &'a RequestRecord>,
+    ) -> serde_json::Value {
+        let record = match self.read_reply_reminders() {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return serde_json::json!({"unanswered_after_reminder": [], "reminder_waiting": false})
+            }
+            Err(error) => {
+                return serde_json::json!({
+                    "unanswered_after_reminder": [],
+                    "reminder_waiting": false,
+                    "problem": error.to_string(),
+                })
+            }
+        };
+        let open: BTreeSet<&str> = records
+            .filter(|request| request.reply_count == 0 && !request.reply_closed)
+            .map(|request| request.key.as_str())
+            .collect();
+        let mut unanswered: Vec<&RemindedRequest> = record
+            .reminded
+            .iter()
+            .filter(|request| open.contains(request.key.as_str()))
+            .collect();
+        unanswered.sort_by_key(|request| std::cmp::Reverse(request.at_millis));
+        serde_json::json!({
+            "unanswered_after_reminder": unanswered
+                .iter()
+                .map(|request| serde_json::json!({
+                    "key": request.key,
+                    "reply_id": request.reply_id,
+                    "reminded_at_millis": request.at_millis,
+                }))
+                .collect::<Vec<_>>(),
+            "reminder_waiting": record.pending.is_some(),
+        })
+    }
+
     /// The open requests whose prompts are recorded as typed and that hold no reply, a reply
     /// the post-rate breaker holds back included, newest delivery first, each with the reply ID
     /// its prompt gave; and the key of every request the state retains.

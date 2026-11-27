@@ -1,6 +1,6 @@
 ---
 title: 'chat-headless-reply-reminders: a headless target that ends a chat request''s turn without a reply gets one reminder, keyed on its event log'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-leanprofile
@@ -9,7 +9,7 @@ labels:
 - chat
 - headless
 created_at: 2026-11-26T20:00:00-05:00
-updated_at: 2026-11-26T20:00:00-05:00
+updated_at: 2026-11-26T21:35:00-05:00
 ---
 
 # Description
@@ -41,3 +41,12 @@ Reminders for headless targets, keyed on the event log the bridge already follow
 # Notes
 
 Found while tracing a lost reply for #2322 agentctl-coordinator-lean-headless-profile (owner requests 389/390), where fenced replies become the only reply path for a headless coordinator. Until this lands, a headless coordinator should check `agentctl chat sent NNN` for each request it answered in a long turn.
+
+## Resolution
+
+`rs/agentctl/src/chat_service/headless_reminders.rs` finds when each request's turn ended in the headless event log: the first `turn.completed` (or harness exit) after the latest start of its `chat-<key>` input, whether that input started alone, batched or mid-turn. Starts more than 10 minutes before the recorded delivery are ignored. `ReplyReminders::check_headless` runs every 5 s in the headless owner loop, after the capture tick, and reads the log at most every 10 s while requests wait. A request still holding no reply 20 s after its turn ended gets one reminder, recorded and composed with the existing `reply-reminders.json` machinery (once per request, restart-safe) and queued at the turn boundary through the headless queue. A refused queueing holds off the next reminder for 60 s. The start log no longer says reminders are off for headless targets. `chat status` gains `reply_reminders` (`unanswered_after_reminder`, `reminder_waiting`). The chat user guide and the harness support matrix row say so.
+
+Tested:
+- Unit tests over fake event logs: alone, batched and mid-turn starts; a dropped input; a harness exit; an open turn; the latest start counting; the grace; the read cache.
+- A service test: one reminder after the turn ends with no block, none for a request answered by a captured block, none again on a second check or after a restart, and the status summary.
+- Live on a scratch fake-provider bridge with a scratch headless agent (Claude Code 2.1.319, haiku). The agent answered a request with plain text, and its turn ended at 18:29:28 PT. The bridge queued the reminder at 18:29:52, the agent answered with the block at 18:29:53, and the bridge captured it and posted "reminded reply" through its outbound helper.

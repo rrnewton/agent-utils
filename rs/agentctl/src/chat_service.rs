@@ -43,6 +43,7 @@ use crate::subagents::{ManagedAgents, ManagedApi};
 pub mod channel_lock;
 #[cfg(test)]
 mod grant_refresh_tests;
+mod headless_reminders;
 pub mod health;
 pub mod latency;
 pub mod owner_alarm;
@@ -2184,8 +2185,8 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         service_log(format!(
             "agentctl: {} is headless: requests go to its queue, each earns its receipt when \
              the model starts it, replies are read from its event log when one is followed \
-             (else only through `agentctl chat reply`); reply reminders and the stale composer \
-             guard are off",
+             (else only through `agentctl chat reply`); a request still unanswered 20 s after \
+             the turn that took it ends is reminded once; the stale composer guard is off",
             state.config().agent_name
         ));
     }
@@ -2196,7 +2197,6 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         _ => None,
     };
     let reminders = match &settings.reply_reminders {
-        Some(_) if headless => None,
         Some(reminders) if state.config().outbound_enabled => {
             service_log(ReplyReminders::describe(reminders));
             Some(ReplyReminders::new(reminders))
@@ -6124,6 +6124,7 @@ fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
                 notices,
                 reply_wakes,
                 transport,
+                &mut reminders,
                 &mut health,
             ),
             Ok(false) => owner_loop_pass(
@@ -7830,6 +7831,9 @@ fn outbound(
 
 /// How often the headless loop captures reply blocks from the event log it follows (#1974).
 const HEADLESS_CAPTURE_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the headless owner loop checks for requests due a reply reminder (#2331); the event
+/// log itself is read at most every ten seconds while requests wait.
+const HEADLESS_REMINDER_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Capture the reply blocks the headless target's event log gained, exactly as a pane capture
 /// does for a TUI target (#1974): an empty screen, because no screen is read and every block
@@ -7942,6 +7946,7 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
     notices: &mpsc::Receiver<ProviderNotice>,
     reply_wakes: &mpsc::Receiver<String>,
     transport: &mut Option<CommandOutboundTransport>,
+    reminders: &mut Option<ReplyReminders>,
     health: &mut ServiceHealth,
 ) -> Result<(), ChatServiceError> {
     let mut routes = RouteCache::from_entries(state.reply_route_entries()?);
@@ -7949,6 +7954,7 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
         transport,
         stop: Some(stop),
     };
+    let mut next_reminder_check = Instant::now() + HEADLESS_REMINDER_CHECK_INTERVAL;
     let mut direct_keys = DirectKeyQueue::default();
     let mut notes = NoteLog::default();
     let mut starts = StartWatch::default();
@@ -8006,6 +8012,15 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
                     "agentctl: headless reply capture failed (a later tick tries again): \
                      {error}"
                 ));
+            }
+        }
+        // Reply reminders keyed on the event log (#2331), after the capture tick so a block
+        // printed at a turn's end is stored before its request is judged unanswered.
+        if let Some(reminders) = reminders.as_mut() {
+            if Instant::now() >= next_reminder_check {
+                next_reminder_check = Instant::now() + HEADLESS_REMINDER_CHECK_INTERVAL;
+                let check = reminders.check_headless(state, manager, stop, options.delivery);
+                notes.log(&check.report);
             }
         }
         take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
@@ -18772,6 +18787,166 @@ esac
             "a set-aside prompt earned a receipt"
         );
         assert_eq!(state.status().expect("status")["stages"]["cancelled"], 1);
+    }
+
+    /// The reminders queued for the fixture's agent `worker`, by message file name.
+    fn queued_reminders(fixture: &crate::subagents::tests::Fixture) -> Vec<String> {
+        fn walk(directory: &Path, found: &mut Vec<String>) {
+            for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                    if name.starts_with("chat-reminder-") && name.ends_with(".json") {
+                        found.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&fixture.manager().agent_directory("worker"), &mut found);
+        found
+    }
+
+    /// Mark request `key` delivered at `at_millis` in its record.
+    fn mark_delivered(state: &BridgeState, key: &str, at_millis: u64) {
+        let path = state
+            .state_root()
+            .join("requests")
+            .join(format!("{key}.json"));
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&path).expect("request file")).expect("request JSON");
+        record["phase"] = json!("delivered");
+        record["delivery_started_at_millis"] = json!(at_millis);
+        record["delivered_at_millis"] = json!(at_millis);
+        fs::write(&path, serde_json::to_vec(&record).expect("request bytes")).expect("mark");
+    }
+
+    #[test]
+    fn a_headless_request_unanswered_when_its_turn_ends_is_reminded_once() {
+        // #2331: a headless coordinator ended the turn that took a request without a reply
+        // block. Once the turn has ended (the grace is zero here), the bridge reminds it once,
+        // queued for the turn boundary; a check after that, or after a bridge restart, sends no
+        // second one, and a request answered in the same turn gets none.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state_with_log(&fixture);
+        state
+            .update_reply_reminders(1, None, |_| (false, ()))
+            .expect("start reminders");
+        let manager = fixture.manager();
+        let forgotten = admitted_worker_message(&state, 1, "forgotten");
+        let answered = admitted_worker_message(&state, 2, "answered");
+        let forgotten_prompt = state.prompt(&forgotten, "").expect("prompt");
+        let answered_prompt = state.prompt(&answered, "").expect("prompt");
+        assert!(
+            forgotten_prompt.contains("<CHAT_REPLY_001>"),
+            "{forgotten_prompt}"
+        );
+        assert!(
+            answered_prompt.contains("<CHAT_REPLY_002>"),
+            "{answered_prompt}"
+        );
+        let delivered = crate::chat_runtime::unix_millis();
+        mark_delivered(&state, &forgotten, delivered);
+        mark_delivered(&state, &answered, delivered);
+        let fresh_reminders = || {
+            ReplyReminders::with_source(
+                Duration::from_secs(60),
+                Box::new(FakeClaude {
+                    idle: Arc::new(AtomicBool::new(true)),
+                    asked: Arc::default(),
+                    script: Arc::default(),
+                    printed: Arc::default(),
+                    delay: Duration::ZERO,
+                }),
+            )
+            .with_headless_timing(Duration::ZERO, Duration::ZERO)
+        };
+        let mut reminders = fresh_reminders();
+        let mut turn = TurnEvidence::default();
+        let events = crate::headless::events::directory(&manager.agent_directory("worker"));
+        let mut writer =
+            crate::headless::events::EventWriter::open(&events, "worker").expect("event log");
+        for key in [&forgotten, &answered] {
+            writer
+                .append(
+                    "input.started",
+                    None,
+                    json!({"queue_id": format!("chat-{key}"), "mid_turn": true}),
+                )
+                .expect("append");
+        }
+        writer
+            .append(
+                "assistant.text",
+                None,
+                json!({"text": "REPLIED (in a status line)"}),
+            )
+            .expect("append");
+        writer
+            .append(
+                "assistant.text",
+                None,
+                json!({"text": "<CHAT_REPLY_002>\nthe answer\n</CHAT_REPLY_002>"}),
+            )
+            .expect("append");
+        // The block is captured from the log, as the owner loop's capture scan does.
+        let mut routes = RouteCache::from_entries(state.reply_route_entries().expect("routes"));
+        let mut notes = NoteLog::default();
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let mut watch = HeadlessCaptureWatch::default();
+        watch
+            .tick(
+                &state,
+                &manager,
+                DrainOptions::default(),
+                &mut routes,
+                &mut notes,
+                &mut control,
+            )
+            .expect("capture tick");
+        assert_eq!(
+            state.inspect_request(&answered).expect("inspect")["replies"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        // The turn is still running: nothing is due.
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert!(queued_reminders(&fixture).is_empty());
+        writer
+            .append("turn.completed", None, json!({"outcome": "completed"}))
+            .expect("append");
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        let queued = queued_reminders(&fixture);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        let (record, ()) = state
+            .update_reply_reminders(crate::chat_runtime::unix_millis(), None, |_| (false, ()))
+            .expect("reminder record");
+        let reminded: Vec<&str> = record
+            .reminded
+            .iter()
+            .map(|request| request.key.as_str())
+            .collect();
+        assert_eq!(reminded, vec![forgotten.as_str()]);
+        assert!(
+            record.pending.is_none(),
+            "a queued headless reminder is settled"
+        );
+        let status = state.status().expect("status");
+        let unanswered = &status["reply_reminders"]["unanswered_after_reminder"];
+        assert_eq!(unanswered.as_array().map(Vec::len), Some(1), "{status}");
+        assert_eq!(unanswered[0]["key"], json!(forgotten));
+        assert_eq!(status["reply_reminders"]["reminder_waiting"], false);
+        // Another check, and a restarted bridge, remind no one again.
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        let mut restarted = fresh_reminders();
+        reminder_check(&fixture, &state, &mut restarted, &mut turn, false);
+        assert_eq!(queued_reminders(&fixture).len(), 1);
     }
 
     #[test]

@@ -736,7 +736,10 @@ The bridge delivers through the same queue and submission paths as
   assumed.
 - **Headless (Claude Code)**: supported — the wrapper drains the queue;
   bridge raw messages keep their raw mark there (#1223
-  bridge-raw-headless).
+  bridge-raw-headless). A request still unanswered 20 s after the turn
+  that took it ends, by the event log, is reminded once at the next turn
+  boundary (#2331, `chat_service/headless_reminders.rs`). A TUI target is
+  reminded by the pane rules instead.
 
 ### Watcher notices (DONE / BLOCKED / idle / stalled)
 

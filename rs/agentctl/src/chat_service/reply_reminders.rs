@@ -540,6 +540,8 @@ pub(crate) struct ReplyReminders {
     // The requests whose reply the coordinator's transcript showed, which are never reminded: a
     // transcript only grows, so it is not read again for them.
     printed: BTreeSet<String>,
+    // A headless coordinator's turn ends and refusal hold (#2331).
+    headless: super::headless_reminders::HeadlessState,
     #[cfg(test)]
     pub(super) said: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -573,6 +575,7 @@ impl ReplyReminders {
             idle_block: None,
             withheld: None,
             printed: BTreeSet::new(),
+            headless: super::headless_reminders::HeadlessState::default(),
             #[cfg(test)]
             said: std::sync::Arc::default(),
         }
@@ -584,6 +587,14 @@ impl ReplyReminders {
     pub(super) fn with_retry(mut self, first: Duration, max: Duration) -> Self {
         self.retry_first = first;
         self.retry_max = max;
+        self
+    }
+
+    /// These reminders with a headless grace and event-log read interval of `grace` and
+    /// `interval` (#2331), so a test never waits the real 20 s.
+    #[cfg(test)]
+    pub(super) fn with_headless_timing(mut self, grace: Duration, interval: Duration) -> Self {
+        self.headless = super::headless_reminders::HeadlessState::with_timing(grace, interval);
         self
     }
 
@@ -852,6 +863,11 @@ seen working and is idle again, or for {}s if it is not seen working",
         }
         let runtime = StopRuntime::new(stop);
         let agent_name = &state.config().agent_name;
+        // A headless coordinator has no pane to judge idle by; its event log says when the turn
+        // that took a request ended (#2331).
+        if manager.is_headless(agent_name).unwrap_or(false) {
+            return Ok(self.check_headless(state, manager, stop, delivery));
+        }
         // A reminder an earlier check could not settle is settled before another is composed.
         let Settled::Record(record) =
             self.settle_recorded(state, manager, stop, Some(turn.seen_working()))
@@ -1069,6 +1085,133 @@ seen working and is idle again, or for {}s if it is not seen working",
         check.report.prompt_typed |= outcome.may_have_typed();
         report_receipt_errors(&notes, &mut check.report);
         Ok(check)
+    }
+
+    /// The check for a headless coordinator (#2331): remind once of each request still holding
+    /// no reply `HEADLESS_REMINDER_GRACE` after the turn that took it ended, by the event log, and
+    /// queue the reminder at the turn boundary.
+    pub(super) fn check_headless<A: ManagedApi + ?Sized>(
+        &mut self,
+        state: &BridgeState,
+        manager: &ManagedAgents<'_, A>,
+        stop: &StopState,
+        delivery: DrainOptions,
+    ) -> ReminderCheck {
+        use super::headless_reminders as headless;
+        let mut check = ReminderCheck::default();
+        let agent_name = state.config().agent_name.clone();
+        let Settled::Record(record) = self.settle_recorded(state, manager, stop, None) else {
+            return check;
+        };
+        let now = chat_runtime::unix_millis();
+        let candidates = match state.reply_reminder_candidates() {
+            Ok(candidates) => {
+                self.worked("the request records");
+                candidates
+            }
+            Err(error) => {
+                self.failed("the request records", error);
+                return check;
+            }
+        };
+        let eligible = candidates.eligible(&record, now);
+        if eligible.is_empty() {
+            self.headless.forget();
+            self.withheld = None;
+            return check;
+        }
+        if self.headless.held() {
+            self.note_withheld(
+                eligible.len(),
+                "held after the headless queue refused a reminder".to_owned(),
+            );
+            return check;
+        }
+        let since = headless::start_bounds(&eligible);
+        let ends = match self
+            .headless
+            .turn_ends(manager.registry(), &agent_name, &since)
+        {
+            Ok(ends) => {
+                self.worked("the headless event log");
+                ends
+            }
+            Err(error) => {
+                self.failed("the headless event log", error);
+                return check;
+            }
+        };
+        let due = headless::due(&eligible, &ends, now, self.headless.grace);
+        if due.is_empty() {
+            return check;
+        }
+        // A reply captured since the first read leaves the candidates.
+        let now = chat_runtime::unix_millis();
+        let candidates = match state.reply_reminder_candidates() {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                self.failed("the request records", error);
+                return check;
+            }
+        };
+        let still = candidates
+            .eligible(&record, now)
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect::<BTreeSet<_>>();
+        let due = due
+            .into_iter()
+            .filter(|candidate| still.contains(&candidate.key))
+            .collect::<Vec<_>>();
+        if due.is_empty() {
+            return check;
+        }
+        self.withheld = None;
+        let reminder = chat_runtime::compose_reminder(state, &due, now);
+        let recorded = state.update_reply_reminders(now, Some(&candidates.retained), |record| {
+            for request in &due {
+                if !record.reminded(&request.key) {
+                    record.reminded.push(chat_runtime::RemindedRequest {
+                        key: request.key.clone(),
+                        reply_id: request.reply_id.clone(),
+                        at_millis: now,
+                    });
+                }
+            }
+            record.pending = Some(reminder.clone());
+            (true, ())
+        });
+        let record = match recorded {
+            Ok((record, ())) => {
+                self.worked("the reminder record");
+                record
+            }
+            Err(error) => {
+                self.failed("the reminder record", error);
+                return check;
+            }
+        };
+        let outcome = headless::deliver(
+            manager,
+            &StopRuntime::new(stop),
+            &agent_name,
+            &reminder,
+            delivery,
+        );
+        if matches!(outcome, ReminderOutcome::Withdrawn(_)) {
+            self.headless.refused();
+        }
+        self.record(
+            state,
+            &reminder,
+            &outcome,
+            &record,
+            chat_runtime::unix_millis(),
+            Some(&candidates.retained),
+            None,
+        );
+        check.report.prompt_typed |= outcome.may_have_typed();
+        check
     }
 
     /// `due` without each request whose reply ID heads a complete reply block in the transcript of

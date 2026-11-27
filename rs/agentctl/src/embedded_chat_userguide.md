@@ -2151,9 +2151,19 @@ the `chat reply` command remains as the fallback (named where
 `--offer-reply-command` offers it). Only while no log is followed does the
 prompt name the `chat reply` command as the only way to reply. The mode is
 decided when each prompt is composed, so a wrapper that starts after the
-bridge switches the next prompt with no `chat run` restart. Reply reminders and `--stale-composer-clear-after`
-are off for a headless agent. Give the agent permission to run the printed
-`chat reply` command and to write its reply files. Restart `chat run` when
+bridge switches the next prompt with no `chat run` restart.
+`--stale-composer-clear-after` is off for a headless agent.
+
+Reply reminders work from the event log instead of a pane (#2331). A
+request's input starts in a turn. If the request still holds no reply 20 s
+after that turn ends (`turn.completed`, or the harness exiting), the bridge
+queues one reminder for the next turn boundary, as it does for a TUI agent.
+"Holds no reply" means no block captured from the log and no `chat reply`
+command. `chat status` lists each request reminded and still unanswered
+under `reply_reminders.unanswered_after_reminder`.
+
+Give the agent permission to run the printed `chat reply` command and to
+write its reply files, if it is to use them. Restart `chat run` when
 the agent is restarted in the other mode under the same name, since the
 other per-target settings are chosen at startup and at each `chat repoint`.
 
