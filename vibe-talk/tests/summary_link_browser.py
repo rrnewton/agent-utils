@@ -731,6 +731,79 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
             **trace}, indent=1) + "\n")
     assert_stayed("Back after stay-jump")
 
+    # `#2350 vibe-talk-back-toast-covers-returned-row`: Back from a row with NO Linked bubble still
+    # reads as having worked. The reader puts the mark out, jumps from the main row again (the
+    # reply citation) and goes Back. With no toast and no bubble, the confirmation is the screen
+    # itself: the row returned to is put back within 0.5 px on the first frame drawn with the
+    # place restored and on every frame watched after it, every row in view stands where it stood
+    # before the tap (0.5 px), and no Linked bubble is left anywhere (Back takes the jump's away).
+    page.locator('#discord-log li[data-linked="true"] .linked-marker-clear').first.click()
+    page.wait_for_function("() => !document.querySelector('#discord-log li[data-linked=\"true\"]')",
+                           timeout=20_000)
+    check_stable("putting the Linked mark out")
+    view_probe = """() => {
+      const area = document.getElementById('scroll-area').getBoundingClientRect();
+      return [...document.querySelectorAll('#discord-log li')]
+        .filter(r => { const b = r.getBoundingClientRect(); return b.height > 0 && b.bottom > area.top && b.top < area.bottom; })
+        .map(r => [r.getAttribute('data-id'), Math.round(r.getBoundingClientRect().top * 100) / 100]);
+    }"""
+    page.evaluate(BACK_TRACE_START, ids["main_msg"])
+    plain_top = float(page.evaluate(
+        "() => [...document.querySelectorAll('#discord-log li')]"
+        f".find(r => (r.getAttribute('data-ids') || '').split(' ').includes('{ids['main_msg']}'))"
+        ".getBoundingClientRect().top"))
+    plain_view: object = page.evaluate(view_probe)
+    check(isinstance(plain_view, list) and len(plain_view) > 0, f"{label}: fixture: no rows in view before the plain jump")
+    check(page.evaluate(linked_probe) == [], f"{label}: fixture: a Linked bubble stood before the plain jump")
+    if shots is not None:
+        page.screenshot(path=str(shots / f"{label}-plain-before-tap.png"))
+    tap_visible(citations.nth(1), "reply citation from a plain row")
+    assert_landed(ids["reply_msg"], "reply citation from a plain row")
+    check_stable("reply citation from a plain row")
+    page.evaluate("() => { const t = window.__backTrace; t.mark('go_back plain'); t.backAt = t.frames.length; }")
+    page.go_back()
+    plain_probe = f"""() => {{
+      const t = window.__backTrace;
+      const after = t.frames.slice(t.backAt);
+      const first = after.findIndex(f => f[2] !== null && Math.abs(f[2] - {plain_top}) <= {BACK_TOLERANCE_PX});
+      if (first < 0) return null;
+      const watched = after.slice(first);
+      const drift = Math.max(...watched.map(f => (f[2] === null ? Infinity : Math.abs(f[2] - {plain_top}))));
+      return {{first: t.backAt + first, frames: watched.length, drift,
+               moved: watched.filter(f => f[2] === null || Math.abs(f[2] - {plain_top}) > {BACK_TOLERANCE_PX}).slice(0, 8)}};
+    }}"""
+    try:
+        page.wait_for_function(
+            f"() => {{ const p = ({plain_probe})(); return p !== null && (p.frames >= {BACK_WATCH_FRAMES} || p.moved.length > 0); }}",
+            timeout=20_000)
+    except Exception as error:
+        raise back_failure("Back from a plain row", ids["main_msg"], plain_top, error) from error
+    plain_settled: object = page.evaluate(plain_probe)
+    check(isinstance(plain_settled, dict) and not plain_settled["moved"],
+          f"{label}: Back from a plain row did not hold the row it returned to: {plain_settled}")
+    assert isinstance(plain_settled, dict)
+    back_trace_stop()
+    plain_after: object = page.evaluate(view_probe)
+    assert isinstance(plain_view, list) and isinstance(plain_after, list)
+    before_rows = {row_id: top for row_id, top in plain_view}
+    after_rows = {row_id: top for row_id, top in plain_after}
+    shifted = {row_id: (before_rows[row_id], after_rows.get(row_id)) for row_id in before_rows
+               if row_id not in after_rows or abs(after_rows[row_id] - before_rows[row_id]) > BACK_TOLERANCE_PX}
+    check(not shifted and set(after_rows) == set(before_rows),
+          f"{label}: after Back from a plain row the screen is not the one the reader left: shifted {shifted},"
+          f" before {plain_view}, after {plain_after}")
+    left_linked: object = page.evaluate(linked_probe)
+    check(left_linked == [], f"{label}: Back from a plain row left a Linked bubble standing: {left_linked}")
+    if shots is not None:
+        page.screenshot(path=str(shots / f"{label}-plain-back-returned.png"))
+        (shots / f"{label}-plain-back-sidecar.json").write_text(json.dumps({
+            "label": label, "row": ids["main_msg"], "expected_top": plain_top,
+            "before": f"{label}-plain-before-tap.png", "after": f"{label}-plain-back-returned.png",
+            "rows_in_view_before": plain_view, "rows_in_view_after": plain_after,
+            "linked_after": left_linked, "max_drift_px": plain_settled["drift"],
+            "watched_frames": plain_settled["frames"]}, indent=2) + "\n")
+    assert_stayed("Back from a plain row")
+
     # (c) a message not yet loaded, loaded in place.
     citations.nth(2).click()
     assert_landed(ids["old_msg"], "not-yet-loaded citation")
