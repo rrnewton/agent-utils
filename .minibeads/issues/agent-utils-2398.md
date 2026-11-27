@@ -8,7 +8,7 @@ labels:
 - dagrun
 - validation
 created_at: 2026-11-27T13:36:27-05:00
-updated_at: 2026-11-27T13:36:27-05:00
+updated_at: 2026-11-27T15:38:17-05:00
 ---
 
 # Description
@@ -42,3 +42,8 @@ Make an abort stop the run's whole scope or cgroup, not only its process group, 
 
 - Found while withdrawing a #2359 gate after the #2362 tree, which contains it, passed (2026-11-27).
 - Related: #1254 (per-gate CPU containment), #1370 (preflight containment).
+- Second instance on 2026-11-27, with SIGINT. A full gate (ticket 1795798933471760095-b80fe1ee) was withdrawn about 3 minutes after admission, because a sibling change on the same files landed first and the tree needed a rebase.
+  - SIGINT to gate.py logged `gate: aborted by SIGINT; run's process group stopped by SIGTERM`. gate.py exited with rc 130, and the ledger row says `aborted`.
+  - dagrun was gone: the scope's `supervisor` cgroup was empty. `dagrun-2185134.scope` stayed active with 15 processes (`pids.current`) in its step cgroups. `python.agentctl.build-rust` was still running a release `cargo build` and its `rustc`, and `repository.hygiene.issue-parse` and `repository.hygiene.issue-parse-self-test` were building `mb`. One `rustc` started about a minute after the abort.
+  - The step processes were in their own process group, not gate.py's.
+  - Every process in that one scope had its working directory in the aborted gate's worktree. Writing 1 to the scope's `cgroup.kill` cleared them: the unit went inactive, and no process was left in the worktree.
