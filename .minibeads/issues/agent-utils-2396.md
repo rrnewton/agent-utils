@@ -6,7 +6,7 @@ issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-27T12:57:06-05:00
-updated_at: 2026-11-27T12:57:06-05:00
+updated_at: 2026-11-27T13:03:04-05:00
 ---
 
 # Description
@@ -17,11 +17,13 @@ A heartbeat changes one row. It must judge only the heartbeating slot's own row 
 
 # Design
 
-Find where the heartbeat path resolves every row's source repository: the whole-fleet validation in the lock-free prepare and in the locked fallback, or a load-all-rows helper that resolves repositories as it parses. Then narrow it:
+Cause (traced on main and at a consumer pin 132dd98d): every repository-requiring state load resolves EVERY active row's source repository. `_load_active_snapshot` / `_load_active` / `_validate_global_state` reach `_active_from_obj` -> `_assert_record_paths(require_repository=True)` -> `_stored_repository_path`, which raises "does not exist or cannot be resolved" for whichever row's clone is gone. heartbeat loads that way in its TTL read, its lock-free prepare, its locked fallback and its post-write snapshot compare. Its lock-free prepare also runs the registry-wide storage scan (`_assert_command_registry_storage` -> `_assert_record_registered` / `_registry_storage_inconsistencies`), which resolves each row's repository the same way and raises instead of recording a per-row finding. The Rust edition refuses the same scene the same way (its global validation and storage-git scan).
 
-- The heartbeat judges its own record in full: owner, storage, the repositories it names, owner release, and the validate-batch seals and cleanup journals that overlap it.
-- Other rows are read for what the heartbeat genuinely needs, for example disjointness from seals and journals. Resolving their source repositories is not one of those needs, and a failure to resolve one does not refuse this heartbeat.
-- The stale row stays refused by name: any command that targets it (finish, remove, validate, doctor) still names it and its missing repository.
+Fix: the heartbeat path, and any per-slot operation, resolves only its OWN rows' repositories. Other rows are validated lexically (the existing `require_repository=False` path keeps the containment checks: no symlink components, inside the project or one sibling, outside the managed worktrees), or lazily, or reported by name; never a refusal of this command.
+
+- The heartbeat judges its own record in full: paths and repositories resolved strictly, owner, its own storage (the one-row storage check plus the one-slot nested-registration scan from #2174/#2353), owner release, and the validate-batch seals and cleanup journals that overlap it.
+- Other rows are read only for what the heartbeat genuinely needs, for example disjointness from seals and journals.
+- The stale row stays refused by name: its own heartbeat, and any command that targets it, names it and its missing repository.
 - Python and Rust editions behave identically.
 
 # Acceptance Criteria
@@ -33,4 +35,4 @@ Find where the heartbeat path resolves every row's source repository: the whole-
 
 # Notes
 
-Seen on a consumer host on 2026-11-27: one stale validate row, whose source clone a cleanup had deleted, refused all of that host's wrkslots heartbeats with rc 3. Sibling of #2353 (heartbeat busy fallback scan under the lock) and #2174 (transfer-owner).
+Seen on a consumer host on 2026-11-27: one stale validate row, whose source clone a cleanup had deleted, refused all of that host's wrkslots heartbeats with rc 3. Sibling of #2353 (heartbeat busy fallback scan under the lock) and #2174 (transfer-owner). The same stale row also refuses `create` host-wide (rc 3); `status` and `doctor` load leniently and still run. Other strict loaders are probably affected too and are outside this issue unless widened.
