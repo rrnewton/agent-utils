@@ -12,6 +12,15 @@ signal N ended it). AGENT_UTILS_PRIVATE_TMP=0 runs the command unchanged. Use it
 test runs outside a gate:
 
     scripts/with-private-tmp cargo test -p agentctl --lib -- chat_
+
+    scripts/with-private-tmp --host-temp COMMAND [ARG...]
+
+`--host-temp` is the scoped exception for the wrkslots test steps only (private_tmp.HOST_TEMP_STEPS;
+interim until #2415): a FRESH root at /tmp/aut-<uid>/<n> even inside an outer run, with a locked
+owner record so a sweep can tell a finished run from a live one. The root is measured every
+HOST_TEMP_POLL_SECONDS; past HOST_TEMP_LIMIT_BYTES (5 GB) the command is refused and stopped
+(SIGTERM, SIGKILL after STOP_GRACE_SECONDS), the root removed, and the exit status is
+OVER_LIMIT_EXIT (73), as when no such root can be made.
 """
 
 from __future__ import annotations
@@ -32,34 +41,78 @@ def main(argv: list[str]) -> int:
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__.strip())
         return 0 if argv else 2
-    with private_tmp.activate() as private:
-        # The handlers go in before the child starts, so a signal in between is held and
-        # passed on once it runs, never left to kill this wrapper and strand the root.
-        started: list[subprocess.Popen[bytes]] = []
-        pending: list[int] = []
+    host_temp = argv[0] == "--host-temp"
+    if host_temp:
+        argv = argv[1:]
+        if not argv:
+            print(__doc__.strip())
+            return 2
+    try:
+        with private_tmp.activate(host_temp=host_temp) as private:
+            return _run(argv, private, bounded=host_temp)
+    except private_tmp.HostTempUnavailable as error:
+        print(f"with-private-tmp: REFUSED: {error}", file=sys.stderr)
+        return private_tmp.OVER_LIMIT_EXIT
 
-        def forward(signum: int, _frame: FrameType | None) -> None:
-            if started:
-                started[0].send_signal(signum)
-            else:
-                pending.append(signum)
 
-        previous = {sig: signal.signal(sig, forward) for sig in FORWARDED}
+def _wait(child: subprocess.Popen[bytes], root: Path | None, bounded: bool) -> int:
+    """The child's status; when `bounded`, stop it with a named refusal once `root` passes its
+    byte bound and return OVER_LIMIT_EXIT."""
+    if not bounded or root is None:
+        return child.wait()
+    while True:
         try:
-            try:
-                child = subprocess.Popen(argv)
-            except OSError as error:
-                print(f"with-private-tmp: cannot run {argv[0]}: {error}", file=sys.stderr)
-                return 127
-            started.append(child)
-            for signum in pending:
-                child.send_signal(signum)
-            code = child.wait()
-        finally:
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
-        private.failed = code != 0
-        return 128 - code if code < 0 else code
+            return child.wait(timeout=private_tmp.HOST_TEMP_POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        used = private_tmp.tree_bytes(root)
+        if used <= private_tmp.HOST_TEMP_LIMIT_BYTES:
+            continue
+        print(
+            f"with-private-tmp: REFUSED: host-temp root {root} holds {used} bytes, past its bound "
+            f"of {private_tmp.HOST_TEMP_LIMIT_BYTES} (#2383 scoped exception, #2415); stopping the "
+            "command so it cannot fill the host temp dir",
+            file=sys.stderr,
+            flush=True,
+        )
+        child.send_signal(signal.SIGTERM)
+        try:
+            child.wait(timeout=private_tmp.STOP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+        return private_tmp.OVER_LIMIT_EXIT
+
+
+def _run(argv: list[str], private: private_tmp.Run, *, bounded: bool) -> int:
+    # The handlers go in before the child starts, so a signal in between is held and
+    # passed on once it runs, never left to kill this wrapper and strand the root.
+    started: list[subprocess.Popen[bytes]] = []
+    pending: list[int] = []
+
+    def forward(signum: int, _frame: FrameType | None) -> None:
+        if started:
+            started[0].send_signal(signum)
+        else:
+            pending.append(signum)
+
+    previous = {sig: signal.signal(sig, forward) for sig in FORWARDED}
+    try:
+        try:
+            child = subprocess.Popen(argv)
+        except OSError as error:
+            print(f"with-private-tmp: cannot run {argv[0]}: {error}", file=sys.stderr)
+            return 127
+        started.append(child)
+        for signum in pending:
+            child.send_signal(signum)
+        code = _wait(child, private.root, bounded)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    private.failed = code != 0
+    return 128 - code if code < 0 else code
+
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))

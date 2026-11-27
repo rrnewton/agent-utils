@@ -540,6 +540,19 @@ def _gate_tmp_root() -> Path | None:
     return root
 
 
+def _sweep_host_temp_roots() -> None:
+    """At gate start, sweep the wrkslots steps' host-temp roots whose run is over (the #2383
+    scoped exception, until #2415); private_tmp logs each root and the bytes. Best effort: a
+    sweep problem never stops a gate."""
+    module = _private_tmp()
+    if not module.enabled():
+        return
+    try:
+        module.sweep_host_temp()
+    except OSError as error:
+        print(f"gate: host-temp sweep skipped: {error}", file=sys.stderr)
+
+
 def _finish_gate_tmp_root(*, keep: bool) -> None:
     """Remove the root this gate made (a kept one is named); a reused root is left alone."""
     global _GATE_TMP_ROOT, _GATE_TMP_ROOT_OWNED
@@ -3272,6 +3285,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             args.cls = "shared"
             print("gate: rerun names no timing-sensitive step; "
                   "runs in the shared class (#1260 rerun-shared-class)", flush=True)
+    _sweep_host_temp_roots()
     adm = Admission(state_dir(), args.slots)
     # #1146: the rerun ordering mark needs a live parent, checked with the
     # same liveness as a grant, before the parent slot is released below. An

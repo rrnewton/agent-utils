@@ -1208,6 +1208,46 @@ def test_the_keep_going_flag_reaches_the_graph_run(
     assert seen == [True, False]
 
 
+# ---- `#2383` scoped host-temp exception: only the wrkslots steps, until #2415 -----------------
+
+
+def _private_tmp_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "_private_tmp_contract", REPO_ROOT / "scripts" / "private_tmp.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_only_the_listed_wrkslots_steps_run_in_the_host_temp_dir() -> None:
+    """Liaison 1081's condition 1: `with-private-tmp --host-temp` (a root under /tmp/aut-<uid>)
+    is allowed for private_tmp.HOST_TEMP_STEPS only, and every listed step present uses it.
+    No step may point a temp base anywhere itself, and no script but the wrapper asks for it."""
+    import fnmatch
+
+    private_tmp = _private_tmp_module()
+    config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    allowed = {
+        step.tag
+        for step in config.steps
+        if any(fnmatch.fnmatch(step.tag, pattern) for pattern in private_tmp.HOST_TEMP_STEPS)
+    }
+    wrapped = {step.tag for step in config.steps if "--host-temp" in step.cmd}
+    assert wrapped - allowed == set(), f"not allowed to use the host temp dir: {sorted(wrapped - allowed)}"
+    assert allowed - wrapped == set(), f"listed wrkslots steps missing --host-temp: {sorted(allowed - wrapped)}"
+    assert len(wrapped) >= 27, "9 lifecycle + 16 wrkslots shards + 2 wrkslots Rust steps"
+    for step in config.steps:
+        for forbidden in ("/tmp/aut", private_tmp.BASE_ENV, private_tmp.HOST_BASE_ENV):
+            assert forbidden not in step.cmd, f"{step.tag} names {forbidden}"
+    for path in sorted((REPO_ROOT / "scripts").iterdir()):
+        if path.is_file() and path.name not in ("private_tmp.py", "with-private-tmp"):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            assert "host_temp=" not in text, f"{path.name} asks for a host-temp root"
+
+
 # ---- `#941 gate-pytest-basetemp-leak`: each run owns its pytest temp root ----------------------
 
 
@@ -1219,6 +1259,11 @@ def test_each_run_owns_a_pytest_temp_root_and_removes_it_read_only_parts_too(
     temp.mkdir()
     monkeypatch.setattr(validate.tempfile, "tempdir", str(temp))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # no host settings file
+    # The #941 root is what a run uses when it is opted out of the #2383 private run root (and
+    # not handed one by an outer gate, as this test is when the gate runs it); the private-root
+    # path has its own tests in test_private_tmp.py.
+    monkeypatch.setenv("AGENT_UTILS_PRIVATE_TMP", "0")
+    monkeypatch.delenv("AGENT_UTILS_RUN_TMP", raising=False)
     roots: list[Path] = []
 
     def fake_run(*_args: object, pytest_root: Path | None = None, **_kw: object) -> int:

@@ -264,12 +264,18 @@ steps:
     cpu_timeout: 1200
     hint: *rust_test_hint
 
+  # #2383 scoped exception (interim until #2415 wrkslots-tests-temp-independent; liaison 1081):
+  # these wrkslots tests name /tmp as the root-owned sticky parent of ownerless validation
+  # exclusion and walk Git markers up from tmp_path inside a user namespace, so they run under
+  # `with-private-tmp --host-temp` (a fresh, owner-recorded, 5 GB-bounded root under
+  # /tmp/aut-<uid>, removed at the end). Only private_tmp.HOST_TEMP_STEPS may; a contract
+  # test fails any other step that does.
   - group: wrkslots
     job: test
     desc: wrkslots daemon Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      WRKSLOTS_LOCK_ORDER_CHECK=1 RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
+      WRKSLOTS_LOCK_ORDER_CHECK=1 RUST_TEST_THREADS=4 scripts/with-private-tmp --host-temp python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p wrkslotsd ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-wrkslots]

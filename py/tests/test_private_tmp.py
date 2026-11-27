@@ -7,7 +7,10 @@ condition with a generous hang backstop; no verdict depends on elapsed time.
 
 from __future__ import annotations
 
+import fcntl
+import importlib.machinery
 import importlib.util
+import json
 import os
 import signal
 import stat
@@ -48,6 +51,9 @@ def base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """A private base for roots; no inherited root, the mechanism switched on."""
     where = tmp_path / "base"
     monkeypatch.setenv("AGENT_UTILS_TMP_BASE", str(where))
+    # Host-temp roots too: no test touches the real /tmp/aut-<uid>.
+    (tmp_path / "host").mkdir()
+    monkeypatch.setenv("AGENT_UTILS_HOST_TMP_BASE", str(tmp_path / "host" / "aut-test"))
     monkeypatch.delenv("AGENT_UTILS_RUN_TMP", raising=False)
     monkeypatch.delenv("AGENT_UTILS_PRIVATE_TMP", raising=False)
     yield where
@@ -334,3 +340,179 @@ def test_the_wrapper_forwards_sigterm_and_still_removes_the_root(base: Path, tmp
 def test_the_wrapper_without_a_command_prints_usage() -> None:
     done = subprocess.run([str(WRAPPER)], capture_output=True, text=True, check=False)
     assert done.returncode == 2 and "with-private-tmp COMMAND" in done.stdout
+
+
+# ---- the scoped host-temp exception (wrkslots steps only, until #2415; liaison 1081) ----------
+
+
+def _host_base(tmp_path: Path) -> Path:
+    return tmp_path / "host" / "aut-test"
+
+
+def _owner_locked(record: Path) -> bool:
+    descriptor = os.open(record, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(descriptor)
+    return False
+
+
+def test_a_host_temp_run_gets_a_fresh_locked_root_even_inside_an_outer_run(
+    pt: ModuleType, base: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    monkeypatch.setenv("AGENT_UTILS_RUN_TMP", str(outer))
+    host = _host_base(tmp_path)
+    with pt.activate(host_temp=True) as run:
+        root = run.root
+        assert root is not None and root.parent == host and run.owned
+        assert stat.S_IMODE(host.stat().st_mode) == 0o700 and stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert os.environ["TMPDIR"] == os.environ["AGENT_UTILS_RUN_TMP"] == str(root)
+        record = host / f"{root.name}.owner"
+        owner = json.loads(record.read_text())
+        assert owner["pid"] == os.getpid() and owner["start"] == pt.process_start(os.getpid())
+        assert _owner_locked(record), "a live run holds its owner record locked"
+        assert pt.sweep_host_temp(host) == [] and root.exists(), "a live root is never swept"
+        run.failed = False
+    assert not root.exists() and not record.exists()
+    assert os.environ["AGENT_UTILS_RUN_TMP"] == str(outer)
+
+
+def test_the_host_temp_sweep_removes_only_finished_runs_and_logs_bytes(
+    pt: ModuleType, base: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    host = _host_base(tmp_path)
+    host.mkdir(mode=0o700)
+    namespace = os.readlink("/proc/self/ns/pid")
+
+    def root_with_record(name: str, owner: object) -> Path:
+        root = host / name
+        (root / "deep").mkdir(parents=True)
+        (root / "deep" / "data").write_bytes(b"x" * 65536)
+        (host / f"{name}.owner").write_text(json.dumps(owner))
+        return root
+
+    dead = root_with_record("101", {"pid": _dead_pid(), "start": 1, "pid_namespace": namespace})
+    reused = root_with_record(
+        "102", {"pid": os.getpid(), "start": -5, "pid_namespace": namespace}
+    )  # the pid lives, but its start time says it is another process
+    alive = root_with_record(
+        "103", {"pid": os.getpid(), "start": pt.process_start(os.getpid()), "pid_namespace": namespace}
+    )  # unlocked, but the recorded process is this one: kept
+    unreadable = root_with_record("104", {"pid": "x"})
+    no_record = host / "105"
+    no_record.mkdir()
+    held = root_with_record("106", {"pid": _dead_pid(), "start": 1, "pid_namespace": "pid:[other]"})
+    lock = os.open(host / "106.owner", os.O_RDONLY)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        swept = pt.sweep_host_temp(host)
+    finally:
+        os.close(lock)
+    assert sorted(path.name for path, _ in swept) == ["101", "102"]
+    assert all(size >= 65536 for _, size in swept)
+    assert not dead.exists() and not reused.exists()
+    assert not (host / "101.owner").exists() and not (host / "102.owner").exists()
+    assert alive.exists() and unreadable.exists() and no_record.exists() and held.exists()
+    err = capsys.readouterr().err
+    assert "swept 2 root(s)" in err and "bytes" in err
+    assert "105 has no owner record; kept" in err and "unreadable owner record" in err
+    # Once its holder lets go, a record from another PID namespace is judged by its lock.
+    assert [path.name for path, _ in pt.sweep_host_temp(host)] == ["106"]
+
+
+def test_a_host_temp_base_that_is_not_a_private_directory_is_refused(
+    pt: ModuleType, base: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    trap = tmp_path / "host" / "trap"
+    trap.symlink_to(elsewhere)
+    monkeypatch.setenv("AGENT_UTILS_HOST_TMP_BASE", str(trap))
+    with pytest.raises(pt.HostTempUnavailable, match="not a real directory"):
+        with pt.activate(host_temp=True):
+            pass
+    assert list(elsewhere.iterdir()) == []
+    done = subprocess.run(
+        [str(WRAPPER), "--host-temp", sys.executable, "-c", "raise SystemExit(0)"],
+        capture_output=True, text=True, check=False, env={**os.environ},
+    )
+    assert done.returncode == pt.OVER_LIMIT_EXIT and "REFUSED: no host-temp root" in done.stderr
+
+
+def test_the_wrapper_runs_a_host_temp_command_and_removes_its_root(base: Path, tmp_path: Path) -> None:
+    report = tmp_path / "report"
+    done = subprocess.run(
+        [str(WRAPPER), "--host-temp", sys.executable, "-c",
+         f"import os; open({str(report)!r}, 'w').write(os.environ['TMPDIR'])"],
+        capture_output=True, text=True, check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    root = Path(report.read_text())
+    assert root.parent == _host_base(tmp_path) and not root.exists()
+    assert list(_host_base(tmp_path).iterdir()) == []
+
+
+def _wrapper_module() -> ModuleType:
+    loader = importlib.machinery.SourceFileLoader("_with_private_tmp_under_test", str(WRAPPER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def test_a_host_temp_root_past_its_bound_stops_the_command_with_a_named_refusal(
+    base: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wrapper = _wrapper_module()
+    monkeypatch.setattr(wrapper.private_tmp, "HOST_TEMP_LIMIT_BYTES", 1_000_000)
+    monkeypatch.setattr(wrapper.private_tmp, "HOST_TEMP_POLL_SECONDS", 0.05)
+    report = tmp_path / "report"
+    child_code = (
+        "import os, time; root = os.environ['TMPDIR']; "
+        "open(os.path.join(root, 'big'), 'wb').write(os.urandom(4_000_000)); "
+        f"open({str(report)!r}, 'w').write(root); time.sleep({HANG_BACKSTOP_S})"
+    )
+    code = wrapper.main(["--host-temp", sys.executable, "-c", child_code])
+    assert code == wrapper.private_tmp.OVER_LIMIT_EXIT == 73
+    err = capsys.readouterr().err
+    assert "with-private-tmp: REFUSED: host-temp root" in err and "past its bound of 1000000" in err
+    root = Path(report.read_text())
+    assert not root.exists() and list(_host_base(tmp_path).iterdir()) == []
+
+
+def test_the_sweep_command_reports_both_bases(base: Path, tmp_path: Path) -> None:
+    host = _host_base(tmp_path)
+    host.mkdir(mode=0o700)
+    (host / "201").mkdir()
+    (host / "201" / "f").write_bytes(b"y" * 8192)
+    (host / "201.owner").write_text(json.dumps({"pid": _dead_pid(), "start": 1, "pid_namespace": ""}))
+    done = subprocess.run(
+        [sys.executable, str(SCRIPTS / "private_tmp.py"), "sweep"],
+        capture_output=True, text=True, check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert f"swept {host / '201'}" in done.stdout
+    assert "private tmp sweep: 1 host-temp root(s)" in done.stdout and not (host / "201").exists()
+
+
+def test_gate_start_sweeps_finished_host_temp_roots(
+    base: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import inspect
+
+    gate = _load("_gate_host_temp_sweep_under_test", SCRIPTS / "gate.py")
+    host = _host_base(tmp_path)
+    host.mkdir(mode=0o700)
+    (host / "301").mkdir()
+    (host / "301" / "f").write_bytes(b"z" * 8192)
+    (host / "301.owner").write_text(json.dumps({"pid": _dead_pid(), "start": 1, "pid_namespace": ""}))
+    gate._sweep_host_temp_roots()
+    assert not (host / "301").exists() and not (host / "301.owner").exists()
+    assert "swept 1 root(s)" in capsys.readouterr().err
+    assert "_sweep_host_temp_roots()" in inspect.getsource(gate.run_admitted), "every admitted gate sweeps first"

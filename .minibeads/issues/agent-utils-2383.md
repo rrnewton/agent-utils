@@ -86,5 +86,30 @@ Covered here, not fixed one by one: three agentctl library tests leave entries e
   - In one run under strace, its own `fusermount -u` failed, and two mounts and their fuse2fs daemons were left behind. The mount guard kept the root, as designed, instead of removing through the mounts. The leftovers were released with a user-level `fusermount -u` and a SIGTERM to each daemon.
   - One run without strace: all 4 passed, with no mounts left. The daemons exited on their own within minutes.
   - So the leak came from strace, not the change. Hardening (not done here): the test should unmount in a `finally` block and verify that the mount is gone.
-- On at least one host, home is also visible through a bind at `/data/users/<user>/dotsync-home`, so every mount under `~` appears twice in `/proc/self/mountinfo`. The mount guard matches by the root's path as given and as resolved, and an unmount by the `~` path works.
+- On at least one host, home is also visible through a bind mount at a second path, so every mount under `~` appears twice in `/proc/self/mountinfo`. The mount guard matches by the root's path as given and as resolved, and an unmount by the `~` path works.
 - A test that copies `scripts/gate.py` into a scratch checkout must now copy `scripts/private_tmp.py` beside it.
+
+## The first gate and the scoped host-temp exception
+
+[opus 5.5] cl-tmpfix, 2026-11-27. The first full gate (3d421bfd, ticket 1795811325223360050-2994da33) failed 19 steps.
+
+- 14 came from this change. On the gating host, `~/.aut` and `/tmp` are different btrfs subvolumes, and the parent of the home directory is automounted.
+  - Every python-lifecycle shard, `python.wrkslots.shard-6`, `rust.wrkslots.test` and `repository.check.wrkslots-debug-test` failed for one of three reasons:
+    - "validation exclusion found no trusted root-owned, same-filesystem sticky parent". The Python fixtures and the Rust tests name `/tmp` itself as the trusted parent (`test_release_frozen_rust.py`, `test_lifecycle.py`, `validation_exclusion.rs`), so `tmp_path` must be on `/tmp`'s filesystem.
+    - "cannot determine Git provenance ... cannot inspect ancestor marker <home parent>/.git: Operation not permitted". Inside the namespace shards' user and mount namespace, the automounted home parent refuses the lookup that the Git-marker walk up from a home-based `tmp_path` makes. Outside a namespace the same lookup gives ENOENT.
+    - `test_strict_build_binds_under_box_tmp_and_confirms_masks`: "root view path is outside every trusted root".
+  - `python.repository-infrastructure.validation-graph`: the #941 test reused the gate's inherited root. It now opts out (`AGENT_UTILS_PRIVATE_TMP=0`) and exercises the #941 path; the private-root path is covered in `test_private_tmp.py`.
+- The other 5 were load or known reds on other trees: `python.wrkslots.shard-4` (#2065 census), `python.wrkslots.shard-14` (the #2372 per-test timeout in the mount-holder scan), `cross.herdr-run.differential` and `rust.merge-queue.test` (CPU timeouts, red on other trees 3 and 6 times since 11-25), `vibe-talk.check.discuss-browser` (#2175) and `vibe-talk.check.reload-place-browser` (red on other trees 3 times since 11-25).
+- A sticky private root is not possible: a root-owned 01777 directory needs root. wrkslots' configured production exclusion root does qualify for `~/.aut` paths on that host (through the home directory's bind alias), but the tests name `/tmp`. Fixing that is #2415.
+
+The scoped exception (interim until #2415, approved by the lead coordinator after the owner-facing liaison's review, which set four conditions):
+
+1. Only `private_tmp.HOST_TEMP_STEPS` run under `with-private-tmp --host-temp`: the 9 python-lifecycle steps, the 16 `python.wrkslots` shards, `rust.wrkslots.test`, `repository.check.wrkslots-debug-test`, and #2065's future `python.wrkslots.host-*` steps.
+   - Each gets a fresh root at `/tmp/aut-<uid>/<n>`. Every other step stays in `~/.aut`.
+   - `test_only_the_listed_wrkslots_steps_run_in_the_host_temp_dir` fails the gate when any other step uses it, when a listed step does not, or when a step names `/tmp/aut` or a temp base.
+2. Each root has an owner record (pid, process start time, PID namespace), written and flock-locked before the root exists and held for the run.
+   - `sweep_host_temp` removes a root only when the lock is free and the recorded process is gone (pid absent or start time different). It never removes by name.
+   - It logs each root's bytes and the total.
+   - It runs at every host-temp activation and at gate start, and the daily tick runs `python3 scripts/private_tmp.py sweep`.
+3. The wrapper measures the root every 10 s. Past 5,000,000,000 bytes it prints a named REFUSED line, stops the command (SIGTERM, then SIGKILL after 30 s), removes the root, and exits 73.
+4. #2415 names this exception, and every DAG comment on a wrapped step points to it.
