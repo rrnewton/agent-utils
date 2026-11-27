@@ -7,7 +7,7 @@ labels:
 - wrkslots
 - census
 created_at: 2026-11-19T01:30:00+00:00
-updated_at: 2026-11-26T19:57:00-05:00
+updated_at: 2026-11-26T20:02:00-05:00
 ---
 
 # Description
@@ -44,3 +44,7 @@ Trusted consumer evidence, two more runs tonight on a loaded host (about 113k pr
 - A retry refused rc 3 after 273.95 s: "same-UID process evidence changed during three liveness attempts".
 
 The retained checkout was costing about 43.6e9 bytes of disk while removal stayed refused, and a validation's own teardown had hit the same refusal earlier the same evening. The consumer asks for a churn-tolerant proof: scope the census to the processes that could reference the target, or prove per-PID absence by start-time generation, instead of requiring whole-host inventories to hold still. The owner decision on that scoped owner/cgroup direction, pending since 2026-11-20 per the Status above, is being asked again.
+
+## Addendum: dead-owner row without a run record (2026-11-26, 7:42 PM ET)
+
+Trusted consumer evidence for one of tonight's validation teardowns: the validate row was generation 1 and its recorded owner was dead, but a dry-run path had materialized the checkout without writing a run record. The teardown entry point (`validate-run --retire-unit`) therefore refused: "no run handle ... recorded no checkout to retire". The operator fell back to plain `wrkslots remove --validate-complete`, which took the general same-UID census and refused under churn. The 2026-11-20 validation teardown closure would have covered the same facts (recorded owner proven dead, recorded slice subtree empty-or-unknown, one ordinary reference scan), but plain remove did not reach it. That narrower entry-point gap is split to #2337; the general-census direction above is unchanged.
