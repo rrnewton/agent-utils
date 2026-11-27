@@ -139,13 +139,21 @@ class PerfApi(typing_fast.BigApi):
         return {**super().client_config(scope), "live_poll_seconds": 1}
 
 
+def _count(row: dict[str, object], key: str) -> int:
+    """A measured count from a row, as an int."""
+    value = row[key]
+    assert isinstance(value, (int, float)) and not isinstance(value, bool), (
+        f"the probe reported {key}={value!r}")
+    return int(value)
+
+
 def check_ceilings(row: dict[str, object]) -> None:
     """Gate mode: the pure counts stay under their ceilings (#2281)."""
     limits = CEILINGS.get(str(row["trigger"]))
     if limits is None:
         return
     for key, limit in limits.items():
-        check(int(row[key]) <= limit,
+        check(_count(row, key) <= limit,
               f"{row['trigger']}: {key}={row[key]} over the ceiling {limit} "
               f"(counts only; re-measure before raising)")
 
