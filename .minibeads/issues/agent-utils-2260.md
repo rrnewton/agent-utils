@@ -29,3 +29,8 @@ Pre-existing, same on main. Found while tracing #2256 vibe-talk-search-head-room
 # Notes
 
 Owner-UI (owner 370). Filed at the coordinator's request from the #2256 traces. Related: #2256 vibe-talk-search-head-room-no-shift, #2257 vibe-talk-search-fast-pass-holds-reader, #243 filter-keeps-selection, #2230 vibe-talk-reading-row-stays-put.
+
+Cause (2026-11-26, real throwaway server, reader at the head of the channel list, first key of a search whose results leave the list a few pixels taller than the screen; scroll writes hooked with their stacks): the reader was turned into a newest-line follower. The entry landing (#1734: no hit on the screen the reader typed at, so `scrollToNewest`) let the filter's hold go; then the chips' resize keeper (`chipsFollowFoot` -> `toFoot`) and a later restore (`restoreScroll` with a pinned mark -> `scrollToNewest`) followed the foot as the search's line and chips changed height: 0 -> 20 -> 5 px on a phone. On a desk the key's own place-keeping put the nearest shown row in the hidden head row's place (`nudge` 0 -> 31), which the shortened list could not hold: the browser clamped it to 9 a frame later, and the restore took it to 0.
+
+Fix: a reader at the head with search words typed (`atSearchHead`) gives a head anchor; where the change hides their row, they keep the list's head (`toPosition` 0) instead of a place below it for the nearest row. The entry landing does not take a reader who typed at the head to the newest hits when the newest line already stands within the slack of the screen, so the filter's hold stays and neither the chips' keeper nor a restore follows the foot. Every other reader lands as #1734 has it (its page test and `search_scroll_browser.py` unchanged).
+

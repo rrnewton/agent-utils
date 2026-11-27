@@ -3319,6 +3319,8 @@ let searchScreenIdentity = null;
 // found rows in place as `#243` asks.
 let searchEntryAnchor = null;
 let searchEntryMoved = false;
+// `#2260`: whether the reader stood at the head of the list when they typed the entry's words.
+let searchEntryAtHead = false;
 // `#1913 vibe-talk-search-typing-lag`: the full filter change a keystroke schedules, run once
 // the typing pauses. Each keystroke replaces the pending one, so a burst of typing pays for
 // one full pass (place-keeping, seams, tallies, the server ask), never one per key.
@@ -3365,6 +3367,7 @@ function noteSearchScreenPass() {
   // `#1968`: a new entry may move the reader; remember where they are before it does.
   searchEntryAnchor = filterAnchor();
   searchEntryMoved = false;
+  searchEntryAtHead = el("scroll-area").scrollTop <= 0;
   const list = visibleList();
   // `#1913`: only rows with a box can stand on screen; the hidden ones carry no layout, and
   // leaving them out lets `rowsOnScreen` measure only the screen's neighbourhood.
@@ -3390,7 +3393,11 @@ function landSearchEntry() {
   // Nothing matched: the emptied list's own placement takes the reader to
   // the sentence at its head that says why; there are no recent hits to show.
   if (hits.size === 0) return;
-  if (!searchScreenRows.some((row) => hits.has(row))) {
+  // `#2260` (owner 370): a reader who typed at the head of a list the search shortened to about a
+  // screen already has the newest hits on screen (the rows' foot is within the slack): no landing,
+  // and the filter's hold stays, so neither the chips' keeper nor a later restore takes them on to
+  // the foot, a few pixels down and clamped back. Every other reader lands as `#1734` has it.
+  if (!searchScreenRows.some((row) => hits.has(row)) && !(searchEntryAtHead && atBottom(el("scroll-area")))) {
     // `#1968`: the entry is taking the reader to the newest hits; closing the bar
     // owes them the place this took them from.
     searchEntryMoved = true;

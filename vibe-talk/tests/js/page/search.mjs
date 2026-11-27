@@ -3421,6 +3421,46 @@ test("`#1734 vibe-talk-search-view-scroll-default`: entering a search stays on a
   assert.ok(Math.abs(anchor.getBoundingClientRect().top - anchorTop) <= 2, "the row under the reader's eye moved");
 });
 
+test("`#2260 vibe-talk-search-barely-overflowing-list-clamp`: a reader at the head keeps the head when the search leaves a list a few pixels taller than the screen", async () => {
+  // Thirty messages; "needle" only in the last three, so a reader at the head has no hit on
+  // screen and the row they read goes. The screen is then sized so the needle rows overflow it by
+  // a few pixels: the reader is at the head and, within the slack, at the newest line too.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, Array.from({ length: 30 }, (_u, i) =>
+    message({ id: String(i + 1), content: `haystack note ${i}${i >= 27 ? " needle" : ""}` })));
+  const area = page.el("scroll-area");
+  await search(page, "needle");
+  await page.settle();
+  const filtered = area.scrollHeight;
+  await page.el("search-field").setValue("");
+  await page.settle();
+  area.clientHeight = filtered - 6;
+  await page.settle();
+  assert.ok(area.scrollHeight > area.clientHeight * 2, "the unfiltered list does not overflow, so this proves nothing");
+  area.scrollTop = 0;
+  await page.settle();
+  const tops = [];
+  const head = () => {
+    const shown = unfiltered(page, "discord-log");
+    return shown.length ? { id: shown[0].getAttribute("data-id"), top: shown[0].getBoundingClientRect().top } : null;
+  };
+  await page.el("search-field").setValue("needle");
+  const atKey = { scrollTop: area.scrollTop, head: head() };
+  for (let i = 0; i < 6; i += 1) {
+    await page.settle();
+    tops.push({ scrollTop: area.scrollTop, head: head() });
+  }
+  const overflow = area.scrollHeight - area.clientHeight;
+  assert.ok(overflow > 0 && overflow <= 24, `the needle list overflows by ${overflow}px, not by a few, so this proves nothing`);
+  assert.equal(atKey.scrollTop, 0, `the key's own change moved the head reader to ${atKey.scrollTop}`);
+  for (const seen of tops) {
+    assert.equal(seen.scrollTop, 0, `after the key the head reader was moved to ${seen.scrollTop} (the foot followed, then clamped)`);
+    assert.equal(seen.head && seen.head.id, atKey.head.id, "the head row changed after the key");
+    assert.ok(Math.abs(seen.head.top - atKey.head.top) <= 0.5, `the head row moved from ${atKey.head.top} to ${seen.head.top}`);
+  }
+});
+
 test("`#1968 vibe-talk-search-close-x`: closing after a search entry moved the reader puts them back where they were reading", async () => {
   // The entry landing is a loan, not a move: typing "needle" from a parked place with
   // no hit on screen takes the reader to the newest hits, and closing the bar — here

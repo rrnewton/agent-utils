@@ -48,6 +48,10 @@ export interface FilterAnchor {
   time: number;
   offset: number;
   alternate: FilterAnchor | null;
+  /** `#2260`: taken from a reader at the head of the list with search words typed (`atSearchHead`):
+   * where the change hides the row they read, they keep the list's head, not a place for the nearest
+   * row that the list as it now stands may not be able to hold. */
+  head?: boolean;
 }
 
 /** A pane's selection mark, as the filter place reads it. */
@@ -384,7 +388,8 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
       return held.row === null ? asked : { ...asked, alternate: anchorAt(held.row) };
     }
     if (showing && pane && mark && chosen) return anchorAt(chosen, mark);
-    if (deps.atBottom(area) && !atSearchHead(area)) {
+    const atHead = atSearchHead(area);
+    if (deps.atBottom(area) && !atHead) {
       return { placeMark: deps.inputStamp ? { inputAt: deps.inputStamp() } : undefined,
         newest: true, row: null, ids: [], selected: null, drawn: false, focused: false, time: NaN, offset: 0,
         alternate: null };
@@ -396,7 +401,9 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
       const box = row.getBoundingClientRect();
       return box.bottom > head && box.top < foot;
     });
-    return first ? anchorAt(first as HTMLElement) : null;
+    if (!first) return null;
+    const anchor = anchorAt(first as HTMLElement);
+    return atHead ? { ...anchor, head: true } : anchor;
   }
 
   /**
@@ -510,6 +517,11 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
       const delta = deps.messageTop(placed, row ? id : null) - deps.listPlaceTop(area) - offset;
       // `#2285`: a tapped row keeps its top even where the list cannot scroll that far.
       if (room && row && deps.holdRowAt) deps.holdRowAt(area, placed, delta);
+      // `#2260` (owner 370): a reader at the head whose row the change hid stays at the head. The
+      // nearest row put in the hidden row's place asks for a place below the head that a list the
+      // search shortened to about a screen cannot hold: the browser clamps it back a frame later,
+      // and the list moves twice under the reader.
+      else if (!row && anchor.head) deps.toPosition(area, 0);
       else deps.nudge(area, delta);
     }
     carrySelection(anchor, placed, substitute !== null);
