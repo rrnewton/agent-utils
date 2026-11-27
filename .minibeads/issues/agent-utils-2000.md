@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-lock-order: never hold the config lock while waiting for the ACTIVE global lock'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 - locking
 created_at: 2026-11-20T14:43:46-05:00
-updated_at: 2026-11-20T14:43:46-05:00
+updated_at: 2026-11-26T22:22:41-05:00
+closed_at: 2026-11-26T22:22:41-05:00
 ---
 
 # Description
@@ -36,3 +37,7 @@ Rule: never hold the config lock while waiting for ACTIVE.global. One global loc
 # Notes
 
 Related: #1975 restore-boot-recovery (Phase 1 shortened the transfer-owner hold on the same stack; this issue is its own commit after Phase 1/6 land), #1276/#1808 (prevalidated mutations and the dual config lock), #1194 (config flock scope), #1987 wrkslots-rust-transfer-parity (Rust lock-scope gaps at cutover — the Rust side of this fix must not regress those). Starts only after Phase 1 lands. Number pre-assigned by the lead coordinator.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as a8cc8d82ef4b26d7c8660f5592d3f6e054bd8e98 (gated stack tip 23ee4242; PARTIAL gate row 1795733662788938941-5224ca83 under the 965-extension waiver, liaison 987). The mutation-lock order is now stated once at `_mutation_locks`: project-root flock, then `config.lock`, then `ACTIVE.global.intent`, then `ACTIVE.global`, then `ACTIVE.<machine>`. Configuration-independent prevalidated paths no longer hold the config flocks while queueing for the registry: heartbeat, adopt, transfer-owner, release, hold/unhold, write-handoff, read-handoff and supersede-handoff release after the configuration check, as the prepared-removal and deferred-finish paths already did; busy fallbacks re-check only `config_sha256` rather than full registry identity. Paths kept on the old mode carry their reason at the call site, and Rust create now takes the configuration locks before the registry locks. `WRKSLOTS_LOCK_ORDER_CHECK` records acquisitions and is enabled in the wrkslots test steps, with the enable decision cached and the release step budgeted for the measured cost. Real-flock and mixed old/new coverage lives in `py/wrkslots/tests/test_lock_order.py` and the lock-scope suites. No persisted fields changed.
