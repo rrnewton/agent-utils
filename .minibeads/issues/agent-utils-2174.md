@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-transfer-owner-scan-under-config-lock: transfer-owner holds the configuration lock through a full registry storage scan'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-24T03:00:00-05:00
-updated_at: 2026-11-24T03:00:00-05:00
+updated_at: 2026-11-27T12:13:29-05:00
+closed_at: 2026-11-27T12:13:29-05:00
 ---
 
 # Description
@@ -26,3 +27,7 @@ A dead-owner transfer touches one row. Move the registry storage scan out from u
 # Notes
 
 Evidence is from a consumer's post-reboot re-bind (about 130 slots scanned per call); the scan findings themselves ("missing or inconsistent storage. state: RETAINED", unregistered worktrees, Git paths without a row) are registry-wide and do not concern the one transferred row.
+
+## Resolution
+
+[Claude Opus 5.5] Landed on main as e5420109 + 3f77daee (full gate PASS 71/71 on 8b141e43). The transfer-owner busy fallback no longer runs the registry storage scan or fleet validation under the registry locks. Under the locks it checks only the transferred row's own storage. Its nested registrations come from the last lock-free prepare, or from a one-slot scan when no prepare finished. Tests in test_transfer_lock_scope.py: a second writer runs from inside the scan and never blocks (red on the first commit alone); a slot broken after the scan is still refused under the lock; the one-slot nested registrations equal the full scan's for that slot; the locked fallback counts zero storage scans under the lock. The Rust edition already judged only the record under the lock. No persisted fields. Heartbeat's identical fallback is #2353.
