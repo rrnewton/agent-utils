@@ -6,6 +6,7 @@
 // readers see; this owner only drives it. Distinct from view/voice/readcontrols.ts
 // (`mountReadControls`, the read-aloud controls) — names here are the OlderWalks surface.
 
+import type { ScrollCause } from "./scrollkeep.ts";
 import type { Message, SearchScope } from "../../contract/index.ts";
 import { DISCORD_PAGE_LIMIT, exactReplyCount, threadOf } from "../../core/channels/index.ts";
 import type { ChannelStore, ReplyTally } from "../../core/channels/index.ts";
@@ -79,7 +80,9 @@ export interface OlderWalksDependencies {
   applySearch(): void;
   /** `#2200`: redraw "X of Y loaded" from the fold after the chips move. Optional for doubles. */
   refreshSearchCount?(): void;
-  preservingScroll(mutate: () => void): void;
+  preservingScroll(mutate: () => void, cause?: ScrollCause): void;
+  /** `#2354`: the scroll owner's reader-input stamp (`inputStamp`): changes with the reader's every scroll, touch or key. Optional for doubles. */
+  inputStamp?(): number;
   /** `#2256`: open the scroll owner's user-caused hold (`#2076`), so the restore that follows keeps
    * the reader's row by its top even at the list's foot. Optional for doubles. */
   beginUserChange?(): void;
@@ -684,7 +687,7 @@ function searchOlder() {
         // Under a control that held still, the note simply opens under it; under a reader who moved
         // away, their place is kept.
         if (walk.anchored || area.scrollTop === 0) write();
-        else preservingScroll(write);
+        else preservingScroll(write, "other");
       }
       steps.pause();
     }
@@ -858,7 +861,7 @@ function holdingHeadChange(mutate: () => void): void {
     return;
   }
   if (deps.beginUserChange) deps.beginUserChange();
-  preservingScroll(mutate);
+  preservingScroll(mutate, "other");
 }
 
 /**
@@ -902,8 +905,32 @@ function hideBucketChips(): void {
   }
 }
 
+/** `#2354`: the search the reader last started in a thread (by opening the thread under it, or by
+ * starting it there): the thread's context, the search's key and the reader-input stamp then. */
+let threadSearchStart: { context: string; key: string; input: number } | null = null;
+
+function noteThreadSearchStart(key: string): void {
+  if (selection().view !== "thread" || key === "" || typeof deps.inputStamp !== "function") {
+    threadSearchStart = null;
+    return;
+  }
+  const context = channelContextKey();
+  if (threadSearchStart === null || threadSearchStart.context !== context || threadSearchStart.key !== key) {
+    threadSearchStart = { context, key, input: deps.inputStamp() };
+  }
+}
+
+/** `#2354`: whether the server's answer now landing completes that search for the reader: the same
+ * thread and search, and no scroll, touch or key of theirs since it was started. */
+function answerCompletesThreadSearch(): boolean {
+  const start = threadSearchStart;
+  return start !== null && typeof deps.inputStamp === "function" && selection().view === "thread" &&
+    start.context === channelContextKey() && start.key === serverSearchKeyNow() && start.input === deps.inputStamp();
+}
+
 function scheduleServerSearch() {
   const key = serverSearchKeyNow();
+  noteThreadSearchStart(key);
   // A gathering asked for elsewhere, or with the search closed, is no longer watched here; the
   // server's own bump clears itself once the walk reaches the channel's beginning.
   if (gathering.state().channel !== "" && (key === "" || !searchFurtherRunning())) stopSearchFurther();
@@ -1641,7 +1668,16 @@ function renderServerSearch() {
   // own scroll pass can unmark a placed card (it holds no loaded search
   // text for the filter to mark by), so the placed cards are marked again
   // after it, as `placeServerHits` marked them inside it.
-  preservingScroll(() => placeServerHits(grouped));
+  // `#2354`: hits are growth the reader did not cause ("other": the row being read holds, even at
+  // the foot), except while they complete the reader's own act: the answer to the search a thread
+  // was opened under (or the reader started in it), with nothing scrolled, touched or pressed since,
+  // is part of that landing, followed and parked below the chip panel (`#2200`, `#2258`), as before.
+  preservingScroll(() => placeServerHits(grouped), answerCompletesThreadSearch() ? "reader-act" : "other");
+  // `#2354`: the search's full pass over what the answer placed (which rows stand, the None-match
+  // line's words of `#2269`, the count), now, for every reader. It used to run only as a side
+  // effect of the newest line being followed here (`scrollToNewest` redrawing the tools), so a
+  // reader up the list, or one held at the foot, kept what the list said before the answer.
+  applySearch();
   for (const row of el("discord-log").children) {
     if (row.getAttribute(SERVER_HIT_MARK) === "card") markSearchHits(row, searchParsed(searchField.query()).terms);
   }

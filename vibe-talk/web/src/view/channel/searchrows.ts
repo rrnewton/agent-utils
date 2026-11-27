@@ -5,6 +5,7 @@
 // the legacy script held them. The field itself, the server's search, and the read runs stay
 // their owners'; this asks for them.
 
+import type { ScrollCause } from "./scrollkeep.ts";
 import type { Message } from "../../contract/index.ts";
 import { linksIn } from "../../foundation/index.ts";
 import { searchScopeWords } from "../../present/notices/index.ts";
@@ -103,7 +104,7 @@ export interface SearchRowsDependencies {
   mainColumnRecord(): { searched: SearchCount | null };
   setSearched(count: SearchCount): void;
   searchWalkHeld(): boolean;
-  preservingScroll(fn: () => void): void;
+  preservingScroll(fn: () => void, cause?: ScrollCause): void;
   /** `#2257`: move the list by `delta` through the scroll owner (its own write). Optional for doubles. */
   nudge?(area: HTMLElement, delta: number): void;
   /** `#2257`: the viewport y the floating search panel covers down to (the filter keeper's head). */
@@ -1200,7 +1201,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
       for (let next = at - 1; next >= 0 && !rowShown(rows[next] as HTMLElement); next -= 1) take(rows[next] as HTMLElement);
     }
     if (first === null) return null;
-    if (deps.screen() === "main" && deps.view() === "discord") deps.preservingScroll(applySearch);
+    if (deps.screen() === "main" && deps.view() === "discord") deps.preservingScroll(applySearch, "other");
     else applySearch();
     return first;
   }
@@ -1274,7 +1275,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         apply();
         if (held.row !== null) deps.keepFilterHold();
       } else {
-        deps.preservingScroll(apply);
+        deps.preservingScroll(apply, "other");
       }
     } else {
       apply();

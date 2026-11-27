@@ -5,6 +5,7 @@
 // what a pin keeps of a message, and a message drawn from what its pin kept. The list itself is
 // web/src/core/annotations `createPins`; drawing the rows and the filter is the page's.
 
+import type { ScrollCause } from "./scrollkeep.ts";
 import type { Message, Pin, PinChangeResponse, PinsResponse } from "../../contract/index.ts";
 import { createPins } from "../../core/annotations/index.ts";
 import type { Pins } from "../../core/annotations/index.ts";
@@ -274,7 +275,7 @@ export interface PinnedMessagesDependencies {
   guard(run: () => Promise<void>): void;
   providerName(): string;
   eachColumn(fn: () => void): void;
-  preservingScroll(fn: () => void): void;
+  preservingScroll(fn: () => void, cause?: ScrollCause): void;
   renderChannelRows(): void;
   refreshReadRuns(): void;
   renderScrollTools(): void;
@@ -391,7 +392,7 @@ export function createPinnedMessages(deps: PinnedMessagesDependencies): PinnedMe
   function renderPins(): void {
     if (pinsView().only) {
       deps.eachColumn(() => {
-        deps.preservingScroll(deps.renderChannelRows);
+        deps.preservingScroll(deps.renderChannelRows, "other");
         deps.renderScrollTools();
       });
     } else {

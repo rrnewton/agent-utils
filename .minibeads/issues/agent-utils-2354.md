@@ -1,40 +1,43 @@
 ---
-title: 'two-column-search-replies-place-left-scroll: the two-column check sees the left column scroll by 184px during the cards walk on unrelated heads at normal load'
+title: 'two-column-search-replies-place-left-scroll: a walk in the right column, or the search drawing its marks late, moves the reader''s left column when it sits at its foot'
 status: open
 priority: 1
 issue_type: bug
 assignee: cl-flaketriage
 labels:
 - vibe-talk
-- tests
-- flaky-test
+- owner-ui
+- scroll
 created_at: 2026-11-27T00:23:00-05:00
-updated_at: 2026-11-27T00:23:00-05:00
+updated_at: 2026-11-27T02:10:00-05:00
 ---
 
 # Description
 
-`vibe-talk.check.two-column-browser` (`vibe-talk/tests/two_column_browser.py`, `search_replies` in place mode, `replies_place`) failed twice in an hour on two unrelated heads with the same assertion and the same numbers:
+A page defect (owner rule 370: the row being read never moves; growth extends below), found from `vibe-talk.check.two-column-browser` failing twice in an hour on unrelated heads at normal load with the same numbers: `search-replies-place-1280: the cards' walk scrolled the left column`, the left column's `scrollTop` 379 -> 563 (gate `3b18855a` on `8cfd09e0`, 2026-11-26 11:28 PM ET; gate `0733039c` on `dd2ef05e`, 2026-11-27 12:20 AM ET, load1 107 to 151).
 
-- gate `3b18855a`, head `8cfd09e0`, finished 2026-11-26 11:28 PM ET (with `collapse-anchor-browser` and `page-3`); the same head's next gate was green.
-- gate `0733039c`, head `dd2ef05e` (`#2324`, which changes only `vibe-talk/scripts/screenshots.py`, which this check does not run), finished 2026-11-27 12:20 AM ET, load1 107 to 151 for the whole gate (under the hot bar of 237).
+The reader scrolls the right column's cards and presses "Search replies before". When the left column sits exactly at its foot, the left column moves one row (184 px): the rows on screen move up by the same 184 px. An instrumented copy of the check recorded it in 4 of 108 runs at four in parallel on main, never alone. The writer, stack-traced and source-mapped: the search field's deferred first marking (`core/search/field.ts` `markSearchNow`, a 120 ms timer armed by typing) lands after the walk's press under contention. Its redraw (`app/main.js`, inside `preservingScroll`) grows the left list, and `restoreScroll`'s pinned branch (`scrollkeep.ts`, `mark.pinned && !mark.userCaused && !actedSince`) follows the foot: `scrollToNewest` -> `followFoot` -> `toPosition` -> `writeTo`. The left column's `overflow-anchor` is `none`, so no browser anchoring is involved. Holding that marking until the walk's press reproduces it every time (main 3/3).
 
-The assertion: `search-replies-place-1280: the cards' walk scrolled the left column: {'top': 243.90625, 'right': 338, 'left': 379, ...} {'top': 243.703125, 'right': 384, 'left': 563, ...}`. The reader scrolls the right column's cards, presses "Search replies before", and the walk adds three threads; the check then requires the left column's `scrollTop` (`#scroll-area`) to be unchanged within 1px, and saw it grow by 184px. The same numbers on two unrelated heads at normal load point to a real race in the check or the page, not to overload.
+Latent defects sit behind it: the walk's matching rows in the left column, and the `#2269` None-match sentence after the server's answer, are brought up to date on main only as a side effect of that follow. When the server's answer is placed (`renderServerSearch` -> `preservingScroll` -> `restoreScroll` -> `scrollToNewest` -> `setJumpNewest` -> `renderScrollTools` -> `applySearch`), the rows appear. A reader up the list never sees them.
 
 # Design
 
-First decide which it is. `scrollTop` alone cannot say whether the reader saw the left column move: if the walk's threads enter the left list above the rows on screen, the page (or Chromium's own scroll anchoring, which the check leaves on for the left column) raises `scrollTop` by their height while the reader's rows stay put. Repeat the step on its own and on a main control, and record, before and after the walk, the first left-column row on screen and its offset from the column's head.
+Causal, not timed (liaison direction, agreed with `cl-signpost3` as one design for `#2346`, `#2351` and `#2354`):
 
-- Rows on screen unchanged (only `scrollTop` moved, by the height of rows inserted above): the check measures the wrong thing. Make it compare the reader's place in the left column (the first row on screen and its offset), as it already does for the right column's card, and wait for the walk's rows to settle on a condition rather than a fixed pause.
-- Rows on screen changed: the page moves the reader's left column during a walk in the right column. That is a reader-visible scroll (owner-UI class, rule 370 scroll stability) and goes to the coordinator as a product bug; the check stays as it is.
+- A `ScrollCause` on the `ScrollMark`: `captureScroll(cause)` and `preservingScroll(mutate, cause)`. In a channel list, a change named `"other"` (growth the reader did not cause there) never follows the foot: the row being read is held by its top, and the jump offers what came below, as an arrival already is since `#2230`. A pinned list still at its foot after such a change is left alone, with no row measured (`#249`). An arrival, the reader's own act, or a change that names no cause follows as before. The call transcript keeps its own following contract (`#431`), as for `#2076`.
+- Tagged `"other"` (owner decision via the liaison, items 1 to 3, each a one-line flip at its caller): the search's deferred mark redraw (`main.js`), the search's full passes (`searchrows.ts` x2), `#1901` server hits and the walk's own note and head change (`olderwalks.ts`), summaries (`folding.ts`), the regroup (`channelrows.ts`), the pins (`pins.ts`).
+- What the search must redraw is called explicitly where it arrives, not left to the follow's side effect: `serversearch.ts` `foldRepliesPage` runs the search's full pass over the main column after folding the walk's older page, and `olderwalks.ts` `renderServerSearch` runs it once the server's answer is placed (which rows stand, the None-match line's words of `#2269`, the count). Both used to happen only when the newest line was followed (`scrollToNewest` -> `setJumpNewest` -> `renderScrollTools` -> `applySearch`), so on main a reader up the list never saw the walk's left matches and kept a stale `#2269` reach sentence; this fixes both latent defects. The `#243` filter hold and the jump stay where their own semantics release them.
 
 # Acceptance Criteria
 
-- The cause is named with evidence: the step on its own and a main control, with load1 recorded per run, and the left column's first row on screen before and after the walk for at least one failing run.
-- If the check is at fault: it compares the reader's place in the left column, passes 10 consecutive runs on its own, and still fails when the page moves the rows on screen (a negative control).
-- If the page is at fault: a product issue is filed through the coordinator and this check is not weakened.
-- No wall-clock budget added (owner rule 346).
+- The deterministic reproduction (the search's first marking released just after the walk's press) fails on main and passes on the fix; a per-frame trace of the left column's rows during the walk moves them at most 0.5 px on the fix (main: 184 px).
+- `two_column_browser.py` passes 40 runs at four in parallel on the fix and gains a guard: after the walk, every row the left column showed still shows and the walk's matches join them (main: 4 -> 7 rows), failing on a build that holds the foot without the explicit pass.
+- A page test covers the cause rule (held for "other", followed for an arrival, the reader's own act, no cause, and in the call transcript), with a negative control.
+- The screenshot matrix of the two-column desk (light and dark) with `BUILD.txt` naming the gated tree, and the advisory design review.
+- Arrivals, `#1839`, `#1880`, `#1856`, `#2076` and `#1734` unchanged; no wall-clock budget added (owner rule 346).
 
 # Notes
 
-Assigned to `cl-flaketriage` by the coordinator (2026-11-27). The left column's place is guarded by owner rule 370 (scroll stability), so this check is not disabled without liaison clearance.
+Assigned to `cl-flaketriage` by the coordinator (2026-11-27), first as a test intermittent, then as the page fix (owner-UI class: evidence before any fix). Order: `#2346` lands first, then `#2354`, then `#2351` (`cl-signpost3`) on top, passing `"other"` at its `chipsFollowFoot` caller.
+
+Owner follow-ups, for the morning summary: the fold-read pass (`readcore.ts` `applyReadRuns`) is left untagged, because it is shared with reader acts (Enter opening a read run, the read-mode toggle, thread entry); its background passes should hold per caller. `#249`'s same-search page test now takes the jump before its counted redraw: the search's own marking growth holds the reader's row (item 2), so the jump is offered and its "rows below" count would otherwise be measured on the redraw. Its bound of 4 row reads is unchanged. Today a reader parked at the foot of the channel list does not move on an arrival (0.00 px per frame at 1280x800 and 412x915, light, on main `0f1b1b7e`); the call transcript still follows (`#431`).

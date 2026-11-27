@@ -1439,6 +1439,11 @@ PLACE_ROOTS = range(10)
 PLACE_HITS = (133, 125, 112)
 
 # Where card `ID` stands in the window, the right and left columns' scroll, and the search as typed.
+#: `#2354`: the rows the left column shows, by id.
+LEFT_SHOWN_JS = """() => [...document.querySelectorAll('#discord-log > li[data-id]')]
+    .filter((li) => li.getClientRects().length > 0).map((li) => li.getAttribute('data-id'))"""
+
+
 PLACE_JS = """() => {
     const card = document.querySelector("#side-cards > li[data-id='ID']");
     return {top: card ? card.getBoundingClientRect().top : null,
@@ -1498,6 +1503,7 @@ def replies_place(desk: Desk) -> None:
     desk.settled()
     script = PLACE_JS.replace("ID", anchor)
     before = page.evaluate(script)
+    left_before = page.evaluate(LEFT_SHOWN_JS)
     desk.check(float(before["right"]) > 0, "the cards were not scrolled")
     # The control is at the head of the cards, out of sight: pressed as the keys would, without scrolling to it.
     page.evaluate("() => document.getElementById('side-search-replies').click()")
@@ -1519,6 +1525,13 @@ def replies_place(desk: Desk) -> None:
     desk.check(abs(moved) <= 1.5, f"the cards' walk moved the card the reader was on by {moved:.1f}px")
     desk.check(abs(float(after["left"]) - float(before["left"])) <= 1, f"the cards' walk scrolled the left column: {before} {after}")
     desk.check(after["field"] == REPLIES_TERM and after["open"], f"the cards' walk lost the search: {after}")
+    # `#2354`: what the walk found stands in the left column as well, as the search chooses, wherever that
+    # column was held: every row it showed still shows, and the walk's own matches join them.
+    left_after = page.evaluate(LEFT_SHOWN_JS)
+    lost = [row for row in left_before if row not in left_after]
+    desk.check(not lost, f"the cards' walk hid rows the left column showed: {lost}")
+    desk.check(len(left_after) > len(left_before),
+               f"the cards' walk showed nothing more in the left column: {left_before} -> {left_after}")
     desk.shot("place")
     desk.notes.append(f"scrolled into the cards, the cards' walk found 3 more threads and the reader's card moved "
                       f"{moved:.1f}px: {said_text}")

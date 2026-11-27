@@ -5,6 +5,7 @@
 // as it does is told where the legacy script held them; the page's lists, columns, search and
 // selection stay the page's and are asked for here.
 
+import type { ScrollCause } from "./scrollkeep.ts";
 import { createSummaries, summaryKey } from "../../core/channels/index.ts";
 import type { Summaries, SummaryAnswer } from "../../core/channels/index.ts";
 import {
@@ -82,7 +83,7 @@ export interface FoldingDependencies {
   readerActed(): void;
   /** Open the scroll owner's user-caused hold for a step that changes many rows' heights (`#2076`). Absent: unheld, as before. */
   beginUserChange?(): void;
-  preservingScroll(fn: () => void): void;
+  preservingScroll(fn: () => void, cause?: ScrollCause): void;
   /** Move a scroller by a measured delta, through the scroll owner (`#1251 scroll-single-owner`). */
   nudge(area: HTMLElement, delta: number): void;
   /** Collapse or expand `row` in `area` under the scroll owner's per-act anchor choice (`#1215`). */
@@ -365,7 +366,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
       note.hidden = !on;
       note.textContent = on ? summaryNoteWords(summaryRows.unavailable(), summaryRows.backend(), summaryRows.times()) : "";
       note.setAttribute("data-unavailable", on && summaryRows.unavailable() ? "true" : "false");
-    });
+    }, "other");
     renderScrollTools();
   }
 

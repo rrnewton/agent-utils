@@ -10,6 +10,18 @@ import { shrinkCase } from "./anchorpolicy.ts";
 import type { AnchorCheck } from "./anchorpolicy.ts";
 import { shownRowFor } from "./rows.ts";
 
+/**
+ * Why the change a mark is taken for happens (`#2354 two-column-search-replies-place-left-scroll`,
+ * owner 370). A change named "other" in a channel list (a search re-render, server hits, summaries,
+ * a regroup, the pins, the fold-read pass, a walk's own note: growth the reader did not cause there,
+ * such as a walk in the other column) never takes a reader at the foot to the newest line: it holds
+ * the row being read by its top, and the jump offers what came below. An "arrival" (a new message) or
+ * the reader's own act there ("reader-act"), like a change that names no cause, follows the newest
+ * line from the foot as before. Each "other" is one argument at its caller, so a change the owner
+ * wants followed again is a one-line flip.
+ */
+export type ScrollCause = "arrival" | "reader-act" | "other";
+
 /** Where the reader is: on the newest line, or which element their eye is on and how far down it sits. */
 export interface ScrollMark {
   readonly pinned: boolean;
@@ -34,6 +46,9 @@ export interface ScrollMark {
    * after a later fold or press would follow the foot over the anchor that act
    * just made, as `#1880`'s input stamp guards a reader's scroll. */
   readonly actAt?: number;
+  /** Why the change happens (`#2354`): "other" holds a reader at the foot by their row in a
+   * channel list; any other cause, or none, follows the newest line from the foot as before. */
+  readonly cause?: ScrollCause;
 }
 
 /** A walk for the search whose control holds still while it reads, as far as keeping the reader reads it. */
@@ -152,8 +167,9 @@ export interface ScrollKeeping {
   shownChannelList(): HTMLElement;
   /** The message the reader's eye is on: the first one not already scrolled off the top. */
   scrollAnchor(area: HTMLElement): Element | null;
-  /** Run a mutation and leave the reader looking at the same thing afterwards. */
-  preservingScroll(mutate: () => void): void;
+  /** Run a mutation and leave the reader looking at the same thing afterwards; `cause` "other"
+   * holds a reader at the foot by their row instead of following its growth (`#2354`). */
+  preservingScroll(mutate: () => void, cause?: ScrollCause): void;
   /**
    * Collapse or expand `row` in `area` under the per-act anchor choice (`#1251
    * scroll-single-owner`, `#1215 collapse-anchor-below`, `#2076
@@ -243,8 +259,9 @@ export interface ScrollKeeping {
   intoView(element: Element, block: string, inline?: string): void;
   /** `preservingScroll` for a change that resizes the list's window or the room at its head. */
   holdingReader(mutate: () => void): void;
-  /** Where the reader is: which message their eye is on, and how far down the viewport it sits. */
-  captureScroll(): ScrollMark;
+  /** Where the reader is: which message their eye is on, and how far down the viewport it sits;
+   * `cause` names why the change it is taken for happens (`#2354`). */
+  captureScroll(cause?: ScrollCause): ScrollMark;
   /** Whether the reader has scrolled or touched since `mark` was captured (`#1880`): holders outside this owner (the filter anchor's) ask it of their own capture instead of tracking input a second time. */
   userMovedSince(mark: ScrollMark): boolean;
   /** The reader-input stamp alone, cheaply (`#1894`): a `{ inputAt }` mark for `userMovedSince` without a capture's layout reads. */
@@ -682,9 +699,11 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    * A reader who was already at the bottom is the one exception: for them "the same thing" IS the
    * newest line, so the view follows it — unless the change is their own act (`#2076`): then the
    * row they touched is held by its top, like any other reader, and only an arrival follows.
+   * A change named "other" in a channel list does not follow at all (`#2354`): growth the reader did
+   * not cause there holds the reader at the foot by their row as well.
    */
-  function preservingScroll(mutate: () => void): void {
-    const mark = captureScroll();
+  function preservingScroll(mutate: () => void, cause?: ScrollCause): void {
+    const mark = captureScroll(cause);
     // A rebuild inside takes the reader's text selection with the rows it replaces: kept, and
     // put back on the rebuilt row after (`#1209 selection-survives-updates`).
     const area = el("scroll-area");
@@ -720,7 +739,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    * as well, because hiding an element is allowed to reset its scroll position to zero — and a
    * restore expressed as a DELTA against the anchor is correct whether the browser did that or not.
    */
-  function captureScroll(): ScrollMark {
+  function captureScroll(cause?: ScrollCause): ScrollMark {
     const area = el("scroll-area");
     watchInput(area);
     // `#1224 mention-jump-in-view`. A jump's landed row is the reader's latest explicit place:
@@ -761,6 +780,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       // never reclassifies a change there.
       userCaused: userHold && deps.currentView() === "discord",
       actAt: holdActAt,
+      cause,
     };
   }
 
@@ -1225,7 +1245,15 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // before a fold, landing after it): following the foot there would undo the
     // anchor the act just made, so it is held like the act's own change.
     const actedSince = mark.actAt !== undefined && holdActAt > mark.actAt;
-    if (mark.pinned && !mark.userCaused && !actedSince) {
+    // `#2354`, owner 370: growth the reader did not cause in a channel list ("other": a search
+    // re-render, server hits, summaries, a walk in the other column) holds the row being read, even
+    // at the foot, and the jump offers it, as an arrival under a reader on the newest line already
+    // does (`#2230`). A list still at its foot after the change has nothing below to offer: the
+    // reader is on the newest line as they were, and no row is measured (`#249`). The call
+    // transcript keeps its own following contract (`#431`), as for `#2076`.
+    const holdsFoot = mark.cause === "other" && deps.currentView() === "discord";
+    if (mark.pinned && holdsFoot && deps.atBottom(area, deps.restSlackPx)) return;
+    if (mark.pinned && !mark.userCaused && !actedSince && !holdsFoot) {
       deps.scrollToNewest();
       return;
     }

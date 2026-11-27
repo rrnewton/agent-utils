@@ -36,6 +36,8 @@ export interface ServerSearchDependencies {
   cardsOnScreen(): Element | null;
   inColumn<T>(column: unknown, fn: () => T): T;
   syncUnreadReplies(): void;
+  /** The search's full pass over the column it runs in: which rows stand, and their marks. */
+  applySearch(): void;
   saveChannelScope(): void;
   renderSideColumn(): void;
   serviceWords(): string;
@@ -185,6 +187,11 @@ export function createServerSearchCopy(deps: ServerSearchDependencies): ServerSe
         cover.cursor = (payload as { next_before?: string }).next_before || null;
       }
       deps.inColumn(deps.mainColumn(), deps.syncUnreadReplies);
+      // `#2354`: the older messages the walk folded into All's cover stand in the left list as the
+      // search chooses, now. That pass used to come only from the newest line being followed when
+      // the server's answer was placed (`scrollToNewest` redrawing the tools), so a reader up the
+      // list, or held at the foot, never saw the matches the walk had found.
+      deps.inColumn(deps.mainColumn(), deps.applySearch);
       deps.saveChannelScope();
     }
     deps.renderSideColumn();

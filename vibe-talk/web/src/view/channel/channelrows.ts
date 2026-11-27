@@ -5,6 +5,7 @@
 // where the legacy script held them. Opening a reply stays the page's (`openReply`, injected);
 // the reply box is not this owner's.
 
+import type { ScrollCause } from "./scrollkeep.ts";
 import type { Message } from "../../contract/index.ts";
 import {
   BLANK_TEXT, combinedContent, isNoise, joinsGroup, reactionText, rowEdited,
@@ -92,7 +93,7 @@ export interface ChannelRowsDependencies extends ChannelRenderPassDependencies {
   hideEmptyOn(): boolean;
   combineOn(): boolean;
   listedMessages(): Message[];
-  preservingScroll(fn: () => void): void;
+  preservingScroll(fn: () => void, cause?: ScrollCause): void;
   renderScrollTools(): void;
   renderBodyInto(body: HTMLElement, messages: Message[]): void;
   headingOf(message: Message): unknown;
@@ -261,7 +262,7 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
       patchRows(list, glom(messages), (group) => discordNode(group), [],
         rebuild ? () => false : (drawn, incoming) => drawn === incoming);
       renderChannelRows();
-    });
+    }, "other");
     deps.renderScrollTools();
   }
 

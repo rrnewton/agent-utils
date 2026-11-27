@@ -844,6 +844,13 @@ test("`#249 search-highlight`: a redraw with the same search writes nothing, and
   await typeAndPause(page, "engine");
   const marks = page.el("discord-log").descendants().filter((n) => n.tagName === "mark").length;
   assert.ok(marks >= 12, `the fixture marked ${marks} hits`);
+  // `#2354`: the marking's growth held the reader's row (owner 370) and the jump offers what came
+  // below; the reader takes it, so the redraw below is the one this check is about: the same search
+  // over a reader on the newest line.
+  if (!page.el("jump-newest").hidden) {
+    await page.el("jump-newest").click();
+    await page.settle();
+  }
   const made = page.createdTags.length;
   const replace = FakeElement.prototype.replaceChildren;
   const rect = FakeElement.prototype.getBoundingClientRect;

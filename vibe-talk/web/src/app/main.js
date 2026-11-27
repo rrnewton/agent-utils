@@ -3215,7 +3215,8 @@ const searchField = createSearchField({
       eachColumn(renderScrollTools);
       if (sideColumnUp()) filterSideCards();
     };
-    if (screens.screen() === "main") preservingScroll(mark);
+    // `#2354`: a mark the search draws later, not growth the reader caused in the list.
+    if (screens.screen() === "main") preservingScroll(mark, "other");
     else mark();
   },
 });
@@ -3957,7 +3958,7 @@ const keyboard = createKeyboardComposition({
   isFolded: (entry) => isFolded(/** @type {import("../view/channel/index.ts").FoldEntry} */ (/** @type {unknown} */ (entry))),
   setFolded: (entry, folded) => setFolded(/** @type {import("../view/channel/index.ts").FoldEntry} */ (/** @type {unknown} */ (entry)), folded),
   atBottom: (area) => atBottom(area),
-  preservingScroll: (act) => preservingScroll(act),
+  preservingScroll: (act, cause) => preservingScroll(act, cause),
   preservingCollapse: (area, row, head, foot, act) => preservingCollapse(area, row, head, foot, act),
   // `#2091 vibe-talk-shrink-anchor-policy`: the next-unread move after a Done
   // waits, frame by frame, until the shrink's user-caused hold clears, then
@@ -6218,6 +6219,7 @@ const serverSearchCopy = createServerSearchCopy({
   cardsOnScreen: () => cardsOnScreen(),
   inColumn,
   syncUnreadReplies: () => syncUnreadReplies(),
+  applySearch: () => applySearch(),
   saveChannelScope,
   renderSideColumn,
   serviceWords: () => serviceWords(),
@@ -7928,7 +7930,7 @@ const olderWalks = mountOlderWalks({
   },
   serverCardNode: (hit) => discordNode(/** @type {any} */ ([hit])),
   keepingCardPlace, walkCursorOwed: timelineView.walkCursorOwed, loadOlder: timelineView.loadOlder,
-  guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, refreshSearchCount: () => refreshSearchCount(), preservingScroll, beginUserChange: () => scrollKeeping.beginUserChange(), toPosition: (area, top) => scrollKeeping.toPosition(area, top), intoView: (element, block) => scrollKeeping.intoView(element, block), setStatus,
+  guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, refreshSearchCount: () => refreshSearchCount(), preservingScroll, inputStamp: () => scrollKeeping.inputStamp(), beginUserChange: () => scrollKeeping.beginUserChange(), toPosition: (area, top) => scrollKeeping.toPosition(area, top), intoView: (element, block) => scrollKeeping.intoView(element, block), setStatus,
   columnWork, columns, sideShowing, inColumn, columnSteps: () => /** @type {any} */ (columnSteps()), filterChanges,
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
@@ -8245,7 +8247,7 @@ const liveStream = createLiveStream({
   relayToAgent: (message, selfPosted, replayed, arrival) => voiceCall().relayToAgent(message, selfPosted, replayed, arrival),
   refreshAfterMutation: () => refreshAfterLiveMutation(), noteChannelReadFailure,
   foldLiveMessage: timelineView.foldLiveMessage, appendChannelRow: timelineView.appendChannelRow,
-  appendToColumns: timelineView.appendToColumns, preservingScroll: (act) => preservingScroll(act), renderOutgoingEverywhere: () => renderOutgoingEverywhere(), noteServerThreadHuesIn: (messages, summaries, channel, provisional) => noteServerThreadHuesIn(messages, summaries, channel, provisional),
+  appendToColumns: timelineView.appendToColumns, preservingScroll: (act, cause) => preservingScroll(act, cause), renderOutgoingEverywhere: () => renderOutgoingEverywhere(), noteServerThreadHuesIn: (messages, summaries, channel, provisional) => noteServerThreadHuesIn(messages, summaries, channel, provisional),
   threadOf, loadCanon,
   replayLedger,
   replaysWaiting: () => replayLedger.waiting(), readLedgerEpoch: () => readLedger.epoch(),

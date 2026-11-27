@@ -638,6 +638,65 @@ test("`#624 voice-page-modularity`: the reader is left on the message their eye 
   assert.equal(calls.at(-1), "newest");
 });
 
+test("`#2354 two-column-search-replies-place-left-scroll`: growth the reader did not cause holds a reader at the foot by their row; an arrival, their own act or an untagged change still follows", () => {
+  // Owner 370: a search re-render, server hits, summaries or a walk in the other column ("other")
+  // never takes a reader on the newest line of a channel list down to the newest line; the row being
+  // read keeps its top and the jump offers what came below, as an arrival already does (`#2230`).
+  const { createScrollKeeping } = CHANNEL_VIEW;
+  let shift = 0;
+  let view = "discord";
+  let channel = "main";
+  let bottom = true;
+  let writes = 0;
+  let top = 300;
+  const row = (id, at) => ({ id, parentNode: {}, getAttribute: () => null, getBoundingClientRect: () => ({ top: at + shift, bottom: at + shift + 40 }) });
+  const rows = [row("a", -80), row("b", -40), row("c", 0), row("d", 40)];
+  const log = { id: "discord-log", children: rows };
+  const area = { getBoundingClientRect: () => ({ top: 0 }), scrollHeight: 1000, clientHeight: 700 };
+  Object.defineProperty(area, "scrollTop", { get: () => top, set: (value) => { writes += 1; top = value; } });
+  const chip = { hidden: true, getBoundingClientRect: () => ({ top: 0 }) };
+  const els = { "discord-log": log, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": chip, transcript: { children: [] } };
+  const calls = [];
+  const keep = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => view, channelView: () => channel, pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => bottom,
+    scrollToNewest: () => calls.push("newest"), renderJumpNewest: () => calls.push("jump"), setJumpNewest: () => {},
+  });
+  const grow = (above = 0) => () => { bottom = false; shift = above; };
+  const reset = () => { bottom = true; shift = 0; top = 300; writes = 0; calls.length = 0; };
+  // Growth below the row being read, for a cause that is not the reader's: nothing written, the jump offered.
+  keep.preservingScroll(grow(), "other");
+  assert.deepStrictEqual(calls, ["jump"], "a reader at the foot followed growth the reader did not cause");
+  assert.equal(writes, 0, "holding a row nothing moved wrote a scroll");
+  // Growth above it as well: the row is held by its top, where it was.
+  reset();
+  keep.preservingScroll(grow(25), "other");
+  assert.equal(top, 325, "the row being read moved with growth above it");
+  assert.deepStrictEqual(calls, ["jump"]);
+  // Nothing grew: the reader is on the newest line as they were, and nothing is asked of the page.
+  reset();
+  keep.preservingScroll(() => {}, "other");
+  assert.deepStrictEqual(calls, [], "a change that grew nothing still restored the reader");
+  assert.equal(writes, 0);
+  // An arrival, the reader's own act and a change that names no cause follow the newest line, as before.
+  for (const cause of ["arrival", "reader-act", undefined]) {
+    reset();
+    keep.preservingScroll(grow(), cause);
+    assert.deepStrictEqual(calls, ["newest"], `a change for ${String(cause)} did not follow the newest line`);
+  }
+  // The call transcript keeps its own following contract (`#431`).
+  reset();
+  view = "voice";
+  keep.preservingScroll(grow(), "other");
+  assert.deepStrictEqual(calls, ["newest"], "the transcript stopped following its newest line");
+  // In a thread too, growth for another cause holds (owner 370); only the caller decides a cause.
+  reset();
+  view = "discord";
+  channel = "thread";
+  keep.preservingScroll(grow(), "other");
+  assert.deepStrictEqual(calls, ["jump"], "growth in a thread followed the foot for a cause not the reader's");
+});
+
 test("`#2066 vibe-talk-page-freeze`: a hold that would move nothing writes no scroll at all", () => {
   const { createScrollKeeping } = CHANNEL_VIEW;
   let shift = 0;
