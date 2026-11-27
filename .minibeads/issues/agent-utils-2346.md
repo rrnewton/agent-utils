@@ -28,3 +28,8 @@ Found while tracing #2260 vibe-talk-search-barely-overflowing-list-clamp on the 
 # Notes
 
 Owner-UI (owner 370). Filed at the coordinator's request from the #2260 traces (issue file only). Related: #2260, #1734 vibe-talk-search-view-scroll-default, #2262 vibe-talk-search-head-room-two-columns, #2230 vibe-talk-reading-row-stays-put.
+
+Correction of the premise above (2026-11-27, real throwaway server, scroll writes hooked with their stacks): for a reader who has a hit on the screen they typed at, it is not #1734's landing. The key's filter place-keeper keeps the reader's row (or the nearest shown one) at its offset and asks for a scroll the shortened list cannot make (phone scrollTop 149 of a list that can scroll 51; desk 136 of 39): the browser clamps it to the foot, the next frame the list's foot shrinks and the browser clamps again, and a restore with a pinned mark then follows the foot (reading row 31 + 15 px phone, 30 + 9 px desk). With no hit on that screen, #1734's landing does take the reader to the newest hits, and the restores then follow the foot as the search's line and chips change height (15 px on a desk with Discuss open).
+
+Fix: a search's placement that the shortened list cannot reach holds the row by its top with the room the list lacks (`holdRowAt`, as a tapped row is held) instead of a nudge the browser clamps; and the entry landing clears that held room, goes to the newest hits as #1734 has it, then holds the row it landed on (the list's head row where the list now fits, else the newest row) as a filter hold, so no restore or keeper follows the foot from it.
+

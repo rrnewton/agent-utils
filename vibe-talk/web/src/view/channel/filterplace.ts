@@ -158,6 +158,8 @@ export interface FilterPlace {
   keepingFilterPlace<T>(change: () => T, tapped?: HTMLElement | null): T;
   placeFilterAnchor(anchor: FilterAnchor | null, wasEmptied?: boolean, walked?: boolean, room?: boolean): void;
   settlePendingFilterPlace(): void;
+  /** `#2346`: hold `row` where it stands now, as a filter change holds the row it kept. */
+  holdFilterRow(row: HTMLElement): void;
 }
 
 /** Make the filter-kept place from the page's columns, panes and list. */
@@ -365,6 +367,32 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
    * take the reader down by what the search adds at the foot (its server line) less what it adds at the
    * head (the chip panel's room), moving the row they read.
    */
+  /**
+   * `#2346` (owner 370): hold `row` where it stands now, as a filter change holds the row it kept. The
+   * search's entry landing at the newest hits holds the row it landed on, so neither a later restore
+   * nor the chips' keeper follows the foot from it as the search's own line and chips change height.
+   */
+  function holdFilterRow(row: HTMLElement): void {
+    const area = deps.el("scroll-area");
+    const pane = deps.view() === "discord" ? (deps.columnSide() ? deps.sidePane() : deps.channelPane()) : null;
+    const mark = pane ? deps.markOf(pane) : null;
+    filterState().hold = {
+      key: filterKey(), row, ids: idsOf(row), at: area.scrollTop, origin: anchorAt(row),
+      offset: row.getBoundingClientRect().top - deps.listPlaceTop(area), mark: mark ? mark.id : null,
+    };
+  }
+
+  /** `#2346`: whether the search has words in it now (a filter change of the search's own). */
+  function searchWordsIn(): boolean {
+    return Boolean(deps.searchWordsTyped && deps.searchWordsTyped());
+  }
+
+  /** `#2346`: whether moving `area` by `delta` asks for a place past either end the list can scroll to. */
+  function outOfReach(area: HTMLElement, delta: number): boolean {
+    const wanted = area.scrollTop + delta;
+    return wanted < -0.5 || wanted > area.scrollHeight - (area.clientHeight || 0) + 0.5;
+  }
+
   function atSearchHead(area: HTMLElement): boolean {
     return !deps.columnSide() && area.scrollTop <= 0 && Boolean(deps.searchWordsTyped && deps.searchWordsTyped());
   }
@@ -522,6 +550,17 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
       // search shortened to about a screen cannot hold: the browser clamps it back a frame later,
       // and the list moves twice under the reader.
       else if (!row && anchor.head) deps.toPosition(area, 0);
+      // `#2346` (owner 370): a search that left the list too short to scroll to the place the row
+      // stood holds it by its top with the room the list lacks, as a tapped row is held, instead of
+      // a nudge the browser clamps to the foot. Clamped there, the reader counted as at the newest
+      // line, and the list's next height change (the search's own line, the chips) moved the row
+      // twice more: once by the browser's clamp, once by a restore following the foot.
+      // Where the reader's row went and the nearest hit takes its place, the hit stands clear of the
+      // floating search bar (its own room, 8px under the bar), not partly under it as the hidden row was.
+      else if (deps.holdRowAt && searchWordsIn() && outOfReach(area, delta)) {
+        const clear = row ? 0 : deps.floatingClearance(area) + 8 - (deps.messageTop(placed, null) - delta);
+        deps.holdRowAt(area, placed, clear > 0 ? delta - clear : delta);
+      }
       else deps.nudge(area, delta);
     }
     carrySelection(anchor, placed, substitute !== null);
@@ -667,6 +706,6 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     filterChanges, filterKey,
     filterState, endFilterWalk, anchorAt, anchorHolder, anchorRow, nearestShownRow,
     currentFilterHold, heldFilterRow, readerActed, followsNewest, keepFilterHold, filterAnchor,
-    keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace,
+    keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace, holdFilterRow,
   };
 }

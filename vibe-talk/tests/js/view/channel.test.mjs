@@ -4981,3 +4981,93 @@ test("`#2259` thread-view parking, forced order: an answer that leaves the first
   rows.renderSearchCount(true, false);
   assert.deepStrictEqual(parked, ["201 start", "201 start", "201 start"], "a reopened search did not park its covered first result");
 });
+
+test("`#2346 vibe-talk-search-landed-reader-follows-foot`: a search that leaves the list too short to scroll to the reader's place holds the nearest hit there with room, not a clamped nudge", () => {
+  const { createFilterPlace, freshFilterState } = CHANNEL_VIEW;
+  // The reader mid-list reads row 12; the key's search hides it and keeps row 14, 58 px below it.
+  // The shortened list can scroll only 51 px, and the placement asks for more than that.
+  const run = ({ typed }) => {
+    const record = freshFilterState();
+    const calls = [];
+    const area = {
+      _top: 429, scrollHeight: 694, clientHeight: 643,
+      get scrollTop() { return this._top; },
+      // The browser's clamp: a list scrolls no further than its foot.
+      set scrollTop(value) { this._top = Math.max(0, Math.min(value, this.scrollHeight - this.clientHeight)); },
+    };
+    const makeRow = (id, top) => ({
+      id, parentNode: null, className: "", hidden: false,
+      getAttribute: (name) => (name === "data-search" ? "" : name === "data-ids" ? id : name === "data-id" ? id : null),
+      hasAttribute: () => false,
+      getBoundingClientRect() { return { top: this.at - area.scrollTop, bottom: this.at - area.scrollTop + 50 }; },
+      at: top,
+    });
+    const read = makeRow("12", 429 + 140);
+    const hit = makeRow("14", 429 + 198);
+    const list = { children: [read, hit] };
+    read.parentNode = list; hit.parentNode = list;
+    const pane = { marks: new Map(), context: () => "main", head: () => 100, foot: () => 800 };
+    const owner = createFilterPlace({
+      el: () => area,
+      activeFilter: () => record,
+      activeColumn: () => "main",
+      columnSide: () => false,
+      searchWordsTyped: () => typed,
+      mainColumn: () => "main", sideColumn: () => "side",
+      inColumn: (_c, act) => act(),
+      eachColumn: (act) => act(),
+      screen: () => "main", view: () => "discord",
+      renderOlderControl: () => {}, dismissStatus: () => {},
+      filterPlace: () => "main",
+      pinsView: () => ({ only: false }),
+      visibleList: () => list,
+      listEmptied: () => false,
+      atBottom: () => false,
+      quickReplyHolds: () => false,
+      endSearchWalks: () => {},
+      scrollToNewest: () => calls.push("newest"),
+      nudge: (target, delta) => { calls.push(`nudge ${delta}`); target.scrollTop += delta; },
+      toPosition: (target, top) => { calls.push(`to ${top}`); target.scrollTop = top; },
+      holdRowAt: (target, row, delta) => { calls.push(`hold ${row.id} ${delta}`); target.scrollHeight = Math.max(target.scrollHeight, target.scrollTop + delta + target.clientHeight); target.scrollTop += delta; },
+      renderJumpNewest: () => {},
+      guardQuietly: (fn) => fn,
+      setStatus: () => {},
+      sidePane: () => pane, channelPane: () => pane,
+      markOf: () => null, markedRow: () => null, rowInView: () => false,
+      takeRow: () => {}, rowOf: (_p, r) => r, paneRows: () => [],
+      releaseRow: () => {}, rowTimeTabStop: () => {}, drawSelection: () => {},
+      hidingRead: () => false, threading: () => true,
+      timelineRows: () => ({ messages: [] }),
+      olderPages: () => ({ moreAbove: false, cursor: null }),
+      loadOlder: () => null, walkCursorOwed: () => false,
+      channelContextKey: () => "ctx",
+      scrollAnchor: () => null,
+      listPlaceTop: () => 100,
+      floatingClearance: () => 100,
+      messageTop: (placed) => placed.getBoundingClientRect().top,
+      rowMessages: () => [],
+      clearEntryLanding: () => {},
+      sideShowing: () => false,
+    });
+    const readTop = read.getBoundingClientRect().top;
+    // The key's change: the reader's row goes, the list shrinks above the hit (rows 1-11 hidden).
+    owner.keepingFilterPlace(() => {
+      read.className = "search-hidden";
+      read.hidden = true;
+      // The hit's place in the shortened list: keeping it where row 12 stood would need scrollTop
+      // 149, and the list can scroll only 51.
+      hit.at = 289;
+      area.scrollTop = area.scrollTop; // the browser re-clamps to the shortened list
+    });
+    return { calls, readTop, hitTop: hit.getBoundingClientRect().top, hold: record.hold };
+  };
+  const searched = run({ typed: true });
+  assert.deepStrictEqual(searched.calls.filter((c) => !c.startsWith("to ")).map((c) => c.split(" ")[0]), ["hold"],
+    `the search's placement was not held with room: ${JSON.stringify(searched.calls)}`);
+  assert.ok(Math.abs(searched.hitTop - searched.readTop) <= 0.5,
+    `the nearest hit stands at ${searched.hitTop}, not where the reader's row stood (${searched.readTop})`);
+  assert.ok(searched.hold !== null, "the filter's hold went, so a keeper may follow the foot");
+  // Without words in the search (another filter), the nudge stays as it was.
+  const other = run({ typed: false });
+  assert.deepStrictEqual(other.calls.map((c) => c.split(" ")[0]), ["nudge"], `another filter's placement changed: ${JSON.stringify(other.calls)}`);
+});

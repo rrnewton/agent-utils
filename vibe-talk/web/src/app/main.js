@@ -2266,7 +2266,7 @@ const filterPlaceOwner = createFilterPlace({
   clearEntryLanding: () => { entryState().landing = null; entryState().threadOwed = null; entryState().threadAwaitsRead = false; },
   sideShowing: () => sideShowing(),
 });
-const { filterChanges, filterKey, filterState, endFilterWalk, anchorAt, anchorHolder, anchorRow, nearestShownRow, currentFilterHold, heldFilterRow, readerActed, followsNewest, keepFilterHold, filterAnchor, keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace } = filterPlaceOwner;
+const { filterChanges, filterKey, filterState, endFilterWalk, anchorAt, anchorHolder, anchorRow, nearestShownRow, currentFilterHold, heldFilterRow, readerActed, followsNewest, keepFilterHold, filterAnchor, keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace, holdFilterRow } = filterPlaceOwner;
 
 /** Channel views, threads and the channel composer are web/src/view/channel's now
  * (`createChannelViews`, `#624 voice-page-modularity`). */
@@ -3427,7 +3427,19 @@ function landSearchEntry() {
     // `#1968`: the entry is taking the reader to the newest hits; closing the bar
     // owes them the place this took them from.
     searchEntryMoved = true;
+    // `#2346` (owner 370): the room a placement held for the reader's row is not the foot they
+    // land on, and the row they land on is then held where it landed, so the search's own line
+    // and chips changing height move nothing (no restore or keeper follows the foot from it).
+    // Where the list now fits (the landing left it at its head), the row at its head is the one
+    // held; on a longer list, the newest row the reader was taken to.
+    scrollKeeping.clearTapRooms();
     scrollToNewest();
+    const area = el("scroll-area");
+    const shown = [...visibleList().children].filter((row) => row.getAttribute("data-search") !== null &&
+      !(/** @type {any} */ (row)).hidden && !String(row.className).split(/\s+/).includes("search-hidden"));
+    const top = area.getBoundingClientRect().top;
+    const landed = area.scrollTop <= 0 ? shown.find((row) => row.getBoundingClientRect().bottom > top) : shown[shown.length - 1];
+    if (landed) holdFilterRow(/** @type {HTMLElement} */ (landed));
   }
 }
 
