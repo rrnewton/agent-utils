@@ -183,6 +183,8 @@ export interface OlderWalks {
   } | null;
   /** `#2251`: where the server's search of this channel starts below (null: from the newest). */
   serverAskBelowMs(): number | null;
+  /** `#2269`: whether the server's search answered the words on screen over this channel's whole history. */
+  serverAnsweredWholeHistory(): boolean;
   channelViewWords(): string;
   oldestLoadedMs(): number | null;
   toggleServerHits(): void;
@@ -792,6 +794,26 @@ function threadScoped(): boolean {
  */
 function serverAskBelowMs(): number | null {
   return threadScoped() ? null : oldestLoadedMs();
+}
+
+/**
+ * `#2269 vibe-talk-search-reach-sentence-beside-server-hits`: whether the server's search answered
+ * the words on screen over this channel's whole history -- so "this search does not reach yet"
+ * would be false beside its hits. True only for an answer to this very search (its key), back
+ * (not pending), not failed, nothing left to fetch (no resume, overall or for the channel), with
+ * this channel's copy searched and held whole (`scope.whole`, `#595 cache-full-history`). Any
+ * other state -- the copy closed, the ask refused or failed, the answer still on its way, or one
+ * that stopped short -- leaves the browser's own search the only one that answered.
+ */
+function serverAnsweredWholeHistory(): boolean {
+  if (!serverCopyOpen()) return false;
+  const key = serverSearchKeyNow();
+  const now = serverSearchNow();
+  if (key === "" || key !== now.key || now.loading || now.failed !== "" || now.resume !== null) return false;
+  const channel = String(selectedChannelId() || "");
+  const scope = now.scopes.find((one) => String(one.channel.id) === channel);
+  return scope !== undefined && scope.state === "searched" && scope.whole === true &&
+    (scope.resume_below_ms === undefined || scope.resume_below_ms === null);
 }
 
 /**
@@ -1950,7 +1972,7 @@ function renderOlderControl() {
   return {
     renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField,
     searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk,
-    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk, bucketOnFor, foldCounts, serverAskBelowMs,
+    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk, bucketOnFor, foldCounts, serverAskBelowMs, serverAnsweredWholeHistory,
     dispose() { disposed = true; },
   };
 }

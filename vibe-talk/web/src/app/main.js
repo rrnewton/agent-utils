@@ -3295,6 +3295,7 @@ const searchRows = createSearchRows({
   reachClause,
   oldestLoadedMs: () => oldestLoadedMs(),
   holdsWholeHistory: () => serverCacheBox.holdsWholeHistory(),
+  serverAnsweredWholeHistory: () => serverAnsweredWholeHistory(),
   hidingRead: () => readModes.hiding(),
   threadListOnScreen: () => threadListOnScreen(),
   cardCount: () => cardsDrawn.count(),
@@ -7919,7 +7920,7 @@ const olderWalks = mountOlderWalks({
   columnWork, columns, sideShowing, inColumn, columnSteps: () => /** @type {any} */ (columnSteps()), filterChanges,
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
-const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk, bucketOnFor, foldCounts, serverAskBelowMs } = olderWalks;
+const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, retireStaleBuckets, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk, bucketOnFor, foldCounts, serverAskBelowMs, serverAnsweredWholeHistory } = olderWalks;
 // `#1608`: the Transcripts view's own search and way back to its index.
 el("transcripts-search").addEventListener("input", () => transcriptsView.searchChanged());
 el("transcripts-back").addEventListener("click", () => transcriptsView.closeDay());

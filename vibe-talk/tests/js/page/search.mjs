@@ -2908,7 +2908,11 @@ test("`#1797 vibe-talk-search-bucket-toggles`: in Main, main starts on as cards,
 
 /** A channel whose loaded messages and older server hits both speak of themes. */
 async function foldPage(view = "main", holdOld = false, cache = messageCacheStatus()) {
-  const page = newPage();
+  return foldPageOn(newPage(), view, cache, holdOld);
+}
+
+/** `foldPage` on a page the caller made (`#2269`: a read-only token's). */
+async function foldPageOn(page, view = "main", cache = messageCacheStatus(), holdOld = false) {
   page.messageCache = cache;
   const first = { id: "spaces/A/threads/one & two", root_message_id: "201", is_root: true,
     reply_count: 1, reply_count_exact: true };
@@ -3155,6 +3159,73 @@ test("`#2251 vibe-talk-search-current-view-scope`: a thread's None match does no
   await searchServer(page, "zebra");
   assert.match(page.el("search-empty").textContent,
     /None match\. This server holds the complete history of this channel, which this search does not reach yet\./);
+});
+
+// `#2269 vibe-talk-search-reach-sentence-beside-server-hits`. Every channel whole on the server
+// (`#595`), and a word only the server's older copy holds ("old theme": 150, older than every loaded row).
+const REACH = /This server holds the complete history of this channel, which this search does not reach yet\./;
+const wholeHistory = () => messageCacheStatus({ max_days: 65535, history: { mode: "full", channels: 3, complete: 3 } });
+const wholeScope = (fields = {}) => searchedScope({ whole: true, expanding: false, ...fields });
+const oldMainHit = () => message({ id: "150", content: "an old theme on main", timestamp: "2026-08-02T09:00:00Z" });
+
+for (const view of ["flat", "main"]) {
+  test(`\`#2269\`: in ${view === "flat" ? "All" : "Main"}, a server answer over the whole history with its hit standing says no reach sentence`, async () => {
+    const page = await foldPage(view, false, wholeHistory());
+    page.serverSearch = async () => searchAnswer([oldMainHit()], [wholeScope()]);
+    await searchServer(page, "old theme");
+    assert.equal(chipOf(page, "main").textContent, "1 in main", "the server's hit is not counted on its chip");
+    assert.equal(chipOf(page, "main").getAttribute("aria-pressed"), "true", "the hit's chip is not pressed");
+    assert.match(page.el("search-count").textContent, /^1 found \(0 loaded, 1 older\)$/, "the count does not say the older hit");
+    const said = page.el("search-empty").textContent;
+    assert.match(said, /None match\./, "the loaded messages' part of the line went");
+    assert.doesNotMatch(said, REACH, "the line says the search does not reach the history its hit came from");
+  });
+}
+
+test("`#2269`: the reach sentence stays while no server answer covers the whole history — copy closed, ask failed, answer pending, more to fetch", async () => {
+  // Answer pending: the ask has not come back.
+  let page = await foldPage("flat", false, wholeHistory());
+  let release = () => {};
+  page.serverSearch = () => new Promise((done) => { release = () => done(searchAnswer([oldMainHit()], [wholeScope()])); });
+  await searchServer(page, "old theme");
+  assert.equal(page.el("server-line").textContent, "Searching the server…");
+  assert.match(page.el("search-empty").textContent, REACH, "a pending answer dropped the sentence");
+  // ...and it goes the moment the answer lands, with no new keystroke.
+  release();
+  await page.settle();
+  await page.settle();
+  assert.equal(chipOf(page, "main").textContent, "1 in main");
+  assert.doesNotMatch(page.el("search-empty").textContent, REACH, "the landed answer left the sentence standing");
+
+  // The ask failed.
+  page = await foldPage("flat", false, wholeHistory());
+  page.serverSearch = async () => json(502, { error: "chat_error", detail: "the server is restarting" });
+  await searchServer(page, "old theme");
+  assert.equal(page.el("server-line").textContent, "The server could not be searched — tap for details");
+  assert.match(page.el("search-empty").textContent, REACH, "a failed ask dropped the sentence");
+
+  // The ask was refused for this channel.
+  page = await foldPage("flat", false, wholeHistory());
+  page.serverSearch = async () => searchAnswer([], [{ ...wholeScope(), state: "not_searched", reason: "serve_off",
+    examined: 0, searched_back_to_ms: undefined, held_from_ms: undefined }]);
+  await searchServer(page, "old theme");
+  assert.match(page.el("search-empty").textContent, REACH, "a refused ask dropped the sentence");
+
+  // More to fetch: the answer stopped on its budget.
+  page = await foldPage("flat", false, wholeHistory());
+  const resume = Date.parse("2026-08-03T00:00:00Z");
+  page.serverSearch = async () => searchAnswer([oldMainHit()], [wholeScope({ resume_below_ms: resume })], { resume_below_ms: resume });
+  await searchServer(page, "old theme");
+  assert.equal(chipOf(page, "main").textContent, "1 in main", "the partial answer's hit is not counted");
+  assert.match(page.el("search-empty").textContent, REACH, "an answer with more to fetch dropped the sentence");
+
+  // The copy closed to this device (a read-only token never asks the server).
+  page = newPage();
+  page.tokenScope = "read";
+  page = await foldPageOn(page, "flat", wholeHistory());
+  await searchServer(page, "old theme");
+  assert.equal(page.serverSearchCalls.length, 0, "a closed copy was asked");
+  assert.match(page.el("search-empty").textContent, REACH, "a closed copy dropped the sentence");
 });
 
 test("`#2251 vibe-talk-search-current-view-scope`: in a thread, the offers count main and the other threads whole — held and the server's — each once", async () => {

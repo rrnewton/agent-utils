@@ -1,0 +1,20 @@
+steps:
+  # `#2269 vibe-talk-search-reach-sentence-beside-server-hits` on the shipped server (fake chat
+  # upstream, backfill full, the history complete): in All, a word only an older message holds
+  # shows the server's chip and card and no "does not reach yet" sentence, at 1280x800 and
+  # 412x915 by touch. Conditions, not clocks: it waits for the server to say the history is whole.
+  - group: check
+    job: search-reach-server-browser
+    desc: on a real server holding the channel whole, a search the server answers over the whole history says no reach sentence beside its hit, in current Chromium at 1280x800 and 412x915 by touch, light and dark (#2269)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/search_reach_server_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 600
+    cpu_timeout: 240
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

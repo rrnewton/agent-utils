@@ -173,6 +173,8 @@ export interface SearchRowsDependencies {
   reachClause(reach: unknown): string;
   oldestLoadedMs(): number | null;
   holdsWholeHistory(): boolean;
+  /** `#2269`: whether the server's search answered these words over the channel's whole history. Optional for doubles. */
+  serverAnsweredWholeHistory?(): boolean;
   hidingRead(): boolean;
   threadListOnScreen(): boolean;
   cardCount(): { cards: number; shown: number };
@@ -844,7 +846,11 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     // `#2251 vibe-talk-search-current-view-scope`: not in a thread. Its search is the thread's, and
     // the server is asked over its whole cache from the newest, the bucket row naming what main and
     // the other threads hold, so "does not reach yet" would be false beside those offers.
-    if (deps.holdsWholeHistory() && deps.selectionView() !== "thread") {
+    // `#2269 vibe-talk-search-reach-sentence-beside-server-hits`: nor once the server's search has
+    // answered these words over the channel's whole history; the sentence is true only of the
+    // browser's own search, and the chips and count already say what the server found.
+    const serverReached = typeof deps.serverAnsweredWholeHistory === "function" && deps.serverAnsweredWholeHistory();
+    if (deps.holdsWholeHistory() && deps.selectionView() !== "thread" && !serverReached) {
       said += " This server holds the complete history of this channel, which this search does not reach yet.";
     }
     if (deps.threading() && deps.selectionView() === "main") return `${said} ${MAIN_REPLIES_SEARCHED}`;
