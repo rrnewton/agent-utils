@@ -101,6 +101,8 @@ class GapApi(FakeApi):
 
     def __init__(self) -> None:
         super().__init__()
+        self.answers = threading.Event()
+        self.answers.set()
         self.messages = []
         for index, (thread_id, is_root, words) in enumerate(SCRIPT):
             thread = None
@@ -144,6 +146,9 @@ class GapApi(FakeApi):
 
     def search(self, path: str, query: dict[str, list[str]]) -> Json:
         """The server's copy searched: the older note for "lantern", in one channel or all."""
+        # `#2357`: a walk that measures the loaded rows before the answer holds it here, so the
+        # answer lands when the walk lets it, never in the middle of a step.
+        self.answers.wait(timeout=browser_waits.HANG_BACKSTOP_MS / 1000)
         words = query.get("q", [""])[0].lower()
         everywhere = path == "/api/v1/search"
         hits = [one for one in ([self.older_in, self.older_harbor, self.older, self.elsewhere]
@@ -381,8 +386,14 @@ class Walk:
     def server_settled(self) -> None:
         """`#605 server-side-search`: the server's answer has landed, so the section above the list
         holds still before anything on the list is measured or pressed."""
+        # `#2357`: the busy words are the server line's ("Searching the server…") as well as the
+        # scope's; reading only the scope let the walk go on with the answer still out, and an
+        # answer landing mid-step then changed the count a step read once.
         self.until("() => { const s = document.getElementById('server-search'); "
-                   "return s.hidden || !document.getElementById('search-scope').textContent.includes('searching'); }",
+                   "const line = document.getElementById('server-line'); "
+                   "const busy = document.getElementById('search-scope').textContent.includes('searching') "
+                   "|| Boolean(line && /Searching/.test(line.textContent || '')); "
+                   "return s.hidden || !busy; }",
                    "the server's search did not settle")
         self.settled()
 
@@ -396,7 +407,7 @@ def count_only(words: str | None) -> str | None:
     return words.split(" · ")[0] + " …" if words and " · " in words else words
 
 
-def walk_through(walk: Walk) -> None:
+def walk_through(walk: Walk, api: GapApi) -> None:
     page = walk.page
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
@@ -413,10 +424,15 @@ def walk_through(walk: Walk) -> None:
 
     # 1. "lantern" in All: its thread's four messages, a counted line in every gap.
     walk.press("#search-toggle")
+    # `#2357`: steps 1 and 2 are about the loaded rows and their gaps, before the server answers:
+    # the answer is held until they are done, so it can never land between the press and a read.
+    api.answers.clear()
     page.fill("#search-field", "lantern")
     walk.until("() => document.getElementById('search-count').textContent === '4 of 16 loaded'",
                "the count does not speak for the lantern search")
-    walk.server_settled()
+    walk.until("() => /Searching/.test(document.getElementById('server-line').textContent || '')",
+               "the server was not asked for lantern")
+    walk.settled()
     walk.check(walk.shown() == ["201", "204", "209", "214"], f"lantern shows {walk.shown()}")
     seams = walk.seams()
     words_only = [(row_id, count_only(above), count_only(below)) for row_id, above, below in seams]
@@ -431,6 +447,7 @@ def walk_through(walk: Walk) -> None:
     walk.shot("1-search")
 
     # 2. A real press on the middle line shows its run where it stands; the count is unmoved.
+    counted = str(page.evaluate("() => document.getElementById('search-count').textContent"))
     walk.press("#discord-log > li[data-id='209'] > button.row-seam:not(.row-seam-below)")
     walk.until_shown(["201", "204", "205", "206", "207", "208", "209", "214"], "the opened run did not show its messages")
     # `#2200` seam landing: the first opened row stands fully below the
@@ -442,14 +459,18 @@ def walk_through(walk: Walk) -> None:
     }"""), "the first opened row sits under the chip panel")
     walk.check(walk.shown() == ["201", "204", "205", "206", "207", "208", "209", "214"],
                f"the opened run shows {walk.shown()}")
-    walk.check(page.evaluate("() => document.getElementById('search-count').textContent") == "4 of 16 loaded",
-               "opening a run changed what the bar counts as matched")
+    walk.check(page.evaluate("() => document.getElementById('search-count').textContent") == counted,
+               f"opening a run changed what the bar counts as matched (was {counted!r})")
     rest = [(row_id, above, below) for row_id, above, below in walk.seams() if row_id != "209"]
     walk.check(len(rest) == 3 and all(row_id != "209" for row_id, _, _ in walk.seams()),
                f"another gap moved, or the opened one stayed: {walk.seams()}")
     walk.lines_between()
     walk.shot("2-opened")
     walk.notes.append("lantern 4 of 16, the run above 209 opened by its line")
+    api.answers.set()
+    walk.until("() => /Server search details|No more hits/.test(document.getElementById('server-line').textContent || '')",
+               "the server's answer to lantern never landed")
+    walk.settled()
 
     # 3. Into the lantern thread under the search: the bar stays, and the thread is searched.
     # The opened run landed at the head (`#2200`), leaving the root's badge
@@ -777,7 +798,7 @@ def main() -> int:
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
                     walk = Walk(page, label, touch, args.screenshots)
-                    walk_through(walk)
+                    walk_through(walk, api)
                     walk_server_search(walk, api)
                     check(not errors, f"{label}: the page threw: {errors}")
                     context.close()

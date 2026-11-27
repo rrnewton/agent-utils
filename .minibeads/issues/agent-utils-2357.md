@@ -27,3 +27,8 @@ vibe-talk/tests/search_unmatched_browser.py went red once on a lane's tree (2026
 # Notes
 
 Filed at the coordinator's request from the #2346 lane's checks (issue file only). Related: #2175 vibe-talk-browser-load-known-red, #2177, #2346 vibe-talk-search-landed-reader-follows-foot.
+
+Cause (2026-11-27, 20 runs at 4-parallel on main plus an instrumented copy recording every count and server-line change): the walk's `server_settled` waited on the scope text, but the busy words ("Searching the server…") are the server line's, so steps 1 and 2 always ran with the server's answer still out (at the seam press the line still said "Searching the server…" in every run). When the answer landed, its older hits folded into the count ("7 found (4 loaded, 3 older)", `#2200`, the page's correct count), so a slow run in which the answer landed between the press and the one read of the count went red. Forcing the answer to land before the read turns the old check red every time. Not a page fault.
+
+Fix (test only): the fixture server holds the lantern answer through steps 1 and 2 (they are about the loaded rows and their gaps), the walk waits for the ask to be out instead of a settle that cannot see it, the count check compares the count after the press with the count read just before it, and the answer is let through and waited for before step 3, which already expects the fold. `server_settled` now counts the server line's busy words too.
+
