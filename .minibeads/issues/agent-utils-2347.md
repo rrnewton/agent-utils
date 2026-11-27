@@ -30,3 +30,8 @@ On a phone, when a read starts and the read strip appears, the list's foot is pu
 # Notes
 
 Owner-UI fast-track (liaison 995 chose fix B, the product fix). Related: #2077 vibe-talk-browser-checks-hot-host (read-aloud-blocks-browser is on its CPU-timeout known-red list), #998 gate-browser-steps-under-load. Logs of the red runs on main: cl-flaketriage's readaloud runs (2026-11-26).
+
+Cause (2026-11-26, a copy of the check's 412x915 phone walk with a MutationObserver on `data-read-strip` and per-frame and post-frame samples): the read's tap shows the strip and sets `data-read-strip` in one task, and `#screen-main` keeps the strip's room as `padding-bottom: var(--read-steer-height)`, a value written only by the strip's ResizeObserver at the next rendering update. Between the two, every layout read saw the list's foot 93.0 px under the strip's top (padding 0px), and so did the next frame's requestAnimationFrame; that frame's observer then wrote 93px. `wait_position("1 of 7")` often resolves in that window. The reading row did not move (83 px in every sample); taking the strip away was already same-task.
+
+Fix: the observer's body is one function (`measureReadSteer` in web/src/app/main.js), which the read's layout (`renderReadLayout`) runs at the end of the task in which it showed, hid or changed the strip (a microtask, once the same pass has settled the strip's own rows, so the height is the final one); the observer stays for later size changes. Main 3 reds in 11 runs ("the list runs 93.0px under the strip" at 393x852 and 375x812), the fix 10 of 10 green and no frame with the list under the strip.
+

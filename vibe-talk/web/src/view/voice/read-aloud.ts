@@ -139,6 +139,11 @@ export interface HeldSentence { readonly id: string; readonly text: string; read
 export interface ReadAloudDependencies<Column = unknown> {
   el<K extends string>(id: K): K extends keyof ElementById ? ElementById[K] : HTMLElement;
   /**
+   * `#2347 vibe-talk-read-strip-foot-same-frame`: the read's layout showed, hid or changed the strip
+   * (`data-read-strip`): the page measures it at once, so the list's foot moves with it in this task.
+   */
+  readStripChanged?(): void;
+  /**
    * `#821 voice-page-read-aloud-react`. React: open a quoted reply to message `id` on `text`, the words a
    * pause held, under `box` where they stood.
    */
@@ -3529,6 +3534,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * view's "pause, dictate, reply, resume"). Stop, or the read's end, takes the strip away and puts
    * everything back. A desk keeps its layout: nothing there reads this.
    */
+  /** `#2347`: whether the strip stood when the read's layout last ran (`renderReadLayout`). */
+  let layoutStripShown = false;
   function renderReadLayout() {
     const strip = deps.el("read-steer");
     if (!strip) return;
@@ -3545,10 +3552,15 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // it there instead of the frame re-searching for the strip on every toggle.
     const screen = deps.el("screen-main");
     if (screen) screen.toggleAttribute("data-react-steer", !strip.hidden && strip.hasAttribute("data-react-only"));
+    const was = root.getAttribute("data-read-strip");
     // `#821`: a strip standing for React alone is no read in progress: the layout stays as it was.
     if (strip.hidden || strip.hasAttribute("data-react-only")) root.removeAttribute("data-read-strip");
     // Held through a jump, it says what it said: a held read's jump cues its block up held.
     else if (nowPlaying !== null) root.setAttribute("data-read-strip", readingPaused() ? "paused" : "playing");
+    // `#2347`: the strip came up, went, or changed its state: measured now, not a frame later.
+    const shown = !strip.hidden;
+    if (deps.readStripChanged && (root.getAttribute("data-read-strip") !== was || shown !== layoutStripShown)) deps.readStripChanged();
+    layoutStripShown = shown;
   }
 
   /** A read is playing or held, or moving to another of its blocks (`readJumpPending`). */

@@ -630,31 +630,52 @@ if (typeof window.ResizeObserver === "function") {
 // nothing), so none of that room is kept for a strip that is not there. Kept beside the chips'
 // measurement, and held on the hidden screen for the reason that one is (`#280`, above).
 let readSteerHeight = 0;
+// `#2347 vibe-talk-read-strip-foot-same-frame`: the strip's measure, run by its resize observer and
+// also at once where the read's layout shows or hides the strip (`readStripChanged`), so the list's
+// foot (`--read-steer-height`) moves in the task the strip appears in, not at the next rendering's
+// observer: between the two, the list ran the strip's whole height under it for any reader of the
+// layout (the one-shot phone layout check caught it about 40% of the time). The observer's own call
+// for the same strip then finds it measured: nothing grew, so it only holds what it always holds.
+function measureReadSteer() {
+  // The whole box, padding and border included: a content-box measure would leave what stacks
+  // over the strip standing that much into it. Half a rem over it is the air the pill keeps
+  // over whatever it stands on, stated here because the chips' room states it only while a
+  // chip is showing.
+  const height = el("read-steer").offsetHeight || 0;
+  const grew = Math.max(0, height - readSteerHeight);
+  readSteerHeight = height;
+  const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
+  const area = el("scroll-area");
+  const landed = screens.screen() === "main" && screens.view() === "discord" && entryLandingHolds();
+  const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area, grew);
+  geometry.write("--read-steer-clearance", room);
+  // `scrubber-full-width`. The height itself, without the air: on a phone the strip playing is a
+  // row of its own over the dock, and the list ends at its top edge (`data-read-strip`). Held on
+  // the hidden screen as the room is, so the list comes back laid out with it (`#280`).
+  geometry.write("--read-steer-height", `${height}px`);
+  if (landed) placeEntryLanding(entryState().landing.row, entryState().landing.first);
+  if (pinned) scrollKeeping.toFoot(area);
+  // The strip floats in the same band as the chips over the channel's box, so it moved with it.
+  placeChipsOverComposer();
+  // `#442 read-strip-order`: a strip moved on a desk that grew is held inside the window again.
+  readAloudOwner().placeReadSteer();
+}
+// At the end of the task that changed the strip, not at once: the same pass goes on to settle the
+// strip's own rows (React shown or hidden, its timeline), so its height is only final once the task's
+// code has run; a microtask still lands before the next task and the next rendering read the layout.
+let readSteerMeasureQueued = false;
+function measureReadSteerSoon() {
+  if (readSteerMeasureQueued) return;
+  readSteerMeasureQueued = true;
+  // A resolved promise's reaction, the one microtask every page this runs on has.
+  Promise.resolve().then(() => {
+    readSteerMeasureQueued = false;
+    // Not while the read-aloud owner is still being made: the measure holds the strip through it.
+    if (pageReadAloud) measureReadSteer();
+  });
+}
 if (typeof window.ResizeObserver === "function") {
-  new window.ResizeObserver(() => {
-    // The whole box, padding and border included: a content-box measure would leave what stacks
-    // over the strip standing that much into it. Half a rem over it is the air the pill keeps
-    // over whatever it stands on, stated here because the chips' room states it only while a
-    // chip is showing.
-    const height = el("read-steer").offsetHeight || 0;
-    const grew = Math.max(0, height - readSteerHeight);
-    readSteerHeight = height;
-    const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
-    const area = el("scroll-area");
-    const landed = screens.screen() === "main" && screens.view() === "discord" && entryLandingHolds();
-    const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area, grew);
-    geometry.write("--read-steer-clearance", room);
-    // `scrubber-full-width`. The height itself, without the air: on a phone the strip playing is a
-    // row of its own over the dock, and the list ends at its top edge (`data-read-strip`). Held on
-    // the hidden screen as the room is, so the list comes back laid out with it (`#280`).
-    geometry.write("--read-steer-height", `${height}px`);
-    if (landed) placeEntryLanding(entryState().landing.row, entryState().landing.first);
-    if (pinned) scrollKeeping.toFoot(area);
-    // The strip floats in the same band as the chips over the channel's box, so it moved with it.
-    placeChipsOverComposer();
-    // `#442 read-strip-order`: a strip moved on a desk that grew is held inside the window again.
-    readAloudOwner().placeReadSteer();
-  }).observe(el("read-steer"));
+  new window.ResizeObserver(() => measureReadSteer()).observe(el("read-steer"));
 }
 
 // `#245 done-feedback`. The chips float over the foot of the list, and the channel's message box is
@@ -947,6 +968,7 @@ var pageReadAloud;
 function readAloudOwner() {
   if (!pageReadAloud) pageReadAloud = createReadAloud({
     get el() { return el; },
+    readStripChanged: () => measureReadSteerSoon(),
     openSentenceReply: (id, text, box) => openSentenceReply(id, text, box),
     readingMoved: () => readingJump.refresh(),
     get leftEl() { return leftEl; },
