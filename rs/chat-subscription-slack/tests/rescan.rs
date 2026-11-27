@@ -2019,3 +2019,282 @@ fn a_rate_limited_relay_poll_never_starves_the_owner_rescan() {
     subscription.close().unwrap();
     fs::remove_dir_all(&directory).unwrap();
 }
+
+// #2366 slack-old-thread-reply-late: a reply the stream never carries, in a thread whose root is
+// older than the rescan window, waited 5 h 20 min on a live bridge: no history row shows such a
+// thread, and the stream had carried nothing in it for hours, so nothing listed it until the
+// stream carried a later reply there.
+const HOUR: u64 = 60 * 60 * 1_000;
+
+fn watch_extra() -> Value {
+    // A ten-minute window keeps the root out of history; no cursor refresh, so a jump of hours
+    // on the test clock reopens nothing.
+    json!({"rescan_window_seconds": 600, "cursor_refresh_seconds": 0})
+}
+
+fn watch_file(directory: &Path) -> Value {
+    serde_json::from_slice(
+        &fs::read(directory.join(chat_subscription_slack::watch::WATCH_FILE)).unwrap(),
+    )
+    .unwrap()
+}
+
+clock!(watched_clock, WATCHED_NOW);
+
+#[test]
+fn a_reply_in_a_watched_thread_older_than_the_window_is_rescued_hours_after_the_stream_went_quiet()
+{
+    let directory = scratch("watched");
+    let fake = FakeTransport::new();
+    let root = ts(T0 - 2 * HOUR);
+    let carried_reply = ts(T0 + 5_000);
+    let bridge_reply = ts(T0 + 3 * HOUR - 120_000);
+    let question = ts(T0 + 3 * HOUR - 60_000);
+    fake.push_history(listed(&root, None, OWNER, "old root", &[]));
+    fake.push_history(listed(&carried_reply, Some(&root), OWNER, "a reply", &[]));
+    let mut script = vec![stream_message(4, &carried_reply, Some(&root), "a reply")];
+    script.extend(heartbeats(6));
+    fake.push_script(script);
+    let mut backend = backend(&fake, watched_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(&directory, None, watch_extra())).unwrap();
+    commit_next(&mut subscription);
+    commit_next(&mut subscription);
+    let key = format!("{CHANNEL}/{root}");
+    assert_eq!(watch_file(&directory)["threads"][0]["key"], key.as_str());
+
+    // Three hours later, with nothing more on the stream: the bridge replied in the thread
+    // (a bot post, never on the stream), and a minute later a reply the stream never carried.
+    fake.push_history(listed(&bridge_reply, Some(&root), BOT, "our reply", &[]));
+    fake.push_history(listed(&question, Some(&root), OWNER, "a question", &[]));
+    WATCHED_NOW.store(T0 + 3 * HOUR, Ordering::SeqCst);
+    let rescued = next_batch_within(&mut subscription, 3)
+        .expect("the watched thread is listed and its reply rescued");
+    let reply = single_message(&rescued);
+    assert_eq!(
+        reply.message_id().as_str(),
+        format!("{CHANNEL}/messages/{question}")
+    );
+    assert_eq!(
+        reply.thread_id().as_str(),
+        format!("{CHANNEL}/threads/{root}")
+    );
+    subscription.commit_durable(&rescued).unwrap();
+    let text = log(&directory);
+    assert!(text.contains("; 1 watched thread listed"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "rescan: watched threads rescued {CHANNEL}/{question} 1 min after it was posted"
+        )),
+        "{text}"
+    );
+    let saved = watch_file(&directory);
+    assert_eq!(
+        saved["schema"],
+        chat_subscription_slack::watch::WATCH_SCHEMA
+    );
+    assert_eq!(saved["threads"][0]["listed_at_millis"], T0 + 3 * HOUR);
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(refused_clock, REFUSED_NOW);
+
+/// The thread listings so far, as (thread root, oldest).
+fn thread_listings(fake: &FakeTransport) -> Vec<(String, String)> {
+    fake.state()
+        .scans
+        .iter()
+        .filter_map(|scan| scan.1.clone().map(|root| (root, scan.2.clone())))
+        .collect()
+}
+
+// While the bridge's request store is full it refuses every batch, and the provider opens a new
+// subscription about once a minute. The watch must survive that: a reply that only the watch
+// makes visible is still found, offered again identically after a refusal, and admitted once;
+// and a new subscription neither lists a watched thread from the window floor again nor before
+// its back-off.
+#[test]
+fn a_watched_thread_survives_refused_batches_and_resubscribes_without_relisting() {
+    let directory = scratch("watched-refused");
+    let fake = FakeTransport::new();
+    let root = ts(T0 - 2 * HOUR);
+    let carried_reply = ts(T0 + 5_000);
+    let question = ts(T0 + 3 * HOUR - 60_000);
+    fake.push_history(listed(&root, None, OWNER, "old root", &[]));
+    fake.push_history(listed(&carried_reply, Some(&root), OWNER, "a reply", &[]));
+    let mut script = vec![stream_message(4, &carried_reply, Some(&root), "a reply")];
+    script.extend(heartbeats(2));
+    fake.push_script(script);
+    let mut backend = backend(&fake, refused_clock);
+    let mut first =
+        ChatSubscription::open(&mut backend, &request(&directory, None, watch_extra())).unwrap();
+    commit_next(&mut first);
+    commit_next(&mut first);
+    first.close().unwrap();
+    let resume = "slack1:seq:4";
+
+    // Three hours later the reply arrives, and the store is full: the rescued batch is refused.
+    fake.push_history(listed(&question, Some(&root), OWNER, "a question", &[]));
+    REFUSED_NOW.store(T0 + 3 * HOUR, Ordering::SeqCst);
+    fake.push_script(heartbeats(6));
+    let mut refused = ChatSubscription::open(
+        &mut backend,
+        &request(&directory, Some(resume), watch_extra()),
+    )
+    .unwrap();
+    let offered = next_batch_within(&mut refused, 3).expect("the watched thread's reply");
+    assert_eq!(
+        offered.cursor().as_str(),
+        format!("{resume};rescued:{CHANNEL}/{question}")
+    );
+    refused.close().unwrap();
+    let listings = thread_listings(&fake);
+    assert_eq!(listings.len(), 1);
+    assert_eq!(listings[0].0, root);
+
+    // The next subscription offers the same batch first, before any listing, and it is
+    // admitted once.
+    REFUSED_NOW.store(T0 + 3 * HOUR + 30_000, Ordering::SeqCst);
+    fake.push_script(heartbeats(6));
+    let mut admitted = ChatSubscription::open(
+        &mut backend,
+        &request(&directory, Some(resume), watch_extra()),
+    )
+    .unwrap();
+    let again = next_batch_within(&mut admitted, 1).expect("offered again first");
+    assert_eq!(again.cursor(), offered.cursor());
+    assert_eq!(again.events(), offered.events());
+    assert_eq!(
+        thread_listings(&fake).len(),
+        1,
+        "nothing was listed before the replay"
+    );
+    admitted.commit_durable(&again).unwrap();
+    // Its newest message is a minute old, so the thread is listed on this pass too, from where
+    // it was listed through (the reply), not from the window floor; nothing is offered twice.
+    assert!(next_batch_within(&mut admitted, 2).is_none());
+    let listings = thread_listings(&fake);
+    assert_eq!(listings.len(), 2);
+    assert_eq!(listings[1], (root.clone(), question.clone()));
+
+    // An hour later the thread is quiet: one pass lists it, and a new subscription three
+    // minutes later does not list it again; ten minutes after the last listing it is due.
+    REFUSED_NOW.store(T0 + 4 * HOUR + 30_000, Ordering::SeqCst);
+    assert!(next_batch_within(&mut admitted, 2).is_none());
+    assert_eq!(thread_listings(&fake).len(), 3);
+    admitted.close().unwrap();
+    REFUSED_NOW.store(T0 + 4 * HOUR + 210_000, Ordering::SeqCst);
+    fake.push_script(heartbeats(6));
+    let mut later = ChatSubscription::open(
+        &mut backend,
+        &request(&directory, Some(resume), watch_extra()),
+    )
+    .unwrap();
+    assert!(next_batch_within(&mut later, 2).is_none());
+    assert_eq!(
+        thread_listings(&fake).len(),
+        3,
+        "a quiet watched thread waits out its back-off across subscriptions"
+    );
+    REFUSED_NOW.store(T0 + 4 * HOUR + 30_000 + 10 * 60_000, Ordering::SeqCst);
+    assert!(next_batch_within(&mut later, 2).is_none());
+    let listings = thread_listings(&fake);
+    assert_eq!(listings.len(), 4);
+    assert_eq!(listings[3].0, root);
+    later.close().unwrap();
+    let saved = ledger(&directory);
+    assert_eq!(saved["rescued"].as_array().unwrap().len(), 1);
+    assert_eq!(saved["pending"], Value::Null);
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(watch_off_clock, WATCH_OFF_NOW);
+
+#[test]
+fn the_watch_can_be_turned_off_and_a_too_short_one_is_refused() {
+    let directory = scratch("watch-off");
+    let fake = FakeTransport::new();
+    let root = ts(T0 - 2 * HOUR);
+    let carried_reply = ts(T0 + 5_000);
+    let mut script = vec![stream_message(4, &carried_reply, Some(&root), "a reply")];
+    script.extend(heartbeats(2));
+    fake.push_script(script);
+    let mut backend = backend(&fake, watch_off_clock);
+    let mut off = json!({"rescan_watch_seconds": 0});
+    off.as_object_mut()
+        .unwrap()
+        .extend(watch_extra().as_object().unwrap().clone());
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(&directory, None, off)).unwrap();
+    commit_next(&mut subscription);
+    commit_next(&mut subscription);
+    subscription.close().unwrap();
+    assert!(!directory
+        .join(chat_subscription_slack::watch::WATCH_FILE)
+        .exists());
+    let refused = ChatSubscription::open(
+        &mut backend,
+        &request(&directory, None, json!({"rescan_watch_seconds": 1_800})),
+    );
+    assert!(refused.is_err());
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(invalid_watch_clock, INVALID_WATCH_NOW);
+
+// A consumer pins old readers and asked that a damaged watch file never stop the bridge: garbage
+// or an unknown schema is an empty watch and a log line, and the next watched thread replaces
+// the file with a valid one.
+#[test]
+fn a_garbage_or_unknown_schema_watch_file_never_stops_the_subscription() {
+    for (name, bytes) in [
+        ("garbage", b"\x00\xff{{ not json".as_slice()),
+        (
+            "schema",
+            br#"{"schema":"agentctl.slack.watched-threads.v2","threads":[]}"#.as_slice(),
+        ),
+    ] {
+        let directory = scratch(&format!("invalid-watch-{name}"));
+        let file = directory.join(chat_subscription_slack::watch::WATCH_FILE);
+        fs::write(&file, bytes).unwrap();
+        let fake = FakeTransport::new();
+        let root = ts(T0 - 2 * HOUR);
+        let carried_reply = ts(T0 + 5_000);
+        let mut script = vec![stream_message(4, &carried_reply, Some(&root), "a reply")];
+        script.extend(heartbeats(2));
+        fake.push_script(script);
+        let mut backend = backend(&fake, invalid_watch_clock);
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &request(&directory, None, watch_extra()))
+                .expect("a damaged watch file never stops the subscription");
+        commit_next(&mut subscription);
+        let delivered = commit_next(&mut subscription);
+        assert_eq!(
+            single_message(&delivered).message_id().as_str(),
+            format!("{CHANNEL}/messages/{carried_reply}")
+        );
+        subscription.close().unwrap();
+        let text = log(&directory);
+        assert!(
+            text.contains(
+                "rescan: the watched-thread file was not a valid watch; starting an empty one"
+            ),
+            "{name}: {text}"
+        );
+        assert!(
+            text.contains("rescan: watching 0 threads"),
+            "{name}: {text}"
+        );
+        let saved = watch_file(&directory);
+        assert_eq!(
+            saved["schema"],
+            chat_subscription_slack::watch::WATCH_SCHEMA
+        );
+        assert_eq!(
+            saved["threads"][0]["key"],
+            format!("{CHANNEL}/{root}").as_str()
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+}

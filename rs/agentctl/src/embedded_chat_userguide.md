@@ -2942,7 +2942,8 @@ history from the last `rescan_window_seconds` (a day by default) with
 `slack.message list --content-format=mrkdwn`, as the same member the tail runs
 as. It also lists the replies of each thread in that history whose newest reply
 it has not yet listed, and of each thread the stream carried a reply in during
-the last 30 minutes whose root is older than that history. A thread whose
+the last 30 minutes whose root is older than that history, and of each watched
+thread (below) whose root is older than that history. A thread whose
 newest reply is still inside the 15-second grace period below is left for the
 next pass, which lists it whatever its newest reply then is. A thread whose
 history row shows that its newest reply, and every reply it gained since its
@@ -2995,6 +2996,31 @@ place for the ledger, so the rescan stays off; `rescan_interval_seconds: 0`
 turns it off too. An unacknowledged rescued batch whose cursors match neither
 the resume cursor nor the one before it is recorded delivered and not offered
 again (a lost rather than a refused message), and the log says so.
+
+Watched threads (#2366) cover a reply that the event stream never publishes
+in a thread whose root is older than `rescan_window_seconds`. No history row
+shows such a thread, and once the stream has been quiet in it for half an hour
+nothing else lists it. On 2026-11-27 a partner member's plain thread reply, posted
+a minute after the bridge's own reply in a 38-hour-old thread, never reached the
+owner's event topic and arrived 5 h 20 min late, when the stream carried a later
+reply in the same thread. So each thread in which an allowed sender's message
+reached the bridge, by the stream or by the rescan, stays watched for
+`rescan_watch_seconds` (two days by default) after its newest known message,
+however old its root. A watched thread whose root the history listing does not
+show is listed on every pass while its newest known message is under an hour old,
+then at most every 10 minutes, from where it was last listed through. It shares
+the pass's thread cap and the host listing budget. A listing raises the newest
+known message to the newest message it returned, whoever posted it, so the
+bridge's own reply puts a thread back on every pass once a listing sees it. The
+plugin keeps the watch in `slack-watched-threads.json` beside `diagnostics_log`:
+per thread, the newest known message, the listed-through point and when it was
+last listed. Because the file outlives a subscription, the watch survives a
+restart and the once-a-minute resubscribes of a bridge whose request store is
+full, and a new subscription neither lists a watched thread again before its
+back-off nor from the start of the window. While rescued messages still wait to
+be offered, a pass lists no watched thread. Each pass that lists one says how
+many in its log line, and a message one rescues is logged with how long after it
+was posted. `rescan_watch_seconds: 0` turns the watch off.
 
 A pass reads at most 5 history pages of 20 messages, 8 threads of 2 pages each,
 and queues at most 32 messages; what it leaves is found by the next pass. It
@@ -3160,6 +3186,7 @@ known key with an invalid value is refused.
 | `diagnostics_log` | stderr | Private diagnostics file (identifiers and codes only, never message text). The rescan keeps its ledger beside it. |
 | `rescan_interval_seconds` | 90 | How often, while the tail is idle, to list recent history for messages the stream did not carry (see "Messages the event stream never carries"). 30–3600, or 0 to never rescan. |
 | `rescan_window_seconds` | 86400 | How far back a rescan lists, 600–604800. |
+| `rescan_watch_seconds` | 172800 | How long a thread an allowed sender wrote in stays watched after its newest known message, however old its root (see "Messages the event stream never carries"). 3600–604800, or 0 to watch no thread. |
 | `rescan_calls_per_minute` | 20 | Listing calls a minute shared by every bridge on this host with the same `rescan_budget_key`, 0–600; 0 is unlimited. |
 | `rescan_budget_key` | `user` | Name of the shared listing budget; bridges that list as different people can use different keys. `off` gives this bridge no shared budget. |
 | `relay_poll_seconds` | unset | How often to poll only the `relay_channels` history (and threads with new replies) for relay posts the tail never carries: one history listing per relay channel per poll, independent of the rescan, with no settle wait and no grace. Only the relay peers' posts and their thread replies are polled — human posts in a relay channel wait for the stream and the general rescan. 5–60; unset never polls (relay posts wait for the rescan). Every listing spends the shared `rescan_calls_per_minute` budget, and the poll stops once half of it is used, keeping headroom for the general rescan — at 5 s one channel costs about 12 history calls a minute, so several bridges polling one channel want `rescan_calls_per_minute` raised. |

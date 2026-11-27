@@ -35,6 +35,7 @@ pub mod refusals;
 pub mod rescan;
 pub mod transport;
 pub mod warm;
+pub mod watch;
 
 /// Release version reported in diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -261,6 +261,9 @@ pub struct PluginConfig {
     pub rescan_calls_per_minute: u64,
     /// The name of the host-wide listing budget, by default the user's one (`user`).
     pub rescan_budget_key: String,
+    /// How long a thread an allowed sender wrote in stays watched after its newest known message;
+    /// `None` watches none (#2366 slack-old-thread-reply-late; see [`crate::watch`]).
+    pub rescan_watch: Option<Duration>,
     /// Keys this plugin does not know, sorted: ignored, and named in the diagnostics each time a
     /// subscription starts.
     pub ignored_keys: Vec<String>,
@@ -360,6 +363,7 @@ impl PluginConfig {
             "rescan_window_seconds",
             "rescan_calls_per_minute",
             "rescan_budget_key",
+            "rescan_watch_seconds",
             "relay_channels",
             "relay_poll_seconds",
         ];
@@ -479,6 +483,22 @@ impl PluginConfig {
         };
         let rescan_window = optional_seconds(data, "rescan_window_seconds", 600..=604_800)?
             .map_or(rescan::DEFAULT_WINDOW, Duration::from_secs);
+        let rescan_watch = match optional_seconds(
+            data,
+            "rescan_watch_seconds",
+            0..=crate::watch::MAX_WATCH_SECONDS,
+        )? {
+            None => Some(crate::watch::DEFAULT_WATCH),
+            Some(0) => None,
+            Some(seconds) if seconds < crate::watch::MIN_WATCH_SECONDS => {
+                return Err(invalid(format!(
+                    "rescan_watch_seconds must be 0 (never) or from {} to {}",
+                    crate::watch::MIN_WATCH_SECONDS,
+                    crate::watch::MAX_WATCH_SECONDS
+                )))
+            }
+            Some(seconds) => Some(Duration::from_secs(seconds)),
+        };
         let mut relay_peers: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
         match data.get("relay_channels") {
@@ -541,6 +561,7 @@ impl PluginConfig {
                 .unwrap_or(rescan::DEFAULT_CALLS_PER_MINUTE),
             rescan_budget_key: optional_string(data, "rescan_budget_key")?
                 .unwrap_or_else(|| "user".to_owned()),
+            rescan_watch,
             ignored_keys,
             relay_peers,
             relay_poll: optional_seconds(data, "relay_poll_seconds", 5..=60)?
@@ -982,6 +1003,27 @@ fn open_rescan(
             ledger.path().display()
         )),
     }
+    // #2366: the watched threads, beside the ledger, so a new subscription (after a stream
+    // failure, a restart, or a refused batch while the request store is full) still lists them,
+    // from where they were listed through and on their own back-off.
+    let watch = config.rescan_watch.and_then(|duration| {
+        let path = crate::watch::Watch::path_beside(config.diagnostics_log.as_deref())?;
+        let (watch, note) = crate::watch::Watch::load(path, duration, now_micros);
+        if let Some(note) = note {
+            diagnostics.log(&format!("rescan: {note}"));
+        }
+        if config.rescan_interval.is_some() {
+            diagnostics.log(&format!(
+                "rescan: watching {} thread{} an allowed sender wrote in, for {} s after each \
+                 one's newest message, however old its root; file {}",
+                watch.len(),
+                if watch.len() == 1 { "" } else { "s" },
+                duration.as_secs(),
+                watch.path().display()
+            ));
+        }
+        Some(watch)
+    });
     // `#1682 slack-rate-limit-budget`: the effective poll never runs faster
     // than the floor; a faster setting is clamped, never refused.
     let relay_interval = config
@@ -1051,6 +1093,7 @@ fn open_rescan(
         relay_interval,
         relay_next_due_millis: now_millis,
         relay_failures: 0,
+        watch,
     })
 }
 
@@ -1100,6 +1143,9 @@ struct Rescan {
     relay_interval: Option<Duration>,
     relay_next_due_millis: u64,
     relay_failures: u32,
+    // Threads an allowed sender wrote in, listed for `rescan_watch_seconds` however old their
+    // root, durably (#2366); `None` when the watch is off.
+    watch: Option<crate::watch::Watch>,
 }
 
 /// Thread listings one relay poll may still make during a budget hold
@@ -1172,6 +1218,39 @@ fn all_new_replies_carried(
             .count() as u64
     });
     new > 0 && new == carried && reply_count > seen_count
+}
+
+/// Watch the thread of an allowed sender's message, or raise its newest known message, and save
+/// the watch when that changed it (#2366). `sequence` names the stream event, if any, in a log line
+/// about a failed save.
+fn note_watched(
+    rescan: &mut Rescan,
+    message: &SlackMessage,
+    diagnostics: &Diagnostics,
+    sequence: Option<u64>,
+) {
+    let Some(watch) = rescan.watch.as_mut() else {
+        return;
+    };
+    let Some(at) = ids::ts_micros(&message.message_ts) else {
+        return;
+    };
+    let root = message
+        .thread_ts
+        .as_deref()
+        .filter(|root| ids::valid_ts(root))
+        .unwrap_or(&message.message_ts);
+    if watch.note_activity(&message_key(&message.channel_id, root), at) {
+        if let Err(error) = watch.save() {
+            diagnostics.log(&format!(
+                "{}the watched-thread file could not be saved: {error}",
+                sequence.map_or_else(
+                    || "rescan: ".to_owned(),
+                    |sequence| format!("event {sequence}: ")
+                )
+            ));
+        }
+    }
 }
 
 fn micros_ts(micros: u128) -> String {
@@ -1498,9 +1577,13 @@ impl SlackDriver {
     /// rescan already delivered it, and otherwise a durable record that the stream carried it, so
     /// the rescan never offers it.
     fn rescan_guard(&mut self, sequence: u64, message: &SlackMessage) -> Option<CommittableEvent> {
+        let watched_sender = self.watched_sender(message);
         let rescan = self.rescan.as_mut()?;
         if !self.channels.contains(&message.channel_id) || !ids::valid_ts(&message.message_ts) {
             return None;
+        }
+        if watched_sender {
+            note_watched(rescan, message, &self.diagnostics, Some(sequence));
         }
         let key = message_key(&message.channel_id, &message.message_ts);
         if rescan.ledger.rescued(&key) {
@@ -2295,6 +2378,9 @@ impl SlackDriver {
         // Skipped thread listings, for the pass's log line.
         let mut postponed = 0_usize;
         let mut unchanged = 0_usize;
+        // Threads listed only because they are watched (#2366), and what those listings rescued.
+        let mut watched_listed = 0_usize;
+        let mut watched_found: Vec<String> = Vec::new();
         'pass: for channel in &channels {
             let mut due_threads: Vec<(u128, String)> = Vec::new();
             // Each thread root the history listing showed, with its reply count and newest reply.
@@ -2393,12 +2479,37 @@ impl SlackDriver {
                     due_threads.push((u128::from(*at) * 1_000, root.to_owned()));
                 }
             }
+            // #2366: watched threads (an allowed sender wrote in them) whose root no history row
+            // showed, on their own back-off. None while rescued messages still wait to be
+            // offered: they go one at a time, so listing more could only queue more.
+            let mut watched_due: BTreeSet<String> = BTreeSet::new();
+            if rescan.queue.is_empty() {
+                if let Some(watch) = rescan.watch.as_ref() {
+                    for (activity, root) in watch.due(channel, now) {
+                        if history_roots.contains_key(&root)
+                            || due_threads.iter().any(|(_, due)| *due == root)
+                        {
+                            continue;
+                        }
+                        watched_due.insert(root.clone());
+                        due_threads.push((activity, root));
+                    }
+                }
+            }
             due_threads.sort_by(|a, b| b.cmp(a));
             due_threads.dedup_by(|a, b| a.1 == b.1);
             due_threads.truncate(rescan::MAX_THREADS_PER_PASS);
             for (latest, root) in due_threads {
                 let key = message_key(channel, &root);
-                let through = rescan.threads.get(&key).copied().unwrap_or(0);
+                // A watched thread resumes where any earlier subscription listed it through.
+                let through = rescan.threads.get(&key).copied().unwrap_or(0).max(
+                    rescan
+                        .watch
+                        .as_ref()
+                        .and_then(|watch| watch.get(&key))
+                        .map_or(0, |watched| watched.listed_through_micros),
+                );
+                let mut newest_row = 0_u128;
                 let oldest = micros_ts(floor.max(through));
                 let mut listed_through = through;
                 let mut token: Option<String> = None;
@@ -2444,10 +2555,19 @@ impl SlackDriver {
                         if row.message.message_ts == root {
                             continue;
                         }
+                        let before = found.len();
                         overflowed |= !self.consider(rescan, &row.message, floor, ripe, &mut found);
                         if let Some(at) = ids::ts_micros(&row.message.message_ts) {
+                            newest_row = newest_row.max(at);
                             if at <= ripe {
                                 listed_through = listed_through.max(at);
+                            }
+                            if found.len() > before && watched_due.contains(&root) {
+                                watched_found.push(format!(
+                                    "{} {} min after it was posted",
+                                    message_key(channel, &row.message.message_ts),
+                                    (now_micros.saturating_sub(at) + 30_000_000) / 60_000_000
+                                ));
                             }
                         }
                     }
@@ -2464,6 +2584,22 @@ impl SlackDriver {
                     if let Some(&(count, latest)) = history_roots.get(&root) {
                         rescan.seen.insert(key.clone(), (count, latest, now));
                     }
+                }
+                // A watched thread's newest known message is the newest the listing returned,
+                // whoever posted it (the bridge's own reply too); a complete listing moves its
+                // listed-through point and restarts its back-off.
+                if let Some(watch) = rescan.watch.as_mut() {
+                    if watch.get(&key).is_some() {
+                        if newest_row > 0 {
+                            watch.note_activity(&key, newest_row);
+                        }
+                        if !overflowed && !thread_failed {
+                            watch.listed(&key, listed_through, now);
+                        }
+                    }
+                }
+                if watched_due.contains(&root) && !thread_failed {
+                    watched_listed += 1;
                 }
                 // A reply left out because the queue was full must be listed again.
                 if !overflowed && !thread_failed {
@@ -2492,10 +2628,18 @@ impl SlackDriver {
         while rescan.seen.len() > MAX_TRACKED_THREADS {
             rescan.seen.pop_first();
         }
+        if let Some(watch) = rescan.watch.as_mut() {
+            watch.prune(now_micros);
+            if let Err(error) = watch.save() {
+                self.diagnostics.log(&format!(
+                    "rescan: the watched-thread file could not be saved: {error}"
+                ));
+            }
+        }
         self.diagnostics.log(&format!(
             "rescan: pass made {} history and {} thread listing call{}; {postponed} thread{} \
              postponed (newest reply in its grace period), {unchanged} not listed (new replies \
-             all carried); host budget {}",
+             all carried); host budget {}{}",
             spend.history_calls,
             spend.thread_calls,
             if spend.thread_calls == 1 { "" } else { "s" },
@@ -2509,8 +2653,22 @@ impl SlackDriver {
                 } else {
                     format!("{} of {} calls this minute", usage.used, usage.per_minute)
                 }
-            )
+            ),
+            if watched_listed == 0 {
+                String::new()
+            } else {
+                format!(
+                    "; {watched_listed} watched thread{} listed",
+                    if watched_listed == 1 { "" } else { "s" }
+                )
+            }
         ));
+        if !watched_found.is_empty() {
+            self.diagnostics.log(&format!(
+                "rescan: watched threads rescued {}",
+                watched_found.join(", ")
+            ));
+        }
         while rescan.threads.len() > MAX_TRACKED_THREADS {
             rescan.threads.pop_first();
         }
@@ -2625,6 +2783,19 @@ impl SlackDriver {
     /// Queue one listed message for delivery when it is inside the pass's window, neither
     /// carried by the stream nor already rescued or queued, and admitted. Returns `false` only
     /// when such a message was left out because the queue is full.
+    /// Whether a message's author starts or extends a thread's watch (#2366): an allowed sender
+    /// or a configured relay peer, never the bridge's own posts or a stranger's.
+    fn watched_sender(&self, message: &SlackMessage) -> bool {
+        message.user_id.as_deref().is_some_and(|user| {
+            self.senders.contains(user)
+                || self
+                    .config
+                    .relay_peers
+                    .get(&message.channel_id)
+                    .is_some_and(|peers| peers.iter().any(|peer| peer == user))
+        })
+    }
+
     fn consider(
         &self,
         rescan: &mut Rescan,
@@ -2653,6 +2824,9 @@ impl SlackDriver {
         }
         match self.admit(message, true) {
             Ok(_) => {
+                if self.watched_sender(message) {
+                    note_watched(rescan, message, &self.diagnostics, None);
+                }
                 let files = message.file_ids.len();
                 found.push(if files == 0 {
                     key
