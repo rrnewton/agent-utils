@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
+from tests import adapter_cache
 from tests.wrkviz_rust_binary import main, rust_wrkvizd
+
+
+@pytest.fixture(autouse=True)
+def _no_adapter_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests fake Cargo; the host cache (#2340) has its own tests."""
+    monkeypatch.setattr(adapter_cache, "ROOT", None)
 
 
 def _artifact(binary: Path) -> str:
@@ -103,7 +110,7 @@ def test_build_step_builds_the_executable_and_names_it(
         assert main() == 0
     finally:
         rust_wrkvizd.cache_clear()
-    assert capsys.readouterr().out == f"{binary}\n"
+    assert capsys.readouterr().out == f"{binary}\nadapter-cache: disabled\n"
 
 
 def test_build_step_failure_shows_the_compiler_diagnostics(

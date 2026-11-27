@@ -17,6 +17,7 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from tests import adapter_cache
 from wrkslots.tests.rust_binary import main as rust_binary_main
 from wrkslots.tests.rust_binary import rust_wrkslotsd
 
@@ -40,6 +41,7 @@ def test_rust_adapter_build_is_checked_once_per_session(
             "executable": str(binary),
         }))
 
+    monkeypatch.setattr(adapter_cache, "ROOT", None)  # these fake Cargo; #2340 has its own tests
     monkeypatch.setattr(subprocess, "run", build)
     rust_wrkslotsd.cache_clear()
     try:
@@ -61,6 +63,7 @@ def test_rust_adapter_failed_build_cannot_use_an_old_binary(
         del kwargs
         raise subprocess.CalledProcessError(1, command, stderr="compile failed")
 
+    monkeypatch.setattr(adapter_cache, "ROOT", None)  # these fake Cargo; #2340 has its own tests
     monkeypatch.setattr(subprocess, "run", fail)
     rust_wrkslotsd.cache_clear()
     try:
@@ -88,6 +91,7 @@ def test_build_step_builds_the_adapter_and_names_it(
             "executable": str(binary),
         }))
 
+    monkeypatch.setattr(adapter_cache, "ROOT", None)  # these fake Cargo; #2340 has its own tests
     monkeypatch.setattr(subprocess, "run", build)
     rust_wrkslotsd.cache_clear()
     try:
@@ -95,7 +99,7 @@ def test_build_step_builds_the_adapter_and_names_it(
     finally:
         rust_wrkslotsd.cache_clear()
     assert [command[command.index("-p") + 1] for command in builds] == ["wrkslotsd"]
-    assert capsys.readouterr().out == f"{binary}\n"
+    assert capsys.readouterr().out == f"{binary}\nadapter-cache: disabled\n"
 
 
 def test_build_step_failure_shows_the_compiler_diagnostics(
@@ -114,6 +118,7 @@ def test_build_step_failure_shows_the_compiler_diagnostics(
             101, command, output=stdout, stderr="error: could not compile `wrkslotsd`\n"
         )
 
+    monkeypatch.setattr(adapter_cache, "ROOT", None)  # these fake Cargo; #2340 has its own tests
     monkeypatch.setattr(subprocess, "run", fail)
     rust_wrkslotsd.cache_clear()
     try:

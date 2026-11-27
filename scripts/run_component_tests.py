@@ -86,6 +86,7 @@ EXPECTED_COMPONENTS = frozenset(
         "repository-infrastructure",
         "run-agent-prompt",
         "tick-hub",
+        "validation-adapters",
         "wrkslots",
         "wrkviz",
     }

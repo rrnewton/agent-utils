@@ -356,6 +356,19 @@ steps:
   # Sixteen shards halve the per-shard CPU so the step stays robust on a hot host
   # (owner rule 346). The 2400 s cap per shard is unchanged headroom, not a budget raise.
   # #696 wrkslots-shard-timeout.
+  # #2340: the content-keyed host cache the three adapter helpers (agentctl, wrkslots, wrkviz)
+  # share; its manifest entry names those components as reverse dependencies, so a change to
+  # the cache also runs the differentials that use it.
+  - group: validation-adapters
+    job: test
+    desc: the validation adapter executable cache's key, verification, publish and prune tests
+    cmd: python3 scripts/run_component_tests.py --component validation-adapters -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-validation-adapters]
+    timeout: 1800
+    cpu_timeout: 300
+    hint: *python_test_hint
+
   # #2318: py/wrkslots/tests/rust_binary.py release-builds wrkslotsd for the shards' Rust
   # differential cases, which the family weighting spreads over every shard, so whichever
   # shard reached one first ran that compile inside its own memory cap (shards peaked at

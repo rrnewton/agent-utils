@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
+from tests import adapter_cache
 from tests.rust_binary import main, rust_agentctl, rust_agentctl_with_fake
+
+
+@pytest.fixture(autouse=True)
+def _no_adapter_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests fake Cargo; the host cache (#2340) has its own tests."""
+    monkeypatch.setattr(adapter_cache, "ROOT", None)
 
 
 def test_rust_agentctl_builds_once_per_process(
@@ -95,6 +102,7 @@ def test_build_step_builds_every_adapter_and_names_them(
             str(executables["agentctl"]),
             str(executables["agentctl"]),
             str(executables["chat-subscription-fake-plugin"]),
+            "adapter-cache: disabled",
         ]
     finally:
         rust_agentctl.cache_clear()

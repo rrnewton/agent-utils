@@ -12,6 +12,9 @@ wrkslots shard starts (#2318, the shape of #2306): the Rust differential cases
 are spread over every shard, so whichever shard reached one first used to run
 the release compile inside its own memory cap. Now each shard's freshness
 check finds the binary current, and its cap measures the Python tests alone.
+
+When the build's inputs are committed and match an earlier build on this host, the executable
+comes from the content-keyed cache in ``tests.adapter_cache`` without running Cargo (#2340).
 """
 
 from __future__ import annotations
@@ -23,24 +26,40 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __package__ in (None, ""):  # run as a script: put py/ on the path for the cache module
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tests import adapter_cache  # noqa: E402
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+TARGET = REPO_ROOT / "rs" / "target" / "validation-adapters" / "wrkslotsd"
 
 
 @functools.cache
 def rust_wrkslotsd() -> Path:
-    """Return this session's freshly built release binary, or fail the build."""
-    target = REPO_ROOT / "rs" / "target" / "validation-adapters" / "wrkslotsd"
+    """Return this session's release binary, cached or freshly built, or fail the build."""
     # Bound Cargo's job parallelism (#883): a cold release build at the
     # host's default width peaked past a test shard's memory cap, while
     # two jobs keep the same binary with a much smaller build tree.
     env = dict(os.environ)
     env["CARGO_BUILD_JOBS"] = "2"
+    spec = adapter_cache.Spec(
+        name="wrkslotsd",
+        packages=("wrkslotsd",),
+        binaries=("wrkslotsd",),
+        cargo_args=("build", "--release", "--locked", "-p", "wrkslotsd", "--bin", "wrkslotsd"),
+        env=env,
+    )
+    built = adapter_cache.fetch_or_build(spec, lambda: {"wrkslotsd": _cargo_build(env)}, TARGET)
+    return built["wrkslotsd"]
+
+
+def _cargo_build(env: dict[str, str]) -> Path:
     result = subprocess.run(
         [
             "cargo", "build", "--quiet", "--release", "--locked",
             "--manifest-path", str(REPO_ROOT / "rs" / "Cargo.toml"),
-            "-p", "wrkslotsd", "--bin", "wrkslotsd", "--target-dir", str(target),
+            "-p", "wrkslotsd", "--bin", "wrkslotsd", "--target-dir", str(TARGET),
             "--message-format", "json",
         ],
         cwd=REPO_ROOT, check=True, capture_output=True, text=True, timeout=900, env=env,
@@ -83,6 +102,8 @@ def main() -> int:
         print(f"rust_binary: Cargo exited {error.returncode}", file=sys.stderr)
         return 1
     print(executable, flush=True)
+    # Last, so the DAG step's summary line shows the cache outcome and the cache size.
+    print(adapter_cache.summary(), flush=True)
     return 0
 
 

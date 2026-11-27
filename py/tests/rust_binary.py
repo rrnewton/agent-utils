@@ -13,6 +13,9 @@ before either agentctl shard starts (#2306): the release compile of the
 agentctl crate peaks near 3 GiB in one rustc, which a pytest shard's memory cap
 must not have to cover, so each shard's freshness check finds the binaries
 current and its cap measures the Python tests alone.
+
+When the build's inputs are committed and match an earlier build on this host, the executables
+come from the content-keyed cache in ``tests.adapter_cache`` without running Cargo (#2340).
 """
 
 from __future__ import annotations
@@ -23,6 +26,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+if __package__ in (None, ""):  # run as a script: put py/ on the path for the cache module
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests import adapter_cache  # noqa: E402
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +42,24 @@ def _build(
     # Bound Cargo's job parallelism (#883), as in the wrkslots helper.
     build_env = dict(os.environ if env is None else env)
     build_env["CARGO_BUILD_JOBS"] = "2"
+    spec = adapter_cache.Spec(
+        name="-".join(packages),
+        packages=tuple(packages),
+        binaries=tuple(binaries),
+        cargo_args=(
+            "build", "--release", "--locked",
+            *[item for package in packages for item in ("-p", package)],
+        ),
+        env=build_env,
+    )
+    return adapter_cache.fetch_or_build(
+        spec, lambda: _cargo_build(packages, binaries, build_env), TARGET_DIR
+    )
+
+
+def _cargo_build(
+    packages: list[str], binaries: list[str], build_env: dict[str, str]
+) -> dict[str, Path]:
     result = subprocess.run(
         [
             "cargo", "build", "--quiet", "--release", "--locked",
@@ -115,6 +140,8 @@ def main() -> int:
         return 1
     for executable in (agentctl, launch_agentctl, fake_plugin):
         print(executable, flush=True)
+    # Last, so the DAG step's summary line shows each build's cache outcome and the cache size.
+    print(adapter_cache.summary(), flush=True)
     return 0
 
 

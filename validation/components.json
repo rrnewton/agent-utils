@@ -391,6 +391,19 @@
       "reverse_dependencies": [],
       "test_files": []
     },
+    "validation-adapters": {
+      "source_prefixes": [
+        "py/tests/adapter_cache.py"
+      ],
+      "reverse_dependencies": [
+        "agentctl",
+        "wrkslots",
+        "wrkviz"
+      ],
+      "test_files": [
+        "py/tests/test_adapter_cache.py"
+      ]
+    },
     "wrkslots": {
       "source_prefixes": [
         "common/docs/wrkslots/",

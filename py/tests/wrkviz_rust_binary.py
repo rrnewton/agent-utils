@@ -16,6 +16,10 @@ DAG does that in its own step, ``python.wrkviz.build-rust``, before any wrkviz
 shard starts (#2318, the shape of #2306), so the release compile is not charged
 to a shard's memory cap and each shard's freshness check finds the binary
 current.
+
+When the build's inputs are committed and match an earlier build on this host,
+the executable comes from the content-keyed cache in ``tests.adapter_cache``
+without running Cargo (#2340).
 """
 
 from __future__ import annotations
@@ -27,6 +31,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __package__ in (None, ""):  # run as a script: put py/ on the path for the cache module
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests import adapter_cache  # noqa: E402
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TARGET_DIR = REPO_ROOT / "rs" / "target" / "validation-adapters" / "wrkviz"
@@ -34,9 +42,21 @@ TARGET_DIR = REPO_ROOT / "rs" / "target" / "validation-adapters" / "wrkviz"
 
 @functools.cache
 def rust_wrkvizd() -> Path:
-    """Return this process's freshly built release ``wrkvizd``, or fail the build."""
+    """Return this process's release ``wrkvizd``, cached or freshly built, or fail the build."""
     env = dict(os.environ)
     env["CARGO_BUILD_JOBS"] = "2"
+    spec = adapter_cache.Spec(
+        name="wrkvizd",
+        packages=("wrkviz",),
+        binaries=("wrkvizd",),
+        cargo_args=("build", "--release", "--locked", "-p", "wrkviz", "--bin", "wrkvizd"),
+        env=env,
+    )
+    built = adapter_cache.fetch_or_build(spec, lambda: {"wrkvizd": _cargo_build(env)}, TARGET_DIR)
+    return built["wrkvizd"]
+
+
+def _cargo_build(env: dict[str, str]) -> Path:
     result = subprocess.run(
         [
             "cargo", "build", "--quiet", "--release", "--locked",
@@ -84,6 +104,8 @@ def main() -> int:
         print(f"wrkviz_rust_binary: Cargo exited {error.returncode}", file=sys.stderr)
         return 1
     print(executable, flush=True)
+    # Last, so the DAG step's summary line shows the cache outcome and the cache size.
+    print(adapter_cache.summary(), flush=True)
     return 0
 
 
