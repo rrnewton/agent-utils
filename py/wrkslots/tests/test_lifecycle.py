@@ -36009,7 +36009,7 @@ def _gate_in_slot_alone(
             cwd == root or wrkslots._path_is_within(cwd, root) for root in resolved
         )
 
-    base = Path(os.environ.get("GATE_ADMISSION_DIR") or "/tmp/dev-agent-utils-gate-admission")
+    base = wrkslots._gate_admission_dir()
     for state, folder in (("running", "runs"), ("queued", "queue")):
         try:
             entries = sorted((base / folder).glob("*.json"))

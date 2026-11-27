@@ -45,3 +45,20 @@ local-ci-hub and the wrkslots sandbox read only an explicitly exported `$GATE_AD
 # Notes
 
 Filed 2026-11-27 10:51 AM ET at the lead coordinator's request. It follows #2383 private-run-tmpdir, which moves gate scratch out of the host temp dir, and comes after #2382 lands.
+
+## Design as approved (2026-11-27; replaces the read-both-directories sketch above)
+
+- **One admission domain, never two.** The old and new paths are never separate queues. `state_dir()` returns `$GATE_ADMISSION_DIR` if set. Otherwise it returns the old directory while that is a real directory (unmigrated, so an older gate.py's tickets and running gates are there). Otherwise it returns `~/.local/state/agent-utils/gate-admission/`. A gate.py on the new default leaves a symlink at a free old path, so an older gate.py (which opens the old path directly) and readers of the old default share its lock file and queue. If a real directory appears at the old path first, it wins and the new gate.py uses it.
+- **Migration is explicit, never automatic at gate start.** `python3 scripts/gate.py admission-dir` shows the state; `--migrate` is run by an operator at a quiet moment. It refuses (exit 1) unless:
+  - both admission locks are free (non-blocking flock)
+  - no queued, running or deferred entry in the old directory is live
+  - no other process of this user holds the old lock file open (an older gate.py keeps its lock descriptor for its whole life; found by scanning `/proc/<pid>/fd` for the lock's device and inode)
+
+  It copies `hold.json` if the new directory has none, appends `history.jsonl`, renames the old directory aside and puts the symlink in its place. A path recreated during the move aborts with the recreated directory left in use. `--migrate` refuses with exit 2 when `$GATE_ADMISSION_DIR` is set.
+- **Lock identity.** After every flock an Admission compares its descriptor's inode with the lock path's and reopens on a mismatch, so a replaced lock file never splits admission.
+- **Readers.** gate.py, the wrkslots gate-run check and `cross/loadgen.py` resolve the directory the same way. Readers pinned to an older release keep opening the old path; after migration the symlink makes that the same directory, so they stay correct until the fallback ends. Host operations scripts outside this repository that read the queue or holds change in parallel, made by the lead coordinator.
+- **Fallback removal date: 2026-12-11.** After it, the old-path branch in `state_dir()`, the symlink and the old-path readers go (`LEGACY_FALLBACK_UNTIL` in gate.py), provided no pinned reader still needs the old path.
+
+## Validation (pre-gate)
+
+New `py/tests/test_gate_admission_dir.py`: 11 tests, every path redirected into tmp_path, the real old path never touched. Also the repository-infrastructure component, the wrkslots clean-caches tests, strict mypy and no-Any. The host's real old directory was left a real directory; no new default directory was created by the tests.

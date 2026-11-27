@@ -359,6 +359,7 @@
         "py/tests/test_engine_resolver_wrkslots_optin.py",
         "py/tests/test_engine_resolver_wrkviz_optin.py",
         "py/tests/test_gate_admission.py",
+        "py/tests/test_gate_admission_dir.py",
         "py/tests/test_gate_stats.py",
         "py/tests/test_gh_resolve.py",
         "py/tests/test_gh_resolve_copies.py",

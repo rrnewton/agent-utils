@@ -19,9 +19,11 @@ running and blocks new admissions until it finishes, so load-sensitive steps
 Waiting callers print their queue position and elapsed wait. Every finished
 run appends one JSON line to the state history for gates/hour and wait-time
 measurement (`scripts/gate status`). Admission state lives outside the
-repository (default /tmp/dev-agent-utils-gate-admission, override with
-$GATE_ADMISSION_DIR); tickets and runs are files, reaped when their pid dies,
-so a killed lane never holds a slot forever.
+repository (default ~/.local/state/agent-utils/gate-admission, override with
+$GATE_ADMISSION_DIR; the old /tmp/dev-agent-utils-gate-admission is still used
+while it is a real directory, until `gate admission-dir --migrate` moves it,
+#2390); tickets and runs are files, reaped when their pid dies, so a killed
+lane never holds a slot forever.
 
 Known-red verdict (#2114 gate-known-red-aware-verdict): the versioned
 list validation/known-red.toml names steps that fail on unrelated
@@ -396,7 +398,16 @@ if sys.version_info >= (3, 11):
 else:  # Python 3.10: the tomli package provides the same API
     import tomli as tomllib
 
-DEFAULT_DIR = Path("/tmp/dev-agent-utils-gate-admission")
+#: Admission state (`#2390 gate-admission-dir-out-of-tmp`): a per-user state directory, never
+#: the host temp dir. $GATE_ADMISSION_DIR overrides it.
+DEFAULT_DIR = Path("~/.local/state/agent-utils/gate-admission")
+#: The old default. Until LEGACY_FALLBACK_UNTIL: while it is a real directory, gate.py keeps
+#: using it (an older gate.py's tickets and runs live there) until `gate admission-dir --migrate`
+#: moves it at a quiet moment; once it is free, gate.py leaves a symlink there to DEFAULT_DIR, so
+#: an older gate.py and readers of the old default share the one admission domain (the same lock
+#: file, the same queue).
+LEGACY_DIR = Path("/tmp/dev-agent-utils-gate-admission")
+LEGACY_FALLBACK_UNTIL = "2026-12-11"
 
 #: Durable per-run ledger (#827): /tmp history dies with every cleanup, taking the
 #: full-gate pass rate with it, so finished runs also append here, outside /tmp.
@@ -413,7 +424,36 @@ _VERDICT = re.compile(r"(?:validate|dagrun): (OK|PARTIAL|FAILED|PASS|FAIL)\b")
 
 
 def state_dir() -> Path:
-    return Path(os.environ.get("GATE_ADMISSION_DIR") or DEFAULT_DIR)
+    """Where admission state lives; pure, it never creates or moves anything (#2390).
+
+    $GATE_ADMISSION_DIR when set; else the old host-temp directory while it is a real directory
+    (not yet migrated); else DEFAULT_DIR."""
+    configured = os.environ.get("GATE_ADMISSION_DIR")
+    if configured:
+        return Path(configured)
+    if LEGACY_DIR.is_dir() and not LEGACY_DIR.is_symlink():
+        return LEGACY_DIR
+    return DEFAULT_DIR.expanduser()
+
+
+def settle_admission_root(root: Path) -> Path:
+    """The directory to keep admission state in, given `state_dir()`'s answer (#2390).
+
+    For the new default it makes the directory and, when the old path is free, a symlink there to
+    it, so an older gate.py (which opens the old path) and readers of the old default follow it
+    into the same domain. If a real directory appeared at the old path first (an older gate.py
+    made it just now), that directory is the admission directory instead: one domain either way.
+    Any other root is returned unchanged."""
+    if os.environ.get("GATE_ADMISSION_DIR") or root != DEFAULT_DIR.expanduser():
+        return root
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        LEGACY_DIR.symlink_to(root)
+    except OSError:
+        pass  # present already (our symlink, or a real directory), or no access to /tmp
+    if LEGACY_DIR.is_dir() and not LEGACY_DIR.is_symlink():
+        return LEGACY_DIR
+    return root
 
 
 #: Keep a failing gate's child registries when this is 1 (#1917).
@@ -1076,7 +1116,7 @@ def _hold_text(hold: dict[str, object]) -> str:
 
 
 def set_hold(until: float, reason: str) -> None:
-    root = state_dir()
+    root = settle_admission_root(state_dir())
     root.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"until": until, "reason": reason, "set_at": hold_now()})
     with (root / "admission.lock").open("a+") as lock:
@@ -1118,6 +1158,138 @@ def _wait_for_hold(args: argparse.Namespace) -> int | None:
         time.sleep(0.25)
     print("gate: admission hold lifted; proceeding", flush=True)
     return None
+
+
+def _live_admission_entries(root: Path) -> list[str]:
+    """Queue, run and deferred files under `root` whose recorded process is still alive."""
+    live: list[str] = []
+    for folder in ("queue", "runs", "deferred"):
+        for path in sorted((root / folder).glob("*.json")):
+            data = Admission._read(path)
+            if data is not None and _alive(data.get("pid")):
+                live.append(f"{folder}/{path.name} (pid {data.get('pid')})")
+    return live
+
+
+def _lock_holders(lock: Path, proc: Path = Path("/proc")) -> list[int]:
+    """This user's processes, other than this one, with a descriptor open on `lock`."""
+    try:
+        target = os.stat(lock)
+    except OSError:
+        return []
+    holders: list[int] = []
+    me, uid = os.getpid(), os.getuid()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            descriptors = list((entry / "fd").iterdir())
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                info = os.stat(descriptor)
+            except OSError:
+                continue
+            if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
+                holders.append(int(entry.name))
+                break
+    return holders
+
+
+def migrate_admission_dir(legacy: Path, new: Path, proc: Path = Path("/proc")) -> int:
+    """Move the old admission directory to `new` and leave a symlink at its path (#2390).
+
+    Run by an operator at a quiet moment, never by a gate. It refuses (exit 1, nothing moved)
+    unless both admission locks are free, no queued, running or deferred entry is live, and no
+    other process of this user has the old lock file open (an older gate.py keeps it open for
+    its whole run). hold.json is copied when `new` has none; history.jsonl is appended to `new`'s.
+    If another process recreates the old path in the instant between the rename and the
+    symlink, that directory stays the admission directory and the migration says so (exit 1)."""
+    new.mkdir(parents=True, exist_ok=True)
+    old_lock_path = legacy / "admission.lock"
+    with old_lock_path.open("a+") as old_lock, (new / "admission.lock").open("a+") as new_lock:
+        for handle, where in ((old_lock, legacy), (new_lock, new)):
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"gate: admission-dir: {where}/admission.lock is held; a gate is admitting. "
+                      "Run again when no gate is queued or running.", file=sys.stderr)
+                return 1
+        live = _live_admission_entries(legacy)
+        if live:
+            print("gate: admission-dir: not idle; live entries in the old directory: "
+                  + ", ".join(live), file=sys.stderr)
+            return 1
+        holders = _lock_holders(old_lock_path, proc)
+        if holders:
+            print("gate: admission-dir: not idle; processes hold the old lock open (an older "
+                  f"gate.py?): {', '.join(map(str, holders))}", file=sys.stderr)
+            return 1
+        if (legacy / "hold.json").is_file() and not (new / "hold.json").exists():
+            shutil.copy2(legacy / "hold.json", new / "hold.json")
+        if (legacy / "history.jsonl").is_file():
+            with (legacy / "history.jsonl").open("rb") as source, \
+                    (new / "history.jsonl").open("ab") as sink:
+                shutil.copyfileobj(source, sink)
+        for folder in ("queue", "runs", "deferred"):
+            (new / folder).mkdir(exist_ok=True)
+        moved = legacy.with_name(f"{legacy.name}.moved-{int(time.time())}")
+        os.rename(legacy, moved)
+        try:
+            legacy.symlink_to(new)
+        except FileExistsError:
+            print(f"gate: admission-dir: {legacy} was recreated by another process during the "
+                  f"move; it stays the admission directory. The copy in {new} is unused; run "
+                  "again at a quiet moment.", file=sys.stderr)
+            return 1
+    shutil.rmtree(moved, ignore_errors=True)
+    print(f"gate: admission-dir: moved {legacy} to {new}; {legacy} is now a symlink to it "
+          f"(the fallback ends {LEGACY_FALLBACK_UNTIL})")
+    return 0
+
+
+def run_admission_dir(argv: list[str]) -> int:
+    """`gate admission-dir [--migrate]` (#2390): where admission state lives, and the move."""
+    parser = argparse.ArgumentParser(
+        prog="gate admission-dir",
+        description=(
+            "Show where gate admission state lives, or move it out of the host temp dir. "
+            f"The default is {DEFAULT_DIR}; while the old {LEGACY_DIR} is a real directory, "
+            "gates keep using it. --migrate moves it and leaves a symlink at the old path, so "
+            "an older gate.py and readers of the old default share the one admission domain. "
+            "Run --migrate only at a quiet moment: it refuses unless no gate is queued, "
+            "running or deferred and no process holds the old lock open. $GATE_ADMISSION_DIR, "
+            f"when set, overrides both. The old-path fallback ends {LEGACY_FALLBACK_UNTIL}."
+        ),
+    )
+    parser.add_argument("--migrate", action="store_true",
+                        help="move the old directory to the default and leave a symlink")
+    args = parser.parse_args(argv)
+    configured = os.environ.get("GATE_ADMISSION_DIR")
+    new = DEFAULT_DIR.expanduser()
+    if LEGACY_DIR.is_symlink():
+        legacy_state = f"symlink to {os.readlink(LEGACY_DIR)}"
+    elif LEGACY_DIR.is_dir():
+        legacy_state = "real directory (not migrated)"
+    else:
+        legacy_state = "absent"
+    print(f"gate: admission dir in use: {state_dir()}"
+          + (" ($GATE_ADMISSION_DIR)" if configured else ""))
+    print(f"gate: default {new} ({'exists' if new.is_dir() else 'absent'}); "
+          f"old path {LEGACY_DIR}: {legacy_state}")
+    if not args.migrate:
+        return 0
+    if configured:
+        print("gate: admission-dir: $GATE_ADMISSION_DIR is set; nothing to migrate",
+              file=sys.stderr)
+        return 2
+    if LEGACY_DIR.is_symlink() or not LEGACY_DIR.is_dir():
+        print("gate: admission-dir: nothing to migrate")
+        return 0
+    return migrate_admission_dir(LEGACY_DIR, new)
 
 
 def run_hold(argv: list[str]) -> int:
@@ -2348,6 +2520,7 @@ def _tier(data: dict[str, object]) -> int:
 
 class Admission:
     def __init__(self, root: Path, slots: int) -> None:
+        root = settle_admission_root(root)
         self.root = root
         self.slots = slots
         self._slots_problem: str | None = None
@@ -2357,7 +2530,20 @@ class Admission:
         self._lock = (root / "admission.lock").open("a+")
 
     def _locked(self) -> None:
-        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        # #2390: a lock file replaced under an open descriptor (the admission directory moved)
+        # would leave this process locking an inode nobody else locks; reopen by path until the
+        # locked descriptor is the path's file.
+        while True:
+            fcntl.flock(self._lock, fcntl.LOCK_EX)
+            try:
+                current = os.stat(self.root / "admission.lock").st_ino
+            except OSError:
+                current = None
+            if current == os.fstat(self._lock.fileno()).st_ino:
+                return
+            fcntl.flock(self._lock, fcntl.LOCK_UN)
+            self._lock.close()
+            self._lock = (self.root / "admission.lock").open("a+")
 
     def _unlocked(self) -> None:
         fcntl.flock(self._lock, fcntl.LOCK_UN)
@@ -4666,6 +4852,8 @@ def main(argv: list[str] | None = None) -> int:
                              "see `gate prune --help`)")
     if argv[:1] == ["hold"]:
         return run_hold(argv[1:])
+    if argv[:1] == ["admission-dir"]:
+        return run_admission_dir(argv[1:])
     if argv[:1] == ["status"]:
         return show_status(parser.parse_args([]))
     if argv[:1] == ["queue"]:

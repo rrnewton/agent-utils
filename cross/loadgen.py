@@ -54,9 +54,19 @@ def _host_quiet_path() -> Path | None:
 
 
 HOST_QUIET = _host_quiet_path()
-GATE_RUNS_DIR = Path(os.environ.get(
-    "GATE_ADMISSION_DIR", "/tmp/dev-agent-utils-gate-admission",
-)) / "runs"
+def _gate_admission_dir() -> Path:
+    """Resolved as scripts/gate.py resolves it (#2390): $GATE_ADMISSION_DIR; else the old host-temp
+    directory while it is a real directory (not yet migrated); else the per-user state directory."""
+    configured = os.environ.get("GATE_ADMISSION_DIR")
+    if configured:
+        return Path(configured)
+    legacy = Path("/tmp/dev-agent-utils-gate-admission")
+    if legacy.is_dir() and not legacy.is_symlink():
+        return legacy
+    return Path.home() / ".local" / "state" / "agent-utils" / "gate-admission"
+
+
+GATE_RUNS_DIR = _gate_admission_dir() / "runs"
 ALLOWED_ACTIVE_UNITS = frozenset({"validate-checkout-cleanup-worker.service"})
 _BURNER = (
     "import os, time\n"

@@ -60759,6 +60759,23 @@ def _list_proc_pid_dirs(proc_root: Path) -> list[Path]:
     return list(proc_root.iterdir())
 
 
+def _gate_admission_dir() -> Path:
+    """The gate admission directory, resolved as scripts/gate.py resolves it (#2390).
+
+    $GATE_ADMISSION_DIR when set; else the old /tmp/dev-agent-utils-gate-admission while it is a
+    real directory (not yet migrated by ``gate admission-dir --migrate``); else the per-user
+    ~/.local/state/agent-utils/gate-admission. After the migration the old path is a symlink to
+    the new one, so a reader that still uses the old path sees the same tickets.
+    """
+    configured = os.environ.get("GATE_ADMISSION_DIR")
+    if configured:
+        return Path(configured)
+    legacy = Path("/tmp/dev-agent-utils-gate-admission")
+    if legacy.is_dir() and not legacy.is_symlink():
+        return legacy
+    return Path.home() / ".local" / "state" / "agent-utils" / "gate-admission"
+
+
 def _gates_running_in_slots(
     roots: Mapping[str, Path | None],
     *,
@@ -60766,8 +60783,7 @@ def _gates_running_in_slots(
 ) -> dict[str, tuple[int, str]]:
     """Each slot with a gate running or queued in its root: ``(pid, state)`` (#1029).
 
-    The gate admission directory ($GATE_ADMISSION_DIR, default
-    /tmp/dev-agent-utils-gate-admission) names a pid in runs/*.json and
+    The gate admission directory (``_gate_admission_dir``) names a pid in runs/*.json and
     queue/*.json; that pid's cwd decides the slot. A queued ticket counts
     as running: its gate will build into the slot's caches soon. Fall
     back to any live dagrun, validate.py, gate.py or cargo process whose
@@ -60808,7 +60824,7 @@ def _gates_running_in_slots(
     gates: dict[str, tuple[int, str]] = {}
     if not slots_by_root:
         return gates
-    base = Path(os.environ.get("GATE_ADMISSION_DIR") or "/tmp/dev-agent-utils-gate-admission")
+    base = _gate_admission_dir()
     for state, folder in (("running", "runs"), ("queued", "queue")):
         try:
             entries = sorted((base / folder).glob("*.json"))
