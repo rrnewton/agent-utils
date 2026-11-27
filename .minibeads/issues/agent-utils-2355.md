@@ -1,6 +1,6 @@
 ---
 title: 'gate-evidence-incomplete-steps-refused: the landing wrapper refuses gate evidence that leaves selected steps unmeasured (NO_RESULT) unless a recorded waiver names them for that commit'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-shardcap
@@ -9,7 +9,8 @@ labels:
 - landing
 - validation
 created_at: 2026-11-27T00:38:00-05:00
-updated_at: 2026-11-27T00:38:00-05:00
+updated_at: 2026-11-27T00:45:00-05:00
+closed_at: 2026-11-27T00:45:00-05:00
 ---
 
 # Description
@@ -57,4 +58,19 @@ Out of scope here (#2317): recording per-step NO_RESULT outcomes and passed step
 - #2306 is the six-and-a-half-day agentctl shard blind spot behind this.
 - #2207 made NO_RESULT runs exit 3 and record `incomplete_steps`.
 - The fix lives in the harness repository. Its commit is recorded here when it lands.
-- Possible follow-up for #2317: once gate.py records each run's passed step names in the row, the wrapper can read them there instead of from log directories that get pruned.
+- Rows without the field can't be checked. gate.py runs from the gated tree, so a gate on a base without #2207 still writes rows with no `incomplete_steps`, even after #2207 landed. A NO_RESULT step in such a row is invisible to the wrapper. It warns about the row, and the coordinator must read that run's journal by hand before landing.
+- Journal pruning: gate.py keeps only its newest 20 log directories. If a rerun's journal is pruned before landing, that rerun clears nothing, and the refusal says so. The landing then needs a new rerun or a waiver. The durable fix is #2317: record each run's passed step names in its ledger row, so the wrapper reads them there.
+
+## Resolution
+
+Fixed in the harness repository, commit e8c9a166 (reviewed by the coordinator before it went live). The landing wrapper:
+
+- runs the check on all three evidence paths;
+- reads rerun journals as designed, and reports a missing journal;
+- matches waivers by the commit prefix plus the exact step name;
+- warns about rows from a gate.py without #2207;
+- documents the rule in its `--help`.
+
+Its new 18-case test passes, using only a scratch ledger, waiver file, journals and repository. It covers every case in the acceptance criteria plus the missing-field warning. 13 of those cases fail against the previous wrapper.
+
+A replay of the real 2026-11-27 evidence was refused with exit 3, naming `python.agentctl.shard-0` and `python.agentctl.shard-1`. The replay used a scratch copy of its two ledger rows and a stand-in that refuses all network commands.
