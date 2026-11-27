@@ -82,7 +82,13 @@ function makeNavigation(state) {
     providerNameOf: () => "discord", providerName: () => "discord", threadOf: () => null,
     setStatus: (text) => calls.push(["status", text]), showError: (text) => calls.push(["error", text]),
     guardQuietly: (run) => (...args) => run(...args), settleFocus: () => {}, replyOnScreen: () => false,
-    setLinkedMark: () => {}, cardsCycle: () => false, rowShown: () => true, visibleList: () => ({ children: state.listRows ?? [] }),
+    setLinkedMark: (channel, id) => { if (state.markModel) { state.mark = { channel, id }; calls.push(["mark", channel, id]); } },
+    // `#2270`: the linked mark's owner, wired only where a test asks, as a host may leave it unwired.
+    ...(state.markModel ? {
+      linkedMark: () => state.mark,
+      putOutLinkedMark: () => { state.mark = null; calls.push(["markOut"]); },
+    } : {}),
+    cardsCycle: () => false, rowShown: () => true, visibleList: () => ({ children: state.listRows ?? [] }),
     rowOnScreen: () => true, eachColumn: (act) => act(), openReadRun: () => {}, setSearchOpen: () => {},
     finishPackSlide: () => {}, headOfList: () => 0, renderScrollTools: () => {},
     revealRow: (_row, center) => { (state.reveals ??= []).push(center); },
@@ -392,6 +398,67 @@ test("`#2261 vibe-talk-summary-link-back-race`: Back ends the undone jump's land
 const rowNamed = (id) => ({ getAttribute: (name) => (name === "data-context-id" ? id : null), className: "" });
 const settle = async () => { for (let i = 0; i < 30; i += 1) await Promise.resolve(); };
 const restores = (calls) => calls.filter((call) => Array.isArray(call) && call[0] === "restore").map((call) => call[1]);
+
+test("`#2270 vibe-talk-linked-bubble-follows-back`: Back puts the Linked mark back as the spot had it, before the row, and keeps a reader's put-out", async () => {
+  const marking = (mark) => {
+    const state = freshState();
+    state.selection = { view: "flat", threadId: null, origin: null };
+    state.landSeek = true;
+    state.row = { className: "" };
+    state.markModel = true;
+    state.mark = mark;
+    const eye = rowNamed("m1");
+    state.capture = { pinned: false, anchor: eye, top: 120 };
+    state.listRows = [eye];
+    return { state, eye, ...makeNavigation(state) };
+  };
+  const marksAndRestores = (calls) => calls.filter((call) => Array.isArray(call) && ["mark", "markOut", "restore"].includes(call[0]))
+    .map((call) => (call[0] === "restore" ? ["restore", call[1].top] : call));
+
+  // The issue's walk: m1 came with the mark (a first citation); a second citation lands m42 with it.
+  let { state, nav, calls } = marking({ channel: "C1", id: "m1" });
+  await nav.jumpToMessageInPlace({ service: "discord", channel: "C1", message: "m42", thread: "T1" });
+  assert.deepStrictEqual(state.mark, { channel: "C1", id: "m42" }, "fixture: the jump did not move the mark");
+  calls.length = 0;
+  nav.returnFromLinkJump();
+  await settle();
+  assert.deepStrictEqual(marksAndRestores(calls), [["mark", "C1", "m1"], ["restore", 120]],
+    "Back did not put the mark back on the row it returned to, before putting the row back");
+  assert.deepStrictEqual(state.mark, { channel: "C1", id: "m1" }, "the mark stayed on the jump's target");
+
+  // A mark the reader had put out before the jump does not come back: Back puts the target's out.
+  ({ state, nav, calls } = marking(null));
+  await nav.jumpToMessageInPlace({ service: "discord", channel: "C1", message: "m42", thread: "T1" });
+  assert.deepStrictEqual(state.mark, { channel: "C1", id: "m42" });
+  calls.length = 0;
+  nav.returnFromLinkJump();
+  await settle();
+  assert.deepStrictEqual(marksAndRestores(calls), [["markOut"], ["restore", 120]], "Back brought back a mark the reader had put out");
+  assert.equal(state.mark, null);
+
+  // The reader put the jump's own mark out (its x, Esc) before Back: no older mark comes back over it (`#890`).
+  ({ state, nav, calls } = marking({ channel: "C1", id: "m1" }));
+  await nav.jumpToMessageInPlace({ service: "discord", channel: "C1", message: "m42", thread: "T1" });
+  state.mark = null;
+  calls.length = 0;
+  nav.returnFromLinkJump();
+  await settle();
+  assert.deepStrictEqual(marksAndRestores(calls), [["restore", 120]], "Back brought a mark back over the reader's put-out");
+  assert.equal(state.mark, null);
+
+  // Unwired (a host without the mark's owner): Back still returns, and nothing throws.
+  const bare = freshState();
+  bare.selection = { view: "flat", threadId: null, origin: null };
+  bare.landSeek = true;
+  bare.row = { className: "" };
+  bare.capture = { pinned: false, anchor: rowNamed("m1"), top: 120 };
+  bare.listRows = [bare.capture.anchor];
+  const plain = makeNavigation(bare);
+  await plain.nav.jumpToMessageInPlace({ service: "discord", channel: "C1", message: "m42", thread: "T1" });
+  plain.nav.returnFromLinkJump();
+  await settle();
+  assert.ok(restores(plain.calls).length === 1, "unwired, Back no longer returned");
+});
 
 test("`#2273 vibe-talk-cross-view-back-lands-wrong`: a held :email: short ref is a jump of its own, so Back undoes it, not an earlier jump", async () => {
   const state = freshState();

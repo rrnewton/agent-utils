@@ -1163,6 +1163,9 @@ const shellNavigation = createPageNavigation({
   settleFocus: () => settleFocus(),
   replyOnScreen: () => replyOnScreen(),
   setLinkedMark: (channel, id) => linkedMark.set(channel, id),
+  // `#2270 vibe-talk-linked-bubble-follows-back`: Back puts the mark back as the spot had it.
+  linkedMark: () => linkedMark.linked(),
+  putOutLinkedMark: () => { linkedMark.clear(); },
   noteJumpAnchor: (row, id) => jumpAnchor.note(/** @type {HTMLElement} */ (row), id),
   // `#2261 vibe-talk-summary-link-back-race`: Back ends the landing it undoes (flash and
   // per-frame re-assert) and the jump's hold on the row it leaves.

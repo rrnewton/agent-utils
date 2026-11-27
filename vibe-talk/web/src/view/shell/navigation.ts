@@ -126,6 +126,12 @@ export interface NavLinkSpot {
   readonly anchor: string | null;
   readonly offset: number;
   readonly focus: DeepLinkRef | null;
+  /**
+   * `#2270 vibe-talk-linked-bubble-follows-back`: the "Linked message" mark as it stood when the
+   * jump was taken (null: none, or the reader had put it out), so Back puts it back with the view.
+   * Absent where it was not read (an older spot, a test double): Back leaves the mark as it is.
+   */
+  readonly mark?: { readonly channel: string; readonly id: string } | null;
   readonly call?: boolean;
   readonly docs?: boolean;
 }
@@ -377,6 +383,10 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   replyOnScreen(): boolean;
   // Linked mark (owned by `view/channel`'s `createLinkedMark`, still created in the legacy script).
   setLinkedMark(channel: string, id: string): void;
+  /** `#2270`: the linked mark now (null: none). Optional for doubles. */
+  linkedMark?(): { channel: string; id: string } | null;
+  /** `#2270`: put the linked mark out, as Back restoring a spot that had none does (not the reader's dismissal). Optional for doubles. */
+  putOutLinkedMark?(): void;
   cardsCycle(): boolean;
   rowShown(row: HTMLElement): boolean;
   visibleList(): HTMLElement;
@@ -1460,8 +1470,33 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       anchor: anchor ? anchor.getAttribute("data-context-id") || deps.idsOf(anchor as HTMLElement)[0] || null : null,
       offset: anchor ? mark.top - deps.listPlaceTop(el("scroll-area")) : 0,
       focus: deepLinks.focus(),
+      ...markNow(),
       call: false,
     };
+  }
+
+  /** `#2270`: the linked mark as it stands, for a spot (nothing where the mark cannot be read). */
+  function markNow(): { mark?: { channel: string; id: string } | null } {
+    if (typeof deps.linkedMark !== "function") return {};
+    const linked = deps.linkedMark();
+    return { mark: linked ? { channel: String(linked.channel), id: String(linked.id) } : null };
+  }
+
+  /**
+   * `#2270`: put the linked mark back as `spot` had it -- on its message, or out -- before the row
+   * is put back, so the bubble's height comes back with it below the row's top and the restore
+   * holds the row there. A spot that never read the mark leaves it as it is, and so does a reader
+   * who put the jump's own mark out (its x or Esc) before Back: no mark stands, and Back does not
+   * bring an older one back over that choice (`#890`).
+   */
+  function restoreMark(spot: NavLinkSpot): void {
+    if (spot.mark === undefined) return;
+    if (typeof deps.linkedMark === "function" && deps.linkedMark() === null) return;
+    if (spot.mark === null) {
+      if (typeof deps.putOutLinkedMark === "function") deps.putOutLinkedMark();
+      return;
+    }
+    deps.setLinkedMark(spot.mark.channel, spot.mark.id);
   }
 
   /** The levels a Back would close, with the jumps taken by links among them (`LinkJumps.levels`). */
@@ -1843,6 +1878,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     deepLinks.setFocus(spot.focus);
     syncDeepLinkAddress();
     const column = spot.column === "side" && deps.sideShowing() ? deps.sideColumn() : deps.mainColumn();
+    restoreMark(spot);
     const put = (): boolean => deps.inColumn(column, () => putBackOnSpot(spot));
     if (spot.pinned || !spot.anchor) {
       if (spot.pinned) deps.inColumn(column, deps.scrollToNewest);

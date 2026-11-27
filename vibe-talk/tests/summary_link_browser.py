@@ -40,6 +40,12 @@ Should it not, the step's log carries that trace with the row's current
 and expected top, the list's state, `history.state` and the walk label,
 and a screenshot is kept beside it.
 
+`#2270 vibe-talk-linked-bubble-follows-back`: the "Linked message" bubble
+comes back with Back. Before the reply tap the main row carries it (the
+main citation put it there); after Back the main row carries it again and
+the reply row does not, the row still within 0.5 px of its pre-jump top on
+every watched frame (the bubble's height is below the row's top).
+
 `#2147 vibe-talk-linked-jump-centers-target`: every landing above also
 asserts the target stands centred in the visible list area (above the
 phone Discuss sheet, inside the shrunk viewport), or top-aligned when
@@ -622,6 +628,12 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     row_probe = ("() => { const r = [...document.querySelectorAll('#discord-log li')]"
                  f".find(r => (r.getAttribute('data-ids') || '').split(' ').includes('{ids['main_msg']}'));"
                  " return {top: r.getBoundingClientRect().top, text: r.textContent.trim().slice(0, 80)}; }")
+    # `#2270`: the rows standing with the "Linked message" bubble, by message id.
+    linked_probe = ("() => [...document.querySelectorAll('#discord-log li[data-linked=\"true\"]')]"
+                    ".flatMap(r => (r.getAttribute('data-ids') || '').split(' ').filter(Boolean))")
+    before_linked: object = page.evaluate(linked_probe)
+    check(isinstance(before_linked, list) and ids["main_msg"] in before_linked,
+          f"{label}: fixture: the main citation left no bubble on its row before the reply tap: {before_linked}")
     if shots is not None:
         # The before frame of the Back pair (`#2261`): the reader's row the
         # moment before the tap, as Back must put it back.
@@ -671,12 +683,18 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
                            f"put back at frame {settled['first']}, then moved: {settled['moved']}")
     page.evaluate("() => window.__backTrace.mark('back settled')")
     trace = back_trace_stop()
+    # `#2270`: the bubble came back with the view: on the row returned to, off the reply.
+    after_linked: object = page.evaluate(linked_probe)
+    check(isinstance(after_linked, list) and ids["main_msg"] in after_linked and ids["reply_msg"] not in after_linked,
+          f"{label}: after Back the Linked bubble is not on the row returned to (main {ids['main_msg']},"
+          f" reply {ids['reply_msg']}): {after_linked}")
     if shots is not None:
         page.screenshot(path=str(shots / f"{label}-back-returned.png"))
         (shots / f"{label}-back-sidecar.json").write_text(json.dumps({
             "label": label, "row": ids["main_msg"], "expected_top": anchor_top,
             "before": f"{label}-before-reply-tap.png", "before_row": before_row,
             "after": f"{label}-back-returned.png", "after_row": page.evaluate(row_probe),
+            "before_linked": before_linked, "after_linked": after_linked,
             "max_drift_px": settled["drift"], "watched_frames": settled["frames"]}, indent=2) + "\n")
         (shots / f"{label}-back-trace.json").write_text(json.dumps({
             "label": label, "row": ids["main_msg"], "expected_top": anchor_top,
