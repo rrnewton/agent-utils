@@ -1582,5 +1582,10 @@ def test_usage_keeps_the_first_error_when_stat_and_statvfs_both_fail(
     report = slotimage.usage(image)
     slot_entry = report["slot"]
     assert isinstance(slot_entry, dict)
-    assert "Errno 2" in str(slot_entry["error"])
-    assert "107" not in str(slot_entry["error"])
+    error = str(slot_entry["error"])
+    assert "Errno 2" in error
+    # Name the later statvfs error by its own words: the text embeds the image
+    # path, whose pytest temp directory carries the process ID, so a bare "107"
+    # can appear there by chance (#2345 slot-images-errno-substring).
+    assert f"Errno {errno.ENOTCONN}" not in error
+    assert os.strerror(errno.ENOTCONN) not in error
