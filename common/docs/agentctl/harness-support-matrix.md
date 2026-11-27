@@ -334,7 +334,65 @@ progress in `rs/agentctl/src/work_state.rs` and
   the wrapper over its control socket; queued inputs stay queued
   (`rs/agentctl/src/headless/control.rs`). The `interrupt` command
   itself is headless-only; interactive interrupt rides on `send
-  --urgent` and the watcher's auto-deliver policy.
+  --urgent` and the watcher's auto-deliver policy. Inputs that had
+  already started in the interrupted turn are not queued again; see
+  the next row.
+
+### Headless delivery, interrupt and cancelled inputs
+
+How a headless agent's wrapper (`rs/agentctl/src/headless/wrapper.rs`)
+hands queued inputs to the harness, what an interrupt does to them, and
+what `agentctl tail` prints (`rs/agentctl/src/headless/tail.rs`). Claude
+Code is the harness observed here. Muse goes through the same queue code.
+
+**Two delivery modes.** Each queue item carries `deliver`. Older items
+without it count as `now` when their priority is `urgent`.
+
+- `turn-boundary`, the default for `agentctl send`. The item waits until
+  the agent is idle. Idle items go to the harness as one combined input,
+  owner items first. A slash command or turnover item always goes alone.
+- `now`, from `send --urgent` to a headless agent, or the chat bridge's
+  `--deliver-while-working`. This applies to every bridged owner message
+  when the bridge runs with that option. The item is written into the
+  running turn, one at a time, and Claude Code starts it at the next tool
+  boundary (`tail`: `↳ started [ID] mid-turn`). This is **not** an
+  interrupt. A tool call that is running keeps running, so its length
+  bounds how long a `now` item waits. For a headless agent, `send
+  --urgent` only sets `deliver: now`. The Escape-interrupt that its help
+  text describes is the interactive path.
+
+Either way, only one input is in flight at a time, and the queue settles
+an item when the harness reports that the model started it.
+
+**What an interrupt does.** The triggers are `agentctl interrupt NAME`,
+or `/interrupt` in `agentctl console`.
+
+- The wrapper sends Claude Code a `control_request` of subtype
+  `interrupt` and kills nothing itself. Claude Code stops the running
+  tool call and ends the turn (observed with 2.1.319: a 463 s turn ended
+  about a second after the request). `tail` prints `!! interrupt requested`,
+  then `turn N interrupted · ...` (subtype `error_during_execution`
+  while an interrupt was requested). The same subtype without an
+  interrupt request prints `turn N error`.
+- A bare interrupt holds all delivery for 30 s, or until the next
+  console line, so the owner can type what comes next. `/interrupt
+  MSG` queues MSG as the next turn instead.
+- Items still in the queue are untouched and run next, in their usual
+  order.
+
+**The cancelled lines in `tail`**, from `input.cancelled` events:
+
+| Line | Meaning | What happens to the item |
+| --- | --- | --- |
+| `↳ cancelled [ID] before the model saw it; returned to the queue` | the harness dropped the input before the model started it, usually because the turn it was written into was interrupted | moved back to its queue lane as pending, every member of a combined input with it; offered again 2 s later |
+| `↳ cancelled [ID] after the model saw it` | the input had started (it is in the model's context) and its turn was then interrupted | stays processed and is **not** delivered again. The model has the text in its history, but no turn answers it unless a later input asks |
+| `↳ cancelled [] after the model saw it` | the same, for an input this wrapper generation did not write (for example one recovered after a wrapper restart), so it has no queue ID | as above |
+
+A queue item set aside before delivery (its `--ttl` expired, a newer
+item with the same `--supersede-key` replaced it, or a tombstone
+cancelled it) produces no `tail` line. It sits in the queue's
+`cancelled/` directory with its reason, `expired`, `superseded` or
+`cancelled` (`rs/agent-queue/src/queue.rs`).
 
 ### Approvals relay to chat
 
