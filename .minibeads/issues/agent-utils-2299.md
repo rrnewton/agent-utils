@@ -3,11 +3,12 @@ title: 'finish-archive-remove-budget: the ignored-only archive test fails on unt
 status: open
 priority: 2
 issue_type: bug
+assignee: cl-flaketriage
 labels:
 - wrkslots
 - tests
 created_at: 2026-11-26T11:04:50-05:00
-updated_at: 2026-11-26T11:04:50-05:00
+updated_at: 2026-11-26T21:50:00-05:00
 ---
 
 # Description
@@ -29,3 +30,6 @@ If neither lands promptly, disable the test under this issue (marked with the is
 # Notes
 
 Filed from the #2000 gate triage (mu-restoreboot, 2026-11-26): the test failed in python.wrkslots.shard-4/10 rows on a lock-order tree, passed 5/5 solo on that tree, and failed 1 of 3 solo on untouched main at load1 249.77 with the identical salvage-budget refusal. Related: #2000 wrkslots-lock-order (the gate that surfaced it), #2065 (census-family quarantine — same host-load class, different mechanism).
+
+Extended to four tests (cl-flaketriage, 2026-11-26, coordinator's call): `test_ignored_only_discard_finishes_and_remove_deletes`, `test_ignored_only_archive_finishes_with_verified_tar`, `test_many_ignored_files_finish_bounded_and_remove_enforces` and `test_many_ignored_files_below_writer_ceiling_stay_legacy` all went red in one gate of `#2306` (load1 about 500-600): one met the remove batch's 60-second budget at the /proc scan, three passed run_pytest_shard's 600 s per-test limit inside the remove subprocess, which was in the host-wide `lsof +D` census. On main, 5 solo runs each at load1 130-184 passed 20 of 20 but took 64-201 s per test (the 70-file bounded case 131-201 s): the cost is the host-wide census, not the tests. Test-only fix: the two removes without `--no-lock-budget` get it, and the four tests carry a 1800 s hang backstop (`@pytest.mark.timeout(1800)`), documented as such; no assertion changes. These tests still take minutes on a loaded host, which breaks the fast-tests rule (owner reply 346): `#1896 wrkslots-batch-census-without-lsof` and `#2219 wrkslots-cpu-time-budgets` must bring them back down, or they move out of the default selection.
+
