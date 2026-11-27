@@ -16,7 +16,7 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -413,8 +413,38 @@ def test_validate_mount_fence_without_a_bind_record(
     assert worktreesimage.load_bind_records(control)["v1"].target == str(fenced)
 
 
+@pytest.fixture
+def fake_proc_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Path]]:
+    """`#2372 wrkslots-image-tests-real-mount-scan`: the busy-holder scan reads a fixture process tree.
+
+    A failed unmount names its holders from every process's mount table, and on a loaded host the
+    real /proc holds thousands of processes with about a thousand mounts each: those scans, once
+    per retry and recheck, took the tests past their timeout. One process here, holding nothing.
+    The guard fails the test if the scan ran from any other root, or never ran.
+    """
+
+    root = tmp_path / "proc"
+    pid = root / "4242"
+    pid.mkdir(parents=True)
+    (pid / "mountinfo").write_text("25 1 0:21 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n", encoding="utf-8")
+    monkeypatch.setattr(worktreesimage, "_PROC_ROOT", root)
+    real_scan = worktreesimage.scan_mount_holders
+    roots: list[Path] = []
+
+    def scan(
+        target: Path, proc_root: Path | None = None, entries: Sequence[slotimage.MountEntry] | None = None
+    ) -> list[worktreesimage._MountHolder] | None:
+        roots.append(worktreesimage._PROC_ROOT if proc_root is None else proc_root)
+        return real_scan(target, proc_root=proc_root, entries=entries)
+
+    monkeypatch.setattr(worktreesimage, "scan_mount_holders", scan)
+    yield roots
+    assert roots, "the holder scan never ran, so this test no longer covers the failed unmount"
+    assert all(one == root for one in roots), f"the holder scan read a process tree other than the fixture: {roots}"
+
+
 def test_validate_mount_fence_refuses_when_the_unmount_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_proc_root: list[Path]
 ) -> None:
     # #1318: an unmount failure fails closed naming the mount; the
     # checkout, its mount and the subvolume stay for a retry.
@@ -450,7 +480,7 @@ def test_validate_mount_fence_refuses_when_the_unmount_fails(
 
 
 def test_remove_refuses_when_the_bind_unmount_fails_and_a_retry_finishes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_proc_root: list[Path]
 ) -> None:
     config = _config(tmp_path, worktreesimage.MOUNTED)
     control = config.control
