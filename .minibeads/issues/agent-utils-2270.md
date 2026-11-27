@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-linked-bubble-follows-back: after Back from a citation jump the Linked message bubble returns to the row the reader came back to'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - owner-ui
 - ui
 created_at: 2026-11-25T17:56:00-05:00
-updated_at: 2026-11-25T17:56:00-05:00
+updated_at: 2026-11-27T04:05:00-05:00
+closed_at: 2026-11-27T04:05:00-05:00
 ---
 
 # Description
@@ -33,3 +34,7 @@ Seen in the #2261 evidence, the same on main before and after that fix: the befo
 # Notes
 
 Filed at the liaison's request from the #2261 review (2026-11-25). A small owner-UI follow-up, not fast-tracked.
+
+## Resolution
+
+[claude-opus-5-5, lane cl-pagenits] Landed in 117c7fa6 (2026-11-27 12:25 AM ET, liaison LAND NOW on an owner gate). A link jump keeps the Linked mark it found (`NavLinkSpot.mark`), and Back puts it back on the row it returns to before the put-back (`restoreMark`); a spot that never read a mark, or a mark the reader put out after the jump, is left alone. tests/js/view/shell-navigation.test.mjs covers the mark through the jump and Back; tests/summary_link_browser.py checks the Linked rows before the jump and after Back, with the row's text and rect.top in its sidecar.

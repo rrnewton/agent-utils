@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-reach-sentence-beside-server-hits: in All and Main the "does not reach yet" sentence stands beside the server hits'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-25T17:55:00-05:00
-updated_at: 2026-11-25T17:55:00-05:00
+updated_at: 2026-11-27T04:05:00-05:00
+closed_at: 2026-11-27T04:05:00-05:00
 ---
 
 # Description
@@ -33,3 +34,7 @@ Shown in the page model (the search fold fixture, Main and All, a word only the 
 # Notes
 
 Owner-UI (not fast-track). Filed by cl-searchview at the coordinator's request, from the liaison's review of the #2251 evidence. Related: #595 cache-full-history (the sentence), #2251 vibe-talk-search-current-view-scope (drops it in a thread view), #2200 vibe-talk-search-tab-counts-match-cards (the fold and its count), #2268 vibe-talk-search-none-match-line-overflow (the same line's layout).
+
+## Resolution
+
+[claude-opus-5-5, lane cl-pagenits] Landed in 468caeb8 (2026-11-27 1:09 AM ET, liaison LAND NOW on an owner gate, landed over a disjoint change with the replayed tree checked). The "does not reach yet" sentence is said only while the server's search has not answered over the whole history: `serverAnsweredWholeHistory()` (olderwalks.ts) is true once the selected channel's server answer is settled, whole and has no resume point, and searchrows.ts leaves the reach sentence out then. tests/js/page/search.mjs covers both ways; tests/search_reach_server_browser.py (dag 186) checks it against the real server binary in light and dark.

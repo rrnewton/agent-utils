@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-discuss-hours-field-scale: the Discuss hours field switches to days past a day or two and never clips'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-25T10:15:00-05:00
-updated_at: 2026-11-25T10:15:00-05:00
+updated_at: 2026-11-27T04:05:00-05:00
+closed_at: 2026-11-27T04:05:00-05:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ This is not only a fixture artifact. The field shows the hours since the oldest 
 # Notes
 
 Filed at the coordinator's request as a side finding of #2233; not part of it.
+
+## Resolution
+
+[claude-opus-5-5, lane cl-pagenits] Landed in 22f69412 (2026-11-27 12:40 AM ET, liaison LAND NOW on an owner gate). Past 48 hours (`BOUND_DAYS_FROM_HOURS`) the bound's field reads in days (floored to one decimal under 10, whole from 10) with its unit word beside it, and what is typed is taken in that unit; the field is as wide as its value plus its room (`--discuss-hours-chars`), never under 8ch. tests/js/view/catchup.test.mjs (two tests), the TUNING_BANDS pin, and tests/discuss_browser.py (the step accepts days; a seven-character value fits whole).

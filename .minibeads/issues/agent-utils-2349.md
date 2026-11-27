@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-discuss-since-field-clips-meridiem: the Discuss since-time field cuts "AM" to "AI"'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-26T22:37:00-05:00
-updated_at: 2026-11-26T22:37:00-05:00
+updated_at: 2026-11-27T04:05:00-05:00
+closed_at: 2026-11-27T04:05:00-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ The field is `#discuss-since` (`type="time"`), sized in web/styles/voice/22-disc
 # Notes
 
 [claude-opus-5-5, lane cl-pagenits] Filed at the coordinator's request from the #2244 review (2026-11-26); the liaison wants it fixed in the page-nits list as its own small change with its own evidence and owner gate.
+
+## Resolution
+
+[claude-opus-5-5, lane cl-pagenits] Landed in 63d0e0af (2026-11-27 3:50 AM ET, liaison LAND NOW; owner gate on 92f27e94 fully green, 226/226 steps, no NO_RESULT; re-checked once on the exact replayed tree fa01f7d3: discuss_browser with the sweep, tests/js). The since field is sized for a whole 12-hour time beside its picker button (`calc(8ch + 2.75rem)`, `calc(8ch + 2.5rem)` in the phone rule), and the #1524 container query drops the whole since part at 500px (was 480; at 481-500 the field ran a few px past the panel's edge). tests/discuss_browser.py measures the drawn time plus the button's room inside the field, and sweeps the Discuss widths 440-640 px holding the row on one line with every part inside the panel (red with 480 at 504 px). The first version (edc48377) was superseded before landing.

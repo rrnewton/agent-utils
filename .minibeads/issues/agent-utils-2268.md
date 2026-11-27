@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-none-match-line-overflow: on desk the search None-match line runs past the message column edge'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-25T17:55:00-05:00
-updated_at: 2026-11-25T17:55:00-05:00
+updated_at: 2026-11-27T04:05:00-05:00
+closed_at: 2026-11-27T04:05:00-05:00
 ---
 
 # Description
@@ -32,3 +33,7 @@ Cause: `#search-empty` (`.search-empty`, styles/voice/01-top-bar.css) sits at th
 # Notes
 
 Owner-UI (not fast-track). Filed by cl-searchview at the coordinator's request, from the liaison's review of the #2251 evidence (desk shots of scene 127-search-scope-thread-elsewhere). Related: #2251 vibe-talk-search-current-view-scope, #129 message-search, #2269 vibe-talk-search-reach-sentence-beside-server-hits (the same line's last sentence).
+
+## Resolution
+
+[claude-opus-5-5, lane cl-pagenits] Landed in 341cb049 (2026-11-26 11:56 PM ET, liaison LAND NOW on an owner gate). The None-match line and the Search All chip (`#search-empty`, `#search-in-all`) stand in the reading column: `max-width: var(--reading-width)`, centred, with 0.5rem of side room, so on a desk the line wraps inside the message column instead of running the screen's width; the two-column layout and the side column's own line (`#side-search-empty`) keep their columns. tests/search_empty_column_browser.py (dag 185) measures the line inside the column at 1280, 1920 and 412 px in All and Main; screenshot scenes 129-search-none-match-all and 129-search-none-match-main show it.
