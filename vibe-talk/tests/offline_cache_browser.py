@@ -282,6 +282,49 @@ def thread_of(row: Json) -> Json:
 _CHANNEL_READ = re.compile(r"^GET /api/v1/channels/([^/]+)/(?:timeline\?.*|page(?:\?.*)?)$")
 
 
+# `#2404 vibe-talk-small-drag-reads-channel`. The pull-to-refresh checks count what the PAGE issues, in
+# the order it issues it, never what the fake API happens to have received by some moment. A read the
+# page issued before the finger landed (above all the poll the paused clock's catch-up lets out just
+# before the drag) can reach the fake API late on a loaded host. Counted by arrival, it was taken for
+# the drag's read. Every channel read (timeline or page) and every read mark (/read, /upstream-read)
+# is logged with its reason; `open` is how many are unanswered. `gestures` counts touchends, each
+# marked done one task after the touch's own handlers ran: a MessageChannel task, which the paused
+# page clock does not hold.
+CHANNEL_READS_JS = r"""(() => {
+  const reads = {log: [], open: 0, gestures: 0};
+  Object.defineProperty(window, '__channelReads', {value: reads});
+  const watched = /^\/api\/v1\/channels\/[^/]+\/(timeline|page|read|upstream-read)$/;
+  const send = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+    let url = null;
+    try { url = new URL(String((input && input.url) || input), location.href); } catch (error) { url = null; }
+    const found = url && watched.exec(url.pathname);
+    const counted = found && (method === 'GET' ? found[1] === 'timeline' || found[1] === 'page' : method === 'POST'
+      && (found[1] === 'read' || found[1] === 'upstream-read'));
+    if (!counted) return send(input, init);
+    reads.log.push({method, route: found[1], reason: url.searchParams.get('reason'), before: url.searchParams.has('before')});
+    reads.open += 1;
+    return send(input, init).finally(() => { reads.open -= 1; });
+  };
+  const done = new MessageChannel();
+  done.port1.onmessage = () => { reads.gestures += 1; };
+  window.addEventListener('touchend', () => done.port2.postMessage(0), {capture: true, passive: true});
+})();"""
+
+# Resolves once no counted request is unanswered at two task boundaries in a row: an answer that leads
+# the page straight on to another read is seen. Tasks, not timers, so the paused page clock never holds it.
+READS_SETTLED_JS = """() => new Promise((resolve) => {
+  const channel = new MessageChannel();
+  let quiet = 0;
+  channel.port1.onmessage = () => {
+    quiet = window.__channelReads.open === 0 ? quiet + 1 : 0;
+    if (quiet >= 2) resolve(true); else channel.port2.postMessage(0);
+  };
+  channel.port2.postMessage(0);
+})"""
+
+
 class FakeApi:
     """The routes the page reads, answering from one mutable little store."""
 
@@ -2536,6 +2579,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             )
             browser_waits.hot_host_timeouts(context)
             page = context.pages[0]
+            if mobile:
+                context.add_init_script(CHANNEL_READS_JS)  # `#2404`: the pull checks count what the page issues
             # Time flows as normal; `#32`'s in-place step jumps it past the channel's poll.
             page.clock.install()
             errors: list[str] = []
@@ -3023,42 +3068,34 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 # clock stands still while the finger is down; the fetch itself needs no timer. Then
                 # a moment for anything those timers already put on the wire to land before counting.
                 page.clock.pause_at(int(page.evaluate("() => Date.now()")) + 1000)
-                # `#1512`: until the request record is unchanged over consecutive
-                # polls, not a fixed 500/400 ms a loaded host could outrun.
-                stable = 0
-                seen_count = -1
-                while stable < 3:
-                    page.wait_for_timeout(50)
-                    with api.lock:
-                        now_count = len(api.requests)
-                    stable = stable + 1 if now_count == seen_count else 0
-                    seen_count = now_count
-                with api.lock:
-                    seen = len(api.requests)
-                reads_before = len(api.reads())
-                drag_up(30)
-                stable = 0
-                seen_count = -1
-                while stable < 3:
-                    page.wait_for_timeout(50)
-                    with api.lock:
-                        now_count = len(api.requests)
-                    stable = stable + 1 if now_count == seen_count else 0
-                    seen_count = now_count
-                with api.lock:
-                    during = api.requests[seen:]
-                check(len(api.reads()) == reads_before,
-                      f"{label}: a 30px drag at the newest line read the channel; requests since: {during}")
+                # `#2404`: whatever the catch-up let out (the poll that fell due) is answered before
+                # the finger lands, and only what the page issues AFTER it lands is the drag's: the
+                # page's own record, in its own order, so a request that merely arrives late at the
+                # fake API is never taken for the drag's (the old count was by arrival, #1512).
+                page.evaluate(READS_SETTLED_JS)
+
+                def gesture(travel: float) -> list[Json]:
+                    """What the page issued for one drag: a touch's handlers done, its reads answered."""
+                    mark, gestures = page.evaluate(
+                        "() => [window.__channelReads.log.length, window.__channelReads.gestures]")
+                    drag_up(travel)
+                    page.wait_for_function(f"() => window.__channelReads.gestures > {gestures}")
+                    page.evaluate(READS_SETTLED_JS)
+                    issued: list[Json] = page.evaluate(f"() => window.__channelReads.log.slice({mark})")
+                    return issued
+
+                during = gesture(30)
+                check(not during, f"{label}: a 30px drag at the newest line read the channel or marked it read: {during}")
                 check(affordance()[0] == "", f"{label}: a short drag left the affordance up: {affordance()}")
-                drag_up(160)
+                fresh = gesture(160)
                 deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not affordance()[0].startswith("Updated"):
                     page.wait_for_timeout(50)
                 shown = affordance()
                 shot("4c-pulled-up")
-                fresh = api.reads()[reads_before:]
-                check(len(fresh) == 1 and "before=" not in fresh[0],
-                      f"{label}: a pull up past the newest line made {len(fresh)} reads: {fresh}")
+                check(len(fresh) == 1 and fresh[0]["route"] in ("timeline", "page") and fresh[0]["reason"] == "pull"
+                      and not fresh[0]["before"],
+                      f"{label}: a pull up past the newest line made {len(fresh)} requests: {fresh}")
                 check(re.fullmatch(r"Updated \d{2}:\d{2} · nothing new", shown[0]) is not None
                       and shown[2] == "end", f"{label}: the foot of the list said {shown}")
                 check(bool(page.evaluate("() => window.pullRefreshPageMark === true")),
