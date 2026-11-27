@@ -2582,6 +2582,12 @@ def _act_summary_failed(driver: Driver) -> None:
     driver.settle(300)
 
 
+#: `#2324`: the server search's line no longer says it is still searching (nor that it failed).
+SERVER_SEARCH_SETTLED_JS = (
+    "!/^(Searching the server|The server could not be searched)/.test(window.__text('server-line') || '')"
+)
+
+
 def _act_message_search(driver: Driver) -> None:
     """`#129 message-search`: the glass open over the channel, with a quoted phrase in it.
 
@@ -2618,6 +2624,13 @@ def _act_message_search(driver: Driver) -> None:
         "&& document.getElementById('load-older').textContent.indexOf('Searching') !== 0",
         timeout=20_000,
     )
+    # `#2324 vibe-talk-shots-scene-35-settle`. On a server that serves its copy (a run that also
+    # photographs Discuss), the server's own search for the phrase is still out when the loaded
+    # rows have been filtered, and a picture taken then shows "Searching the server…": a moment,
+    # not the search. Wait for its line to say what it found (a condition; this deadline is
+    # stretched under load like every wait here). A cacheless server never asks, and its line
+    # already reads "Search the server".
+    driver.page.wait_for_function(f"() => {SERVER_SEARCH_SETTLED_JS}", timeout=20_000)
     driver.settle(300)
 
 
@@ -8907,6 +8920,12 @@ SCENES: tuple[Scene, ...] = (
                 "the count is on screen and names what it counted out of",
                 "window.__visible('search-count') && "
                 "/\\bof \\d+ loaded\\b/.test(window.__text('search-count') || '')",
+            ),
+            (
+                # `#2324`: the picture is of the search's answer, never of the server search still
+                # out ("Searching the server…") or of its failure.
+                "the server's search has answered: its line says neither searching nor failed",
+                SERVER_SEARCH_SETTLED_JS,
             ),
             (
                 # The layout claim, and the reason this scene runs on iphone-se as well. Field,
