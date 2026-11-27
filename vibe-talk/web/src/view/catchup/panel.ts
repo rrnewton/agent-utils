@@ -745,6 +745,40 @@ export function formatHoursFloor1(sinceMs: number | null, nowMs: number): string
   return hoursFloor1(sinceMs, nowMs).toFixed(1);
 }
 
+/**
+ * `#2244 vibe-talk-discuss-hours-field-scale`: past two days the bound reads in days, so a channel
+ * whose oldest unread is weeks or years old never shows "1008.0" (or "37920.6") hours in a field
+ * sized for a few digits.
+ */
+export const BOUND_DAYS_FROM_HOURS = 48;
+
+/** The unit the bound's field shows: hours, or days past `BOUND_DAYS_FROM_HOURS`. */
+export type BoundUnit = "hours" | "days";
+
+/** `#2244`: the unit for a bound `hours` long. */
+export function boundUnitFor(hours: number): BoundUnit {
+  return Number.isFinite(hours) && hours >= BOUND_DAYS_FROM_HOURS ? "days" : "hours";
+}
+
+/** `#2244`: hours in one `unit`. */
+export function hoursPerUnit(unit: BoundUnit): number {
+  return unit === "days" ? 24 : 1;
+}
+
+/**
+ * `#2244`: the dependent bound's text and unit, from `sinceMs` to `nowMs`. Under two days it is
+ * `formatHoursFloor1` in hours, as before. Past that, days: floored to one decimal under ten days
+ * ("2.5"), whole from ten ("41", "417"), since a tenth means nothing at that scale. Never rounded
+ * up (`#1817`: the bound never reaches past the message it stands for).
+ */
+export function formatBound(sinceMs: number | null, nowMs: number): { text: string; unit: BoundUnit } {
+  const hours = hoursFloor1(sinceMs, nowMs);
+  if (boundUnitFor(hours) === "hours") return { text: hours.toFixed(1), unit: "hours" };
+  const raw = sinceMs === null ? 0 : (nowMs - sinceMs) / (24 * HOUR_MS);
+  const days = raw < 10 ? (Math.floor(raw * 10) / 10).toFixed(1) : String(Math.floor(raw));
+  return { text: days, unit: "days" };
+}
+
 /** How many unread fall at/after `nowMs - hours` (unknown times count as in). */
 export function countForHours(unread: readonly CatchupUnreadRef[], hours: number, nowMs: number): number {
   // `#1817`: hours are a free variable as typed (fractions included); no
@@ -2347,6 +2381,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   // owner's and is never rewritten; only the dependent end follows.
   let boundOwner: "count" | "hours" | "since" | null = null;
   let boundHours: number | null = null;
+  // `#2244`: the unit the hours field shows, and the value as typed in it while the hours end
+  // owns the bound (`boundHours` is always hours). The unit follows the bound's length while
+  // another end owns it, and stays the typed one while the reader's own value stands.
+  let boundUnit: BoundUnit = "hours";
+  let boundTyped: number | null = null;
   let editingBoundInput: HTMLInputElement | null = null;
   let drawingBound = false;
   let lastSinceMs: number | null = null;
@@ -2402,6 +2441,25 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   }
 
   /** Draw the Summarize bound: its button, and the three linked ends of it. */
+  /**
+   * `#2244`: the word after the hours field and its name say the unit it shows, and the field is
+   * as wide as its value (`--discuss-hours-chars`, read by 22-discuss.css), so no value is cut.
+   */
+  function sayBoundUnit(hours: HTMLInputElement): void {
+    const unit = maybe("discuss-hours-unit");
+    if (unit !== null && unit.textContent !== boundUnit) unit.textContent = boundUnit;
+    const label = boundUnit === "days" ? "Days since the bound" : "Hours since the bound";
+    if (hours.getAttribute("aria-label") !== label) hours.setAttribute("aria-label", label);
+    sizeBoundField(hours);
+  }
+
+  function sizeBoundField(hours: HTMLInputElement): void {
+    const style = hours.style;
+    if (style && typeof style.setProperty === "function") {
+      style.setProperty("--discuss-hours-chars", String(String(hours.value || "").length));
+    }
+  }
+
   function drawBound(): void {
     const button = deps.byId("discuss-summarize") as HTMLButtonElement;
     const count = deps.byId("discuss-count") as HTMLInputElement;
@@ -2420,12 +2478,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       try {
         if (editingBoundInput !== count) count.value = boundOwner === "count" ? String(boundCount) : "0";
         if (editingBoundInput !== hours) {
-          hours.value = boundOwner === "hours" && boundHours !== null ? String(boundHours) : "";
+          hours.value = boundOwner === "hours" && boundTyped !== null ? String(boundTyped) : "";
         }
         if (editingBoundInput !== since) since.value = "";
       } finally {
         drawingBound = false;
       }
+      sayBoundUnit(hours);
       return;
     }
     const bound = currentBound();
@@ -2440,9 +2499,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         count.value = boundOwner === "count" ? String(boundCount) : String(bound.count);
       }
       if (editingBoundInput !== hours) {
-        hours.value = boundOwner === "hours" && boundHours !== null
-          ? String(boundHours)
-          : formatHoursFloor1(bound.sinceMs, nowMs());
+        if (boundOwner === "hours" && boundTyped !== null) {
+          hours.value = String(boundTyped);
+        } else {
+          const shown = formatBound(bound.sinceMs, nowMs());
+          boundUnit = shown.unit;
+          hours.value = shown.text;
+        }
       }
       if (editingBoundInput !== since) {
         since.value = bound.sinceMs === null ? "" : hhmm(bound.sinceMs);
@@ -2450,6 +2513,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     } finally {
       drawingBound = false;
     }
+    sayBoundUnit(hours);
     // `#1382`: the button says only "Summarize"; the line beside it carries the bound.
     button.textContent = "Summarize";
   }
@@ -2488,6 +2552,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         boundStartMs = null;
         boundOwner = null;
         boundHours = null;
+        boundTyped = null;
         // `#1842`: with a prior summary in this scope, the default bound
         // starts where it ended, so repeated Summaries are contiguous.
         const coveredEnd = lastCoveredEnd(scope);
@@ -2758,6 +2823,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           if (countInput.value.trim() === "" || !Number.isFinite(parsed) || parsed < 0) return;
           boundOwner = "count";
           boundHours = null;
+          boundTyped = null;
           boundCount = Math.trunc(parsed);
           boundStartMs = boundForCount(previewUnread, boundCount).sinceMs;
           drawBound();
@@ -2765,11 +2831,15 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         listening.listen(hoursInput, "input", () => {
           if (drawingBound) return;
           editingBoundInput = hoursInput;
+          sizeBoundField(hoursInput);
           const parsed = Number(hoursInput.value);
           if (hoursInput.value.trim() === "" || !Number.isFinite(parsed) || parsed <= 0) return;
-          const bound = boundForHours(previewUnread, parsed, nowMs());
+          // `#2244`: typed in the unit the field shows (days past two days), held as hours.
+          const typedHours = parsed * hoursPerUnit(boundUnit);
+          const bound = boundForHours(previewUnread, typedHours, nowMs());
           boundOwner = "hours";
-          boundHours = parsed;
+          boundHours = typedHours;
+          boundTyped = parsed;
           boundCount = bound.count;
           boundStartMs = bound.sinceMs;
           drawBound();
@@ -2779,6 +2849,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           editingBoundInput = sinceInput;
           boundOwner = "since";
           boundHours = null;
+          boundTyped = null;
           boundCount = countSince(previewUnread, sinceInput.value);
           boundStartMs = boundForCount(previewUnread, boundCount).sinceMs;
           drawBound();

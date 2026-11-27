@@ -114,7 +114,7 @@ const IDS = [
   "discuss-actions", "discuss-resize", "discuss-head", "discuss-title",
   "discuss-search", "discuss-search-toggle", "discuss-search-input", "discuss-search-results", "discuss-search-status",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
-  "discuss-summarize", "discuss-count", "discuss-since", "discuss-hours",
+  "discuss-summarize", "discuss-count", "discuss-since", "discuss-hours", "discuss-hours-unit",
   // `#1531 discuss-top-bar-slim-fixed`: no #discuss-read in the top bar; the
   // bottom toolbar's #read-aloud (with #read-steer as its standing strip).
   "read-aloud", "read-steer",
@@ -418,6 +418,81 @@ test("catchup: the hours end moves together with N and since (#1524)", async () 
     click(fx.els["discuss-summarize"]);
     await flush();
     assert.equal(fx.calls.posts.at(-1).body.since_ms, now - 99 * 3_600_000);
+  } finally { fx.restore(); }
+});
+
+test("catchup: past two days the bound reads in days, whole from ten, and the field is as wide as its value (#2244)", async () => {
+  const now = new Date(2026, 8, 20, 12, 0).getTime();
+  const MIN = 60_000;
+  const HOUR = 60 * MIN;
+  // [oldest unread age, field text, unit]: minutes, hours, just past two days, ~42 days, ~417 days,
+  // and the years-old screenshot fixture's 37920.6 hours.
+  const cases = [
+    [30 * MIN, "0.5", "hours"],
+    [5.5 * HOUR, "5.5", "hours"],
+    [47.9 * HOUR, "47.9", "hours"],
+    [60 * HOUR, "2.5", "days"],
+    [(42 * 24 + 3) * HOUR, "42", "days"],
+    [(417 * 24 + 23) * HOUR, "417", "days"],
+    [37920.6 * HOUR, "1580", "days"],
+  ];
+  for (const [age, text, unit] of cases) {
+    const unread = [{ id: "a", at_ms: now - age, label: "A" }, { id: "b", at_ms: now - 10 * MIN, label: "B" }];
+    const fx = fixture({ nowMs: now, previewBody: { window: { count: 12, unread_count: 2 }, unread } });
+    try {
+      const view = createDiscussView(fx.deps);
+      view.mountControls();
+      view.open();
+      await flush();
+      const hours = fx.els["discuss-hours"];
+      assert.equal(hours.value, text, `an oldest unread ${age / HOUR} h old shows ${hours.value}`);
+      assert.equal(fx.els["discuss-hours-unit"].textContent, unit, `${text} is not said in ${unit}`);
+      assert.equal(hours.getAttribute("aria-label"), unit === "days" ? "Days since the bound" : "Hours since the bound");
+      assert.equal(hours.style.props["--discuss-hours-chars"], String(text.length), "the field is not sized to its value");
+    } finally { fx.restore(); }
+  }
+});
+
+test("catchup: typed in days or in hours, the bound is the same one (#2244)", async () => {
+  const now = new Date(2026, 8, 20, 12, 0).getTime();
+  const HOUR = 3_600_000;
+  const unread = [
+    { id: "a", at_ms: now - 42 * 24 * HOUR, label: "A" },
+    { id: "b", at_ms: now - 9 * 24 * HOUR, label: "B" },
+    { id: "c", at_ms: now - 2 * HOUR, label: "C" },
+  ];
+  const fx = fixture({ nowMs: now, previewBody: { window: { count: 12, unread_count: 3 }, unread } });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    const count = fx.els["discuss-count"];
+    const hours = fx.els["discuss-hours"];
+    assert.equal(hours.value, "42");
+    assert.equal(fx.els["discuss-hours-unit"].textContent, "days");
+    // Typed in the unit shown (days): 10 days takes b and c, and the typed text stays.
+    hours.value = "10";
+    fireInput(hours);
+    assert.equal(count.value, "2", "10 days did not reach the 9-day-old message");
+    assert.equal(hours.value, "10", "the typed days were rewritten");
+    assert.equal(fx.els["discuss-hours-unit"].textContent, "days", "the unit flipped under the reader's value");
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.equal(fx.calls.posts.at(-1).body.since_ms, now - 10 * 24 * HOUR, "10 days is not 240 hours back");
+    // The count end owns it again: the dependent end restates in its own unit.
+    count.value = "1";
+    fireInput(count);
+    assert.equal(hours.value, "2.0", "one message 2 h old is not 2.0 hours");
+    assert.equal(fx.els["discuss-hours-unit"].textContent, "hours");
+    // Typed in hours now: 240 hours is the same bound as 10 days.
+    hours.value = "240";
+    fireInput(hours);
+    assert.equal(count.value, "2");
+    assert.equal(fx.els["discuss-hours-unit"].textContent, "hours", "the unit flipped under the reader's value");
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.equal(fx.calls.posts.at(-1).body.since_ms, now - 240 * HOUR, "240 hours is not the bound 10 days set");
   } finally { fx.restore(); }
 });
 

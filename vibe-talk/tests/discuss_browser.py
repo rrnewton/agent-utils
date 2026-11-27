@@ -437,10 +437,14 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         "() => document.getElementById('discuss-hours').value === '150'",
         timeout=browser_waits.HANG_BACKSTOP_MS)
     page.fill("#discuss-count", "2")
+    # The dependent end restates the bound: floored hours (one decimal) under two days, and past
+    # that days (`#2244 vibe-talk-discuss-hours-field-scale`: this fixture's unread are over a year
+    # old, so whole days), the word after the field saying which.
     page.wait_for_function(
         "() => document.getElementById('discuss-count').value === '2'"
         " && document.getElementById('discuss-hours').value !== ''"
-        " && document.getElementById('discuss-hours').value.includes('.')",
+        " && (document.getElementById('discuss-hours').value.includes('.')"
+        " || document.getElementById('discuss-hours-unit').textContent === 'days')",
         timeout=browser_waits.HANG_BACKSTOP_MS)
     # `#1527 discuss-summarize-bottom-bar-mobile`: on a phone the ask row is a
     # bar at the pane's bottom with Summarize rightmost; on a desk it stays
@@ -482,6 +486,16 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         "() => { const el = document.getElementById('discuss-hours');"
         " return el.scrollWidth <= el.clientWidth + 1; }")
     check(fits, "the hours field cuts off a five-digit value")
+    # `#2244 vibe-talk-discuss-hours-field-scale`: the field grows with its value, so even a value
+    # past five characters (typed, or a bound centuries long) is never cut.
+    page.fill("#discuss-hours", "1234567")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-hours').value === '1234567'",
+        timeout=browser_waits.HANG_BACKSTOP_MS)
+    fits = page.evaluate(
+        "() => { const el = document.getElementById('discuss-hours');"
+        " return el.scrollWidth <= el.clientWidth + 1; }")
+    check(fits, "the hours field cuts off a seven-character value")
     heading = page.locator("#discuss-answer h2").first.text_content() or ""
     check(heading == "Progress", f"the answer did not render its heading: {heading!r}")
     # `#1525 fold-marker-on-heading-line`: the chevron shares the heading's

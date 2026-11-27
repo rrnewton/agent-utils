@@ -334,7 +334,11 @@
  * (12345) show in full there too, as the browser walk asserts. */
 #discuss-hours {
   width: 3.4rem;
-  min-width: 8ch;
+  /* `#2244 vibe-talk-discuss-hours-field-scale`: and never narrower than its value (its characters,
+     `--discuss-hours-chars`, set by web/src/view/catchup/panel.ts, plus room for the padding and a
+     desk's spin buttons), so a value past five characters grows the box instead of being cut. Past
+     two days the bound reads in days, so that is rare. */
+  min-width: max(8ch, calc((var(--discuss-hours-chars, 0) + 3) * 1ch));
   padding: 2px 4px;
   text-align: center;
 }

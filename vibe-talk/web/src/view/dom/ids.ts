@@ -150,6 +150,7 @@ export interface ElementById {
   "discuss-full-toggle": HTMLButtonElement;
   "discuss-head": HTMLDivElement;
   "discuss-hours": HTMLInputElement;
+  "discuss-hours-unit": HTMLSpanElement;
   "discuss-latest": HTMLElement;
   "discuss-links": HTMLUListElement;
   "discuss-mark-read": HTMLButtonElement;

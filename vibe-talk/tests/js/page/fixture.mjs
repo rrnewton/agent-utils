@@ -5869,6 +5869,10 @@ const TUNING_BANDS = {
   TIMELINE_MIN_PX: [32, 96,
     "the smallest expanded timeline body a drag or a key leaves (#2263): one folded row; it mirrors " +
     "the device setting's floor"],
+  // `#2244 vibe-talk-discuss-hours-field-scale`. Past this many hours the Discuss bound reads in
+  // days: no sooner than a day (a few hours must still read as hours), no later than a week (past
+  // that the hours run to four digits and the field cuts them).
+  BOUND_DAYS_FROM_HOURS: [24, 168, "hours past which the Discuss bound reads in days"],
   TIMELINE_COLLAPSE_BELOW_PX: [16, 48,
     "a boundary released with less timeline body than this collapses it (#2263): under a row's " +
     "worth it reads as a fold, past the floor a real small pane would collapse by surprise"],
