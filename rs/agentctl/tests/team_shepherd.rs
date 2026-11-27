@@ -44,6 +44,20 @@ struct GroupGuard {
     armed: std::cell::Cell<bool>,
 }
 
+/// Whether `pid` is a live process. A zombie counts as exited: its parent just has not reaped it
+/// yet, and `team_shepherd::claim_owner_alive` judges a claim's owner the same way.
+fn pid_alive(pid: u64) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace().next() != Some("Z"))
+        .unwrap_or(false)
+}
+
 /// Whether any process still belongs to group `pgid` (identity check
 /// before ever signalling it: a bare recycled id is never killed).
 fn group_exists(pgid: u32) -> bool {
@@ -805,6 +819,17 @@ fn recovery_smoke_records_profiles_and_start_recovery_claims_once() {
         let _ = Command::new("kill")
             .arg(supervisor_pid.to_string())
             .status();
+        // #2403: the kill only sends SIGTERM. Status reports supervisor-dead once the claim's owner
+        // has exited, so wait for that exit, with a generous bound and never a fixed sleep: on a
+        // loaded host the supervisor can outlive the next command's start.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while pid_alive(supervisor_pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "supervisor {supervisor_pid} is still alive 120 s after SIGTERM"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
     if let Some(restore_pid) = report["restore_pid"].as_u64() {
         let _ = restore_pid;
@@ -1134,17 +1159,6 @@ fn blocking_restore_blocks_stamp_and_acts_until_released() {
     fn read_json_at(dir: &Path, name: &str) -> Option<Value> {
         let path = find_named(dir, name)?;
         serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
-    }
-    fn pid_alive(pid: u64) -> bool {
-        if pid == 0 {
-            return false;
-        }
-        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        stat.rsplit_once(')')
-            .map(|(_, rest)| rest.split_whitespace().next() != Some("Z"))
-            .unwrap_or(false)
     }
     fn recorded_restore_alive(dir: &Path) -> bool {
         let Some(state_json) = read_json_at(dir, "state.json") else {
