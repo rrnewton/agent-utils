@@ -411,6 +411,8 @@ def test_real_holder_with_real_unclosed_census_refuses(
     assert seal_path.is_file()
 
 
+@pytest.mark.ordinary_environment(reason="the real scoped census needs host-visible processes (#2065)")
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: real scoped census under host churn
 def test_real_churn_with_real_census_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -512,6 +514,8 @@ def test_early_motion_with_real_holder_refuses(
     assert seal_path.is_file()
 
 
+@pytest.mark.ordinary_environment(reason="the real scoped census needs host-visible processes (#2065)")
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: real scoped census under host churn
 def test_evidence_changed_after_completed_round_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -380,6 +380,7 @@ def test_an_unreadable_thread_listing_refuses_each_snapshot(
 
 
 @_REAL_CENSUS_COMMANDS
+@pytest.mark.ordinary_environment(reason="the census commands are trusted only in the initial identity user namespace (#2065)")
 @pytest.mark.parametrize("hold", ("cwd", "fd"))
 def test_the_same_uid_census_reports_the_slot_the_thread_holds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold: str,
@@ -407,6 +408,7 @@ def test_the_same_uid_census_reports_the_slot_the_thread_holds(
 
 
 @_REAL_CENSUS_COMMANDS
+@pytest.mark.ordinary_environment(reason="the census commands are trusted only in the initial identity user namespace (#2065)")
 @pytest.mark.parametrize("hold", ("cwd", "fd"))
 def test_the_privileged_census_reports_the_slot_the_thread_holds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold: str,
@@ -432,6 +434,7 @@ def test_the_privileged_census_reports_the_slot_the_thread_holds(
 
 
 @_REAL_CENSUS_COMMANDS
+@pytest.mark.ordinary_environment(reason="the census commands are trusted only in the initial identity user namespace (#2065)")
 def test_a_leader_that_exits_under_running_threads_is_followed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -486,6 +489,7 @@ def test_a_leader_that_exits_under_running_threads_is_followed(
 
 
 @_REAL_CENSUS_COMMANDS
+@pytest.mark.ordinary_environment(reason="the census commands are trusted only in the initial identity user namespace (#2065)")
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
 def test_a_leader_that_exits_between_the_link_and_maps_readers_is_followed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str,
@@ -570,6 +574,7 @@ def test_a_leader_that_exits_between_the_link_and_maps_readers_is_followed(
 
 
 @_REAL_CENSUS_COMMANDS
+@pytest.mark.ordinary_environment(reason="the census commands are trusted only in the initial identity user namespace (#2065)")
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
 def test_leaders_that_exit_before_their_readers_are_followed_and_block(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str,
@@ -651,6 +656,7 @@ def test_leaders_that_exit_before_their_readers_are_followed_and_block(
 
 
 @_REAL_CENSUS_COMMANDS
+@pytest.mark.ordinary_environment(reason="the census commands are trusted only in the initial identity user namespace (#2065)")
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
 def test_a_thread_that_executes_after_the_snapshot_is_followed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str,
@@ -734,6 +740,7 @@ def test_an_executed_thread_is_neither_vanished_nor_active(tmp_path: Path) -> No
 
 
 @_REAL_CENSUS_COMMANDS
+@pytest.mark.ordinary_environment(reason="the census commands are trusted only in the initial identity user namespace (#2065)")
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
 def test_threads_that_execute_before_their_readers_are_followed_and_block(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str,

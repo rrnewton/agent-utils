@@ -472,6 +472,7 @@ def test_classify_live_seal_structured_blocking_reason_matches_python(
         ("operator-moved-cgroup", True),
     ),
 )
+@pytest.mark.ordinary_environment(reason="seal liveness is judged by host-visible process IDs (#2065)")
 def test_classify_unproven_dead_seal_blocks_in_both_editions(
     tmp_path: Path, shape: str, blocking: bool
 ) -> None:
@@ -512,6 +513,7 @@ def test_classify_unproven_dead_seal_blocks_in_both_editions(
     assert _scrub_report(result.stdout, rust_root) == _scrub_report(out, oracle_root)
 
 
+@pytest.mark.ordinary_environment(reason="seal liveness is judged by host-visible process IDs (#2065)")
 def test_classify_dead_seal_is_not_blocking_in_both_editions(
     tmp_path: Path,
 ) -> None:
@@ -898,6 +900,7 @@ def test_all_kinds_reports_import_and_finish_in_both_editions(
     assert _scrub_report(result.stdout, rust_root) == _scrub_report(out, oracle_root)
 
 
+@pytest.mark.ordinary_environment(reason="seal liveness is judged by host-visible process IDs (#2065)")
 def test_all_kinds_reports_dead_seal_as_nonblocking_in_both_editions(
     tmp_path: Path,
 ) -> None:

@@ -796,6 +796,8 @@ def _add_long_ignored_entries(root: Path) -> tuple[str, str]:
     return target, deep
 
 
+@pytest.mark.ordinary_environment(reason="the Rust census names the test's own child as a holder inside a PID and user namespace (#2065)")
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_ignored_long_symlink_archives_in_both_editions(
     tmp_path: Path,
 ) -> None:
@@ -832,6 +834,8 @@ def test_remove_ignored_long_symlink_archives_in_both_editions(
         assert archives[0] == archives[1]
 
 
+@pytest.mark.ordinary_environment(reason="the Rust census names the test's own child as a holder inside a PID and user namespace (#2065)")
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_ignored_file_archives_in_both_editions(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         rust_root, oracle_root = _pair(base)
@@ -868,6 +872,8 @@ def _add_dangling_copy(root: Path) -> None:
     (dangling / "file.txt").write_text("copied work\n")
 
 
+@pytest.mark.ordinary_environment(reason="the Rust census names the test's own child as a holder inside a PID and user namespace (#2065)")
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_dangling_gitfile_discards_in_both_editions(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         rust_root, oracle_root = _pair(base)
@@ -1432,6 +1438,8 @@ def _liveness_evidence(root: Path) -> list[dict[str, object]]:
     return found
 
 
+@pytest.mark.ordinary_environment(reason="the Rust census names the test's own child as a holder inside a PID and user namespace (#2065)")
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_records_the_same_liveness_line_as_python(tmp_path: Path) -> None:
     """#994: both editions record the dead line escaped, capped and flagged alike."""
 

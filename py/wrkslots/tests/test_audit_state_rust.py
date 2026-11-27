@@ -964,6 +964,7 @@ def _validate_cache_fixture(base: Path) -> tuple[Path, Path]:
     return root, cache
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_nested_repo_disposable_matches_python(
     tmp_path: Path,
 ) -> None:
@@ -976,6 +977,7 @@ def test_audit_validate_nested_repo_disposable_matches_python(
     assert row["verdict"] == "DELETABLE"
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_nested_core_worktree_matches_python(
     tmp_path: Path,
 ) -> None:
@@ -988,6 +990,7 @@ def test_audit_validate_nested_core_worktree_matches_python(
     assert "repository config sets core.worktree" in str(row["cache_error"])
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_nested_gitfile_matches_python(
     tmp_path: Path,
 ) -> None:
@@ -1001,6 +1004,7 @@ def test_audit_validate_nested_gitfile_matches_python(
     assert ".git file points to a repository directory outside the cache: /tmp/elsewhere" in str(row["cache_error"])
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_nested_linked_worktrees_matches_python(
     tmp_path: Path,
 ) -> None:
@@ -1148,6 +1152,7 @@ def _validate_fixture(base: Path) -> Path:
     return root
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_deletable_matches_python(tmp_path: Path) -> None:
     root = _validate_fixture(tmp_path)
     actual = _check(root, tmp_path)
@@ -1157,6 +1162,7 @@ def test_audit_validate_deletable_matches_python(tmp_path: Path) -> None:
     assert rows[0]["liveness_state"] == "dead"
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_absent_matches_python(tmp_path: Path) -> None:
     root = _validate_fixture(tmp_path)
     subprocess.run(
@@ -1170,6 +1176,7 @@ def test_audit_validate_absent_matches_python(tmp_path: Path) -> None:
     assert "recover-absent-validate-rows" in str(rows[0]["reasons"])
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_foreign_machine_matches_python(tmp_path: Path) -> None:
     root = _validate_fixture(tmp_path)
     _git(
@@ -1230,6 +1237,7 @@ def _dead_handle_identity() -> dict[str, object]:
         proc.wait()
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_unrelated_run_handle_matches_python(tmp_path: Path) -> None:
     root = _validate_fixture(tmp_path)
     _write_run_handle(
@@ -1241,6 +1249,7 @@ def test_audit_validate_unrelated_run_handle_matches_python(tmp_path: Path) -> N
     assert _rows(actual)[0]["verdict"] == "DELETABLE"
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_related_run_handle_matches_python(tmp_path: Path) -> None:
     root = _validate_fixture(tmp_path)
     checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
@@ -1254,6 +1263,7 @@ def test_audit_validate_related_run_handle_matches_python(tmp_path: Path) -> Non
     assert row["liveness_state"] == "dead"
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_relative_run_handle_matches_python(tmp_path: Path) -> None:
     root = _validate_fixture(tmp_path)
     _write_run_handle(
@@ -1267,6 +1277,7 @@ def test_audit_validate_relative_run_handle_matches_python(tmp_path: Path) -> No
     assert _rows(actual)[0]["verdict"] == "DELETABLE"
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_source_run_handle_matches_python(tmp_path: Path) -> None:
     root = _validate_fixture(tmp_path)
     checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
@@ -1281,6 +1292,7 @@ def test_audit_validate_source_run_handle_matches_python(tmp_path: Path) -> None
     assert _rows(actual)[0]["verdict"] == "DELETABLE"
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_dead_process_run_handle_matches_python(
     tmp_path: Path,
 ) -> None:
@@ -1298,6 +1310,7 @@ def test_audit_validate_dead_process_run_handle_matches_python(
     assert _rows(actual)[0]["verdict"] == "DELETABLE"
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_live_process_run_handle_matches_python(
     tmp_path: Path,
 ) -> None:
@@ -1322,6 +1335,7 @@ def test_audit_validate_live_process_run_handle_matches_python(
     assert row["liveness_state"] == "alive"
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_validate_other_boot_run_handle_matches_python(
     tmp_path: Path,
 ) -> None:
@@ -2131,6 +2145,7 @@ def _text_audits(root: Path, tmp_path: Path) -> tuple[str, str]:
     return stream.getvalue(), rust.stdout
 
 
+@pytest.mark.ordinary_environment(reason="validation-run handles are judged against host PIDs and the host's user-systemd units (#2065)")
 def test_audit_text_labels_match_the_json_verdicts(tmp_path: Path) -> None:
     """#1107: one verdict per row, the same in both formats and both editions."""
 

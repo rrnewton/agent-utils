@@ -57,6 +57,7 @@ def test_abort_own_create_without_coordinator_pid(tmp_path: Path) -> None:
     assert not checkout(project).exists()
 
 
+@pytest.mark.ordinary_environment(reason="owner liveness is judged by host-visible process IDs (#2065)")
 def test_abort_without_coordinator_refuses_a_foreign_journal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

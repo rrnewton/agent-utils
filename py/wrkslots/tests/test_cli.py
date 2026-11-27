@@ -1581,6 +1581,7 @@ def test_entry_compares_the_masks_again_from_the_spec_it_writes(
         ),
     ],
 )
+@pytest.mark.ordinary_environment(reason="isolated tool lookup trusts only root-owned executables and real scope masks (#2065)")
 def test_run_refuses_policy_options_where_they_cannot_apply(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1606,6 +1607,7 @@ def test_run_refuses_policy_options_where_they_cannot_apply(
     assert _calls(log) == []
 
 
+@pytest.mark.ordinary_environment(reason="isolated tool lookup trusts only root-owned executables and real scope masks (#2065)")
 def test_run_in_scope_print_reports_masks_and_expect_masks_binds_them(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1926,6 +1928,7 @@ def _hostile_git_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     return log
 
 
+@pytest.mark.ordinary_environment(reason="isolated tool lookup trusts only root-owned executables and real scope masks (#2065)")
 def test_isolated_lookup_before_the_view_inherits_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1955,6 +1958,7 @@ def test_isolated_lookup_before_the_view_inherits_nothing(
     assert log.exists() and "rev-parse" in log.read_text()
 
 
+@pytest.mark.ordinary_environment(reason="isolated tool lookup trusts only root-owned executables and real scope masks (#2065)")
 def test_isolated_lookup_refuses_an_unverified_git_executable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -415,6 +415,7 @@ def test_a_holder_born_after_the_first_listing_still_refuses(
         census.assert_slot_unused(slot, None, ignore_current_process=False)
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: argv/environ naming races late forks on a busy host; red on unrelated heads
 def test_naming_matches_read_argv_and_environ_from_proc(slot: Path) -> None:
     """The real argv/environ reader finds a target named by a live process."""
 
@@ -546,6 +547,7 @@ def _forking_holder(slot: Path) -> Iterator[tuple[subprocess.Popen[str], list[in
 
 
 @_REAL_CENSUS_COMMANDS
+@pytest.mark.ordinary_environment(reason="the census commands are trusted only in the initial identity user namespace (#2065)")
 def test_a_real_holder_that_forks_after_the_listing_and_exits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slot: Path,
 ) -> None:
@@ -663,6 +665,7 @@ while True:
 
 
 @_REAL_CENSUS_COMMANDS
+@pytest.mark.ordinary_environment(reason="the census commands are trusted only in the initial identity user namespace (#2065)")
 def test_a_real_holder_dying_during_the_batched_read_still_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slot: Path,
 ) -> None:

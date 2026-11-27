@@ -73,6 +73,8 @@ def _spawn_holder(path: Path) -> subprocess.Popen[str]:
     return holder
 
 
+@pytest.mark.ordinary_environment(reason="teardown falls back to a root-owned sudo and host scopes (#2065)")
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: teardown falls back to a live host census
 def test_teardown_without_a_slice_falls_back_to_the_census(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -139,6 +141,7 @@ def test_teardown_empty_slice_does_not_excuse_a_live_holder(
         holder.wait(timeout=10)
 
 
+@pytest.mark.ordinary_environment(reason="teardown falls back to a root-owned sudo and host scopes (#2065)")
 def test_sealed_remove_completes_through_the_teardown_closure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

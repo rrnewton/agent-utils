@@ -250,7 +250,7 @@ def test_wrkslots_shards_cover_sixteen_way_partition() -> None:
     per_step = {
         step.tag: set(_flag_values(step.cmd, "--shard"))
         for step in config.steps
-        if step.tag.startswith("python.wrkslots.")
+        if step.tag.startswith("python.wrkslots.shard-")
     }
     # #2065: a shard's command names its shard in the namespace branch and in the fallback;
     # each step still runs exactly one shard.
@@ -263,7 +263,8 @@ def test_wrkslots_shards_run_in_a_pid_namespace_and_the_host_step_runs_the_rest(
     """#2065 (owner rule 346): the sixteen non-lifecycle wrkslots shards run in their own PID and
     user namespace with a private /proc (the lifecycle shards' unprivileged wrapper: no sudo, no
     root mounts), so a removal census reads only the shard's processes; they deselect the
-    ordinary_environment cases, which python.wrkslots.host runs on the host, so no case is lost."""
+    ordinary_environment cases, which python.wrkslots.host-0..2 run on the host (under the
+    host-lifecycle cap), so no case is lost."""
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     steps = {step.tag: step for step in config.steps if step.tag.startswith("python.wrkslots.")}
     shards = [step for tag, step in steps.items() if tag.startswith("python.wrkslots.shard-")]
@@ -274,10 +275,16 @@ def test_wrkslots_shards_run_in_a_pid_namespace_and_the_host_step_runs_the_rest(
         assert "-m 'not ordinary_environment'" in step.cmd, step.tag
         assert "sudo" not in step.cmd and "WRKSLOTS_ALLOW_ROOT_TESTS" not in step.cmd, step.tag
         assert "validation-python-namespace-tests" in step.labels, step.tag
-    host = steps["python.wrkslots.host"]
-    assert "-m ordinary_environment" in host.cmd
-    assert "--component wrkslots" in host.cmd and "--shard" not in host.cmd
-    assert "unshare" not in host.cmd
+    hosts = sorted(tag for tag in steps if tag.startswith("python.wrkslots.host-"))
+    assert hosts == [f"python.wrkslots.host-{index}" for index in range(3)]
+    assert sorted(value for tag in hosts for value in _flag_values(steps[tag].cmd, "--shard")) == [
+        f"{index}/3" for index in range(3)
+    ]
+    for tag in hosts:
+        host = steps[tag]
+        assert "-m ordinary_environment" in host.cmd and "--component wrkslots" in host.cmd, tag
+        assert "unshare" not in host.cmd, tag
+        assert host.hint.resources.get("host-lifecycle") == 1, tag
 
 
 def test_wrkslots_component_selection_includes_every_lifecycle_shard() -> None:

@@ -55,3 +55,50 @@ Step 2 then drives each census from a controlled inventory (fake proc root or in
 - `test_shared_submodules.py::test_remove_accepts_shared_placed_submodule_in_flat_layout`: ba707504, shard-6.
 
 The holder scan's 600 s timeouts in the two image unmount tests are the #2372 sub-cause, made hermetic by 906b54fc.
+
+[Claude Opus 5.5, cl-flaketriage] Step A' (owner rule 346; coordinator-approved method, 2026-11-27): the non-lifecycle wrkslots shards no longer read the host process table.
+
+- **Change.**
+  - The sixteen `python.wrkslots.shard-*` steps now run inside the lifecycle shards' unprivileged wrapper: `unshare --user --map-root-user --pid --fork --mount-proc` plus `scripts/pid_namespace_init.py`. No sudo and no root mounts are involved. A removal census there reads only the shard's own processes.
+  - The shards deselect `ordinary_environment`. Those cases run on the host in `python.wrkslots.host-0`, `host-1` and `host-2`, under the `host-lifecycle` cap.
+  - The `python.wrkslots.shard-*` known-red wildcard is retired, so wrkslots changes get wrkslots signal again.
+  - Contract tests pin the wrapper and the partition.
+- **Why.**
+  - Measured 2026-11-27 at load1 190-205: one post-fence census over 6,300 host processes (115,600 threads, 284,000 fds, 1.34 GB of mountinfo) took about 30 CPU-s.
+  - The remove item budget is 60/75 s of wall time. Remove and retire tests therefore refused on unrelated heads: `REFUSED: this remove-agent-batch item used its 75-second budget ... at the /proc scan after the path fence`.
+  - In the discovery gate (2065ee89, `1795811375516954846-8b13c4c6`) the namespaced shards ran in 644-1135 s, against 1400-2600 s on the host, with 2,513 passed.
+- **`ordinary_environment` inventory.** These need host identity; each mark carries a one-line reason.
+  - Module-level:
+    - `test_validation_run_liveness.py` (98): validation-run evidence needs the host's initial PID namespace.
+    - `test_tool_authority.py` (5, parametrized): tool authority trusts only root-owned executables, which a user namespace maps to nobody.
+    - `test_recover_parent_death.py` (3): host-visible process IDs.
+    - `test_absent_slot_closure.py` (7) and `test_validate_teardown_closure.py` (4): they skip outside the initial identity user namespace, so they would have been lost silently.
+  - Per test:
+    - `test_audit_state_rust.py` (15): validation-run handles are judged against host PIDs and user-systemd units.
+    - `test_census_threads.py` (7) and `test_census_late_fork.py` (2): the real census commands are trusted only in the initial identity user namespace.
+    - `test_sandbox_root_spec.py` (5): the real uid and passwd home.
+    - `test_cli.py` (4): root-owned git and real scope masks.
+    - `test_remove_write_rust.py` (4): the Rust census names the test's own child as a holder inside the namespace.
+    - `test_classify_journals_rust.py` (3), `test_recover_abort_own.py` (1) and `test_eden_restart.py` (1): host-visible PIDs.
+    - `test_slice_fallbacks.py` (2): root-owned sudo and host scopes.
+    - `test_seal_recover_scoped_census.py` (2) and `test_recover_late_census_rollback.py` (1): the real census.
+    - `test_release_frozen_rust.py` (1): a root-owned sticky /tmp parent.
+  - In all, 282 cases run on the host (104, 83 and 95 per host shard).
+- **`load_quarantine` additions.** Each has a #2065 pointer and stays runnable with `WRKSLOTS_INCLUDE_QUARANTINED=1` or `-m load_quarantine`.
+  - Host cases that need a live census inside the remove budget:
+    - `test_remove_write_rust.py`: 4 cases;
+    - `test_seal_recover_scoped_census.py`: 2 cases;
+    - `test_recover_late_census_rollback.py::test_early_census_refusal_with_fenced_holder_retains_journal_and_retry_removes`;
+    - `test_slice_fallbacks.py::test_teardown_without_a_slice_falls_back_to_the_census`;
+    - `test_retire_lock_scope.py::test_retire_pending_removes_without_candidate_validation_under_lock`. Its write-handoff checks the owner's host PID; it was red on 50a174b4's gate.
+  - Load, not namespace:
+    - `test_shared_submodules.py::test_remove_never_loses_index_only_blob_of_private_clone`: the item budget runs out in salvage git work even in the namespace.
+    - `test_census_late_fork.py::test_naming_matches_read_argv_and_environ_from_proc`: red on unrelated heads.
+    - `test_lifecycle.py::test_validate_batch_census_deadline_restores_seals_before_outer_bound`. It asserts an 8 s wall-clock rollback reserve, measured at 10.18 s on gate `1795786086386213333-9d85f162`. Proposed fix: assert ordering and outcome, or a budget derived from measured CPU.
+- **Not un-quarantined in this commit.** Quarantined cases are deselected in gates, so none passed in this gate, as the coordinator's rule requires.
+  - Local evidence for a later step: 12 of the 21 existing #2065 Python cases passed inside the namespace on 2026-11-27. They are `test_batch_lock_scope` x2, `test_dead_fuse_entry` x2, `test_remove_fenced_lock_scope` x6, `test_journal_actor_liveness::test_remove_waits_for_a_live_finish_journal_then_proceeds` and `test_audit_state_rust::test_audit_size_unknown_text_matches_python`.
+  - `test_wait_lock_waits_for_a_live_journal_then_proceeds` still failed: a 300 s wall-clock thread join.
+- **Coverage.** Removal-path coverage for the quarantined set now rests on #2392's new tests and on this on-demand set.
+- **Related.**
+  - Two `test_worktrees_image` busy-holder tests hit the 600 s per-test timeout inside `scan_mount_holders` on another gate. #2372's test fix (906b54fc) gives them a fixture proc root, and its production change (#2372 50a174b4, pending) parses each distinct mount table once.
+  - Outside #2065, noted for #2382's audit annex: `cross.herdr-run.differential`, `rust.merge-queue.test` and `vibe-talk.check.documents-browser` were red in the discovery gate.

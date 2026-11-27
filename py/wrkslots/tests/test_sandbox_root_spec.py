@@ -64,6 +64,7 @@ def _document(tmp_path: Path, control: Path) -> dict[str, object]:
     }
 
 
+@pytest.mark.ordinary_environment(reason="sandbox identity checks need the invoking user's real uid and passwd home (#2065)")
 def test_unregistered_and_forged_claims_are_refused(tmp_path: Path) -> None:
     control = _control(tmp_path)
     document = _document(tmp_path, control)
@@ -87,6 +88,7 @@ def test_unregistered_and_forged_claims_are_refused(tmp_path: Path) -> None:
         sandbox._verify_registered(document, view, os.getuid())
 
 
+@pytest.mark.ordinary_environment(reason="sandbox identity checks need the invoking user's real uid and passwd home (#2065)")
 def test_closed_schema_tmp_size_and_policy_are_enforced(tmp_path: Path) -> None:
     control = _control(tmp_path)
     document = _document(tmp_path, control)
@@ -112,6 +114,7 @@ def test_closed_schema_tmp_size_and_policy_are_enforced(tmp_path: Path) -> None:
         sandbox._check_root_schema({**document, "view": {**view, "tmp_size": "0"}})
 
 
+@pytest.mark.ordinary_environment(reason="sandbox identity checks need the invoking user's real uid and passwd home (#2065)")
 def test_paths_outside_trusted_roots_are_refused(tmp_path: Path) -> None:
     control = _control(tmp_path)
     document = _document(tmp_path, control)
@@ -141,6 +144,7 @@ def test_enter_refuses_root_and_sudo_env(monkeypatch: pytest.MonkeyPatch) -> Non
     assert sandbox._main(["enter", "{}", "--", "/bin/true"]) == 126
 
 
+@pytest.mark.ordinary_environment(reason="sandbox identity checks need the invoking user's real uid and passwd home (#2065)")
 def test_sudo_identity_forgery_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     # Item 5/6: env-claimed uid/gid must match the sudo parent's real ids.
     uid, gid = os.getuid(), os.getgid()
@@ -649,6 +653,7 @@ def test_strict_mount_syscalls_fail_closed(monkeypatch: pytest.MonkeyPatch) -> N
         sandbox._require_fd_mount_syscalls()
 
 
+@pytest.mark.ordinary_environment(reason="sandbox identity checks need the invoking user's real uid and passwd home (#2065)")
 def test_claim_prefixes_and_layer_parent_are_refused(tmp_path: Path) -> None:
     # I4: a slot claimed under a claim prefix is not registered, and a
     # state directory outside the control directory refuses.

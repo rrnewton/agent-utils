@@ -235,6 +235,7 @@ def test_release_dry_run_matches_python(
     assert rust_checkout.is_dir()
 
 
+@pytest.mark.ordinary_environment(reason="validation exclusion needs a root-owned sticky /tmp parent (#2065)")
 def test_release_yes_matches_python(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

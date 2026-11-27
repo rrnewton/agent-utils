@@ -450,6 +450,7 @@ def test_absolute_mount_slot_escaping_the_slot_root_refuses(tmp_path: Path) -> N
     )
 
 
+@pytest.mark.ordinary_environment(reason="daemon restart checks host-visible process IDs (#2065)")
 def test_hung_daemon_times_out_and_the_other_slot_still_restarts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

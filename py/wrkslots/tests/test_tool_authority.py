@@ -12,6 +12,9 @@ import pytest
 
 from wrkslots import cli
 
+# Tool authority trusts only root-owned executables; a user namespace maps them to nobody.
+pytestmark = pytest.mark.ordinary_environment(reason="tool authority trusts only root-owned executables, which a user namespace maps to nobody (#2065)")
+
 # fcntl omits the seal constants when Python was built against old kernel
 # headers; the Linux ABI numbers are fixed, so name them as a fallback.
 _F_ADD_SEALS: int = getattr(fcntl, "F_ADD_SEALS", 1033)

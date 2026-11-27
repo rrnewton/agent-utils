@@ -37,9 +37,12 @@ from wrkslots.tests.test_lifecycle import (
     write_absent_validate_input,
 )
 
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux", reason="prctl parent-death signal is Linux-only"
-)
+pytestmark = [
+    pytest.mark.skipif(
+        sys.platform != "linux", reason="prctl parent-death signal is Linux-only"
+    ),
+    pytest.mark.ordinary_environment(reason="parent-death recovery checks host-visible process IDs (#2065)"),
+]
 
 
 @pytest.fixture(autouse=True)

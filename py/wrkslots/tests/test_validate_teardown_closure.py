@@ -23,10 +23,13 @@ import pytest
 from wrkslots import cli
 from wrkslots.tests.test_lifecycle import active_slots, checkout, create, make_project
 
-pytestmark = pytest.mark.skipif(
-    not cli._has_identity_user_namespace(),
-    reason="the census commands are trusted only in the initial identity user namespace",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not cli._has_identity_user_namespace(),
+        reason="the census commands are trusted only in the initial identity user namespace",
+    ),
+    pytest.mark.ordinary_environment(reason="the census commands are trusted only in the initial identity user namespace (#2065)"),
+]
 
 _HOLDER = """
 import os, sys, time

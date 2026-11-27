@@ -21011,6 +21011,7 @@ def test_validate_batch_census_deadline_starts_after_seal_preflight(
 
 
 @pytest.mark.parametrize("expiry_point", ("shared", "fresh"))
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: asserts an 8 s wall-clock rollback reserve (measured 10.18 s under load); needs an ordering/outcome or CPU-based check
 def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

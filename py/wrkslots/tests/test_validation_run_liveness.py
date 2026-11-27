@@ -53,7 +53,10 @@ from wrkslots.tests.test_lifecycle import (
 
 # These tests supply the host's process and user-systemd evidence themselves,
 # below the seam that the suite's idle-host default replaces.
-pytestmark = pytest.mark.validation_run_evidence
+pytestmark = [
+    pytest.mark.validation_run_evidence,
+    pytest.mark.ordinary_environment(reason="validation-run evidence needs the host's initial PID namespace (#2065)"),
+]
 
 RUN_UNIT = "validate-run-0001.service"
 

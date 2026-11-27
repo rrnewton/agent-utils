@@ -200,6 +200,8 @@ def _holder_in(
     )
 
 
+@pytest.mark.ordinary_environment(reason="the real census needs host-visible processes (#2065)")
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: real census under host churn
 def test_early_census_refusal_with_fenced_holder_retains_journal_and_retry_removes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
