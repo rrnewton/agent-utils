@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-reply-box-covers-last-card: Reply on the last card draws its box over the very message being answered'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-27T13:20:00-05:00
-updated_at: 2026-11-27T13:20:00-05:00
+updated_at: 2026-11-27T15:10:09-05:00
+closed_at: 2026-11-27T15:10:09-05:00
 ---
 
 # Description
@@ -45,3 +46,20 @@ Cause, reproduced locally (fake API, Chromium, phone 412x915 and desk 1280x800):
 # Notes
 
 Filed at the coordinator's request (owner-UI fast track), issue file only. Worked in its own worktree on current main, not stacked on #2385.
+
+## Resolution
+
+Landed as 1bf29fe1 (vibe-talk: Reply never draws its box over the row it answers): the commit to name for the OSS redeploy.
+
+- At the moment Reply opens, ONE move, by exactly the overlap: the row's foot sits just above the docked box, and the box goes back under its row.
+- A row taller than the room keeps its top (header and first two lines) clear of the box. Quote reply stays pixel-still.
+- Nothing moves where the box covers nothing.
+- The row is held again after the column's own box hides.
+- The foot keeper does not follow while an inline reply box is open.
+
+Evidence:
+- Overlaps of 28-221 px on main became -4 px (clear) on phone and desk, light and dark, keyboard open, Discuss open.
+- The composer-hide shift went from +42/+43/+152 px to 0.
+- tests/reply_box_clear_browser.py (dag 188), 23 cases; main's page fails it.
+
+Landed under a one-landing waiver (liaison 1072). The owner gate row 1795807615020057618-38a1d2f6 on 552bfbe7 was red only on all-thread-strip-browser. That red was a freeze-report POST counted in a fixed 700 ms window, reproduced on main alike; it is filed as #2400.
