@@ -8,7 +8,7 @@ labels:
 - owner-ui
 - read-aloud
 created_at: 2026-11-27T05:21:00-05:00
-updated_at: 2026-11-27T05:21:00-05:00
+updated_at: 2026-11-27T07:55:00-05:00
 ---
 
 # Description
@@ -33,3 +33,15 @@ Found by the per-frame traces of #2351 vibe-talk-read-strip-foot-reader-moves (t
 # Notes
 
 Filed at the coordinator's request from #2351's traces (issue file only). Also seen in those traces, for the record: at 393x852, with the reader 5 px above the list's end (inside the slack), the chips row's own follow (#1185) takes them the 5 px to the foot at the press, and they come back 5 px as the strip appears (about 3 frames). Related: #2351, #2346, #2354, #1587, #1588, #1866, #837, #1185, rule 370 (R12).
+
+## Part (b) landed
+
+[opus 5.5, cl-signpost3] Part (b) landed as 1110ad92 (gated head 1d968c39, owner gate full: 341 steps passed. It was PARTIAL only from 7 delegated-live-scope dagrun/cpuset cross skips; per-landing waiver from the liaison).
+
+- **Hold.** When the read strip's size changes in a channel list, its measure takes the reader's scroll anchor before the frame changes. If the browser's clamp moved it, the measure holds it with room at the list's foot (scrollKeeping.holdRowAt, as #2346 does).
+- **Veto.** chipsFollowFoot and the list's dock keeper now leave a reader standing in held room where they are (scrollKeeping.holdsRoom). Real-browser traces found both reclaiming the room at the next rendering and letting the clamp drop the row.
+- **Traces.** At 393x852 and 375x812, light and dark, across the read stop: 0.0 px. Base 39c0d887 dropped 32 px at 393.
+- **Page test.** Three negative controls (no hold, no chips veto, no dock veto).
+- **Liaison checks.** Desk and keyboard-open cells unchanged. search_unmatched, floating_chip_overlap and label_chip_tap 3/3. A dock growth over a search or tap hold is a no-op: the filter-hold checks come first. An arrival or an own send after the stop moves nothing and is offered by the chip, and the held room is absorbed.
+
+Part (a), the read-follow's centring at a read's start against R12, stays open for the owner. Related follow-up: #2375 (the reading-mode-off toast over a sent row).
