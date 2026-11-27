@@ -8,7 +8,7 @@ labels:
 - agentctl
 - validation
 created_at: 2026-11-27T02:17:52-05:00
-updated_at: 2026-11-27T03:19:09-05:00
+updated_at: 2026-11-27T13:34:08-05:00
 ---
 
 # Description
@@ -55,5 +55,5 @@ Evidence:
 - Deterministic check: with the adapter forced to open the file, sleep 0.3 s, then write (non-atomic), the old reader failed 3 of 3 runs with the gate error "not enough values to unpack (expected 4, got 0)". The new reader passed 3 of 3 even with that non-atomic writer.
 - The whole test file passes (87 cases).
 - Not done: the 20 runs above 75% host CPU in the acceptance criteria. The host was not hot, and the slow-writer check proves the race instead.
-- Left as found: `test_command_final_wait_failure_always_wakes_anchor_then_reaps_supervisor` still gives its adapter a 0.5 s timeout. On a loaded host the adapter may not publish its pid in that time, which is the shape #389 fixed in the timeout test.
+- Follow-up: `test_command_final_wait_failure_always_wakes_anchor_then_reaps_supervisor` gave its adapter only a 0.5 s timeout, the shape #389 fixed in the timeout test. #2362 fixed it (landed as 418bfe6f, right after this fix as d01382e5): its timeout now fires once the adapter has published its pid, with a 30 s backstop.
 
