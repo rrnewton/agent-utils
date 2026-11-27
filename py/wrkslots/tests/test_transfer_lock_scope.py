@@ -29,9 +29,11 @@ import pytest
 from wrkslots import cli
 from wrkslots.tests.test_lifecycle import (
     active_slots,
+    checkout,
     command,
     control_directory,
     create,
+    git,
     make_project,
     mark_owner_dead,
 )
@@ -317,8 +319,145 @@ def test_transfer_owner_locked_fallback_counts_zero_fleet_work_under_the_lock(
     assert len(writes) == 3
     assert ledger.count("validate", held=False) >= 3
     assert ledger.count("validate", held=True) == 0
+    assert ledger.count("storage-scan", held=True) == 0
     row = _row(project, "slot01")
     assert isinstance(row["owner"], dict) and row["owner"]["pid"] == os.getpid()
+
+
+def _scan_running_a_second_writer(
+    monkeypatch: pytest.MonkeyPatch,
+    project: Path,
+    outcomes: list[tuple[int, str]],
+    after_first_scan: Callable[[], None] | None = None,
+) -> None:
+    """Make every registry storage scan wait on a second writer (#2174).
+
+    The scan does not continue until a second ``wrkslots`` command has
+    tried the mutation locks with a zero lock wait and finished, so a
+    scan that ran while this command held the locks would make that
+    writer refuse as busy at once. The writer is a hold or unhold of
+    another slot, which also changes the registry identity, so the
+    round that scanned is overtaken. A condition, never a time budget.
+    """
+
+    scan = cli._assert_command_registry_storage
+
+    def scan_after_a_second_writer(
+        *args: object, **kwargs: object
+    ) -> cli.RegistryStorageFindings:
+        verb = "hold" if len(outcomes) % 2 == 0 else "unhold"
+        extra = ("--reason", "second writer") if verb == "hold" else ()
+        completed = command(project, "--wait-lock", "0", verb, "slot02", *extra)
+        outcomes.append((completed.returncode, completed.stderr))
+        findings = scan(*args, **kwargs)  # type: ignore[arg-type]
+        if after_first_scan is not None and len(outcomes) == 1:
+            after_first_scan()
+        return findings
+
+    monkeypatch.setattr(
+        cli, "_assert_command_registry_storage", scan_after_a_second_writer
+    )
+
+
+def test_transfer_owner_busy_fallback_scan_never_blocks_a_second_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2174 acceptance 1: no registry storage scan runs under the locks.
+
+    The only lock-free round's scan admits a second writer, which
+    overtakes the round, so the command falls back to its locked body.
+    That body used to run the storage scan again with the registry
+    locks held; the second writer it then admitted refused as busy.
+    Now the fallback checks only the transferred row under the locks,
+    so every second writer acquires them.
+    """
+    project = _project_with_slots(tmp_path)
+    monkeypatch.setattr(cli, "REGISTRY_VALIDATION_ATTEMPTS", 1)
+    ledger = _LockLedger(monkeypatch, project)
+    outcomes: list[tuple[int, str]] = []
+    _scan_running_a_second_writer(monkeypatch, project, outcomes)
+
+    rc = cli.main(_transfer_argv(project))
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "transferred slot=slot01" in captured.out
+    assert outcomes, "the lock-free round ran no registry storage scan"
+    assert [code for code, _err in outcomes] == [0] * len(outcomes), outcomes
+    # One overtaken lock-free round, then the locked fallback.
+    assert ledger.exclusive_rounds == 2
+    assert ledger.count("storage-scan", held=True) == 0
+    assert ledger.count("validate", held=True) == 0
+    row = _row(project, "slot01")
+    assert isinstance(row["owner"], dict) and row["owner"]["pid"] == os.getpid()
+
+
+def test_transfer_owner_busy_fallback_still_refuses_its_own_broken_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2174 acceptance 2: the transferred row is still judged under the lock.
+
+    The row's checkout disappears after the lock-free scan passed and
+    before the fallback takes the locks; the fallback's own check of
+    that row refuses, exactly as the scan would have for the row it
+    names, and nothing is written.
+    """
+    project = _project_with_slots(tmp_path)
+    monkeypatch.setattr(cli, "REGISTRY_VALIDATION_ATTEMPTS", 1)
+    target = checkout(project, "slot01")
+    moved = target.with_name(target.name + ".moved")
+
+    def break_the_target() -> None:
+        target.rename(moved)
+
+    outcomes: list[tuple[int, str]] = []
+    _scan_running_a_second_writer(
+        monkeypatch, project, outcomes, after_first_scan=break_the_target
+    )
+
+    rc = cli.main(_transfer_argv(project))
+
+    captured = capsys.readouterr()
+    assert rc == 3, (captured.out, captured.err)
+    assert moved.is_dir()
+    assert "slot directory does not match its record" in captured.err, captured.err
+    assert "missing checkouts product" in captured.err, captured.err
+    assert "transferred slot=" not in captured.out
+    row = _row(project, "slot01")
+    assert isinstance(row["owner"], dict) and row["owner"]["boot_id"] == "finished-boot"
+
+
+def test_one_record_nested_registrations_match_the_scan_for_that_slot(
+    tmp_path: Path,
+) -> None:
+    """#2174: the journal path derives what the scan reports for its slot.
+
+    With a journal outstanding there is no lock-free round, so the
+    locked body derives the transferred slot's nested registrations
+    from that one record. They must equal the storage scan's findings
+    for the slot, and another slot's nested worktree must not appear.
+    """
+    project = _project_with_slots(tmp_path)
+    for slot, name in (("slot01", "nested-a"), ("slot02", "nested-b")):
+        nested = checkout(project, slot) / "ignored" / name
+        nested.parent.mkdir(parents=True)
+        git(checkout(project, slot), "worktree", "add", "--detach", str(nested), "HEAD")
+    config = cli._load_config(str(project), "testhost")
+    states, _archives = cli._validate_global_state(config)
+    state = cli._load_active(config)
+    record = cli._find_record(state, "slot01")
+
+    scanned = cli._assert_registry_storage_consistent(
+        config,
+        states,
+        target_slot="slot01",
+        tolerate_target_git_registrations=True,
+    )
+    derived = cli._target_git_registrations(config, state, record)
+
+    assert derived == scanned.target_git_registrations
+    assert len(derived) == 1 and "nested-a" in derived[0]
+    assert not any("nested-b" in detail for detail in derived)
 
 
 def test_transfer_owner_with_an_outstanding_journal_takes_the_locked_body(

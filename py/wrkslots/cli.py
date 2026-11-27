@@ -18552,6 +18552,35 @@ def _global_rows(
     return rows
 
 
+def _target_git_registrations(
+    config: Config, state: ActiveState, record: ActiveRecord
+) -> tuple[str, ...]:
+    """Git registrations inside one record's slot that no row names (#2174).
+
+    These are the registry storage scan's ``git-registration-without-row``
+    findings for the slot a command names, which a command that tolerates
+    a nested worktree records instead of refusing. Derived from the one
+    record, as ``_assert_target_record_storage_consistent`` derives its
+    findings: it reads this record's repositories' worktree lists and the
+    managed directories' entry names once, runs no Git probe for any other
+    row and inspects no other row's checkouts, so no per-row work runs
+    while the mutation locks are held.
+    """
+
+    findings = _registry_storage_inconsistencies(
+        config,
+        (dataclasses.replace(state, slots=(record,)),),
+        verify_row_identity=False,
+    )
+    return tuple(
+        finding.detail
+        for finding in findings
+        if finding.kind == "git-registration-without-row"
+        and finding.slot == record.slot
+        and finding.slot_type == record.slot_type
+    )
+
+
 def _assert_transfer_only_slot_changed(
     before: ActiveState, after: ActiveState, transferred: ActiveRecord
 ) -> None:
@@ -50855,6 +50884,11 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     captured_notes: list[tuple[str, str]] = []
     # The task-scope outcome of the build that was written (#2179).
     scope_note: list[str] = []
+    # What the latest lock-free round established, or None when it
+    # deferred to the locked body (#2174): the busy fallback takes the
+    # nested registrations from that round's storage scan instead of
+    # scanning again with the registry locks held.
+    last_prepared: list[_TransferPrevalidated | None] = [None]
 
     def remember_notes(stdout_text: str, stderr_text: str) -> None:
         # Notes accumulate across prevalidation rounds: a dead-mount note
@@ -51056,6 +51090,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         # The partial-state refusal is read-only, so it runs first here
         # too, keeping its old precedence; it is re-checked under the
         # locks before the write.
+        last_prepared[0] = None
         _refuse_partial_state(config)
         if _outstanding_journals(config):
             return None
@@ -51065,11 +51100,13 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
                 stderr_buffer
             ):
-                return validate()
+                prepared = validate()
         finally:
             remember_notes(stdout_buffer.getvalue(), stderr_buffer.getvalue())
+        last_prepared[0] = prepared
+        return prepared
 
-    def locked_body() -> tuple[
+    def locked_body(prepared: _TransferPrevalidated | None) -> tuple[
         str,
         ActiveRecord,
         str | None,
@@ -51077,27 +51114,34 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         tuple[str, ...],
         tuple[tuple[str, bytes], ...],
     ]:
-        """The pre-#1975 transfer, run with the mutation locks held.
+        """The transfer judged with the mutation locks held.
 
-        Used when a journal is outstanding: its classification and any
-        dead-actor repair belong under the lock. Only the touched
+        Used when a journal is outstanding (its classification and any
+        dead-actor repair belong under the lock) and as the fallback
+        when every lock-free round was overtaken. Only the touched
         record is judged here (#2174): the fleet validation and the
         registry storage scan stay in the lock-free prepare, exactly
         as the Rust edition's commit re-judges only its record. Under
-        the locks run the journal phase, the one record's own checks
-        (from the local state and its machine's event chain), the
-        write, and a snapshot comparison proving no other local row
-        moved -- never a fleet-wide read.
+        the locks run the journal phase, the one record's own storage
+        check (the refusal the scan raises for the slot it names), its
+        machine's event chain, the write, and a snapshot comparison
+        proving no other local row moved -- never a fleet-wide read
+        and never another row's storage. The nested registrations come
+        from ``prepared``, the latest lock-free round's scan; with no
+        such round (a journal was outstanding) they are derived from
+        this record's own repositories.
         """
 
         _refuse_partial_state(config)
         _assert_no_journal(config)
         state = _load_active(config)
         record = _find_record(state, args.slot)
-        findings = _assert_command_registry_storage(
-            config, [state], args, tolerate_target_git_registrations=True
+        _assert_record_storage_consistent(config, record)
+        nested = (
+            prepared.nested
+            if prepared is not None
+            else _target_git_registrations(config, state, record)
         )
-        nested = findings.target_git_registrations
         _report_dead_for_record(config, [state], record)
         events = _load_events(config, record.machine)
         rename, previous_state, released, basis, already, ignored = judge(
@@ -51122,7 +51166,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         outcome = "reopened" if action == "owner-reopened" else "transferred"
         return (outcome, transferred, basis, previous_state, tuple(nested), ignored)
 
-    def locked_body_captured() -> tuple[
+    def locked_body_captured(prepared: _TransferPrevalidated | None) -> tuple[
         str,
         ActiveRecord,
         str | None,
@@ -51136,7 +51180,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
                 stderr_buffer
             ):
-                return locked_body()
+                return locked_body(prepared)
         finally:
             remember_notes(stdout_buffer.getvalue(), stderr_buffer.getvalue())
 
@@ -51155,7 +51199,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         # prepare validated, so its facts still hold.
         _refuse_partial_state(config)
         if prepared is None:
-            return locked_body_captured()
+            return locked_body_captured(None)
         states, archives = list(prepared.states), list(prepared.archives)
         before = _global_rows(states, archives)
         local = (
@@ -51209,9 +51253,11 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             )
         except _RegistryBusy:
             # Every lock-free round was overtaken (e.g. dozens of lanes
-            # transferring at once after a reboot): fall back to the old
-            # behaviour — wait for the lock and validate there — instead
-            # of refusing a transfer as busy, as heartbeat does. Like
+            # transferring at once after a reboot): wait for the lock and
+            # re-judge the one record there, instead of refusing a
+            # transfer as busy, as heartbeat does; the latest round's
+            # fleet validation and storage scan are not repeated under
+            # the lock (#2174). Like
             # heartbeat, the fallback queues without the configuration
             # locks (#2000): the transfer commit re-judges the one
             # record from the prepared state and writes only owner,
@@ -51241,7 +51287,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                     final_previous,
                     final_nested,
                     final_ignored,
-                ) = locked_body_captured()
+                ) = locked_body_captured(last_prepared[0])
     finally:
         for stdout_text, stderr_text in captured_notes:
             if stdout_text:
