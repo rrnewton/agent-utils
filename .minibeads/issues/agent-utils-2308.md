@@ -1,6 +1,6 @@
 ---
 title: 'gate-preflight-issue-parse-and-fmt: gate.py preflight refuses admission when an issue file is unparseable or a touched crate is unformatted'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: cl-flaketriage
@@ -8,7 +8,8 @@ labels:
 - gate
 - hygiene
 created_at: 2026-11-26T17:20:00-05:00
-updated_at: 2026-11-26T18:05:00-05:00
+updated_at: 2026-11-27T13:52:00-05:00
+closed_at: 2026-11-27T13:52:00-05:00
 ---
 
 # Description
@@ -34,3 +35,17 @@ Keep the existing two `PREFLIGHT_STEPS` and every other preflight behaviour (nes
 # Notes
 
 Brief `mu-flaketriage`, taken over by `cl-flaketriage` (coordb, 2026-11-26). Team-tick frequent-red counts (7 days, distinct gate heads): `repository.hygiene.issue-parse` 35, `vibe-talk.check.fmt` 13. Sequencing: base on main after `#2207` (touches `scripts/gate.py` and `validate.py`) lands; keep the `gate.py` hunk in the preflight code only. Related: `scripts/check_issue_parse.py` (`#951` mb-id-collision-guard), `validation/repository.dag.yaml` (`hygiene.issue-parse`, `format.rust`), `vibe-talk/tests/dag.d/000-fmt.yaml` (`check.fmt`).
+
+## Resolution
+
+[Claude Opus 5.5, cl-flaketriage] Landed on main as ea46dd3e, replayed from 514c7971 on dfa74c15.
+- Gate: a full gate on 514c7971 failed only on python.wrkslots.shard-5. That failure is a known-red census test, test_census_late_fork, in a component this change does not touch. An exclusive rerun of that shard passed: 154 passed, load1 143-150.
+- The change: the gate preflight adds repository.hygiene.issue-parse when the change touches `.minibeads/`. It also adds the rustfmt step of each Rust workspace (`rs/` -> repository.format.rust, `vibe-talk/` -> vibe-talk.check.fmt; a root rustfmt.toml adds both) when that workspace has a changed Rust source, manifest or rustfmt config.
+- The touched set is the one `validate.py --base` selects from: commits since the merge base, uncommitted edits and untracked files.
+- When the touched set is unknown, every conditional step runs and the message says so. A refusal goes through the existing preflight path (exit 65, before admission) and names the command to run to fix it. rustfmt only, never a build.
+- Tests in py/tests/test_gate_admission.py:
+  - the conditional steps are real graph steps with fix hints;
+  - the touched-path to step mapping, including the unknown-change fallback;
+  - the selection over committed, uncommitted and untracked work in a scratch repository;
+  - a refusal on issue-parse or rustfmt names the fix.
+- The existing nested and `--rerun` preflight skips are unchanged. No persisted fields. No wall-clock budget.
