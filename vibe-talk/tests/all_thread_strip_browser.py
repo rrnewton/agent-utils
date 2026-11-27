@@ -31,8 +31,10 @@ At a 1280x800 desk with a mouse, in the dark scheme and the light, in All:
   the thread nobody had answered, live: its root gets a strip, and its words do not move.
 
 On a 412x915 phone by touch, in the dark scheme and the light: the strips a 22px hit box and a 6px
-bar -> a tap selects the thread -> a finger drawn sideways from a strip archives nothing and opens no
-details -> no horizontal overflow.
+bar -> a tap selects the thread -> a finger drawn sideways from a strip archives nothing, opens no
+details and writes nothing: no Done, put-back or read-cursor POST, counted where the page issues it and
+waited for by events, not a clock (`#2400`; the page's own telemetry, such as a hot host's freeze
+report, is not a swipe's write) -> no horizontal overflow.
 
 No page error at any step. Pass --screenshots DIR to keep a PNG of each state for review; --web-root
 DIR to run the same walk against another copy of the page.
@@ -45,6 +47,7 @@ import base64
 import json
 import os
 import queue
+import re
 import tempfile
 import threading
 import time
@@ -274,6 +277,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 browser_waits.hot_host_timeouts(context)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
+            if touch:
+                page.add_init_script(SWIPE_WRITES_JS)
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             desk = Desk(page, args.screenshots, label, width, height)
@@ -291,6 +296,47 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+# --- what a swipe could write ------------------------------------------------------------------------
+
+# `#2400 vibe-talk-strip-swipe-post-count-timing`. The writes a swipe on a row can make: the Done it
+# performs (dismiss), the put-back of an archived row (restore) and the provider's read cursor
+# (upstream-read). Only these count as "the swipe wrote": the page also posts its own telemetry, above
+# all the freeze watch's report (`#2066`), which a hot host's long task sends at any moment, so a
+# count of every POST failed the walk on load alone.
+SWIPE_WRITE = re.compile(r"^/api/v1/channels/[^/]+/(?:dismiss|restore|upstream-read)$")
+
+# Every swipe write the page issues, counted where it is issued (so no window has to wait for it to
+# reach the fake API), and how many are still unanswered.
+SWIPE_WRITES_JS = r"""(() => {
+  const writes = {issued: 0, open: 0};
+  Object.defineProperty(window, '__swipeWrites', {value: writes});
+  const pattern = /^\/api\/v1\/channels\/[^/]+\/(?:dismiss|restore|upstream-read)$/;
+  const send = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+    const url = String((input && input.url) || input);
+    if (method !== 'POST' || !pattern.test(new URL(url, location.href).pathname)) return send(input, init);
+    writes.issued += 1;
+    writes.open += 1;
+    return send(input, init).finally(() => { writes.open -= 1; });
+  };
+})();"""
+
+# The gesture's own handlers have run: the touch's last events are handled in the frames after it,
+# and what they start is issued by the next task.
+GESTURE_DONE_JS = """() => new Promise((done) =>
+  requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(done, 0))))"""
+
+NEXT_FRAME_JS = "() => new Promise((done) => requestAnimationFrame(() => done()))"
+
+
+def swipe_writes(api: StripApi) -> int:
+    """The swipe writes the fake API has received."""
+    with api.lock:
+        return sum(1 for request in api.requests
+                   if request.startswith("POST ") and SWIPE_WRITE.match(urlsplit(request[5:]).path))
 
 
 # --- reading what was measured -----------------------------------------------------------------------
@@ -646,21 +692,29 @@ def phone_walk(desk: Desk, api: StripApi, context: BrowserContext) -> None:
     reply = next(row for row in rows_of(selected) if row["strip"] and in_view(desk, row) and row["id"] not in READ_REPLIES
                  and row["id"] != PIVOT)
     sx, sy = bar_point(reply)
-    posts = sum(1 for request in api.requests if request.startswith("POST"))
+    # `#2400`: every wait here is an event, not a clock. The finger moves a frame at a time; after it
+    # lifts, the gesture's handlers have run and anything they started is issued; then the walk waits
+    # for every swipe write to be answered, so the fake API has it too.
+    issued = page.evaluate("() => window.__swipeWrites.issued")
+    received = swipe_writes(api)
     cdp = context.new_cdp_session(page)
     cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": sx + 6, "y": sy}]})
     for step in range(1, 13):
-        page.wait_for_timeout(16)
+        page.evaluate(NEXT_FRAME_JS)
         cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [{"x": sx + 6 + 14 * step, "y": sy}]})
-    page.wait_for_timeout(16)
+    page.evaluate(NEXT_FRAME_JS)
     cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-    page.wait_for_timeout(700)
+    page.evaluate(GESTURE_DONE_JS)
+    desk.wait_for("() => window.__swipeWrites.open === 0", "a swipe write was never answered")
     row = f"#discord-log > li[data-id='{reply['id']}']"
     after = page.evaluate(f"""() => {{ const li = document.querySelector("{row}");
         return {{archived: li.getAttribute('data-archived'), details: !!li.querySelector('.msg-details'), transform: li.style.transform}}; }}""")
     desk.check(after["archived"] != "true" and not after["details"] and not after["transform"],
                f"a finger drawn sideways from the strip did something to the row: {after}")
-    desk.check(sum(1 for request in api.requests if request.startswith("POST")) == posts, "a swipe from the strip posted something")
+    wrote = page.evaluate("() => window.__swipeWrites.issued") - issued
+    desk.check(wrote == 0 and swipe_writes(api) == received,
+               f"a swipe from the strip wrote: {wrote} issued, {swipe_writes(api) - received} received "
+               "(dismiss, restore or upstream-read)")
     desk.check(number(state(desk), "overflow") <= 0, "the page scrolls sideways")
     desk.notes.append("a tap on a strip selected its thread, the rest at 0.3 with grey strips; a finger drawn sideways "
                       "from a strip archived nothing and opened nothing")
