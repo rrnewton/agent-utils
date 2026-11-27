@@ -4386,6 +4386,7 @@ test("`#624 voice-page-modularity`: one card highlighted — per channel, toggle
     const made = { attrs: new Map(Object.entries(attrs)), children, className: "", parentNode: null,
       hasAttribute: (name) => made.attrs.has(name), getAttribute: (name) => (made.attrs.has(name) ? made.attrs.get(name) : null),
       setAttribute: (name, value) => made.attrs.set(name, String(value)), removeAttribute: (name) => made.attrs.delete(name),
+      toggleAttribute: (name, force) => { if (force) made.attrs.set(name, ""); else made.attrs.delete(name); return force; },
       getBoundingClientRect: () => ({ top: 10 }) };
     for (const child of children) child.parentNode = made;
     return made;
@@ -4396,10 +4397,11 @@ test("`#624 voice-page-modularity`: one card highlighted — per channel, toggle
   const sideCards = el({}, [cardA, cardB]);
   let channel = "c1";
   let cycle = false;
+  let cardAShown = true;
   const owner = createLitCards({
     cardsCycle: () => cycle, selectedChannelId: () => channel,
     leftById: (id) => (id === "side-cards" ? sideCards : el({}, [])),
-    noteLinkedSelection: () => {}, rowShown: () => true,
+    noteLinkedSelection: () => {}, rowShown: (row) => row !== cardA || cardAShown,
     sidePane: () => ({ scroller: () => ({ scrollTop: 0 }) }), channelPane: () => ({ scroller: () => ({ scrollTop: 0 }) }),
     fitOverscroll: () => {}, bringIntoView: () => {}, noteOverscrollReader: () => {},
     nudge: (scroller, delta) => { scroller.scrollTop += delta; },
@@ -4415,6 +4417,15 @@ test("`#624 voice-page-modularity`: one card highlighted — per channel, toggle
   assert.equal(owner.litCard(), "t1");
   assert.equal(cardA.getAttribute("data-highlighted"), "true", "the pressed card was not drawn lit");
   assert.equal(button.getAttribute("aria-expanded"), "true");
+  // `#2283`: the list names the standing highlight, and a search dress that hides the
+  // lit card takes the name away again without a repaint (the search pass syncs it).
+  assert.equal(sideCards.hasAttribute("data-lit"), true, "the list does not name its lit card");
+  cardAShown = false;
+  owner.syncLitFlags();
+  assert.equal(sideCards.hasAttribute("data-lit"), false, "the list still claims a lit card the search hid");
+  cardAShown = true;
+  owner.syncLitFlags();
+  assert.equal(sideCards.hasAttribute("data-lit"), true, "the list did not name the lit card standing again");
   // Another channel keeps its own highlight, or none.
   channel = "c2";
   assert.equal(owner.litCard(), null, "one channel's highlight showed in another");

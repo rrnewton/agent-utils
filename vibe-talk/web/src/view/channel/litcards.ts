@@ -55,6 +55,7 @@ export interface LitCards {
   cardThread(row: HTMLElement): string;
   paintLitCard(row: HTMLElement, id: string): void;
   paintLitCards(): void;
+  syncLitFlags(): void;
   toggleLitCard(id: string, row: HTMLElement): void;
   cardOpener(prefix: string, replies: string, unread: string, open: () => void): HTMLButtonElement;
   cardCountParts(prefix: string, replies: string, unread: string, empty?: string): Node[];
@@ -101,6 +102,23 @@ export function createLitCards(deps: LitCardsDependencies): LitCards {
     if (button && button.getAttribute("aria-expanded") !== expanded) button.setAttribute("aria-expanded", expanded);
   }
 
+  /**
+   * `#2283 vibe-talk-root-has-rules`. A highlighted card standing in each list, named on
+   * the list itself: the stylesheet dims every other card off this mark instead of
+   * re-searching the list for the highlighted card on every toggle. Kept wherever the
+   * cards' standing changes without a repaint — a search pass dressing them
+   * `search-hidden` above all — so the mark never claims a grey-out no card earns.
+   */
+  function syncLitFlags(): void {
+    for (const list of ["side-cards", "thread-list"]) {
+      const host = deps.leftById(list);
+      const standing = ([...host.children] as HTMLElement[]).some(
+        (row) => row.hasAttribute("data-highlighted") && deps.rowShown(row),
+      );
+      host.toggleAttribute("data-lit", standing);
+    }
+  }
+
   /** Draw every card of both lists as the highlight now stands, and the links between the columns with it. */
   function paintLitCards(): void {
     for (const list of ["side-cards", "thread-list"]) {
@@ -109,6 +127,7 @@ export function createLitCards(deps: LitCardsDependencies): LitCards {
         paintLitCard(row, cardThread(row));
       }
     }
+    syncLitFlags();
     deps.noteLinkedSelection();
   }
 
@@ -266,6 +285,7 @@ export function createLitCards(deps: LitCardsDependencies): LitCards {
     cardThread,
     paintLitCard,
     paintLitCards,
+    syncLitFlags,
     toggleLitCard,
     cardOpener,
     cardCountParts,

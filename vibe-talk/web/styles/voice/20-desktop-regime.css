@@ -1568,12 +1568,12 @@ li.discord-message[data-root-continuation] .thread-replies {
 /* ...and every other card's edge and unread count grey, while the highlighted one shows: a card the
    filters hide greys nothing. `#440 thread-card-pack-toggle`: and, by the same rule, a read thread's card
    under Unpack unread, packed while the unread ones stand unpacked, and in no other state. */
-.side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]),
+.side-cards[data-lit] > .side-card-row:not([data-highlighted]),
 .side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] {
   border-left-color: var(--thread-grey);
 }
 
-.side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) .side-card-unread,
+.side-cards[data-lit] > .side-card-row:not([data-highlighted]) .side-card-unread,
 .side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] .side-card-unread {
   color: var(--muted);
 }

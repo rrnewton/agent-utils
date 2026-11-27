@@ -157,6 +157,9 @@ export interface SearchRowsDependencies {
   } | null;
   /** `#2251`: whether the Transcripts screen is up (its scope words are its own). Optional for doubles. */
   transcriptsOpen?(): boolean;
+  /** `#2283`: a pass just dressed the rows (search-hidden among them) — the lit cards
+   * re-mark which lists hold a standing highlighted card. Optional for doubles. */
+  afterSearchPass?(): void;
   placeInlineReply(): void;
   placeRowsInPlaceAgain(): void;
   replyDocked(): boolean;
@@ -577,6 +580,7 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     // its counts stay debounced with the full pass — no fetch, no recompute leaves this event.
     // `#2256`: the rows it stood decide the chip panel's head room in this same event.
     if (!deps.side() && deps.retireStaleBuckets) deps.retireStaleBuckets(standing);
+    deps.afterSearchPass?.();
   }
 
   /** `#2200`: the one disjoint bucket a message counts in: Transcripts when its
@@ -756,6 +760,8 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     drawSeams(el("pinned-log"));
     deps.drawCardGaps(el("thread-list"));
     deps.renderReplyLinks();
+    // The pass has dressed every row; what follows only words the emptiness.
+    deps.afterSearchPass?.();
     // `#1762 vibe-talk-server-hits-collapsed-line`. The signpost over the loaded
     // cards' matches: one element, shown while a search is typed and never
     // reworded here, so this pass pays nothing for it per keystroke.

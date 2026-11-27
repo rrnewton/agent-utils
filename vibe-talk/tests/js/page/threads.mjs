@@ -2530,7 +2530,7 @@ test("`#440 thread-card-pack-toggle`: Unpack goes Pack all, Unpack unread, Unpac
   // The grey edge: the highlight's own dim rule, for a read card under Unpack unread and in no other state.
   const dim = cssRules(CSS_UNCONDITIONAL, '.side-cards[data-unpack="unread"] > .side-card-row[data-thread-read]').join("\n");
   assert.match(dim, /border-left-color:\s*var\(--thread-grey\)/, "a read card under Unpack unread is not greyed");
-  assert.ok(cssRules(CSS_UNCONDITIONAL, ".side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted])")
+  assert.ok(cssRules(CSS_UNCONDITIONAL, ".side-cards[data-lit] > .side-card-row:not([data-highlighted])")
     .some((block) => block === cssRules(CSS_UNCONDITIONAL, '.side-cards[data-unpack="unread"] > .side-card-row[data-thread-read]')[0]),
     "the grey edge is not the highlight's own dim rule");
   for (const mode of ["packed", "all"]) {

@@ -881,11 +881,11 @@
   background: color-mix(in srgb, hsl(var(--thread-hue, 210) var(--thread-sat, 55%) var(--thread-light, 50%)) 14%, var(--panel));
 }
 
-#thread-list:has(> .thread-card[data-highlighted]:not([hidden]):not(.search-hidden)) > .thread-card:not([data-highlighted]) {
+#thread-list[data-lit] > .thread-card:not([data-highlighted]) {
   border-inline-start-color: var(--thread-grey);
 }
 
-#thread-list:has(> .thread-card[data-highlighted]:not([hidden]):not(.search-hidden)) > .thread-card:not([data-highlighted]) .thread-card-unread {
+#thread-list[data-lit] > .thread-card:not([data-highlighted]) .thread-card-unread {
   color: var(--muted);
 }
 

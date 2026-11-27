@@ -3252,6 +3252,7 @@ const searchRows = createSearchRows({
   renderOlderControl: () => renderOlderControl(),
   scheduleServerSearch: () => scheduleServerSearch(),
   retireStaleBuckets: (loadedHits) => retireStaleBuckets(loadedHits),
+  afterSearchPass: () => litCardsOwner.syncLitFlags(),
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   floatingClearance: (area) => floatingClearance(area),
   bucketOn: (id) => bucketOnFor(id),

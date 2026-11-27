@@ -2306,7 +2306,7 @@ test("`#277 thread-card-focus`: a click highlights a card and shows it whole wit
 });
 
 test("`#277 thread-card-focus`: while a card is highlighted every other card's edge and unread count, and every other link between the columns, go grey, and the highlighted card's link is drawn over them", async () => {
-  const others = ".side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted])";
+  const others = ".side-cards[data-lit] > .side-card-row:not([data-highlighted])";
   // The cards' rules stand outside the two columns' block, for the thread list's too (`#281 view-keys`).
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, others), /border-left-color:\s*var\(--thread-grey\)/, "the other cards keep their colours");
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, `${others} .side-card-unread`), /color:\s*var\(--muted\)/,
@@ -2457,7 +2457,7 @@ test("`#277 thread-card-focus`: Esc with no card highlighted leaves the cards wh
 });
 
 test("`#277 thread-card-focus`: the Threads list in one column is the same — contracted, a click highlights a card and greys the rest, its replies button or → enters it, ← comes back to it, Esc puts it out", async () => {
-  const others = "#thread-list:has(> .thread-card[data-highlighted]:not([hidden]):not(.search-hidden)) > .thread-card:not([data-highlighted])";
+  const others = "#thread-list[data-lit] > .thread-card:not([data-highlighted])";
   assert.match(cssBlock(others), /border-inline-start-color:\s*var\(--thread-grey\)/, "the other cards keep their colours");
   assert.match(cssBlock(".thread-card-text"), /display:\s*none/, "a card that is not highlighted shows what its thread is about");
   assert.match(cssBlock(".thread-card[data-highlighted] .thread-card-text"), /display:\s*block/, "a highlighted card does not show it");
