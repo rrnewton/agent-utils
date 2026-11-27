@@ -329,25 +329,30 @@ grandchild = "import time; time.sleep(60)"
 child = (
     "import os,pathlib,subprocess,sys,time; "
     "nested=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
-    "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {nested.pid}'); "
+    "pathlib.Path(sys.argv[1]+'.tmp').write_text(f'{os.getpid()} {nested.pid}'); "
+    "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); "
     "time.sleep(60)"
 )
+# The child publishes its pids atomically, so the file never exists empty;
+# the leader waits on that condition with a generous deadline (#2359).
 leader = (
     "import pathlib,subprocess,sys,time\n"
     "path=pathlib.Path(sys.argv[1])\n"
     "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1],sys.argv[3]])\n"
-    "deadline=time.monotonic()+2\n"
+    "deadline=time.monotonic()+20\n"
     "while not path.exists() and time.monotonic()<deadline:\n"
     "    time.sleep(0.01)\n"
     "if not path.exists():\n"
     "    raise RuntimeError('descendant did not start')\n"
 )
 result = _run_command(
-    (sys.executable, "-c", leader, str(pids), child, grandchild), timeout=5,
+    (sys.executable, "-c", leader, str(pids), child, grandchild), timeout=30,
 )
 if result.returncode != 0:
     raise SystemExit(f"leader returned {result.returncode}: {result.stderr}")
 descendants = [int(value) for value in pids.read_text().split()]
+if len(descendants) != 2:
+    raise SystemExit(f"child published {descendants!r}, not its own and its child's pid")
 remaining = [
     (pid, pathlib.Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2][:1])
     for pid in descendants
@@ -365,7 +370,7 @@ if remaining:
 '''
     completed = subprocess.run(
         (sys.executable, "-c", probe, str(pids), str(package_parent)),
-        text=True, capture_output=True, timeout=10, check=False,
+        text=True, capture_output=True, timeout=60, check=False,
     )
     assert completed.returncode == 0, completed.stderr
 
@@ -401,7 +406,8 @@ child = "import os,time; os.close(0); os.close(1); os.close(2); time.sleep(60)"
 adapter = (
     "import os,pathlib,subprocess,sys,time; "
     "nested=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
-    "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {nested.pid}'); "
+    "pathlib.Path(sys.argv[1]+'.tmp').write_text(f'{os.getpid()} {nested.pid}'); "
+    "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); "
     "time.sleep(60)"
 )
 _run_command((sys.executable, "-c", adapter, str(pids), child), timeout=60)
@@ -420,8 +426,8 @@ while time.monotonic() < deadline:
                 line.split()[1] for line in status.splitlines() if line.startswith("PPid:")
             ))]
         except (FileNotFoundError, IndexError, ValueError):
-            # The adapter creates the file before writing the PIDs into it; an
-            # empty or partial read is "not ready", not a failure (#827).
+            # The adapter publishes its pids atomically (#2359); a vanished
+            # adapter or an unparsable read still counts as "not ready" (#827).
             supervisors = []
         if len(supervisors) == 1 and supervisors[0] != 0:
             break
@@ -980,9 +986,10 @@ def test_command_preserves_signal_returncode(signum: signal.Signals) -> None:
 def test_command_timeout_terminates_descendants_holding_output_pipes(tmp_path: Path) -> None:
     pid_path = tmp_path / "child.pid"
     script = (
-        "import pathlib,subprocess,sys,time; "
+        "import os,pathlib,subprocess,sys,time; "
         "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(60)"
+        "pathlib.Path(sys.argv[1]+'.tmp').write_text(str(child.pid)); "
+        "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); time.sleep(60)"
     )
     # The timeout is the thing under test: the script sleeps 60 s, so any shorter
     # timeout fires it. It must still leave the script time to start, spawn its
@@ -1113,7 +1120,8 @@ def test_command_output_is_bounded_before_json_parsing(
     script = (
         "import os,pathlib,subprocess,sys,time; "
         "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "pathlib.Path(sys.argv[1]+'.tmp').write_text(str(child.pid)); "
+        "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); "
         f"os.write({descriptor}, b'x' * 1025); time.sleep(60)"
     )
     with pytest.raises(ValueError, match=rf"{name} exceeds its byte limit"):
@@ -1128,7 +1136,8 @@ def test_command_output_read_failure_cleans_the_complete_group(
     script = (
         "import os,pathlib,subprocess,sys,time; "
         "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
-        "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {child.pid}'); "
+        "pathlib.Path(sys.argv[1]+'.tmp').write_text(f'{os.getpid()} {child.pid}'); "
+        "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); "
         "print('ready',flush=True); time.sleep(60)"
     )
     original_read = os.read
@@ -1190,7 +1199,8 @@ def test_command_final_wait_failure_always_wakes_anchor_then_reaps_supervisor(
     monkeypatch.setattr(subprocess.Popen, "wait", wait_failure)
     pid_path = tmp_path / "wait-failure-adapter"
     command = (sys.executable, "-c", "import os,pathlib,sys,time; "
-               "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)",
+               "pathlib.Path(sys.argv[1]+'.tmp').write_text(str(os.getpid())); "
+               "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); time.sleep(60)",
                str(pid_path))
     with pytest.raises(subprocess.TimeoutExpired):
         _run_command(command, timeout=0.5)
@@ -1273,7 +1283,8 @@ from agentctl import chat
 adapter = (
     "import os,pathlib,subprocess,sys,time; "
     "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
-    "pathlib.Path(sys.argv[1]).write_text(f'{os.getppid()} {os.getpgrp()} {os.getpid()} {child.pid}'); "
+    "pathlib.Path(sys.argv[1]+'.tmp').write_text(f'{os.getppid()} {os.getpgrp()} {os.getpid()} {child.pid}'); "
+    "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); "
     "time.sleep(60)"
 )
 censuses = []
@@ -1284,7 +1295,7 @@ def census(anchor):
     return result
 chat._command_group_members = census
 try:
-    chat._run_command((sys.executable, "-c", adapter, sys.argv[1]), timeout=10)
+    chat._run_command((sys.executable, "-c", adapter, sys.argv[1]), timeout=30)
 except ValueError as exc:
     if "final result" not in str(exc):
         raise
@@ -1299,15 +1310,25 @@ path = pathlib.Path(sys.argv[1])
 caller = subprocess.Popen((sys.executable, "-c", caller_program, str(path), sys.argv[2]))
 identities = []
 try:
-    deadline = time.monotonic() + 5
-    while not path.exists() and time.monotonic() < deadline:
+    # The adapter publishes its four pids atomically; still treat a missing or
+    # unparsable file as "not ready" and fail by name, never by unpacking (#2359).
+    deadline = time.monotonic() + 30
+    while not identities:
         if caller.poll() is not None:
             raise SystemExit("caller failed before adapter started")
-        time.sleep(0.005)
-    identities = [int(value) for value in path.read_text().split()]
+        if time.monotonic() >= deadline:
+            raise SystemExit("adapter never published its pids")
+        try:
+            published = [int(value) for value in path.read_text().split()]
+        except (FileNotFoundError, ValueError):
+            published = []
+        if len(published) == 4:
+            identities = published
+        else:
+            time.sleep(0.005)
     supervisor, anchor, adapter, descendant = identities
     os.kill(supervisor, signal.SIGKILL)
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 30
     while caller.poll() is None and time.monotonic() < deadline:
         # Only the outer test reaper owns these orphaned processes. Reap each
         # after it exits, without stealing the caller or its direct child S.
@@ -1342,7 +1363,7 @@ finally:
 '''
     completed = subprocess.run(
         (sys.executable, "-c", probe, str(pids), str(package_parent)),
-        text=True, capture_output=True, timeout=18, check=False,
+        text=True, capture_output=True, timeout=90, check=False,
     )
     assert completed.returncode == 0, completed.stderr
 
