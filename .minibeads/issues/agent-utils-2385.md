@@ -7,7 +7,7 @@ labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-27T10:40:00-05:00
-updated_at: 2026-11-27T10:40:00-05:00
+updated_at: 2026-11-27T14:30:00-05:00
 ---
 
 # Description
@@ -47,3 +47,20 @@ Open owner choice: O1 (skeleton-first paint), scoped to the thread view. O2 to O
 # Notes
 
 Filed at the coordinator's request (owner-UI fast track), issue file only. The diagnosis and the slice plan went to the coordinator before any code.
+
+## S-t2(a) landed (2026-11-27)
+
+[opus 5.5, cl-signpost3] Landed as cabd6987 (gated head d0a13d89), deployed 1:42 PM ET, with a clean watch. What landed:
+- the boxes from the count already held, with one "N more replies loading" line said once;
+- the late-count read, so a thread opened from the saved copy is read when the count arrives, not at the poll;
+- the rule-370 landing on the first box;
+- a rollback kill switch, vibe-talk.voice.thread-reply-boxes "0", on by default and not shown in Settings (liaison: O1 confirmed for the thread view; on by default).
+
+Throttled numbers at 3000 ms round trip and 8 KB/s:
+- opened from the saved copy: boxes at +3.44 s, all 9 replies at +7.1 s (main: +52.2 s, no boxes);
+- count already known: boxes in the first frame, all 9 at +3.9 s.
+
+Landed under a one-landing waiver for discuss-browser: a known red with a new message, recorded in #2176's notes; 18 of 18 focused runs passed. Local post-deploy guards were green: thread_reply_boxes, thread-switch-fast, search_unmatched, two_column, and discuss_browser 3 of 3.
+
+Still open: S-t1 (the server's layout read, giving each reply its id and size) with S-t2 (b, c) and a fixture that crosses the real router for threads. Related: #2391 (the coverage line shift, pre-existing) and #2393 (the label in view with the keyboard up).
+
