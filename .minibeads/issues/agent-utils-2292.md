@@ -1,15 +1,16 @@
 ---
 title: 'vibe-talk-windowed-composer-foot-fight: with windowed lists on, arrivals and the windowed renderer never move the composer or leave a mid-list jump blank'
-status: open
+status: closed
 priority: 0
 issue_type: bug
-assignee: mu-windowfoot
+assignee: cl-windowfoot
 labels:
 - vibe-talk
 - owner-ui
 - scroll-stability
 created_at: 2026-11-26T09:45:00-05:00
-updated_at: 2026-11-26T09:45:00-05:00
+updated_at: 2026-11-26T19:50:00-05:00
+closed_at: 2026-11-26T19:50:00-05:00
 ---
 
 # Description
@@ -52,3 +53,16 @@ A counting/trace check for the composer-foot case joins the gate (no wall time; 
 
 - Stacking: scroll code is shared. Landing order: `#2277` (landed fbe206a9), the `#2276` follow-up spans, `#2283`, `#2258`, `#2291`, then this issue. Start on current github/main and rebase onto each landed SHA the lead sends.
 - Evidence before the fix: `/tmp/cl-freeze/evidence-final/windowed/` (cl-freeze lane, read-only).
+
+## Resolution
+
+Landed on main as a0c2ec41 on 2026-11-26 at about 7:45 PM ET (gated as c81760c6: owner gate red only on `vibe-talk.test.page-3`, a CPU budget timeout with 0 failing tests, the slice budget tracked in `#2320`; its exclusive rerun passed; liaison approved the evidence).
+
+- One writer while the reader types: the scroll owner offers its composer hold (`heldComposerTop`, `keepComposer`) to the writers outside its holds. `renderWindowed`, `settleAfterRead` and `appendChannelRow` keep the held composer instead of a row (no anchor nudge, no foot lock, no row restore while it holds the view); the jump to the newest is still decided.
+- Found in scope and fixed: at the desk, windowing on or off, the composer dipped 8.7-9.1 px for a frame on every arrival (the redraw's hold measured it after the row was appended; its edge correction and the list's foot keeper then disagreed by the list padding).
+- (c)2: measured at paint time, main painted no blank frame on programmatic jumps (the earlier 0.16 s was polling latency behind the re-slice). The windowed scroll listener now re-slices in the same task when the band stands wholly above or below the mounted rows (two rows measured), so a row is in the band as the jump's scroll is answered (main 0/5, after 5/5).
+- Results, whole-pixel bar (scroll positions land on whole CSS pixels): composer max step 0.09 px phone / 0.69 px desk, spread <= 0.69 px, in all 12 cells (windowing on/off x light/dark x phone keyboard open / closed / desk); the cl-freeze walk's windowed composer spread 45.89 -> 0.62 px (off 0.38); rule 370 traces 0.0 px; rows mounted 746 -> 60.
+- Search hits, jump-to-message, back gesture and cross-view Back (48 of 48 walks, real server) pass with windowing forced on: nothing broke.
+- Gate check `tests/windowed_composer_foot_browser.py` (dag 184): every scroll write while typing through arrivals is the composer keep and the composer moves under one pixel, windowing on and off, phone and desk; jumps into a windowed list have a row in the band. Red on main, green after.
+- Not changed here: the history above the composer still moves by each arrival's height while the reader types; that is `#2315 vibe-talk-kb-open-arrival-moves-history-94px`, waiting on the owner's choice.
+
