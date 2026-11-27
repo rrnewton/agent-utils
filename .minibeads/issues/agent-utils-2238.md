@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-ensure-binds-reclaim-aware: ensure_binds never re-binds a checkout a reclaimer is reclaiming'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-25T09:02:00-05:00
-updated_at: 2026-11-25T09:50:00-05:00
+updated_at: 2026-11-26T20:15:16-05:00
+closed_at: 2026-11-26T20:15:16-05:00
 ---
 
 # Description
@@ -53,3 +54,7 @@ A per-slot reclaim marker in the control directory, honoured by `ensure_binds` i
 # Notes
 
 Related to #2199, which moves unbind's unmount under the records lock. The marker covers the unmount-to-drop window without putting non-constant-time unmount retries under that lock. Root tests stay skipped unless `WRKSLOTS_ALLOW_ROOT_TESTS=1`.
+
+## Resolution
+
+[opus 5.5 cl-reclaimland] Landed on main as 59f6c741 (gated as 258aafac, all green, replayed onto main). A reclaimer now holds the per-slot reclaim marker `<control>/RECLAIM.<slot>.lock` (an exclusive flock) from before its first unmount until its bind record is dropped. `ensure_binds` makes its binding decisions only in its locked pass and leaves a slot alone while the marker is live or unverifiable. wrkslots' own unbind and remove hold the marker, and the record drop and the marker unlink happen under the bind-records lock. The two whole-map bind-record writers became locked per-slot writes. The Rust mount and unbind paths honour and write the marker, and both status editions report it under the output-only `reclaim_markers` key. `.worktrees-image.json` keeps its shape. Older readers skip `*.lock` names in the control directory, so the marker is not registry state for them. This was checked against an older reader's code and its CLI output. The user guide has a new section, "Reclaiming a bound slot: the reclaim marker".
