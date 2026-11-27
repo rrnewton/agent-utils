@@ -9,7 +9,7 @@ labels:
 - python
 - rust
 created_at: 2026-11-26T20:45:00-05:00
-updated_at: 2026-11-26T20:45:00-05:00
+updated_at: 2026-11-27T18:45:00-05:00
 ---
 
 # Description
@@ -74,3 +74,44 @@ Many gates build an executable whose inputs are byte-identical to one already bu
 # Notes
 
 Proposed while measuring the build steps' cost for #2306 and #2318, and filed at the lead coordinator's request. Do it after #2318 lands, as its own commit and gate. Related: #2306 (`python.agentctl.build-rust`), #2318 (the wrkslots and wrkviz build steps and the wrkviz helper), #883 (two Cargo jobs for test-shard builds), #818 (memory hint rule).
+
+## Landed; one criterion partly owed
+
+Landed as 7c5f4dd7 on 2026-11-27. The landing replayed ba707504, gated on 05197820.
+
+**What the first gate found.** The first gate, on 647722c3, showed that a cached hit must not run from the cache directory.
+
+- wrkslotsd finds `py/wrkslots/__main__.py` by walking up from its own executable. Run from the cache, it failed shell_command tests in two shards.
+- The fix: a hit copies the verified executables to the place in the worktree's target where a build would have put them, checks each copy's hash, and returns the copies.
+- wrkvizd embeds its build worktree's path (`CARGO_MANIFEST_DIR` in `source_root`). An executable that holds its worktree's path now gets that path in its key, so it is reused only in that worktree. An executable the scan cannot read counts as worktree-bound.
+
+**Tests per criterion** (`py/tests/test_adapter_cache.py`):
+
+- Hit: `test_a_clean_tree_hit_runs_no_build`, `test_a_hit_runs_where_a_build_would_so_self_located_files_resolve`, `test_a_hit_in_another_worktree_runs_from_that_worktree`.
+- Misses: `test_a_crate_or_lock_change_misses`, `test_an_extra_input_change_misses`, `test_a_declared_env_change_misses`. A dev-only or unrelated change still hits (`test_a_dev_only_dependency_or_unrelated_change_still_hits`).
+- Dirty tree: `test_a_dirty_tree_builds_and_publishes_nothing`.
+- Atomic publish: `test_an_incomplete_entry_is_never_used`, `test_two_publishers_of_one_key_leave_one_complete_entry`, `test_an_altered_executable_is_never_run`.
+- Prune: `test_prune_removes_nothing_while_a_ticket_exists`, `test_prune_enforces_age_count_and_size`.
+- No wall-clock budget: the cache and its tests have no time limits. Prune ages are entry ages, not pass/fail budgets.
+
+**Measured, from the gate steps' tables:**
+
+| Step | First gate, 647722c3 (cold, all missed) | Landing gate, ba707504 |
+|---|---|---|
+| `python.wrkslots.build-rust` | 189.4 s, 331.6 CPU-s | 0.78 s, 0.50 CPU-s; wrkslotsd hit, no Cargo |
+| `python.wrkviz.build-rust` | 189.4 s, 346.3 CPU-s | 0.89 s, 0.52 CPU-s; wrkvizd hit, no Cargo |
+| `python.agentctl.build-rust` | 334.4 s, 588.6 CPU-s | 3.97 s, 2.94 CPU-s; agentctl hit, but the chat-subscription fake missed, so Cargo ran (up to date, about 3 s) and published it |
+
+In the landing gate every executable ran from inside that worktree's own target, and no shard log names a cache path.
+
+**Gate history.** Gate `1795814047939690226-8446a000` failed four steps, none on this change's path:
+
+- `python.wrkslots.shard-3` and `-4`: the #2372 image tests, made hermetic by 906b54fc, which is not in this base. Covered by step waivers.
+- `python.wrkslots.shard-6`: the #2065 remove-census budget.
+- `rust.chat-subscription.slack`: a wall-clock shared-deadline test.
+
+shard-6 and chat-subscription passed in exclusive rerun `1795821251079936576-40b11778`.
+
+**Still owed.** A gate in which `python.agentctl.build-rust` also runs no Cargo. The fake's entry `c38bd95acaab` is now published, so the next gate of an unchanged agentctl tree should hit every executable.
+
+**Known limit.** wrkvizd hits only in the worktree that published it, until wrkviz stops embedding `CARGO_MANIFEST_DIR` outside tests.

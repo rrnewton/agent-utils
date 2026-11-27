@@ -8,7 +8,7 @@ labels:
 - agentctl
 - testing
 created_at: 2026-11-21T12:45:00-05:00
-updated_at: 2026-11-22T09:17:46-05:00
+updated_at: 2026-11-27T18:50:00-05:00
 ---
 
 # Description
@@ -46,3 +46,12 @@ Shard CPU timeouts (family (d)): the sixteen wrkslots shards are already balance
 Step 2 then drives each census from a controlled inventory (fake proc root or injected inventory, whichever each edition already half-supports), covering census-not-closed, exiting-process-with-unreadable-fd, and unrelated non-dumpable same-UID process deterministically in both editions, and removes each quarantine mark as its case passes under gate load. What the fail-closed holder rule should be for a process that provably is not a holder is decided and documented in step 2; any production behaviour change there is a separate, cold-reviewed commit.
 
 [watermelon-full-preview] Step 1 landed as 3d26c0aa on the default branch (verified-overlap landing under a coordinator waiver: fresh gate 107 of 111 steps passed, none of the 31 quarantined cases ran, remaining reds were rotating census victims in untouched differentials). Step 2 (fresh lane) is the hermetic return: drive every quarantined case above from a controlled inventory — scripted process snapshots in Python, the test-only fake process table for the holder scan in Rust, snapshot/injected evidence for the Rust differentials — covering census-not-closed, exiting process or thread with an unreadable fd directory, and unrelated non-dumpable same-UID process deterministically, and remove each mark as its family passes under gate load. Step 2 scope also covers the wider differential surface the step-1 gates exposed as rotating victims of the same cause (remove and audit Rust differentials whose verdicts read the live table, for example the ignored-file and unrelated-pane remove differentials and audit planning exhaustion): inventory that surface first, hermetically cover or quarantine each case found, and do not chase victims one gate at a time. The fail-closed rule for a process that provably is not a holder is decided and documented in step 2; any production census-behaviour change is a separate cold-reviewed commit. Timing-budget cases are tracked separately under #2031, and CPU-cap sizing under #2084.
+
+2026-11-27, seen while gating #2388 and #2340. Four gating cases that are not in the quarantine failed with the same remove-batch refusal, each on a different tree: "REFUSED: this remove-agent-batch item used its 75-second budget for work before deletion at the /proc scan after the path fence". The cases on 668e988f and ba707504 passed in their exclusive reruns; I did not check reruns for the other two.
+
+- `test_shared_submodules.py::test_remove_keeps_every_linked_worktree_index_of_private_clone`: 252bf52d, shard-15.
+- `test_shared_submodules.py::test_remove_never_loses_index_only_blob_of_private_clone`: 668e988f, shard-0.
+- `test_audit_state_rust.py::test_audit_validate_nested_repo_disposable_matches_python` and `test_audit_validate_relative_run_handle_matches_python`: 2065ee89, shard-15.
+- `test_shared_submodules.py::test_remove_accepts_shared_placed_submodule_in_flat_layout`: ba707504, shard-6.
+
+The holder scan's 600 s timeouts in the two image unmount tests are the #2372 sub-cause, made hermetic by 906b54fc.
