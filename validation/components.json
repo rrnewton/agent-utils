@@ -480,6 +480,7 @@
         "py/wrkslots/tests/test_handoff_write_rust.py",
         "py/wrkslots/tests/test_harness_layout.py",
         "py/wrkslots/tests/test_heartbeat_lock_scope.py",
+        "py/wrkslots/tests/test_heartbeat_unrelated_row.py",
         "py/wrkslots/tests/test_heartbeat_write_rust.py",
         "py/wrkslots/tests/test_hold_state_rust.py",
         "py/wrkslots/tests/test_hold_write_rust.py",

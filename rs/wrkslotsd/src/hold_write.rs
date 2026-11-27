@@ -450,8 +450,35 @@ pub(crate) fn refuse_target_storage_except_nested(
     root: Option<&Path>,
     slot: &str,
 ) -> Result<Vec<String>> {
+    refuse_target_storage_except_nested_census(root, slot, false)
+}
+
+/// [`refuse_target_storage_except_nested`] over the tolerant Git census
+/// (#2396), for heartbeat: another row whose source repository was
+/// deleted becomes that row's own finding, which this slot's command
+/// ignores, instead of refusing every heartbeat on the host. The
+/// target's own unavailable repository is still one of its findings and
+/// refuses. Hold and transfer-owner keep the strict census until #2397
+/// narrows them in both editions.
+pub(crate) fn refuse_target_storage_except_nested_tolerant(
+    root: Option<&Path>,
+    slot: &str,
+) -> Result<Vec<String>> {
+    refuse_target_storage_except_nested_census(root, slot, true)
+}
+
+fn refuse_target_storage_except_nested_census(
+    root: Option<&Path>,
+    slot: &str,
+    tolerate_unavailable: bool,
+) -> Result<Vec<String>> {
     let mut warnings: Vec<String> = Vec::new();
-    for value in [parse_storage(root)?, parse_storage_git(root)?] {
+    let git = if tolerate_unavailable {
+        crate::git_storage_state::parse_storage_git_tolerant(root)?
+    } else {
+        parse_storage_git(root)?
+    };
+    for value in [parse_storage(root)?, git] {
         if let Some(findings) = value.get("findings").and_then(Value::as_array) {
             for finding in findings {
                 if finding.get("slot").and_then(Value::as_str) == Some(slot) {
@@ -477,10 +504,28 @@ pub(crate) fn refuse_target_storage_except_nested(
 /// `_report_dead_mounts`: another slot's dead entry is warned about
 /// and retained; the acted-on slot's dead entry refuses, naming it.
 pub(crate) fn report_dead_findings(root: Option<&Path>, acted_slot: &str) -> Result<()> {
-    for value in [
-        crate::storage_state::parse_storage(root)?,
-        crate::git_storage_state::parse_storage_git(root)?,
-    ] {
+    report_dead_findings_census(root, acted_slot, false)
+}
+
+/// [`report_dead_findings`] over the tolerant Git census (#2396): a row
+/// whose source repository was deleted is that row's finding, not a
+/// refusal of the command acting on `acted_slot`. Python's
+/// `_report_dead_mounts` resolves no repository at all.
+pub(crate) fn report_dead_findings_tolerant(root: Option<&Path>, acted_slot: &str) -> Result<()> {
+    report_dead_findings_census(root, acted_slot, true)
+}
+
+fn report_dead_findings_census(
+    root: Option<&Path>,
+    acted_slot: &str,
+    tolerate_unavailable: bool,
+) -> Result<()> {
+    let git = if tolerate_unavailable {
+        crate::git_storage_state::parse_storage_git_tolerant(root)?
+    } else {
+        crate::git_storage_state::parse_storage_git(root)?
+    };
+    for value in [crate::storage_state::parse_storage(root)?, git] {
         let Some(findings) = value.get("findings").and_then(Value::as_array) else {
             continue;
         };

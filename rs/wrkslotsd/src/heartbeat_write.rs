@@ -19,7 +19,9 @@ use crate::ensure_states::{
     require_fixture, utc_now,
 };
 use crate::global_state::{event_log_status, load_event_chain, EventLogStatus};
-use crate::hold_write::{active_document, refuse_target_storage_except_nested, validate_global};
+use crate::hold_write::{
+    active_document, refuse_target_storage_except_nested_tolerant, validate_global,
+};
 use crate::journals_state::parse_journals;
 use crate::status_state::{process_state, read_process_identity, Identity};
 
@@ -320,6 +322,33 @@ pub(crate) fn release_in_effect(
     Ok(Some(event))
 }
 
+/// Resolve the source repositories this heartbeat's own row names
+/// (#2396), mirroring the Python edition's `_assert_own_record_paths`:
+/// other rows' repositories are never resolved by a heartbeat (its
+/// storage census runs tolerant), but a missing repository of its own
+/// row refuses, naming the row.
+fn refuse_own_repositories(cfg: &Cfg, record: &Value, slot: &str) -> Result<()> {
+    let checkouts = record
+        .get("checkouts")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for checkout in checkouts {
+        if checkout.get("vcs").and_then(Value::as_str) == Some("eden") {
+            // Eden backing repositories live outside the project by
+            // design (#1204); the Eden checks judge them.
+            continue;
+        }
+        let raw = checkout
+            .get("repository")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        crate::finish_write::stored_repository_path(cfg, raw)
+            .map_err(|error| format!("slot {slot}: {error}"))?;
+    }
+    Ok(())
+}
+
 /// Refresh the named slot's heartbeat, printing the outcome.
 pub(crate) fn heartbeat(
     root: Option<&Path>,
@@ -357,6 +386,7 @@ pub(crate) fn heartbeat(
         })
         .cloned()
         .ok_or_else(|| format!("slot '{slot}' is not active on machine {selected}"))?;
+    refuse_own_repositories(&cfg, &record, slot)?;
     let generation = record
         .get("generation")
         .and_then(Value::as_i64)
@@ -412,8 +442,8 @@ pub(crate) fn heartbeat(
     // warning, not a refusal — heartbeat still records. Scope is
     // strictly heartbeat; remove/retire/write-handoff keep their own
     // nested handling (see #1400).
-    let _nested_warnings = refuse_target_storage_except_nested(root, slot)?;
-    crate::hold_write::report_dead_findings(root, slot)?;
+    let _nested_warnings = refuse_target_storage_except_nested_tolerant(root, slot)?;
+    crate::hold_write::report_dead_findings_tolerant(root, slot)?;
     for detail in &_nested_warnings {
         // Only a PRESENT nested worktree is tolerated; a deleted path is
         // stale bookkeeping and still refuses (Python parity).

@@ -18130,10 +18130,20 @@ def _assert_registry_storage_consistent(
         )
     # Only registration findings are used, and they depend on the worktree lists
     # alone, so the per-checkout identity probes are skipped.
+    #
+    # A scoped scan tolerates a row whose source repository cannot be
+    # resolved (#2396): the target row was judged strictly above, and
+    # another row with a deleted repository is already named in `stale`,
+    # so it must not raise here and refuse an unrelated command. Its
+    # repository has no worktree list left to compare anyway.
     registration_findings = tuple(
         item
         for item in _registry_storage_inconsistencies(
-            config, states, vcs=vcs, verify_row_identity=False
+            config,
+            states,
+            vcs=vcs,
+            verify_row_identity=False,
+            tolerate_unavailable_repositories=scope_to_target,
         )
         if item.kind == "git-registration-without-row"
     )
@@ -18550,6 +18560,24 @@ def _global_rows(
             slot = _as_str(archive_record.get("slot"), "archive slot")
             rows[("archive", archive.machine, slot)] = dict(archive_record)
     return rows
+
+
+def _assert_own_record_paths(config: Config, record: ActiveRecord) -> None:
+    """Judge one record's paths strictly, naming the record (#2396).
+
+    A per-slot command loads the registry lexically
+    (``require_repository=False``: containment checks only), so another
+    row whose source repository was deleted cannot refuse it, and then
+    resolves only its own row here: the slot directory, the checkout
+    paths and the source repositories the row names must exist. The
+    refusal names the row, so the stale row's own commands still fail
+    closed, by name.
+    """
+    try:
+        _assert_record_paths(config, record)
+    except Refusal as exc:
+        kind = StateError if isinstance(exc, StateError) else Refusal
+        raise kind(f"slot {record.slot}: {exc}", remedy=exc.remedy) from exc
 
 
 def _target_git_registrations(
@@ -51985,7 +52013,9 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     try:
         ttl_seconds = float(
-            _find_record(_load_active_snapshot(config), args.slot).heartbeat_ttl_seconds
+            _find_record(
+                _load_active_snapshot(config, require_repository=False), args.slot
+            ).heartbeat_ttl_seconds
         )
     except (Refusal, StateError, OSError):
         ttl_seconds = float(config.heartbeat_ttl_seconds)
@@ -52005,7 +52035,10 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
     last_prepared: list[_HeartbeatPrevalidated | None] = [None]
 
     def validate() -> _HeartbeatPrevalidated:
-        states, archives = _validate_global_state(config)
+        # Other rows are read lexically (#2396): a row whose source
+        # repository was deleted must not refuse this slot's heartbeat.
+        # This heartbeat's own row is resolved strictly just below.
+        states, archives = _validate_global_state(config, require_repository=False)
         state = next(
             (item for item in states if item.machine == config.machine), None
         )
@@ -52015,6 +52048,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
                 "no slot registry exists for it on this project"
             )
         record = _find_record(state, args.slot)
+        _assert_own_record_paths(config, record)
         _report_dead_mounts(
             config, states, slot=record.slot, slot_type=record.slot_type
         )
@@ -52114,8 +52148,9 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         """
 
         _refuse_partial_state(config, allow_validate_batch_seals=True)
-        state = _load_active(config)
+        state = _load_active(config, require_repository=False)
         record = _find_record(state, args.slot)
+        _assert_own_record_paths(config, record)
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         _assert_validate_batch_seals_disjoint_from_record(
             config, record, action="heartbeat"
@@ -52129,7 +52164,9 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             )
             archives: Sequence[ArchiveState] = prepared.archives
         elif _validate_batch_seal_journals(config):
-            states, archives = _validate_global_state(config)
+            states, archives = _validate_global_state(
+                config, require_repository=False
+            )
         else:
             # Without a seal the check reads no fleet fact: it runs the
             # journal phase for this slot alone.
@@ -52173,7 +52210,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             evidence={"heartbeat_at": updated.heartbeat_at},
         )
         _assert_local_only_slot_changed(
-            state, _load_active_snapshot(config), updated
+            state, _load_active_snapshot(config, require_repository=False), updated
         )
         return updated, warnings
 
@@ -52212,7 +52249,11 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             if reference is None
             else _verified_local_log(config, reference, states, archives)
         )
-        state = _load_active(config) if local is None else local.active
+        state = (
+            _load_active(config, require_repository=False)
+            if local is None
+            else local.active
+        )
         record = _find_record(state, args.slot)
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         updated = dataclasses.replace(record, heartbeat_at=_utc_now())
