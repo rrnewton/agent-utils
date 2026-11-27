@@ -9,7 +9,7 @@ labels:
 - validate
 - reclamation
 created_at: 2026-11-27T11:58:00-05:00
-updated_at: 2026-11-27T11:58:00-05:00
+updated_at: 2026-11-27T12:25:00-05:00
 ---
 
 # Description
@@ -68,7 +68,8 @@ v2, a box with cgroup, PID and network namespaces and the checkout mounted only 
 - Root acceptance on the consumer's real validate units, run by the consumer's lead after its pin reaches the landed #2392 commit or later. The runbook is in the design note. The verdict is computed by a script from the printed `unit-proof` lines, never from prose:
   - 20 teardowns at load1 >= 237 for the whole run (recorded per run), each `retired` within its bounds;
   - one deliberately held slot (a process with its cwd in the host bind) returning `checkout-in-use-through-host-path` and deleting nothing;
-  - its sweep re-attempt retiring once the holder exits.
+  - its sweep re-attempt retiring once the holder exits, with both timestamps recorded (each result line carries `at=`);
+  - `cgroup-not-empty` is proven by the hermetic test (a slice that stays populated lists its remaining tasks). A real uninterruptible task is optional, at the consumer's lead's discretion, and counts only after it is shown to stay in `D` state for 60 s after `kill -9` (FUSE waits are usually killable).
 - The user guide documents the mode, the result names (a stable interface: add, never rename) and the residuals.
 
 # Notes
