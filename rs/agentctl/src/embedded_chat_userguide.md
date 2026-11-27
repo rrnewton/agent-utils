@@ -729,7 +729,7 @@ line, the message between two tag lines, a blank line, and a short footer:
 the message, exactly as sent
 </chat_message>
 
-Reply between a line <CHAT_REPLY_007> and a line </CHAT_REPLY_007>, with no tool call between them; send several replies when that helps (progress updates, one reply per topic), each in its own pair.
+Reply between a line <CHAT_REPLY_007> and a line </CHAT_REPLY_007>, with no tool call between them; send several replies when that helps (progress updates, one reply per topic), each in its own pair. A reply written only in your thinking is not delivered: print each pair as ordinary text.
 Earlier messages in this thread: agentctl chat thread 007
 If you have trouble, run: agentctl chat help 007
 ```
@@ -2653,7 +2653,10 @@ person may be typing it; that is the case this warning names.
 A Claude Code agent sometimes writes its reply only in its thinking. Claude
 Code draws nothing of a thinking block, so the reply never reaches the screen,
 the bridge posts nothing, the agent believes it answered, and the owner sees
-silence. `chat run` therefore reminds a Claude Code agent, once, of each
+silence. A headless agent's thinking is likewise never in its event log
+(#2386). So every prompt that asks for the marker lines ends its reply line by
+saying that a reply written only in thinking is not delivered, and `chat help`
+says the same. `chat run` also reminds a Claude Code agent, once, of each
 request it has not answered, once the agent has been idle for
 `--reply-reminder-idle DURATION`: 60 seconds by default. DURATION is a whole
 number of seconds (`s`, or no unit), minutes (`m`) or hours (`h`), at least

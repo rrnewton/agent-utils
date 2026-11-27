@@ -675,7 +675,8 @@ PROVIDER CHANNEL · sent: TIME · reply: ...]`, then the message between its tag
 The normal way to reply: print the reply as ordinary text between two marker lines, each alone \
 on its line and outside code fences. The opening line is `<CHAT_REPLY_`, then the reply ID, then \
 `>`; the closing line is `</CHAT_REPLY_`, then the reply ID, then `>`. The text between them \
-reaches the chat and stays in your terminal. Use the same two lines for every reply (for a long \
+reaches the chat and stays in your terminal; a reply written only in your thinking is not \
+delivered. Use the same two lines for every reply (for a long \
 ID ending in a number, add one to that number for each later reply), make no tool call between \
 them, and give each reply new wording.\n\n\
 When the marker lines cannot do the job (a reply before your turn ends, or one that did not reach \

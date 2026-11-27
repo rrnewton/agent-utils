@@ -82,6 +82,11 @@ const MAX_IGNORED_TEXT_PREFIXES: usize = 32;
 const MAX_IGNORED_TEXT_PREFIX_BYTES: usize = 256;
 const REPLY_NONCE_BYTES: usize = 16;
 pub(crate) const MAX_REPLY_BYTES: usize = 30_000;
+/// The fenced prompt's last sentence (#2386 headless-reply-in-thinking): a block the agent writes
+/// only in its thinking reaches no transcript, event log or screen, so the bridge cannot capture
+/// it. The reply reminder says the same after the fact (#292).
+pub(crate) const THINKING_NOT_SENT: &str =
+    "A reply written only in your thinking is not delivered: print each pair as ordinary text.";
 const MAX_REPLY_RECORD_BYTES: usize = 64 * 1_024;
 const MAX_REPLY_ORDINAL: u32 = 999_999;
 const MAX_REQUEST_REPLIES: u32 = 4_096;
@@ -11165,11 +11170,14 @@ and running this, once per reply: {command}{sent}"
                 Some(short) => format!("reply: CHAT_REPLY_{reply_id} or {short}"),
                 None => format!("reply: CHAT_REPLY_{reply_id}"),
             });
+            // A reply written only in thinking never reaches the transcript, the event log or
+            // the screen, so the bridge has nothing to capture; the prompt says so up front, in
+            // the reminder's words (#2386 headless-reply-in-thinking, #292).
             footer.insert(
                 0,
                 format!(
                     "Reply between a line <CHAT_REPLY_{reply_id}> and a line \
-</CHAT_REPLY_{reply_id}>, with no tool call between them; {numbering}"
+</CHAT_REPLY_{reply_id}>, with no tool call between them; {numbering} {THINKING_NOT_SENT}"
                 ),
             );
         }
@@ -13025,7 +13033,7 @@ it again.\n"
 lines, each alone on its line and outside code fences. The opening line is `<CHAT_REPLY_`, then \
 {reply_id}, then `>`; the closing line is `</CHAT_REPLY_`, then {reply_id}, then `>`. The text \
 between them reaches the chat and also stays in your terminal, where the owner may be reading. \
-{numbering}, make no tool call between them, and give each reply new wording: a text the request \
+A reply written only in your thinking is not delivered. {numbering}, make no tool call between them, and give each reply new wording: a text the request \
 already sent is not sent again. Several replies are welcome: acknowledge long work at once, send \
 real progress, and answer separate topics in separate replies.\n\n\
 Use the command instead only when the marker lines cannot do the job: to send a reply before \
@@ -28691,7 +28699,8 @@ pub(crate) mod tests {
         assert!(prompts[0].contains(
             "\n\nReply between a line <CHAT_REPLY_001> and a line </CHAT_REPLY_001>, with no tool \
 call between them; send several replies when that helps (progress updates, one reply per topic), \
-each in its own pair.\nIf you have trouble, run: "
+each in its own pair. A reply written only in your thinking is not delivered: print each pair as \
+ordinary text.\nIf you have trouble, run: "
         ));
         assert!(!prompts[0].contains("messages to one chat thread"));
         assert!(!prompts[0].contains("combine short updates"));
@@ -37759,7 +37768,7 @@ what about this part?\n\
 \n\
 Reply between a line <CHAT_REPLY_001> and a line </CHAT_REPLY_001>, with no tool call between \
 them; send several replies when that helps (progress updates, one reply per topic), each in its \
-own pair.\n\
+own pair. {THINKING_NOT_SENT}\n\
 Earlier messages in this thread: {program} chat thread --bridge-state {root_word} \
 --thread spaces/example/threads/one --last {DEFAULT_THREAD_HISTORY_MESSAGES}\n\
 If you have trouble, run: {program} chat help --bridge-state {root_word} 001"
@@ -44739,6 +44748,13 @@ agentctl chat sent 001\nIf you have trouble, run: agentctl chat help 001"
             );
             assert!(prompt.contains(" chat reply "), "{prompt}");
         }
+        // Only a prompt that asks for printed reply blocks warns that one written in thinking is
+        // not delivered (#2386); a command-only prompt already says nothing printed is.
+        assert_eq!(
+            prompt.contains(THINKING_NOT_SENT),
+            !command_only,
+            "{prompt}"
+        );
         let record = state.read_request(key).expect("request record");
         let status = state.status().expect("status");
         (
@@ -45197,8 +45213,8 @@ agentctl chat sent 001\nIf you have trouble, run: agentctl chat help 001"
         // chat-prompt-anatomy).
         assert!(
             prompt.ends_with(&format!(
-                "each in its own pair.\nIf you have trouble, run: {program} chat help --bridge-state \
-{root_word} 001"
+                "each in its own pair. {THINKING_NOT_SENT}\nIf you have trouble, run: {program} chat \
+help --bridge-state {root_word} 001"
             )),
             "{prompt}"
         );
@@ -45232,9 +45248,10 @@ agentctl chat sent 001\nIf you have trouble, run: agentctl chat help 001"
             "{prompt}"
         );
         assert!(
-            prompt.ends_with(
-                "each in its own pair.\nIf you have trouble, run: agentctl chat help 001"
-            ),
+            prompt.ends_with(&format!(
+                "each in its own pair. {THINKING_NOT_SENT}\nIf you have trouble, run: agentctl chat \
+help 001"
+            )),
             "{prompt}"
         );
         let page = state.help_page("001", &key);
@@ -45281,7 +45298,10 @@ agentctl chat sent 001\nIf you have trouble, run: agentctl chat help 001"
                 .with_reply_command_offered(true);
             let key = admitted(&state, 1).remove(0);
             let prompt = prompted(&state, &key);
-            assert!(prompt.ends_with("each in its own pair."), "{prompt}");
+            assert!(
+                prompt.ends_with(&format!("each in its own pair. {THINKING_NOT_SENT}")),
+                "{prompt}"
+            );
             assert!(!prompt.contains("PATH_TO_YOUR_REPLY"), "{prompt}");
             fs::remove_dir_all(root).expect("cleanup");
         }
