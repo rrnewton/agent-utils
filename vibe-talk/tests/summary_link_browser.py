@@ -639,9 +639,34 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
         # moment before the tap, as Back must put it back.
         page.screenshot(path=str(shots / f"{label}-before-reply-tap.png"))
         before_row: object = page.evaluate(row_probe)
+    # `#2365 vibe-talk-jump-toast-covers-landed-row`: what the status line is the moment the jump
+    # says its landing, recorded by an observer as the words land (no clock): an idle word,
+    # announced and drawn nowhere, so no toast stands over the landed row (its bubble marks it).
+    page.evaluate("""() => {
+      window.__landSaid = null;
+      const said = document.getElementById('status');
+      const line = document.getElementById('status-line');
+      const look = () => {
+        if (window.__landSaid !== null || said.textContent !== 'Here is the linked message.' || line.hidden) return;
+        const style = getComputedStyle(line);
+        const box = line.getBoundingClientRect();
+        window.__landSaid = {idle: line.hasAttribute('data-idle'), visibility: style.visibility,
+          saidVisibility: getComputedStyle(said).visibility, clip: style.clipPath,
+          width: box.width, height: box.height, live: said.getAttribute('aria-live')};
+      };
+      window.__landSaidWatch = new MutationObserver(look);
+      window.__landSaidWatch.observe(line, {subtree: true, childList: true, characterData: true, attributes: true});
+    }""")
     tap_visible(citations.nth(1), "reply citation")
     assert_landed(ids["reply_msg"], "reply citation")
     check_stable("reply citation")
+    land_said: object = page.evaluate("() => { window.__landSaidWatch.disconnect(); return window.__landSaid; }")
+    check(isinstance(land_said, dict) and land_said["idle"] and land_said["live"] == "polite"
+          and land_said["visibility"] != "hidden" and land_said["saidVisibility"] != "hidden",
+          f"{label}: the jump's landing was not said as an idle word in the polite live region: {land_said}")
+    assert isinstance(land_said, dict)
+    check(land_said["clip"] == "inset(50%)" and land_said["width"] <= 1 and land_said["height"] <= 1,
+          f"{label}: the jump's landing is drawn as a toast over the landed row: {land_said}")
     if shots is not None:
         page.screenshot(path=str(shots / f"{label}-reply-landed.png"))
         # The before/after pair's sidecar (`#2147`): the reply landing the

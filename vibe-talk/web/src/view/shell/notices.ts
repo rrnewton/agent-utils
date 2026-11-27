@@ -25,7 +25,10 @@ const IDLE_STATUS_WORDS: ReadonlySet<string> = new Set(["Ready.", "ready",
   // `#2350 vibe-talk-back-toast-covers-returned-row`: Back's return. The row, and its
   // Linked bubble, standing where the reader left them is the confirmation; a toast
   // over that very row hid it. Announced, not floated.
-  "Back where you were."]);
+  "Back where you were.",
+  // `#2365 vibe-talk-jump-toast-covers-landed-row`: a link jump's landing, row or card. The
+  // landed row's Linked bubble already marks the target; announced, not floated over it.
+  "Here is the linked message.", "Here is the linked message's card."]);
 
 /** How long the connection banner stays before it takes itself away, in ms. */
 const BANNER_DISMISS_MS = 8000;

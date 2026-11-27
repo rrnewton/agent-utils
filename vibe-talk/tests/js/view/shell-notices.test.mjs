@@ -99,6 +99,12 @@ test("#1859: an idle confirmation is marked to wait, action words are not", () =
   notices.setStatus("Back where you were.");
   assert.equal(el("status-line").attrs["data-idle"], "", "Back's return was floated over the row it returned to");
   assert.equal(el("status").textContent, "Back where you were.", "Back's return was not announced");
+  // `#2365`: a link jump's landing, row or card, the same way.
+  for (const landing of ["Here is the linked message.", "Here is the linked message's card."]) {
+    notices.setStatus(landing);
+    assert.equal(el("status-line").attrs["data-idle"], "", `"${landing}" was floated over the landed row`);
+    assert.equal(el("status").textContent, landing, `"${landing}" was not announced`);
+  }
   notices.dismissStatus();
   assert.equal(el("status-line").attrs["data-idle"], undefined, "a taken-away line kept the idle mark");
 });
