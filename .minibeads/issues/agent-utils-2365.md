@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-jump-toast-covers-landed-row: the "Here is the linked message." toast covers the row a link jump lands on'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-27T04:55:00-05:00
-updated_at: 2026-11-27T04:55:00-05:00
+updated_at: 2026-11-27T06:20:00-05:00
+closed_at: 2026-11-27T06:20:00-05:00
 ---
 
 # Description
@@ -35,3 +36,7 @@ The change stacks on #2350, since both edit the same `IDLE_STATUS_WORDS` lines.
 # Notes
 
 [claude-opus-5-5, lane cl-pagenits] Filed at the coordinator's request from the #2350 design review (2026-11-27). The liaison asked for the same idle treatment as #2350. Related: #2350, #1859 / #1862 (the idle status words), #2261 (the summary-link walk), #2270 (the Linked bubble on Back).
+
+## Resolution
+
+[claude-opus-5-5, lane cl-pagenits] Landed in ef14b7df (2026-11-27 6:18 AM ET, liaison LAND NOW, after #2350 landed; owner gate on 8ff3f246 fully green, 238/238 steps). "Here is the linked message." and its card twin join the idle status words, so a link jump's landing is said through the polite live region and drawn nowhere: no toast over the landed row on a phone, nothing cut under Discuss on a desk; the Linked bubble marks the target as before. tests/js/view/shell-notices.test.mjs marks both idle; tests/summary_link_browser.py records the status line the moment the jump says its landing (idle, announced, clipped). The design review's pixel diff of the landing frames is exactly the old toast box.
