@@ -1501,3 +1501,52 @@ test("`#1135 raw-message-page`: Cancel drops the keyboard; with words it asks fi
     "the discarded draft is still kept on the device");
   assert.equal(page.repliesPosted.length, 0, "discarding sent");
 });
+
+// --- `#2301 vibe-talk-ui-review-findings-11-26` item 7: only the focused composer's Send is filled ---
+//
+// R13 with R3: with Discuss's follow-up box focused on a phone, the filled Send was the channel's,
+// the composer the reader is not in, and Discuss's own was the quiet one. The panel marks the
+// screen while its composer holds the focus (`data-discuss-composing` on #screen-main, the
+// `#2283` frame-flag style: one writer, no `:has()`), and the stylesheet swaps the two dresses.
+
+test("`#2301` item 7: the screen is marked while Discuss's composer holds the focus (its box or its own Send), and the mark goes when the focus leaves or the panel closes", async () => {
+  const page = newPage(new Map(), SCRIPT);
+  page.discussAvailable = true;
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001", content: "note 1" })]);
+  await page.el("discuss-open").click();
+  await page.settle();
+  assert.equal(page.el("discuss-panel").hidden, false, "fixture: Discuss did not open");
+  const composing = () => page.el("screen-main").hasAttribute("data-discuss-composing");
+  assert.equal(composing(), false, "the screen was marked before Discuss's composer held the focus");
+  await page.moveFocus(page.el("discuss-followup"));
+  assert.equal(composing(), true, "focusing Discuss's follow-up box did not mark the screen");
+  await page.moveFocus(page.el("discuss-send"));
+  assert.equal(composing(), true, "the focus moving to the composer's own Send (a tap on it) cleared the mark");
+  await page.moveFocus(page.el("channel-compose-text"));
+  assert.equal(composing(), false, "the focus moving to the channel's box left the screen marked");
+  await page.moveFocus(page.el("discuss-followup"));
+  await page.loseFocus();
+  assert.equal(composing(), false, "the box losing the focus to nothing left the screen marked");
+  await page.moveFocus(page.el("discuss-followup"));
+  await page.el("discuss-close").click();
+  await page.settle();
+  assert.equal(composing(), false, "closing Discuss with its box focused left the screen marked");
+});
+
+test("`#2301` item 7: while the mark stands, Discuss's Send wears the filled dress and the channel's Send the quiet one, and neither box moves", () => {
+  // At rest Discuss's Send is quiet and the channel's is the page's filled button.
+  assert.doesNotMatch(cssBlock("#discuss-send"), /var\(--accent\)/, "Discuss's Send is filled at rest");
+  const filled = cssBlock("#screen-main[data-discuss-composing] #discuss-send");
+  assert.match(filled, /background:\s*var\(--accent\)/, "the focused composer's Send is not filled");
+  assert.match(filled, /color:\s*var\(--on-accent\)/, "the filled Send's label is not the on-accent ink");
+  const quiet = cssBlock("#screen-main[data-discuss-composing]:not([data-draft]) #channel-send");
+  assert.match(quiet, /background:\s*transparent/, "the channel's Send stays filled while Discuss composes");
+  assert.match(quiet, /color:\s*var\(--accent\)/, "the channel's quiet Send is not the draft's accent ink");
+  // The swap repaints; it never resizes or moves either control (R11/R12): no box property.
+  for (const [name, block] of [["Discuss's Send", filled], ["the channel's Send", quiet]]) {
+    assert.doesNotMatch(block, /(?:^|[;{\s])(?:padding|margin|width|min-width|height|min-height|border|border-width|font|font-size)\s*:/,
+      `${name}'s composing dress changes its box`);
+  }
+  assert.doesNotMatch(CSS_CODE, /data-discuss-composing[^{]*:has\(/, "a composing rule reads the page with :has()");
+});

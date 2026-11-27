@@ -823,6 +823,23 @@
   font: inherit;
 }
 
+/* `#2301 vibe-talk-ui-review-findings-11-26` item 7 (R13 with R3): only the focused composer's
+ * Send is the filled one. While this composer holds the focus (`data-discuss-composing`, the
+ * panel's flag on #screen-main), its Send takes the page's filled button and the channel's Send
+ * the quiet dress a draft gives it (16-post-confirmation.css), its edge drawn inside so neither
+ * box moves; a draft's own dress already stands there. Back when the focus leaves. */
+#screen-main[data-discuss-composing] #discuss-send {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+}
+
+#screen-main[data-discuss-composing]:not([data-draft]) #channel-send {
+  background: transparent;
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
 /* `#1540 discuss-footer-inline-links`: the label and its times flow as
  * one dense comma-separated line that wraps like text, at phone and
  * desk alike — never one full-width button per time. */

@@ -1473,11 +1473,26 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
   }
 
+  /**
+   * `#2301 vibe-talk-ui-review-findings-11-26` item 7 (R13 with R3). The focus in this panel's
+   * composer, on #screen-main beside the screen's other frame flags (the `#2283` C3 style:
+   * this panel its one writer, no `:has()`), so only the focused composer's Send wears the
+   * filled dress and the channel's the quiet one (22-discuss.css).
+   */
+  function markComposing(on: boolean): void {
+    const screen = maybe("screen-main");
+    if (!screen) return;
+    if (on && !screen.hasAttribute("data-discuss-composing")) screen.setAttribute("data-discuss-composing", "");
+    if (!on && screen.hasAttribute("data-discuss-composing")) screen.removeAttribute("data-discuss-composing");
+  }
+
   function setOpen(open: boolean): void {
     panel().hidden = !open;
     // Every exit (close(), the X, Escape, the bar toggle) lands here, so the
     // screen's docked/maximized mark follows openness from this one place.
     syncScreenMode();
+    // `#2301` item 7: a closed panel's composer holds no focus, whatever event the hide sent.
+    if (!open) markComposing(false);
     // `#2283 vibe-talk-root-has-rules`. Openness itself on the root, from this same one
     // place, for what floats over the panel (the reading strip); the half-sheet fact follows.
     const root = document.documentElement;
@@ -2775,6 +2790,18 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           }
         });
         listening.listen(deps.byId("discuss-send"), "click", () => sendFollowup());
+        // `#2301` item 7: the composer holds the focus while its box or its own buttons do
+        // (a tap on its Send moves the focus there before the click, and the Send keeps its
+        // dress through it); the flag goes when the focus leaves for anything else.
+        const composerParts = [followupBox, maybe("discuss-send"), maybe("discuss-save-draft")]
+          .filter((part): part is HTMLElement => part !== null);
+        for (const part of composerParts) {
+          listening.listen(part, "focusin", () => markComposing(isOpen()));
+          listening.listen(part, "focusout", (event) => {
+            const next = (event as FocusEvent).relatedTarget;
+            markComposing(next != null && composerParts.includes(next as HTMLElement));
+          });
+        }
         listening.listen(deps.byId("discuss-update"), "click", () => {
           if (pending || lastScope === null) return;
           updateFor(lastScope);
@@ -3010,6 +3037,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           mounted = false;
           drag = null;
           listening.unmount();
+          // `#2301` item 7: no listener is left to clear the composer's flag.
+          markComposing(false);
         },
       };
     },

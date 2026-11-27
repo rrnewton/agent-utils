@@ -391,6 +391,45 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     else:
         check(luminance(theme["panelBg"]) < 0.05 and luminance(theme["panelInk"]) > 0.5,
               f"the dark-scheme panel did not stand dark with light ink: {theme}")
+    # `#2301 vibe-talk-ui-review-findings-11-26` item 7 (R13 with R3): only the focused
+    # composer's Send is the filled one. At rest the channel's Send is the page's filled button
+    # (--accent, resolved through a probe) and Discuss's the quiet one; with the focus in
+    # Discuss's box the two swap, the swap repaints without resizing either, and the focus
+    # leaving gives the filled dress back to the channel's Send.
+    sends_js = """() => {
+      const probe = document.createElement('div');
+      document.body.appendChild(probe);
+      probe.style.background = 'var(--accent)';
+      const accent = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      const look = (id) => {
+        const el = document.getElementById(id);
+        const r = el.getBoundingClientRect();
+        return { bg: getComputedStyle(el).backgroundColor, size: [r.width, r.height] };
+      };
+      return { accent, discuss: look('discuss-send'), channel: look('channel-send'),
+               composing: document.getElementById('screen-main').hasAttribute('data-discuss-composing') };
+    }"""
+    sends_rest = page.evaluate(sends_js)
+    check(not sends_rest["composing"] and sends_rest["channel"]["bg"] == sends_rest["accent"]
+          and sends_rest["discuss"]["bg"] != sends_rest["accent"],
+          f"at rest the channel's Send is not the one filled Send: {sends_rest}")
+    page.locator("#discuss-followup").focus()
+    page.wait_for_function("() => document.getElementById('screen-main').hasAttribute('data-discuss-composing')",
+                           timeout=browser_waits.HANG_BACKSTOP_MS)
+    sends_composing = page.evaluate(sends_js)
+    check(sends_composing["discuss"]["bg"] == sends_composing["accent"]
+          and sends_composing["channel"]["bg"] != sends_composing["accent"],
+          f"with Discuss's box focused its Send is not the one filled Send: {sends_composing}")
+    check(sends_composing["discuss"]["size"] == sends_rest["discuss"]["size"]
+          and sends_composing["channel"]["size"] == sends_rest["channel"]["size"],
+          f"the dress swap resized a Send: at rest {sends_rest}, composing {sends_composing}")
+    page.locator("#discuss-followup").blur()
+    page.wait_for_function("() => !document.getElementById('screen-main').hasAttribute('data-discuss-composing')",
+                           timeout=browser_waits.HANG_BACKSTOP_MS)
+    sends_back = page.evaluate(sends_js)
+    check(sends_back["channel"]["bg"] == sends_back["accent"] and sends_back["discuss"]["bg"] != sends_back["accent"],
+          f"the focus leaving Discuss's box did not give the filled Send back to the channel: {sends_back}")
     # Opening asks nothing: the bound is offered first, and only its press posts.
     page.wait_for_function(
         "() => document.getElementById('discuss-summarize').textContent === 'Summarize'"

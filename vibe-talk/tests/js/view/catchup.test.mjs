@@ -1926,6 +1926,53 @@ test("catchup modes: closing a docked panel frees the column; reopening docks ag
   } finally { fx.restore(); }
 });
 
+test("catchup composing: the composer's focus is a flag on the screen that follows it and goes on close (#2301 item 7)", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    const mounted = view.mountControls();
+    view.open();
+    await flush();
+    const screen = fx.els["screen-main"];
+    const box = fx.els["discuss-followup"];
+    const send = fx.els["discuss-send"];
+    const composing = () => screen.hasAttribute("data-discuss-composing");
+    assert.equal(composing(), false, "the flag stood before the composer held the focus");
+    fire(box, "focusin");
+    assert.equal(composing(), true, "focusing the follow-up box did not mark the screen");
+    // A tap on the composer's own Send moves the focus there before the click: still composing.
+    fire(box, "focusout", { relatedTarget: send });
+    assert.equal(composing(), true, "the focus moving to the composer's Send cleared the flag");
+    fire(send, "focusin");
+    assert.equal(composing(), true);
+    fire(send, "focusout", { relatedTarget: fx.els["discuss-close"] });
+    assert.equal(composing(), false, "the focus leaving the composer left the flag");
+    fire(box, "focusin");
+    fire(box, "focusout", { relatedTarget: null });
+    assert.equal(composing(), false, "the box losing the focus to nothing left the flag");
+    // Every close clears it, whatever event the hide sends: close(), the X, Escape, unmount.
+    fire(box, "focusin");
+    view.close();
+    assert.equal(composing(), false, "close() left the flag");
+    view.open();
+    await flush();
+    fire(box, "focusin");
+    click(fx.els["discuss-close"]);
+    assert.equal(composing(), false, "the X left the flag");
+    view.open();
+    await flush();
+    fire(box, "focusin");
+    fire(fx.els["discuss-panel"], "keydown", { key: "Escape" });
+    assert.equal(composing(), false, "Escape left the flag");
+    view.open();
+    await flush();
+    fire(box, "focusin");
+    assert.equal(composing(), true, "reopening did not let the box mark the screen again");
+    mounted.unmount();
+    assert.equal(composing(), false, "unmounting left the flag");
+  } finally { fx.restore(); }
+});
+
 
 // ---- 10. scope binding (`#1395 discuss-scope-binding`) ----------------------------------------
 
