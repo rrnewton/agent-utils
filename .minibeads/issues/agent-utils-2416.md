@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-thread-pin-picker-slug-race: the pin picker check reads its rows once, before the thread summaries draw the named slug'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 - tests
 created_at: 2026-11-27T17:37:18-05:00
-updated_at: 2026-11-27T17:37:18-05:00
+updated_at: 2026-11-27T18:58:12-05:00
+closed_at: 2026-11-27T18:58:12-05:00
 ---
 
 # Description
@@ -36,3 +37,16 @@ From the frequent-red-steps audit, item P2. Its other reds were #2158's date bom
 # Notes
 
 Filed at the coordinator's request from the audit's P2. A fix, not a disable or a known red (owner reply 346). Related: #2158 (the date bomb, fixed by 5d357dc9), #2175.
+
+## Resolution
+
+Fixed by c640c247 (vibe-talk: the pin picker check waits for its rows to be whole before reading them). Test only; the page is unchanged.
+
+- open_popup now waits until the rows are whole: three thread rows AND the named thread's .thread-picker-slug drawn. It is a condition with the hang backstop.
+- The thread-header step waits for the named row's slug the same way instead of evaluating once.
+
+Proof:
+- With every view=threads read held 4 s on the fake API's server thread, the old check failed with c3f49b05's StopIteration, and the new one passed.
+- A fixture without display_name fails the new check.
+- 10/10 plain runs at load1 194-214.
+- Gate on 00a672c9: the pin picker step passed. The only reds were the known reds search-typing-fast-browser and search-unmatched-browser (#2175). Both passed one solo rerun on the same tree, then it landed.
