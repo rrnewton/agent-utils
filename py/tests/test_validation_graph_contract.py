@@ -147,12 +147,22 @@ def test_rust_and_cross_nodes_cover_their_registries_once() -> None:
         if step.tag.startswith("rust.")
         for crate in _flag_values(step.cmd, "-p")
     )
+    # A ``--only-kind`` node (#2388 cross.dagrun.live-scope) runs only the checks the full node
+    # of the same tool skips with that kind; it complements that node and is not a second copy.
     cross_tools = Counter(
         tool
         for step in config.steps
-        if step.tag.startswith("cross.")
+        if step.tag.startswith("cross.") and "--only-kind" not in step.cmd
         for tool in _flag_values(step.cmd, "--tool")
     )
+    complement_tools = {
+        tool
+        for step in config.steps
+        if step.tag.startswith("cross.") and "--only-kind" in step.cmd
+        for tool in _flag_values(step.cmd, "--tool")
+    }
+    assert complement_tools == {"dagrun", "cpuset-alloc"}
+    assert complement_tools <= set(cross_tools)
 
     assert rust_tests == Counter({name: 1 for name in _workspace_crates()})
     listed = _listed("cross/differential.py --list-tools")

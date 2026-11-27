@@ -36,9 +36,9 @@ steps:
     desc: dagrun Python and Rust commands agree
     # Partial by declaration, and only for one structural reason: this node runs inside the
     # parent-owned delegated cgroup, where the harness must not create a live systemd scope, so
-    # the live pin-run cases are listed as skipped rather than run. They run only when someone
-    # invokes `make cross` by hand at top level; no automated lane does
-    # (https://github.com/rrnewton/agent-utils/issues/165). Boxing stays required here; a lane
+    # the live pin-run cases are listed as skipped rather than run. The non-delegated node
+    # cross.dagrun.live-scope below runs them (#2388), and validate counts these skips as
+    # measured only when that node passed them in the same run. Boxing stays required here; a lane
     # that cannot box must declare that itself (AGENT_UTILS_CROSS_ALLOW_SKIP=boxing).
     # A partial run exits 0, so dagrun shows this node as a plain PASS with the PARTIAL line only
     # in its brackets; scripts/validate.py lists the skipped checks in its own summary.
@@ -75,9 +75,7 @@ steps:
     desc: cpuset allocator Python and Rust commands agree
     # Partial for the same structural reason as dagrun.differential: the live-scope cases
     # (selftest, interop, wrapped help, signal status) are listed as skipped inside the
-    # delegated cgroup. They run, with full coverage, only when someone invokes `make cross` by
-    # hand at top level; no automated lane does
-    # (https://github.com/rrnewton/agent-utils/issues/165).
+    # delegated cgroup; cross.dagrun.live-scope below runs and measures them (#2388).
     cmd: python3 cross/differential.py --tool cpuset-alloc --allow-skip delegated-live-scope
     jobs_flag: ""
     labels: [validation-cross, component-dagrun]
@@ -89,6 +87,35 @@ steps:
       classification: latency-bound
       preferred_inner_jobs: 4
       rss_baseline_bytes: 2147483648
+
+  - group: dagrun
+    job: live-scope
+    desc: the dagrun and cpuset allocator live-scope cases, measured outside the delegated cgroup
+    # #2388 gate-full-partial-delegated-live-scope: the seven cases the two nodes above list as
+    # delegated-live-scope skips (pin-run reserve/apply/release and signal status; cpuset
+    # selftest, interop both ways, wrapped help and signal status) run here, and only here. The
+    # node is NOT delegated, so the cases may start their live HARD-pin systemd scope; validate
+    # counts a delegated skip as measured only when this node's record of the same run passed
+    # that check. It allows no skip: a host without a working user scope or HARD pin fails it,
+    # and a hosted lane that cannot box declares that itself (AGENT_UTILS_CROSS_ALLOW_SKIP).
+    # What leaves the step's cgroup, and so the gate's containment, is only each case's wrapped
+    # command, and every one ends on its own: `true`, `printf`, a self-SIGTERM, a selftest with
+    # no sampling, and the interop holder, which waits on a pipe that closes when this harness
+    # ends. Every case uses a scratch core ledger, never the host-wide one. #28
+    # delegated-cpuset is the durable fix that pins inside the delegated cgroup instead.
+    cmd: >-
+      python3 cross/differential.py --tool dagrun --only-kind delegated-live-scope &&
+      python3 cross/differential.py --tool cpuset-alloc --only-kind delegated-live-scope
+    jobs_flag: ""
+    labels: [validation-cross, component-dagrun]
+    timeout: 9600
+    cpu_timeout: 1200
+    hint:
+      est_duration_s: 60
+      classification: latency-bound
+      # The interop cases need two usable CPUs for two disjoint reservations.
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1073741824
 
   # DISABLED by default (owner reply 346, 2026-11-10; #1249
   # cross-differentials-robust; one consuming-project name redacted):

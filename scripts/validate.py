@@ -604,6 +604,49 @@ class CrossCoverage(NamedTuple):
     missing: list[str]
     #: Skipped checks across all readable records, counted per skip kind and sorted by kind.
     by_kind: tuple[tuple[str, int], ...] = ()
+    #: Lines to print, one per record whose ``delegated-live-scope`` skips a passing live-scope
+    #: record of the same run measured (#2388). Those skips are not counted in ``skipped``.
+    measured: tuple[str, ...] = ()
+
+
+#: The skip kind a ``cross/differential.py --only-kind`` record can measure: the live
+#: systemd-scope cases a parent-owned delegated cgroup forbids, which the validation node
+#: ``cross.dagrun.live-scope`` runs outside it (#2388).
+LIVE_SCOPE_KIND = "delegated-live-scope"
+
+
+def _live_scope_coverage(
+    records: Sequence[Mapping[str, object]],
+) -> tuple[dict[tuple[str, str], str], set[tuple[str, str]]]:
+    """What the run's live-scope records measured, and what they skipped themselves.
+
+    Returns ``(measured, superseded)``. ``measured`` maps ``(tool, label)`` to the node of a
+    passing (OK or PARTIAL) record written with ``--only-kind delegated-live-scope`` that lists
+    the label among the checks that passed. ``superseded`` holds the ``(tool, label)`` pairs such
+    a record skipped itself: that record already counts the skip, so a delegated node's skip of
+    the same check is not counted a second time.
+    """
+
+    measured: dict[tuple[str, str], str] = {}
+    superseded: set[tuple[str, str]] = set()
+    for value in records:
+        if value.get("only_kind") != LIVE_SCOPE_KIND:
+            continue
+        if value.get("verdict") not in ("OK", "PARTIAL"):
+            continue
+        tool = str(value.get("tool"))
+        node = str(value.get("node") or "top level")
+        passed = value.get("passed")
+        if isinstance(passed, list):
+            for label in passed:
+                if isinstance(label, str):
+                    measured[(tool, label)] = node
+        skipped = value.get("skipped")
+        if isinstance(skipped, list):
+            for item in skipped:
+                if isinstance(item, dict) and isinstance(item.get("label"), str):
+                    superseded.add((tool, str(item["label"])))
+    return measured, superseded - set(measured)
 
 
 def _kind_counts(counts: Mapping[str, int]) -> str:
@@ -623,25 +666,69 @@ def cross_coverage_report(directory: Path, expected_nodes: Sequence[str]) -> Cro
     """
 
     lines: list[str] = []
+    measured_lines: list[str] = []
     skipped_total = 0
     unreadable = 0
     recorded_nodes: set[str] = set()
     by_kind: dict[str, int] = {}
+    # Read every record first: a live-scope record can measure a skip listed in a record read
+    # before it. Each entry is a readable record or the line describing one that is not, kept in
+    # file order so the summary lists them in that order.
+    entries: list[dict[str, object] | str] = []
     for path in sorted(directory.glob("*.json")):
         try:
             value: object = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            lines.append(f"  unreadable cross coverage record {path.name}: {exc}")
+            entries.append(f"  unreadable cross coverage record {path.name}: {exc}")
             unreadable += 1
             continue
         skipped = value.get("skipped") if isinstance(value, dict) else None
         if not isinstance(value, dict) or not isinstance(skipped, list):
-            lines.append(f"  malformed cross coverage record {path.name}: {value!r}")
+            entries.append(f"  malformed cross coverage record {path.name}: {value!r}")
             unreadable += 1
             continue
         node = value.get("node")
         if isinstance(node, str):
             recorded_nodes.add(node)
+        entries.append(value)
+    measured, superseded = _live_scope_coverage(
+        [entry for entry in entries if isinstance(entry, dict)]
+    )
+    for value in entries:
+        if isinstance(value, str):
+            lines.append(value)
+            continue
+        where = value.get("node") or "top level"
+        tool = str(value.get("tool"))
+        raw_skipped = value.get("skipped")
+        assert isinstance(raw_skipped, list)
+        skipped = []
+        measured_here: dict[str, list[str]] = {}
+        left_to_live: list[str] = []
+        for item in raw_skipped:
+            if (
+                isinstance(item, dict)
+                and item.get("kind") == LIVE_SCOPE_KIND
+                and value.get("only_kind") != LIVE_SCOPE_KIND
+            ):
+                key = (tool, str(item.get("label")))
+                if key in measured:
+                    measured_here.setdefault(measured[key], []).append(key[1])
+                    continue
+                if key in superseded:
+                    left_to_live.append(key[1])
+                    continue
+            skipped.append(item)
+        for live_node, measured_labels in measured_here.items():
+            measured_lines.append(
+                f"  {where} ({tool}): {len(measured_labels)} {LIVE_SCOPE_KIND} skip(s) measured "
+                f"by {live_node}: {', '.join(measured_labels)}"
+            )
+        if left_to_live:
+            lines.append(
+                f"  {where} ({tool}): {len(left_to_live)} {LIVE_SCOPE_KIND} skip(s) counted "
+                f"once, in the live-scope record that skipped them too: {', '.join(left_to_live)}"
+            )
         if not skipped:
             continue
         labels: list[str] = []
@@ -656,7 +743,6 @@ def cross_coverage_report(directory: Path, expected_nodes: Sequence[str]) -> Cro
             kinds[kind] = kinds.get(kind, 0) + 1
             by_kind[kind] = by_kind.get(kind, 0) + 1
         skipped_total += len(skipped)
-        where = value.get("node") or "top level"
         lines.append(
             f"  {where} ({value.get('tool')}, {value.get('verdict')}): {value.get('checks')} "
             f"check(s) ran; {len(skipped)} skipped [{_kind_counts(kinds)}]: "
@@ -668,7 +754,12 @@ def cross_coverage_report(directory: Path, expected_nodes: Sequence[str]) -> Cro
             f"  {node}: no readable coverage record, so its coverage could not be confirmed"
         )
     return CrossCoverage(
-        lines, skipped_total, unreadable, missing, tuple(sorted(by_kind.items()))
+        lines,
+        skipped_total,
+        unreadable,
+        missing,
+        tuple(sorted(by_kind.items())),
+        tuple(measured_lines),
     )
 
 
@@ -2594,6 +2685,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"  {gate}: no primary timing record, so its per-case coverage "
                 "could not be confirmed"
             )
+    if coverage_state.measured:
+        # The live systemd-scope cases a delegated node skips ran, and passed, in this run's
+        # live-scope node outside the delegated cgroup (#2388).
+        print("\nvalidate: delegated-live-scope skips measured by the live-scope node:")
+        for line in coverage_state.measured:
+            print(line)
     if (
         coverage_state.skipped
         or coverage_state.unreadable

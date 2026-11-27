@@ -270,8 +270,9 @@ kind: eight-cpu 1, multi-cpu 2)`. An unknown kind is refused.
 
 | Lane | Coverage |
 |---|---|
-| `make cross`, invoked by hand | full: every skip fails. No workflow or scheduled job runs it, so the live-scope checks the validation nodes skip run only here ([agent-utils issue 165](https://github.com/rrnewton/agent-utils/issues/165)) |
+| `make cross`, invoked by hand | full: every skip fails. No workflow or scheduled job runs it ([agent-utils issue 165](https://github.com/rrnewton/agent-utils/issues/165)) |
 | validation nodes `cross.dagrun.differential` and `cross.dagrun.cpuset-differential` | partial for `delegated-live-scope` only; boxing stays required |
+| validation node `cross.dagrun.live-scope` | full: it runs, with `--only-kind delegated-live-scope`, exactly the seven live-scope checks the two nodes above skip, outside their delegated cgroup, and allows no skip. `scripts/validate.py` counts a delegated node's `delegated-live-scope` skip as measured only when this node's record of the same run lists that check as passed, so a full validation with every step green ends `OK` (#2388) |
 | hosted repository CI and the nightly full run | additionally partial for `boxing`, because hosted runners run the graph with `--allow-cgroup-failure`, and for `eight-cpu`, because hosted runners have fewer than eight CPUs |
 
 The CPA memory-cap check needs a core budget of eight inside the

@@ -477,6 +477,16 @@ def _emit_case_timings(tool: str, rep: Report | None) -> None:
     )
 
 
+def _passed_labels(rep: Report | None) -> list[str]:
+    """The labels of the checks in ``rep`` that passed and never failed, sorted."""
+
+    if rep is None:
+        return []
+    passed = {label for label, outcome, _seconds in rep.case_results if outcome == "pass"}
+    failed = {label for label, outcome, _seconds in rep.case_results if outcome == "fail"}
+    return sorted(passed - failed)
+
+
 def record_coverage(
     tool: str, verdict: str, rep: Report | None, allowed_skips: frozenset[str]
 ) -> ToolCoverage:
@@ -518,6 +528,11 @@ def record_coverage(
             for skip in coverage.skipped
         ],
     }
+    if _ONLY_KIND is not None:
+        # A run of only the checks other runs skip with this kind names the kind and lists the
+        # checks that passed, so validate can count those skips as measured (#2388).
+        record["only_kind"] = _ONLY_KIND
+        record["passed"] = _passed_labels(rep)
     try:
         fd, temporary = tempfile.mkstemp(prefix=f".{tool}-", suffix=".tmp", dir=directory)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -8293,35 +8308,43 @@ def compare_boxed_cpu_bandwidth(
             rep.ok("boxed-cpu-bandwidth")
 
 
-def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
-    """Exercise shared reservation semantics through the paired safe-runner wrapper."""
+def compare_pin_run(
+    py: list[str], rs: list[str], rep: Report, *, only_live_scope: bool = False
+) -> None:
+    """Exercise shared reservation semantics through the paired safe-runner wrapper.
+
+    With ``only_live_scope`` only the two live cases run (``DELEGATED_LIVE_SCOPE_LABELS``), as
+    the validation node ``cross.dagrun.live-scope`` asks (#2388).
+    """
     with tempfile.TemporaryDirectory(prefix="dagrun-cross-pin-") as td:
         extra = {"DAGRUN_CORE_LEDGER": os.path.join(td, "ledger.json")}
-        missing = ("pin-run", "--cores", "1")
-        po, ro = run(py, missing, extra), run(rs, missing, extra)
-        if po.returncode == ro.returncode == 2:
-            rep.ok("pin-run:missing-command")
-        else:
-            rep.bad("pin-run:missing-command", f"py={po}\nrs={ro}")
-        invalid = ("pin-run", "--cores", "0", "--", "true")
-        po, ro = run(py, invalid, extra), run(rs, invalid, extra)
-        if po.returncode == ro.returncode == 2 and "must be >= 1" in po.stderr and "must be >= 1" in ro.stderr:
-            rep.ok("pin-run:nonpositive-refused")
-        else:
-            rep.bad("pin-run:nonpositive-refused", f"py={po}\nrs={ro}")
+        if not only_live_scope:
+            missing = ("pin-run", "--cores", "1")
+            po, ro = run(py, missing, extra), run(rs, missing, extra)
+            if po.returncode == ro.returncode == 2:
+                rep.ok("pin-run:missing-command")
+            else:
+                rep.bad("pin-run:missing-command", f"py={po}\nrs={ro}")
+            invalid = ("pin-run", "--cores", "0", "--", "true")
+            po, ro = run(py, invalid, extra), run(rs, invalid, extra)
+            if po.returncode == ro.returncode == 2 and "must be >= 1" in po.stderr and "must be >= 1" in ro.stderr:
+                rep.ok("pin-run:nonpositive-refused")
+            else:
+                rep.bad("pin-run:nonpositive-refused", f"py={po}\nrs={ro}")
         delegated = _inside_delegated_harness()
         valid = ("pin-run", "--cores", "1", "--", "true")
         if delegated:
             # pin-run currently creates a transient systemd scope directly; unlike `run`, it has
             # no delegated-root execution path.  Invoking that from a parent-owned validation
             # cgroup could migrate the command into a sibling scope and escape the outer step's
-            # ownership.  Its live cross-engine HARD-pin behavior remains covered by standalone
-            # differential runs on a capable host; do not weaken containment to repeat it here.
+            # ownership.  Its live cross-engine HARD-pin behavior is measured instead by the
+            # non-delegated validation node cross.dagrun.live-scope (--only-kind
+            # delegated-live-scope, #2388); do not weaken containment to repeat it here.
             print(
                 "cross[dagrun]: SKIP pin-run live execution: the differential is itself "
                 "inside a parent-owned delegated cgroup; tracked by #28 delegated-cpuset"
             )
-            for label in ("pin-run:reserve-apply-release", "pin-run:signal-status"):
+            for label in DELEGATED_LIVE_SCOPE_LABELS["dagrun"]:
                 rep.skip(
                     label,
                     "delegated-live-scope",
@@ -8350,12 +8373,13 @@ def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
                     f"py:{po.stderr}\nrs:{ro.stderr}",
                 )
 
-        missing_exec = ("pin-run", "--cores", "1", "--", "/definitely/missing/command")
-        po, ro = run(py, missing_exec, extra), run(rs, missing_exec, extra)
-        if po.returncode == ro.returncode == 3 and "Traceback" not in po.stderr and "panicked" not in ro.stderr:
-            rep.ok("pin-run:missing-executable-clean")
-        else:
-            rep.bad("pin-run:missing-executable-clean", f"py={po}\nrs={ro}")
+        if not only_live_scope:
+            missing_exec = ("pin-run", "--cores", "1", "--", "/definitely/missing/command")
+            po, ro = run(py, missing_exec, extra), run(rs, missing_exec, extra)
+            if po.returncode == ro.returncode == 3 and "Traceback" not in po.stderr and "panicked" not in ro.stderr:
+                rep.ok("pin-run:missing-executable-clean")
+            else:
+                rep.bad("pin-run:missing-executable-clean", f"py={po}\nrs={ro}")
 
         signaled = (
             "pin-run",
@@ -8383,6 +8407,24 @@ def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
                 )
             else:
                 rep.bad("pin-run:signal-status", f"py={po}\nrs={ro}")
+
+
+def compare_dagrun_live_scope(*, allowed_skips: frozenset[str] = frozenset()) -> int:
+    """Run only dagrun's live-scope cases: ``pin-run`` with a live HARD pin (#2388).
+
+    The validation node ``cross.dagrun.live-scope`` runs this outside the delegated cgroup in
+    which ``cross.dagrun.differential`` lists the same cases as ``delegated-live-scope`` skips.
+    """
+
+    tool = "dagrun"
+    py = py_command_for(tool)
+    rs = rs_command(tool)
+    rep = Report()
+    if _inside_delegated_harness() or not _skip_live_scope_without_user_scope(tool, rep):
+        compare_pin_run(py, rs, rep, only_live_scope=True)
+    if rep.failures:
+        return divergence_verdict(tool, rep, f"{rep.checks} live-scope checks", allowed_skips)
+    return coverage_verdict(tool, rep, f"{rep.checks} live-scope checks agree", allowed_skips)
 
 
 def compare_dagrun(
@@ -8667,7 +8709,340 @@ def compare_package_guides(
             rep.ok(f"guide:{language}")
 
 
-def compare_cpuset_alloc(*, allowed_skips: frozenset[str] = frozenset()) -> int:
+#: The live cases each tool skips with kind ``delegated-live-scope`` inside a parent-owned
+#: delegated cgroup, in the order its comparator records them. ``--only-kind
+#: delegated-live-scope`` runs exactly these, outside that cgroup, in the validation node
+#: ``cross.dagrun.live-scope`` (#2388).
+DELEGATED_LIVE_SCOPE_LABELS: dict[str, tuple[str, ...]] = {
+    "dagrun": ("pin-run:reserve-apply-release", "pin-run:signal-status"),
+    "cpuset-alloc": (
+        "selftest:mutation-verdict",
+        "interop:py-then-rs",
+        "interop:rs-then-py",
+        "run:wrapped-help-passthrough",
+        "run:signal-status",
+    ),
+}
+
+#: The skip kinds ``--only-kind`` accepts: a run that executes only the checks other runs skip
+#: with that kind.
+ONLY_KINDS = ("delegated-live-scope",)
+
+#: Set by ``main`` for a ``--only-kind`` run; every coverage record it writes names the kind and
+#: lists the checks that passed, so ``scripts/validate.py`` can count a delegated node's skip of
+#: the same check as measured (#2388).
+_ONLY_KIND: str | None = None
+
+
+def _user_scope_available(attempts: int = 3, timeout_s: float = 120.0) -> bool:
+    """Whether ``systemd-run --user --scope`` works here, as the live HARD-pin cases need.
+
+    A refused user bus under heavy scope churn can be transient, so the probe is retried a few
+    times; the timeout only reports a hang.
+    """
+
+    for _attempt in range(attempts):
+        try:
+            completed = subprocess.run(
+                ["systemd-run", "--user", "--scope", "--quiet", "--collect", "true"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_s,
+                start_new_session=True,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if completed.returncode == 0:
+            return True
+    return False
+
+
+def _skip_live_scope_without_user_scope(tool: str, rep: Report) -> bool:
+    """In a live-scope run, list the tool's live cases as ``boxing`` skips when no user scope works.
+
+    Returns True when they were skipped. A local gate allows no skip in that node, so a host
+    that lost its user scope fails it; a hosted lane that cannot box declares ``boxing``.
+    """
+
+    if _user_scope_available():
+        return False
+    print(
+        f"cross[{tool}]: SKIP live systemd-scope cases: `systemd-run --user --scope` does not "
+        "work here"
+    )
+    for label in DELEGATED_LIVE_SCOPE_LABELS[tool]:
+        rep.skip(label, "boxing", "no working systemd --user scope for a live HARD pin")
+    return True
+
+
+def _scratch_core_ledger(directory: str) -> dict[str, str]:
+    """The environment that points both engines at a scratch core ledger in ``directory``.
+
+    Without it the engines fall back to the host-wide reservation ledger that real work on the
+    host shares (#2388).
+    """
+
+    return {"DAGRUN_CORE_LEDGER": os.path.join(directory, "ledger.json")}
+
+
+def _cpuset_selftest_case(rep: Report, py: Sequence[str], rs: Sequence[str]) -> None:
+    """Record ``selftest:mutation-verdict``: a live HARD-pin mutation probe on both engines."""
+
+    selftest_args = ("selftest", "--cores", "1", "--sample-s", "0")
+    with tempfile.TemporaryDirectory(prefix="cpuset-cross-selftest-") as tmp:
+        ledger = _scratch_core_ledger(tmp)
+        _record_selftest_verdict(
+            rep, run(py, selftest_args, ledger), run(rs, selftest_args, ledger)
+        )
+
+
+def _cpuset_wrapped_help_case(rep: Report, py: Sequence[str], rs: Sequence[str]) -> None:
+    """Record ``run:wrapped-help-passthrough``: the wrapped command keeps its own ``--help``."""
+
+    # A wrapped command's own help flag belongs to that command, not the allocator.
+    help_args = ("run", "--cores", "1", "--", "printf", "%s\\n", "--help")
+    with tempfile.TemporaryDirectory(prefix="cpuset-cross-help-") as tmp:
+        ledger = _scratch_core_ledger(tmp)
+        po, ro = run(py, help_args, ledger), run(rs, help_args, ledger)
+    if (
+        po.returncode == ro.returncode == 0
+        and po.stdout.endswith("--help\n")
+        and ro.stdout.endswith("--help\n")
+    ):
+        rep.ok("run:wrapped-help-passthrough")
+    elif (
+        po.returncode == ro.returncode == 3
+        and "HARD" in po.stderr
+        and "HARD" in ro.stderr
+    ):
+        rep.ok("run:wrapped-help-hard-capability-unavailable")
+        rep.skip(
+            "run:wrapped-help-passthrough",
+            "hard-cpuset",
+            "both engines refused the HARD pin with exit 3",
+        )
+    else:
+        rep.bad("run:wrapped-help-passthrough", f"py={po}\nrs={ro}")
+
+
+def _cpuset_signal_status_case(rep: Report, py: Sequence[str], rs: Sequence[str]) -> None:
+    """Record ``run:signal-status``: a wrapped command killed by SIGTERM exits 143 on both."""
+
+    signaled = (
+        "run",
+        "--cores",
+        "1",
+        "--",
+        sys.executable,
+        "-c",
+        "import os; os.kill(os.getpid(), 15)",
+    )
+    with tempfile.TemporaryDirectory(prefix="cpuset-cross-signal-") as tmp:
+        ledger = _scratch_core_ledger(tmp)
+        po, ro = run(py, signaled, ledger), run(rs, signaled, ledger)
+    if po.returncode == ro.returncode == 143:
+        rep.ok("run:signal-status")
+    elif (
+        po.returncode == ro.returncode == 3
+        and "HARD" in po.stderr
+        and "HARD" in ro.stderr
+    ):
+        rep.ok("run:signal-status-hard-capability-unavailable")
+        rep.skip(
+            "run:signal-status",
+            "hard-cpuset",
+            "both engines refused the HARD pin with exit 3",
+        )
+    else:
+        rep.bad("run:signal-status", f"py={po}\nrs={ro}")
+
+
+#: The interop pair's first command: it holds its reservation until its stdin reaches EOF, which
+#: happens when the harness closes the pipe or dies (#2388).
+_INTEROP_STDIN_HOLD = "import sys; sys.stdin.read()"
+
+#: Generous bounds on the interop pair that only report a hang, never decide a verdict by timing
+#: (owner rule 346): how long the first command may take to record its reservation, and how long
+#: it may take to release it and exit once its stdin is closed.
+INTEROP_RESERVATION_BOUND_S = 300.0
+INTEROP_RELEASE_BOUND_S = 300.0
+
+
+def _cpuset_interop_cases(
+    rep: Report, tool: str, py: Sequence[str], rs: Sequence[str], tmp: str
+) -> None:
+    """Record ``interop:py-then-rs`` and ``interop:rs-then-py``: live HARD pins in ``tmp``'s ledgers."""
+
+    # Each implementation must be able to observe the other's LIVE reservation, choose a
+    # disjoint core, and leave the shared ledger empty after both wrapped commands exit.
+    if len(os.sched_getaffinity(0)) >= 2:
+        assignment_re = re.compile(r'reserved (\{"cores":\[[^]]*\],"count":\d+\})')
+
+        def reserved_cores(stderr: str) -> set[int] | None:
+            match = assignment_re.search(stderr)
+            if match is None:
+                return None
+            value: object = json.loads(match.group(1))
+            if not isinstance(value, dict):
+                return None
+            cores = value.get("cores")
+            if not isinstance(cores, list) or not all(
+                isinstance(core, int) and not isinstance(core, bool) for core in cores
+            ):
+                return None
+            return set(cores)
+
+        for label, first, second in (
+            ("py-then-rs", py, rs),
+            ("rs-then-py", rs, py),
+        ):
+            # The first command holds its core until the harness says so, not for a fixed time
+            # (#2388): it reads its stdin until EOF, and the harness closes that pipe only after
+            # the second command has reserved and exited. A slow start on a loaded host then
+            # cannot let the first reservation lapse before the second one is chosen. If the
+            # harness dies, the pipe closes and the holder exits with it.
+            hold_args = ("run", "--cores", "1", "--tag", label, "--")
+            first_args = (*hold_args, sys.executable, "-c", _INTEROP_STDIN_HOLD)
+            second_args = (*hold_args, sys.executable, "-c", "pass")
+            # Retry the WHOLE pair, never just the second command.  Replaying only one side
+            # would test against a different reservation lifetime and could leave the first
+            # attempt's held core in the comparison.  Each attempt gets an independent ledger
+            # and the first child is reaped before the next begins.
+            interop_attempts = 3
+            never_reserved = False
+            for attempt in range(1, interop_attempts + 1):
+                shared_ledger = os.path.join(tmp, f"interop-{label}-{attempt}.json")
+                extra = {"DAGRUN_CORE_LEDGER": shared_ledger}
+                first_started = time.monotonic()
+                first_proc = subprocess.Popen(
+                    [*first, *first_args],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=_env(extra),
+                    start_new_session=True,
+                )
+                # Wait for the first reservation to appear (or the first command to end); the
+                # bound only reports a hang and never decides a verdict by timing.
+                bound = time.monotonic() + INTEROP_RESERVATION_BOUND_S
+                reserved = False
+                while first_proc.poll() is None:
+                    try:
+                        payload = json.loads(Path(shared_ledger).read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        payload = {}
+                    if isinstance(payload, dict) and payload.get("reservations"):
+                        reserved = True
+                        break
+                    if time.monotonic() >= bound:
+                        break
+                    time.sleep(0.02)
+                if not reserved and first_proc.poll() is None:
+                    first_proc.kill()
+                    _, first_stderr = first_proc.communicate()
+                    rep.bad(
+                        f"interop:{label}",
+                        f"the first command recorded no reservation within "
+                        f"{INTEROP_RESERVATION_BOUND_S:.0f} s and was still running; "
+                        f"stderr={first_stderr!r}",
+                    )
+                    never_reserved = True
+                    break
+                try:
+                    second_outcome = run(second, second_args, extra)
+                finally:
+                    # Closing stdin (communicate without input) releases the holder.
+                    try:
+                        first_stdout, first_stderr = first_proc.communicate(
+                            timeout=INTEROP_RELEASE_BOUND_S
+                        )
+                    except subprocess.TimeoutExpired:
+                        first_proc.kill()
+                        first_stdout, first_stderr = first_proc.communicate()
+                first_outcome = Outcome(
+                    first_proc.returncode or 0,
+                    first_stdout,
+                    first_stderr,
+                    time.monotonic() - first_started,
+                )
+                if not _transient_user_bus_refusal(first_outcome, second_outcome):
+                    break
+                if attempt < interop_attempts:
+                    print(
+                        f"cross[{tool}]: transient systemd user-bus refusal during "
+                        f"interop:{label} attempt {attempt}/{interop_attempts}; retrying pair",
+                        file=sys.stderr,
+                    )
+            if never_reserved:
+                continue
+            if first_outcome.returncode == second_outcome.returncode == 0:
+                try:
+                    first_cores = reserved_cores(first_outcome.stderr)
+                    second_cores = reserved_cores(second_outcome.stderr)
+                    final_payload: object = json.loads(
+                        Path(shared_ledger).read_text(encoding="utf-8")
+                    )
+                except (OSError, TypeError, json.JSONDecodeError):
+                    rep.bad(
+                        f"interop:{label}",
+                        f"could not parse assignments/ledger\nfirst={first_outcome}\n"
+                        f"second={second_outcome}",
+                    )
+                else:
+                    if (
+                        first_cores is not None
+                        and second_cores is not None
+                        and first_cores
+                        and second_cores
+                        and first_cores.isdisjoint(second_cores)
+                        and final_payload == {"reservations": []}
+                    ):
+                        rep.ok(f"interop:{label}")
+                    else:
+                        rep.bad(
+                            f"interop:{label}",
+                            f"first={first_cores}; second={second_cores}; "
+                            f"final={final_payload!r}",
+                        )
+            elif (
+                first_outcome.returncode == second_outcome.returncode == 3
+                and "HARD" in first_outcome.stderr
+                and "HARD" in second_outcome.stderr
+            ):
+                rep.ok(f"interop:{label}:hard-capability-unavailable")
+                rep.skip(
+                    f"interop:{label}",
+                    "hard-cpuset",
+                    "both engines refused the HARD pin with exit 3",
+                )
+            else:
+                rep.bad(
+                    f"interop:{label}",
+                    f"first={first_outcome}\nsecond={second_outcome}",
+                )
+    else:
+        for label in ("py-then-rs", "rs-then-py"):
+            rep.skip(
+                f"interop:{label}",
+                "multi-cpu",
+                "two disjoint reservations need at least two usable CPUs",
+            )
+
+
+def compare_cpuset_alloc(
+    *, allowed_skips: frozenset[str] = frozenset(), only_live_scope: bool = False
+) -> int:
+    """Compare both cpuset-alloc engines; with ``only_live_scope``, only the live-scope cases.
+
+    The live-scope cases (``DELEGATED_LIVE_SCOPE_LABELS``) start a live systemd scope, so inside
+    a parent-owned delegated cgroup they are listed as ``delegated-live-scope`` skips. The
+    validation node ``cross.dagrun.live-scope`` runs them, and only them, outside that cgroup
+    (#2388).
+    """
+
     tool = "cpuset-alloc"
     py = py_command_for(tool)
     rs = rs_command(tool)
@@ -8678,18 +9053,24 @@ def compare_cpuset_alloc(*, allowed_skips: frozenset[str] = frozenset()) -> int:
             "cross[cpuset-alloc]: SKIP live systemd-scope cases: the differential is itself "
             "inside a parent-owned delegated cgroup; tracked by #28 delegated-cpuset"
         )
-        for label in (
-            "selftest:mutation-verdict",
-            "interop:py-then-rs",
-            "interop:rs-then-py",
-            "run:wrapped-help-passthrough",
-            "run:signal-status",
-        ):
+        for label in DELEGATED_LIVE_SCOPE_LABELS[tool]:
             rep.skip(
                 label,
                 "delegated-live-scope",
                 "the differential is itself inside a parent-owned delegated cgroup",
             )
+    if only_live_scope:
+        if live_scope_allowed and not _skip_live_scope_without_user_scope(tool, rep):
+            _cpuset_selftest_case(rep, py, rs)
+            with tempfile.TemporaryDirectory(prefix="cpuset-cross-live-") as tmp:
+                _cpuset_interop_cases(rep, tool, py, rs, tmp)
+            _cpuset_wrapped_help_case(rep, py, rs)
+            _cpuset_signal_status_case(rep, py, rs)
+        if rep.failures:
+            return divergence_verdict(tool, rep, f"{rep.checks} live-scope checks", allowed_skips)
+        return coverage_verdict(
+            tool, rep, f"{rep.checks} live-scope checks agree", allowed_skips
+        )
 
     _record_exact(rep, "version", py, rs, ("--version",))
     for args, required in (
@@ -8734,8 +9115,7 @@ def compare_cpuset_alloc(*, allowed_skips: frozenset[str] = frozenset()) -> int:
             rep.bad(f"irq-budget:nonzero-sample:{budget_args[0]}", f"py={po}\nrs={ro}")
 
     if live_scope_allowed:
-        selftest_args = ("selftest", "--cores", "1", "--sample-s", "0")
-        _record_selftest_verdict(rep, run(py, selftest_args), run(rs, selftest_args))
+        _cpuset_selftest_case(rep, py, rs)
 
     with tempfile.TemporaryDirectory(prefix="cpuset-cross-") as tmp:
         py_ledger = os.path.join(tmp, "py.json")
@@ -8878,140 +9258,8 @@ def compare_cpuset_alloc(*, allowed_skips: frozenset[str] = frozenset()) -> int:
         else:
             rep.bad("reclaim:dead-shared-schema", f"py={p_value!r}; rs={r_value!r}")
 
-        # Each implementation must be able to observe the other's LIVE reservation, choose a
-        # disjoint core, and leave the shared ledger empty after both wrapped commands exit.
-        if live_scope_allowed and len(os.sched_getaffinity(0)) >= 2:
-            assignment_re = re.compile(r'reserved (\{"cores":\[[^]]*\],"count":\d+\})')
-
-            def reserved_cores(stderr: str) -> set[int] | None:
-                match = assignment_re.search(stderr)
-                if match is None:
-                    return None
-                value: object = json.loads(match.group(1))
-                if not isinstance(value, dict):
-                    return None
-                cores = value.get("cores")
-                if not isinstance(cores, list) or not all(
-                    isinstance(core, int) and not isinstance(core, bool) for core in cores
-                ):
-                    return None
-                return set(cores)
-
-            for label, first, second in (
-                ("py-then-rs", py, rs),
-                ("rs-then-py", rs, py),
-            ):
-                hold = (
-                    "run",
-                    "--cores",
-                    "1",
-                    "--tag",
-                    label,
-                    "--",
-                    sys.executable,
-                    "-c",
-                    "import time; time.sleep(2)",
-                )
-                # Retry the WHOLE pair, never just the second command.  Replaying only one side
-                # would test against a different reservation lifetime and could leave the first
-                # attempt's held core in the comparison.  Each attempt gets an independent ledger
-                # and the first child is reaped before the next begins.
-                interop_attempts = 3
-                for attempt in range(1, interop_attempts + 1):
-                    shared_ledger = os.path.join(tmp, f"interop-{label}-{attempt}.json")
-                    extra = {"DAGRUN_CORE_LEDGER": shared_ledger}
-                    first_started = time.monotonic()
-                    first_proc = subprocess.Popen(
-                        [*first, *hold],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        env=_env(extra),
-                        start_new_session=True,
-                    )
-                    deadline = time.monotonic() + 10
-                    while first_proc.poll() is None and time.monotonic() < deadline:
-                        try:
-                            payload = json.loads(Path(shared_ledger).read_text(encoding="utf-8"))
-                        except (OSError, json.JSONDecodeError):
-                            payload = {}
-                        if isinstance(payload, dict) and payload.get("reservations"):
-                            break
-                        time.sleep(0.02)
-                    try:
-                        second_outcome = run(second, hold, extra)
-                    finally:
-                        try:
-                            first_stdout, first_stderr = first_proc.communicate(timeout=30)
-                        except subprocess.TimeoutExpired:
-                            first_proc.kill()
-                            first_stdout, first_stderr = first_proc.communicate()
-                    first_outcome = Outcome(
-                        first_proc.returncode or 0,
-                        first_stdout,
-                        first_stderr,
-                        time.monotonic() - first_started,
-                    )
-                    if not _transient_user_bus_refusal(first_outcome, second_outcome):
-                        break
-                    if attempt < interop_attempts:
-                        print(
-                            f"cross[{tool}]: transient systemd user-bus refusal during "
-                            f"interop:{label} attempt {attempt}/{interop_attempts}; retrying pair",
-                            file=sys.stderr,
-                        )
-                if first_outcome.returncode == second_outcome.returncode == 0:
-                    try:
-                        first_cores = reserved_cores(first_outcome.stderr)
-                        second_cores = reserved_cores(second_outcome.stderr)
-                        final_payload: object = json.loads(
-                            Path(shared_ledger).read_text(encoding="utf-8")
-                        )
-                    except (OSError, TypeError, json.JSONDecodeError):
-                        rep.bad(
-                            f"interop:{label}",
-                            f"could not parse assignments/ledger\nfirst={first_outcome}\n"
-                            f"second={second_outcome}",
-                        )
-                    else:
-                        if (
-                            first_cores is not None
-                            and second_cores is not None
-                            and first_cores
-                            and second_cores
-                            and first_cores.isdisjoint(second_cores)
-                            and final_payload == {"reservations": []}
-                        ):
-                            rep.ok(f"interop:{label}")
-                        else:
-                            rep.bad(
-                                f"interop:{label}",
-                                f"first={first_cores}; second={second_cores}; "
-                                f"final={final_payload!r}",
-                            )
-                elif (
-                    first_outcome.returncode == second_outcome.returncode == 3
-                    and "HARD" in first_outcome.stderr
-                    and "HARD" in second_outcome.stderr
-                ):
-                    rep.ok(f"interop:{label}:hard-capability-unavailable")
-                    rep.skip(
-                        f"interop:{label}",
-                        "hard-cpuset",
-                        "both engines refused the HARD pin with exit 3",
-                    )
-                else:
-                    rep.bad(
-                        f"interop:{label}",
-                        f"first={first_outcome}\nsecond={second_outcome}",
-                    )
-        elif live_scope_allowed:
-            for label in ("py-then-rs", "rs-then-py"):
-                rep.skip(
-                    f"interop:{label}",
-                    "multi-cpu",
-                    "two disjoint reservations need at least two usable CPUs",
-                )
+        if live_scope_allowed:
+            _cpuset_interop_cases(rep, tool, py, rs, tmp)
 
     _record_same_exit(rep, "run:missing-command", py, rs, ("run", "--cores", "1"), 2)
     _record_same_exit(
@@ -9038,28 +9286,7 @@ def compare_cpuset_alloc(*, allowed_skips: frozenset[str] = frozenset()) -> int:
         _record_same_exit(rep, label, py, rs, invalid_args, 2)
 
     if live_scope_allowed:
-        # A wrapped command's own help flag belongs to that command, not the allocator.
-        help_args = ("run", "--cores", "1", "--", "printf", "%s\\n", "--help")
-        po, ro = run(py, help_args), run(rs, help_args)
-        if (
-            po.returncode == ro.returncode == 0
-            and po.stdout.endswith("--help\n")
-            and ro.stdout.endswith("--help\n")
-        ):
-            rep.ok("run:wrapped-help-passthrough")
-        elif (
-            po.returncode == ro.returncode == 3
-            and "HARD" in po.stderr
-            and "HARD" in ro.stderr
-        ):
-            rep.ok("run:wrapped-help-hard-capability-unavailable")
-            rep.skip(
-                "run:wrapped-help-passthrough",
-                "hard-cpuset",
-                "both engines refused the HARD pin with exit 3",
-            )
-        else:
-            rep.bad("run:wrapped-help-passthrough", f"py={po}\nrs={ro}")
+        _cpuset_wrapped_help_case(rep, py, rs)
 
     missing_exec = ("run", "--cores", "1", "--", "/definitely/missing/command")
     po, ro = run(py, missing_exec), run(rs, missing_exec)
@@ -9072,32 +9299,8 @@ def compare_cpuset_alloc(*, allowed_skips: frozenset[str] = frozenset()) -> int:
     else:
         rep.bad("run:missing-executable-clean", f"py={po}\nrs={ro}")
 
-    signaled = (
-        "run",
-        "--cores",
-        "1",
-        "--",
-        sys.executable,
-        "-c",
-        "import os; os.kill(os.getpid(), 15)",
-    )
     if live_scope_allowed:
-        po, ro = run(py, signaled), run(rs, signaled)
-        if po.returncode == ro.returncode == 143:
-            rep.ok("run:signal-status")
-        elif (
-            po.returncode == ro.returncode == 3
-            and "HARD" in po.stderr
-            and "HARD" in ro.stderr
-        ):
-            rep.ok("run:signal-status-hard-capability-unavailable")
-            rep.skip(
-                "run:signal-status",
-                "hard-cpuset",
-                "both engines refused the HARD pin with exit 3",
-            )
-        else:
-            rep.bad("run:signal-status", f"py={po}\nrs={ro}")
+        _cpuset_signal_status_case(rep, py, rs)
     _record_same_exit(rep, "cli:abbreviation-refused", py, rs, ("status", "--ledg", "x"), 2)
     _record_same_exit(rep, "unknown-command", py, rs, ("not-a-command",), 2)
 
@@ -9143,6 +9346,7 @@ def allowed_skip_kinds(flags: Sequence[str], environ: Mapping[str, str]) -> dict
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global _ONLY_KIND
     parser = argparse.ArgumentParser(description="py-vs-rs differential tester")
     parser.add_argument(
         "--tool",
@@ -9169,6 +9373,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "the same way"
         ),
     )
+    parser.add_argument(
+        "--only-kind",
+        choices=ONLY_KINDS,
+        default=None,
+        metavar="KIND",
+        help=(
+            "run only the checks that other runs skip with this kind, and nothing else; each "
+            "coverage record then names the kind and lists the checks that passed. "
+            "delegated-live-scope runs the live systemd-scope cases (--tool dagrun or "
+            "cpuset-alloc) that a parent-owned delegated cgroup forbids; the validation node "
+            "cross.dagrun.live-scope runs them outside that cgroup. Default: run every check"
+        ),
+    )
     ns = parser.parse_args(list(argv) if argv is not None else None)
     if ns.list_tools:
         for name in DIFFERENTIAL_TOOLS:
@@ -9179,6 +9396,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     allowed_skips = frozenset(allowance)
+    only_kind = None if ns.only_kind is None else str(ns.only_kind)
+    if only_kind is not None:
+        if str(ns.tool) not in DELEGATED_LIVE_SCOPE_LABELS:
+            parser.error(
+                f"--only-kind {only_kind} applies to --tool "
+                f"{' or '.join(DELEGATED_LIVE_SCOPE_LABELS)}, not --tool {ns.tool}"
+            )
+        if only_kind in allowance:
+            parser.error(
+                f"--only-kind {only_kind} runs exactly the checks that kind skips, so it cannot "
+                f"also allow them to be skipped (from {allowance[only_kind]})"
+            )
+    _ONLY_KIND = only_kind
     if allowance:
         declared = ", ".join(f"{kind} (from {source})" for kind, source in sorted(allowance.items()))
         print(
@@ -9194,10 +9424,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     jobs = validation_jobs if validation_jobs is not None else DEFAULT_VALIDATION_JOBS
     runners: dict[str, Callable[[], int]] = {
-        "dagrun": lambda: compare_dagrun(
-            rand_count, seed, validation_jobs=jobs, allowed_skips=allowed_skips
+        "dagrun": (
+            (lambda: compare_dagrun_live_scope(allowed_skips=allowed_skips))
+            if only_kind is not None
+            else lambda: compare_dagrun(
+                rand_count, seed, validation_jobs=jobs, allowed_skips=allowed_skips
+            )
         ),
-        "cpuset-alloc": lambda: compare_cpuset_alloc(allowed_skips=allowed_skips),
+        "cpuset-alloc": (
+            (lambda: compare_cpuset_alloc(allowed_skips=allowed_skips, only_live_scope=True))
+            if only_kind is not None
+            else lambda: compare_cpuset_alloc(allowed_skips=allowed_skips)
+        ),
         "herdr-run": lambda: compare_herdr_run(
             py_command_for("herdr-run"), rs_command("herdr-run"), allowed_skips=allowed_skips
         ),

@@ -1566,7 +1566,7 @@ def test_validate_summarises_only_records_that_skipped(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    lines, skipped, unreadable, missing, by_kind = validate.cross_coverage_report(
+    lines, skipped, unreadable, missing, by_kind, measured = validate.cross_coverage_report(
         tmp_path,
         [
             "cross.tick-hub.differential",
@@ -1576,6 +1576,7 @@ def test_validate_summarises_only_records_that_skipped(tmp_path: Path) -> None:
     )
 
     assert skipped == 4
+    assert measured == ()
     assert by_kind == (("boxing", 1), ("delegated-live-scope", 2), ("malformed", 1))
     assert unreadable == 2
     assert missing == []
@@ -1633,7 +1634,8 @@ def test_validate_expects_a_record_from_exactly_the_selected_cross_nodes() -> No
     by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
     every_cross_node = [tag for tag, step in by_tag.items() if "cross/differential.py" in step.cmd]
 
-    assert len(every_cross_node) == 7  # 5 tools, agentctl sharded into 3 nodes
+    # 5 tools, agentctl sharded into 3 nodes, plus the dagrun/cpuset live-scope node (#2388).
+    assert len(every_cross_node) == 8
     assert validate.selected_cross_nodes(frozenset(), frozenset(), all_contract=True) == (
         every_cross_node
     )
@@ -1920,3 +1922,482 @@ def test_the_memory_cap_node_gets_fewer_than_eight_cores_only_from_explicit_inpu
     # A run budget of eight keeps the width; one below eight narrows it.
     assert cap_config_max_cpus(cfg, 8).by_tag()[node.tag].hint.preferred_inner_jobs == 8
     assert cap_config_max_cpus(cfg, 7).by_tag()[node.tag].hint.preferred_inner_jobs == 7
+
+
+# ------------------------------------------------- #2388 delegated-live-scope, measured live
+
+
+def _live_scope_engines(
+    differential: ModuleType, monkeypatch: pytest.MonkeyPatch, *, cpus: int = 4
+) -> tuple[list[tuple[tuple[str, ...], dict[str, str]]], list[str]]:
+    """Fake both cpuset-alloc engines for a live-scope run outside any delegated cgroup.
+
+    Returns the list every ``run`` invocation is appended to as ``(args, extra_env)``, and an
+    event log. The interop pair's first command is a fake process that records its reservation
+    in its ledger at once and releases it (emptying the ledger) only when ``communicate`` closes
+    its stdin, which must happen after the second command has run.
+    """
+
+    calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+    events: list[str] = []
+    engine = _cpuset_engine(differential, hard_refusal=False)
+
+    def recording_run(
+        cmd: object, args: tuple[str, ...], extra_env: dict[str, str] | None = None,
+        **kw: object,
+    ) -> object:
+        calls.append((tuple(args), dict(extra_env or {})))
+        if "pass" in args:
+            events.append("second-ran")
+            return differential.Outcome(0, "", 'cpuset-alloc: reserved {"cores":[2],"count":1}')
+        return engine(cmd, tuple(args))  # type: ignore[operator]
+
+    class HoldingPopen:
+        """The first command: holds a reservation until its stdin is closed."""
+
+        def __init__(self, argv: list[str], **kw: object) -> None:
+            env = kw.get("env")
+            assert isinstance(env, dict)
+            assert kw.get("stdin") is subprocess.PIPE, "the holder must get a stdin pipe"
+            assert argv[-1] == differential._INTEROP_STDIN_HOLD, argv
+            self.ledger = Path(str(env["DAGRUN_CORE_LEDGER"]))
+            calls.append((tuple(argv), {"DAGRUN_CORE_LEDGER": str(self.ledger)}))
+            self.ledger.write_text(
+                json.dumps({"reservations": [{"cores": [1], "tag": "first"}]}), encoding="utf-8"
+            )
+            self.returncode: int | None = None
+            events.append("first-reserved")
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            assert events[-1] == "second-ran", f"released before the second ran: {events}"
+            events.append("first-released")
+            self.ledger.write_text(json.dumps({"reservations": []}), encoding="utf-8")
+            self.returncode = 0
+            return "", 'cpuset-alloc: reserved {"cores":[1],"count":1}'
+
+        def kill(self) -> None:
+            raise AssertionError("a holder that reserved must not be killed")
+
+    _set_delegation(monkeypatch, {})
+    monkeypatch.setattr(differential, "py_command_for", lambda _tool: ["python-engine"])
+    monkeypatch.setattr(differential, "rs_command", lambda _tool: ["rust-engine"])
+    monkeypatch.setattr(differential, "run", recording_run)
+    monkeypatch.setattr(
+        differential,
+        "subprocess",
+        SimpleNamespace(
+            Popen=HoldingPopen, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired
+        ),
+    )
+    monkeypatch.setattr(differential, "_user_scope_available", lambda: True)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(cpus)))
+    return calls, events
+
+
+def test_a_live_scope_cpuset_run_measures_exactly_the_five_live_cases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Outside a delegated cgroup, ``--only-kind`` runs the five live cases and nothing else."""
+
+    differential = _differential()
+    calls, events = _live_scope_engines(differential, monkeypatch)
+    sentinel = tmp_path / "runtime" / "dagrun" / "core-reservations.json"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text('{"reservations": ["host"]}', encoding="utf-8")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
+
+    coverage = tmp_path / "coverage"
+    coverage.mkdir()
+    monkeypatch.setenv(COVERAGE_DIR_ENV, str(coverage))
+    monkeypatch.setenv("DAGRUN_OUTER_RUN", "cross.dagrun.live-scope")
+    monkeypatch.setattr(differential, "_ONLY_KIND", "delegated-live-scope")
+
+    status = differential.compare_cpuset_alloc(only_live_scope=True)
+
+    recorded = differential._COVERAGE[-1]
+    assert status == 0
+    assert recorded.verdict == "OK"
+    assert recorded.skipped == ()
+    assert recorded.checks == 5
+    (path,) = coverage.glob("*.json")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["node"] == "cross.dagrun.live-scope"
+    assert record["only_kind"] == "delegated-live-scope"
+    assert record["passed"] == sorted(differential.DELEGATED_LIVE_SCOPE_LABELS["cpuset-alloc"])
+    assert events == ["first-reserved", "second-ran", "first-released"] * 2
+    # Every engine invocation, the holder included, used a scratch ledger, never the host one.
+    assert calls, "no engine ran"
+    for args, extra in calls:
+        ledger = extra.get("DAGRUN_CORE_LEDGER")
+        assert ledger and Path(ledger) != sentinel, (args, extra)
+    assert sentinel.read_text(encoding="utf-8") == '{"reservations": ["host"]}'
+    # No ledger-schema, help or invalid-invocation case ran: only live ones.
+    assert {args[0] for args, _ in calls if args and args[0] in ("status", "reclaim")} == set()
+
+
+def test_a_live_scope_interop_holder_that_never_reserves_is_reported_not_raced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reservation wait is a bound that reports a hang; the second command never runs."""
+
+    differential = _differential()
+    calls, _events = _live_scope_engines(differential, monkeypatch)
+    killed: list[bool] = []
+
+    class SilentPopen:
+        def __init__(self, argv: list[str], **kw: object) -> None:
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            killed.append(True)
+            self.returncode = -9
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            return "", "still starting"
+
+    monkeypatch.setattr(
+        differential,
+        "subprocess",
+        SimpleNamespace(
+            Popen=SilentPopen, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired
+        ),
+    )
+    monkeypatch.setattr(differential, "INTEROP_RESERVATION_BOUND_S", 0.0)
+    report = differential.Report()
+
+    with __import__("tempfile").TemporaryDirectory() as tmp:
+        differential._cpuset_interop_cases(report, "cpuset-alloc", ["py"], ["rs"], tmp)
+
+    assert killed == [True, True]
+    assert not any("pass" in args for args, _ in calls), "the second command ran anyway"
+    assert [failure.split(":", 2)[:2] for failure in report.failures] == [
+        ["interop", "py-then-rs"],
+        ["interop", "rs-then-py"],
+    ]
+    assert all("recorded no reservation within 0 s" in f for f in report.failures)
+
+
+def test_a_live_scope_run_without_a_user_scope_lists_boxing_skips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No working user scope: every live case is a boxing skip, and no engine runs."""
+
+    differential = _differential()
+    _live_scope_engines(differential, monkeypatch)
+    monkeypatch.setattr(differential, "_user_scope_available", lambda: False)
+    monkeypatch.setattr(differential, "run", _unexpected_run)
+
+    status = differential.compare_cpuset_alloc(only_live_scope=True)
+
+    recorded = differential._COVERAGE[-1]
+    assert status != 0  # boxing was not allowed, so the run is INCOMPLETE
+    assert recorded.verdict == "INCOMPLETE"
+    assert [(skip.label, skip.kind) for skip in recorded.skipped] == [
+        (label, "boxing") for label in differential.DELEGATED_LIVE_SCOPE_LABELS["cpuset-alloc"]
+    ]
+
+
+def test_a_live_scope_run_inside_a_delegated_cgroup_still_skips_and_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    differential = _differential()
+    _live_scope_engines(differential, monkeypatch)
+    _set_delegation(monkeypatch, {"DAGRUN_DELEGATED_CGROUP": "/delegated"})
+    monkeypatch.setattr(differential, "run", _unexpected_run)
+    monkeypatch.setattr(differential, "_user_scope_available", _unexpected_run)
+
+    status = differential.compare_cpuset_alloc(only_live_scope=True)
+
+    recorded = differential._COVERAGE[-1]
+    assert status != 0
+    assert [(skip.label, skip.kind) for skip in recorded.skipped] == [
+        (label, "delegated-live-scope")
+        for label in differential.DELEGATED_LIVE_SCOPE_LABELS["cpuset-alloc"]
+    ]
+
+
+def test_a_live_scope_dagrun_run_measures_only_the_two_pin_run_cases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    differential = _differential()
+    _set_delegation(monkeypatch, {})
+    calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+    engine = _pin_run_engine(differential, hard_refusal=False)
+
+    def recording_run(
+        cmd: object, args: tuple[str, ...], extra_env: dict[str, str] | None = None,
+        **_kw: object,
+    ) -> object:
+        calls.append((tuple(args), dict(extra_env or {})))
+        return engine(cmd, tuple(args))
+
+    monkeypatch.setattr(differential, "py_command_for", lambda _tool: ["python-engine"])
+    monkeypatch.setattr(differential, "rs_command", lambda _tool: ["rust-engine"])
+    monkeypatch.setattr(differential, "run", recording_run)
+    monkeypatch.setattr(differential, "_user_scope_available", lambda: True)
+    coverage = tmp_path / "coverage"
+    coverage.mkdir()
+    monkeypatch.setenv(COVERAGE_DIR_ENV, str(coverage))
+
+    assert differential.main(["--tool", "dagrun", "--only-kind", "delegated-live-scope"]) == 0
+
+    recorded = differential._COVERAGE[-1]
+    assert (recorded.verdict, recorded.checks, recorded.skipped) == ("OK", 2, ())
+    (path,) = coverage.glob("*.json")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["only_kind"] == "delegated-live-scope"
+    assert record["passed"] == sorted(differential.DELEGATED_LIVE_SCOPE_LABELS["dagrun"])
+    assert len(calls) == 4  # two cases, each on both engines
+    assert all(extra.get("DAGRUN_CORE_LEDGER") for _args, extra in calls)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["--tool", "herdr-run"], id="tool-without-live-cases"),
+        pytest.param(["--tool", "all"], id="all-tools"),
+        pytest.param(
+            ["--tool", "cpuset-alloc", "--allow-skip", "delegated-live-scope"],
+            id="allows-the-kind-it-measures",
+        ),
+    ],
+)
+def test_only_kind_refuses_a_run_that_could_not_measure_the_kind(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> None:
+    differential = _differential()
+    monkeypatch.delenv("AGENT_UTILS_CROSS_ALLOW_SKIP", raising=False)
+    monkeypatch.setattr(differential, "compare_cpuset_alloc", _unexpected_run)
+    monkeypatch.setattr(differential, "compare_dagrun_live_scope", _unexpected_run)
+
+    with pytest.raises(SystemExit) as raised:
+        differential.main([*argv, "--only-kind", "delegated-live-scope"])
+
+    assert raised.value.code == 2
+
+
+def test_an_ordinary_run_writes_no_live_scope_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    differential = _differential()
+    monkeypatch.setenv(COVERAGE_DIR_ENV, str(tmp_path))
+    report = differential.Report()
+    report.ok("ran")
+
+    assert differential.coverage_verdict("demo", report, "1 checks agree", frozenset()) == 0
+
+    (path,) = tmp_path.glob("*.json")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert "only_kind" not in record and "passed" not in record
+
+
+def _record(
+    tool: str,
+    node: str,
+    verdict: str,
+    skipped: list[tuple[str, str]],
+    *,
+    passed: list[str] | None = None,
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "tool": tool,
+        "node": node,
+        "verdict": verdict,
+        "checks": 1,
+        "skipped": [{"label": label, "kind": kind} for label, kind in skipped],
+    }
+    if passed is not None:
+        value["only_kind"] = "delegated-live-scope"
+        value["passed"] = passed
+    return value
+
+
+_DAGRUN_LIVE = ["pin-run:reserve-apply-release", "pin-run:signal-status"]
+_DELEGATED = [
+    _record(
+        "dagrun",
+        "cross.dagrun.differential",
+        "PARTIAL",
+        [(label, "delegated-live-scope") for label in _DAGRUN_LIVE],
+    ),
+    _record(
+        "cpuset-alloc",
+        "cross.dagrun.cpuset-differential",
+        "PARTIAL",
+        [(label, "delegated-live-scope") for label in _CPUSET_LIVE_LABELS],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("live", "skipped", "by_kind", "measured_lines"),
+    [
+        pytest.param(
+            [
+                _record("dagrun", "cross.dagrun.live-scope", "OK", [], passed=_DAGRUN_LIVE),
+                _record(
+                    "cpuset-alloc",
+                    "cross.dagrun.live-scope",
+                    "OK",
+                    [],
+                    passed=list(_CPUSET_LIVE_LABELS),
+                ),
+            ],
+            0,
+            (),
+            2,
+            id="both-measured",
+        ),
+        pytest.param([], 7, (("delegated-live-scope", 7),), 0, id="no-live-record"),
+        pytest.param(
+            [
+                _record("dagrun", "cross.dagrun.live-scope", "OK", [], passed=_DAGRUN_LIVE),
+                _record(
+                    "cpuset-alloc",
+                    "cross.dagrun.live-scope",
+                    "FAILED",
+                    [],
+                    passed=list(_CPUSET_LIVE_LABELS),
+                ),
+            ],
+            5,
+            (("delegated-live-scope", 5),),
+            1,
+            id="failed-live-record-measures-nothing",
+        ),
+        pytest.param(
+            [
+                _record(
+                    "cpuset-alloc",
+                    "cross.dagrun.live-scope",
+                    "PARTIAL",
+                    [("interop:py-then-rs", "hard-cpuset"), ("interop:rs-then-py", "hard-cpuset")],
+                    passed=["selftest:mutation-verdict", "run:wrapped-help-passthrough"],
+                ),
+            ],
+            # dagrun 2 unmeasured; cpuset: run:signal-status unmeasured, the two interop skips
+            # counted once (in the live record), the other two measured.
+            5,
+            (("delegated-live-scope", 3), ("hard-cpuset", 2)),
+            1,
+            id="partly-measured",
+        ),
+        pytest.param(
+            [_record("dagrun", "cross.dagrun.live-scope", "OK", [], passed=_CPUSET_LIVE_LABELS)],
+            7,
+            (("delegated-live-scope", 7),),
+            0,
+            id="another-tools-record-measures-nothing",
+        ),
+        pytest.param(
+            [
+                {
+                    **_record("cpuset-alloc", "cross.dagrun.live-scope", "OK", []),
+                    "passed": list(_CPUSET_LIVE_LABELS),
+                }
+            ],
+            7,
+            (("delegated-live-scope", 7),),
+            0,
+            id="passes-without-only-kind-measure-nothing",
+        ),
+    ],
+)
+def test_validate_counts_a_delegated_skip_as_measured_only_by_a_passing_live_record(
+    tmp_path: Path,
+    live: list[dict[str, object]],
+    skipped: int,
+    by_kind: tuple[tuple[str, int], ...],
+    measured_lines: int,
+) -> None:
+    validate = _validate()
+    for index, value in enumerate([*_DELEGATED, *live]):
+        (tmp_path / f"{index}.json").write_text(json.dumps(value), encoding="utf-8")
+
+    report = validate.cross_coverage_report(
+        tmp_path,
+        ["cross.dagrun.differential", "cross.dagrun.cpuset-differential"]
+        + (["cross.dagrun.live-scope"] if live else []),
+    )
+
+    assert report.skipped == skipped
+    assert report.by_kind == by_kind
+    assert report.unreadable == 0 and report.missing == []
+    assert len(report.measured) == measured_lines
+    for line in report.measured:
+        assert "measured by cross.dagrun.live-scope" in line
+
+
+def test_validate_says_ok_when_the_live_scope_node_measured_every_delegated_skip(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End to end through real records: the delegated skip plus a passing live record is OK."""
+
+    differential = _differential()
+    validate = _validate()
+    nodes = ["cross.dagrun.cpuset-differential", "cross.dagrun.live-scope"]
+
+    def fake_run(
+        _selected: object,
+        _components: object,
+        *,
+        coverage_dir: Path,
+        timing_dir: Path,
+        **_kw: object,
+    ) -> int:
+        monkeypatch.setenv(COVERAGE_DIR_ENV, str(coverage_dir))
+        monkeypatch.setenv("AGENT_UTILS_CASE_TIMING_DIR", str(timing_dir))
+        allowed = frozenset({"delegated-live-scope"})
+        monkeypatch.setenv("DAGRUN_OUTER_RUN", nodes[0])
+        delegated = differential.Report()
+        delegated.ok("version")
+        delegated.skip("run:signal-status", "delegated-live-scope", "delegated root")
+        assert differential.coverage_verdict("cpuset-alloc", delegated, "1", allowed) == 0
+        monkeypatch.setenv("DAGRUN_OUTER_RUN", nodes[1])
+        monkeypatch.setattr(differential, "_ONLY_KIND", "delegated-live-scope")
+        live = differential.Report()
+        live.ok("run:signal-status")
+        assert differential.coverage_verdict("cpuset-alloc", live, "1", frozenset()) == 0
+        return 0
+
+    monkeypatch.setattr(validate, "run", fake_run)
+    monkeypatch.setattr(validate, "selected_cross_nodes", lambda *_args, **_kw: nodes)
+    monkeypatch.setattr(validate, "selected_timing_gates", lambda *_args, **_kw: nodes)
+    monkeypatch.setattr(validate, "host_env", lambda _environ: {})
+
+    assert validate.main(["--all"]) == 0
+    out = capsys.readouterr().out
+
+    assert (
+        "  cross.dagrun.cpuset-differential (cpuset-alloc): 1 delegated-live-scope skip(s) "
+        "measured by cross.dagrun.live-scope: run:signal-status"
+    ) in out
+    assert out.rstrip().endswith("validate: OK")
+    assert "validate: PARTIAL" not in out
+    assert "cross-language coverage was PARTIAL" not in out
+
+
+def test_the_live_scope_node_runs_both_tools_outside_the_delegated_cgroup() -> None:
+    """#2388: the node is not delegated, allows no skip, and is selected with the two it measures."""
+
+    by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
+    node = by_tag["cross.dagrun.live-scope"]
+    assert node.cmd == (
+        "python3 cross/differential.py --tool dagrun --only-kind delegated-live-scope && "
+        "python3 cross/differential.py --tool cpuset-alloc --only-kind delegated-live-scope"
+    )
+    assert not node.delegated_children
+    assert "AGENT_UTILS_CROSS_ALLOW_SKIP" not in node.env
+    for measured in ("cross.dagrun.differential", "cross.dagrun.cpuset-differential"):
+        assert by_tag[measured].delegated_children
+        assert set(by_tag[measured].labels) == set(node.labels), measured
+    validate = _validate()
+    assert validate._is_timing_gate(node.cmd)
+    preferred = node.hint.preferred_inner_jobs
+    assert preferred is not None and preferred >= 2
