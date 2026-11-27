@@ -51,6 +51,9 @@ SIZES = (("desk", 1280, 800, False), ("phone", 390, 852, True))
 BANG = "spaces/A/threads/bang"
 INCIDENT = "spaces/A/threads/incident"
 RELEASE = "spaces/A/threads/release"
+# The release thread's display name, drawn as its picker row's slug (`#1563`). It comes with the
+# threads' summaries, which can land after the rows themselves are drawn (`#2416`).
+NAMED_SLUG = "release-day"
 
 
 def brief_age(stamp: str, now: datetime | None = None) -> str:
@@ -118,7 +121,7 @@ class PinApi(fixture.FakeApi):
              "reply_count": 1, "reply_count_exact": True,
              "updated_at": self.messages[3]["timestamp"]},
             {"id": RELEASE, "root": self.messages[4], "title": long_title,
-             "display_name": "release-day",
+             "display_name": NAMED_SLUG,
              "reply_count": 1, "reply_count_exact": True,
              "updated_at": self.messages[5]["timestamp"]},
         ]
@@ -343,9 +346,16 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str,
 def open_popup(desk: Desk) -> list[Json]:
     page: Page = desk.page
     page.click("#thread-select")
+    # `#2416 vibe-talk-thread-pin-picker-slug-race`: the rows are read once, so wait until they are
+    # whole. The named thread's slug comes with the threads' summaries, which can land after the
+    # three rows are drawn from the channel's own messages. Read before that, no row had the slug
+    # (c3f49b05's StopIteration at the slug check). A condition with the hang backstop, no clock.
     desk.wait_for("() => { const p = document.querySelector('.thread-picker-popup');"
-                  " return p && !p.hidden && p.querySelectorAll('.thread-picker-thread').length === 3; }",
-                  "the picker's pop-up did not list three threads", seconds=120)
+                  " return p && !p.hidden && p.querySelectorAll('.thread-picker-thread').length === 3"
+                  " && [...p.querySelectorAll('.thread-picker-thread .thread-picker-slug')]"
+                  f".some((el) => el.textContent.trim() === '{NAMED_SLUG}'); }}",
+                  f"the picker's pop-up did not list three threads with the slug {NAMED_SLUG!r} drawn",
+                  seconds=120)
     desk.settled()
     found = page.evaluate(POPUP_JS)
     assert isinstance(found, dict)
@@ -427,7 +437,7 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
     desk.check(gold not in ("", "rgb(231, 233, 238)"),
                f"a pinned pin is not gold-dressed: {thread_rows[0]}")
     # `#1563`: slug plus readable title; an unnamed thread shows its full title.
-    named = next(r for r in thread_rows if r["slug"] == "release-day")
+    named = next(r for r in thread_rows if r["slug"] == NAMED_SLUG)
     desk.check("Release checklist for the November rollout" in str(named["title"]),
                f"the named row does not show slug plus full title: {named}")
     unnamed = next(r for r in thread_rows if r["slug"] in (None, ""))
@@ -589,11 +599,11 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
     desk.notes.append("a bang-bound thread's unpin sticks across a reload")
 
     # `#1563`: inside the thread, the header leads with the slug.
-    page.evaluate("""() => {
-        const open = [...document.querySelectorAll('.thread-picker-open')]
-            .find((el) => el.querySelector('.thread-picker-slug')?.textContent === 'release-day');
-        open.click();
-    }""")
+    # `#2416`: the named row's slug may still be on its way after the reload; wait for it, then open.
+    named_open = ("[...document.querySelectorAll('.thread-picker-open')]"
+                  f".find((el) => el.querySelector('.thread-picker-slug')?.textContent === '{NAMED_SLUG}')")
+    desk.wait_for(f"() => Boolean({named_open})", f"no picker row carried the slug {NAMED_SLUG!r}", seconds=120)
+    page.evaluate(f"() => {{ {named_open}.click(); }}")
     page.wait_for_function(
         "() => (document.querySelector('#thread-card-text')?.textContent || '')"
         ".includes('release-day')", timeout=120_000)
