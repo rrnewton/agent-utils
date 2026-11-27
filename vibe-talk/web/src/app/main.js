@@ -656,6 +656,13 @@ function measureReadSteer() {
   // growth the reader did not cause there. The call transcript follows its foot as before (`#431`).
   const holdsReader = resized && screens.view() === "discord";
   const pinned = !landed && !holdsReader && screens.screen() === "main" && chipsFollowFoot(area, grew);
+  // `#2367 vibe-talk-read-row-moves-start-stop` (b), rule 370: the frame growing back (a read
+  // stopping) leaves a reader further down than the list now overflows, and the browser's clamp
+  // drops every row by the difference in one frame. The row the reader's eye is on is taken before
+  // the frame changes and held at its top after it, with room at the foot where the clamp moved it,
+  // as `#2346` holds a landed row; the reader's next scroll gives the room back.
+  const held = holdsReader && screens.screen() === "main" ? scrollKeeping.scrollAnchor(area) : null;
+  const heldTop = held ? held.getBoundingClientRect().top : 0;
   geometry.write("--read-steer-clearance", room);
   // `scrubber-full-width`. The height itself, without the air: on a phone the strip playing is a
   // row of its own over the dock, and the list ends at its top edge (`data-read-strip`). Held on
@@ -663,7 +670,10 @@ function measureReadSteer() {
   geometry.write("--read-steer-height", `${height}px`);
   if (landed) placeEntryLanding(entryState().landing.row, entryState().landing.first);
   if (pinned) scrollKeeping.toFoot(area);
-  else if (holdsReader && screens.screen() === "main") renderJumpNewest();
+  else if (holdsReader && screens.screen() === "main") {
+    if (held && held.parentNode) scrollKeeping.holdRowAt(area, held, held.getBoundingClientRect().top - heldTop);
+    renderJumpNewest();
+  }
   // The strip floats in the same band as the chips over the channel's box, so it moved with it.
   placeChipsOverComposer();
   // `#442 read-strip-order`: a strip moved on a desk that grew is held inside the window again.
@@ -2859,6 +2869,7 @@ const footRooms = createFootRooms({
     ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0),
   pageStep: (area) => pageStep(area),
   keyboardRoom: (area) => (screenKeyboardRoom ? screenKeyboardRoom.roomIn(area) : 0) + scrollKeeping.footRoom(area),
+  holdsRoom: (area) => scrollKeeping.holdsRoom(area),
   bottomSlack: BOTTOM_SLACK_PX,
   followRestPx: FOLLOW_REST_PX,
   filterState: () => filterState(),
@@ -10462,6 +10473,7 @@ const listKeepersMount = mountListKeepers({
   },
   voiceCall: () => voiceCall(),
   keepWrittenBox: (area, seen, now) => keepWrittenBox(area, seen, now),
+  holdsRoom: (area) => scrollKeeping.holdsRoom(area),
   writingIn: (area) => boxBeingWritten(area) !== null,
   footTop: (area) => footTop(area),
   atBottom: (...args) => atBottom(...args),

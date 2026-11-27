@@ -226,6 +226,10 @@ export interface ScrollKeeping {
    * count it as room, and the next deliberate write to the foot reclaims it.
    */
   footRoom(area: HTMLElement): number;
+  /** Whether a hold keeps room in `area` past its rows' foot (the foot room or the floor under a
+   * held place, `#2076`, `#2285`): a reader standing in it is held there, not following the foot
+   * (`#2367`). */
+  holdsRoom(area: HTMLElement): boolean;
   /**
    * Hold `row`'s top after a change moved it `delta` px down the viewport (`#2285`, the
    * label-chip tap): `nudge`'s write, with the room the list lacks added where it cannot
@@ -414,6 +418,11 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   /** The room held past the foot of the list standing in `area`, else 0 (`#2076`). */
   function footRoom(area: HTMLElement): number {
     return roomList !== null && typeof area.contains === "function" && area.contains(roomList) ? roomPx : 0;
+  }
+
+  function holdsRoom(area: HTMLElement): boolean {
+    if (footRoom(area) > 0) return true;
+    return floorBox !== null && floorPx > 0 && typeof area.contains === "function" && area.contains(floorBox);
   }
 
   /** Give `list` `px` more room above its first row (`#2285`), on the list element itself. */
@@ -1344,6 +1353,6 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     return onScreen;
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, shrinkSettling: () => shrinkActive, shrinkActSettled: () => shrinkActDoneGen === shrinkGen, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom, holdRowAt, clearTapRooms, headRoom,
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, preservingShrink, preservingShrinkAsync, shrinkSettling: () => shrinkActive, shrinkActSettled: () => shrinkActDoneGen === shrinkGen, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince, inputStamp: () => userInputAt, userChangeActive, beginUserChange: openUserHold, footRoom, holdsRoom, holdRowAt, clearTapRooms, headRoom,
     heldComposerTop: composerBefore, keepComposer: (area: HTMLElement, beforeTop: number) => keepComposerInView(area, beforeTop) };
 }

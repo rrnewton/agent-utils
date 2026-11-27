@@ -58,6 +58,8 @@ export interface ListKeepersDependencies<Column> extends SizeWatching {
   voiceCall(): { writingToAgent(): boolean; keepComposerInView(): void };
   /** Keep a box being written in `area` in view as the keyboard shrinks it; whether it did (`#429`). */
   keepWrittenBox(area: HTMLElement, seen: UnderListNote | null, now: UnderListNote): boolean;
+  /** Whether a hold keeps room past `area`'s rows (`holdsRoom`, `#2367`): its reader is held there. */
+  holdsRoom?(area: HTMLElement): boolean;
   /** Whether a box in `area` is being written in (`boxBeingWritten`): its reader focused there. */
   writingIn(area: HTMLElement): boolean;
   /** The scroll position of the rows' foot of `area` (`footTop`), where the page measures it. */
@@ -202,6 +204,10 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       }
       // `#243 filter-keeps-selection`. Nor a message a filter change holds in place, which stays put.
       if (keepFilterHold()) return;
+      // `#2367 vibe-talk-read-row-moves-start-stop`. Nor a reader a hold stands in room past the rows
+      // (a row held across the read strip going, as the bar's second row comes back): taking them to
+      // the foot reclaims that room, and the browser's clamp then drops every row by it.
+      if (deps.holdsRoom && deps.holdsRoom(area)) return;
       // `#241 voice-composer`. The list shrinking under a reader who is writing in the call's box —
       // the on-screen keyboard coming up, as the viewport asks the browser to lay it out — keeps the
       // box in view rather than letting the list's foot, where the box is, slide under the dock.

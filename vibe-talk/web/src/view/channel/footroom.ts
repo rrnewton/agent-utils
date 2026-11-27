@@ -105,6 +105,8 @@ export interface FootRoomsDependencies {
   heldFilterRow(): unknown;
   /** Whether a quick reply holds `area` (`quickReplyHolds`). */
   quickReplyHolds(area: Scroller): boolean;
+  /** Whether a hold keeps room past `area`'s rows (`holdsRoom`, `#2367`): its reader is held there. */
+  holdsRoom?(area: Scroller): boolean;
   /** Take `area` to its foot, and move it by a measured delta, through the scroll owner (`#1251`). */
   toFoot(area: Scroller): void;
   nudge(area: Scroller, delta: number): void;
@@ -480,6 +482,10 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
     const follow = deps.mainFollowState();
     if (!follow) return deps.followsNewest(area);
     if (deps.heldFilterRow() !== null || deps.quickReplyHolds(area)) return false;
+    // `#2367 vibe-talk-read-row-moves-start-stop`: nor one a hold stands in room past the rows (a row
+    // held across the read strip going, a landed search row, a tap's place): taking them to the
+    // foot reclaims the room, and the browser's clamp then drops every row by it.
+    if (deps.holdsRoom && deps.holdsRoom(area)) return false;
     // The keeper's state, or the reader standing at the foot within its rest room where the state
     // has not heard their landing (a screen coming back, a list whose scrolls were another's):
     // past that room a reader resting up the list is left where they are (`#1185`). Either way the

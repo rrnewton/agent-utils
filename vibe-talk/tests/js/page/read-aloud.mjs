@@ -164,6 +164,98 @@ test("`#2351 vibe-talk-read-strip-foot-reader-moves`: the read strip coming and 
   assert.ok(moved.shown > 0, `the negative control did not take the reader to the foot (${JSON.stringify(moved)}), so the check above proves nothing`);
 });
 
+test("`#2367 vibe-talk-read-row-moves-start-stop`: a read stopping holds the row being read where the frame growing back would clamp it", async () => {
+  // Rule 370. While a read plays on a phone the list ends at the strip's top; a reader taken to that
+  // shorter list's end (the read's follow) is further down than the list overflows once the strip
+  // goes, and the browser's clamp dropped every row by the strip's height as the read stopped.
+  const STRIP_PX = 47;
+  const stopFromTheFoot = async (script) => {
+    const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
+    page.readAloud = DEVICE_SPEECH;
+    page.enableDeviceSpeech();
+    await signIn(page);
+    const messages = Array.from({ length: 30 }, (_, i) => message({
+      id: `10000000000000003${String(i).padStart(2, "0")}`,
+      author: i % 2 ? "ci-bot" : "deploy-bot",
+      author_id: i % 2 ? "1000000000000000001" : "1000000000000000002",
+      content: `stop ${i}: the build finished and the deploy is waiting for a look.`,
+    }));
+    const rows = await inReadingMode(page, messages);
+    const area = page.el("scroll-area");
+    const frame = area.clientHeight;
+    // The phone's layout as the browser lays it out: the list ends at the strip's top, its frame
+    // short by the height the strip's measure writes, and a position past the new end clamped.
+    const write = area.style.setProperty;
+    area.style.setProperty = (name, value) => {
+      write(name, value);
+      if (name !== "--read-steer-height") return;
+      area.clientHeight = frame - (parseFloat(value) || 0);
+      area.scrollTop = area.scrollTop;
+    };
+    // ...and the room a hold keeps, which the fixture otherwise lays out as nothing: the pane's
+    // least height (the floor) and the list's padding past its last row.
+    const pane = page.el("pane-discord");
+    const paneHeight = pane.height.bind(pane);
+    pane.height = () => Math.max(paneHeight(), parseFloat(pane.style.minHeight) || 0);
+    const list = page.el("discord-log");
+    const listHeight = list.height.bind(list);
+    list.height = () => listHeight() + (parseFloat(list.style.paddingBottom) || 0);
+    // The scroller answers whether it holds a node, as a browser's does (the room's owner asks it).
+    area.contains = (node) => {
+      for (let at = node; at; at = at.parentNode) if (at === area) return true;
+      return false;
+    };
+    page.resized(page.el("pane-discord"));
+    area.scrollTop = area.scrollHeight - area.clientHeight;
+    await area.dispatch("scroll", {});
+    await page.settle();
+    const strip = page.el("read-steer");
+    strip.offsetHeight = STRIP_PX;
+    await rows.at(-1).dispatch("click", {});
+    await page.settle();
+    assert.equal(strip.hidden, false, "the read did not bring up the strip, so this is not the case here");
+    assert.equal(area.clientHeight, frame - STRIP_PX, "the model did not shorten the frame, so this is not the case here");
+    // The read's follow takes the reader to the shorter list's end, as it does on a phone, and the
+    // list reports the size it plays at.
+    area.scrollTop = area.scrollHeight - area.clientHeight;
+    await area.dispatch("scroll", {});
+    await page.settle();
+    const dock = page.el("dock");
+    dock.offsetHeight = 50;
+    page.resized(area);
+    await page.settle();
+    const row = rows.at(-2);
+    const before = row.getBoundingClientRect().top;
+    strip.offsetHeight = 0;
+    await rows.at(-1).dispatch("click", {});
+    await page.settle();
+    assert.equal(strip.hidden, true, "tapping the row being read did not stop it, so this is not the case here");
+    assert.equal(area.clientHeight, frame, "the model did not give the frame back, so this is not the case here");
+    // The browser's next rendering: the bar's second row and the chips come back as the read's
+    // layout goes, and the list, the chips row and the strip report their sizes. Taking the reader to
+    // the foot at either report reclaimed the held room.
+    dock.offsetHeight += 42;
+    page.resized(area);
+    page.resized(page.el("scroll-tools"));
+    page.resized(strip);
+    await page.settle();
+    return row.getBoundingClientRect().top - before;
+  };
+  const held = await stopFromTheFoot(SCRIPT);
+  assert.equal(held, 0, `the read stopping moved the row being read by ${held}px`);
+  const dropped = await stopFromTheFoot(await brokenModule([{ file: "src/app/main.js",
+    find: "    if (held && held.parentNode) scrollKeeping.holdRowAt(", replace: "    if (false) scrollKeeping.holdRowAt(" }]));
+  assert.ok(dropped > 0, `the negative control did not drop the row (${dropped}px), so the check above proves nothing`);
+  // The hold alone is not enough: the chips row's report at the next rendering found the reader at
+  // the foot of the held room and took them to it, and the room went with it.
+  const reclaimed = await stopFromTheFoot(await brokenModule([{ file: "src/view/channel/footroom.ts",
+    find: "    if (deps.holdsRoom && deps.holdsRoom(area)) return false;\n", replace: "" }]));
+  assert.ok(reclaimed > 0, `the room's negative control did not drop the row (${reclaimed}px), so the veto is unproven`);
+  const docked = await stopFromTheFoot(await brokenModule([{ file: "src/view/channel/listkeepers.ts",
+    find: "      if (deps.holdsRoom && deps.holdsRoom(area)) return;\n", replace: "" }]));
+  assert.ok(docked > 0, `the dock's negative control did not drop the row (${docked}px), so its veto is unproven`);
+});
+
 test("device speech ignores remote voices and waits for a fresh tap when installed voices appear", async () => {
   const remote = { name: "Cloud voice", lang: "en-US", localService: false, default: true };
   const page = devicePage([remote]);
