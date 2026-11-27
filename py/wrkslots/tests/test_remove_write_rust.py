@@ -41,6 +41,19 @@ from wrkslots.tests.rust_binary import rust_wrkslotsd
 AU_ROOT = Path(__file__).resolve().parents[3]
 
 
+#: Why the Rust/Python remove differentials that reach the post-fence census
+#: run only on the host (#2065). A host git wrapper can leave a detached helper
+#: after every git call, which runs git with the checkout as its working
+#: directory. In a PID namespace the census is fast enough to reach that helper
+#: while it lives and refuses on it. They come back when wrkslots waits for its
+#: own commands' descendants before a census (#2418).
+_HOST_GIT_HELPER_HOLDER = (
+    "a host git wrapper's detached helper outlives wrkslotsd's own git calls with its "
+    "working directory in the slot, and the fast census in a PID namespace names it "
+    "as a holder (#2065)"
+)
+
+
 def _git(cwd: Path, *args: str) -> str:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(
@@ -522,6 +535,8 @@ def _add_cache_globs(root: Path) -> Path:
     return cache
 
 
+@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_HOLDER)
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_with_cache_globs_matches_python(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         _remove_with_cache_globs(base)
@@ -632,6 +647,8 @@ def _rebuild(root: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_HOLDER)
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_event_log_replays_through_rust_reader(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         _event_log_replays(base)
@@ -763,6 +780,8 @@ def test_remove_ignored_file_refuses_in_both_editions(tmp_path: Path) -> None:
             assert (root / "worktrees" / "slot-a" / "repo" / "ignored.log").exists()
 
 
+@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_HOLDER)
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_ignored_file_discards_in_both_editions(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         rust_root, oracle_root = _pair(base)
@@ -796,7 +815,7 @@ def _add_long_ignored_entries(root: Path) -> tuple[str, str]:
     return target, deep
 
 
-@pytest.mark.ordinary_environment(reason="the Rust census names the test's own child as a holder inside a PID and user namespace (#2065)")
+@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_HOLDER)
 @pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_ignored_long_symlink_archives_in_both_editions(
     tmp_path: Path,
@@ -834,7 +853,7 @@ def test_remove_ignored_long_symlink_archives_in_both_editions(
         assert archives[0] == archives[1]
 
 
-@pytest.mark.ordinary_environment(reason="the Rust census names the test's own child as a holder inside a PID and user namespace (#2065)")
+@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_HOLDER)
 @pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_ignored_file_archives_in_both_editions(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
@@ -872,7 +891,7 @@ def _add_dangling_copy(root: Path) -> None:
     (dangling / "file.txt").write_text("copied work\n")
 
 
-@pytest.mark.ordinary_environment(reason="the Rust census names the test's own child as a holder inside a PID and user namespace (#2065)")
+@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_HOLDER)
 @pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_dangling_gitfile_discards_in_both_editions(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
@@ -898,6 +917,8 @@ def test_remove_dangling_gitfile_discards_in_both_editions(tmp_path: Path) -> No
             assert "ignored/reverie-third-party-a32b6494/dynamorio/file.txt" in paths
 
 
+@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_HOLDER)
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_ignored_cache_target_still_removes_in_both_editions(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         rust_root, oracle_root = _pair(base)
@@ -1438,7 +1459,7 @@ def _liveness_evidence(root: Path) -> list[dict[str, object]]:
     return found
 
 
-@pytest.mark.ordinary_environment(reason="the Rust census names the test's own child as a holder inside a PID and user namespace (#2065)")
+@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_HOLDER)
 @pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_records_the_same_liveness_line_as_python(tmp_path: Path) -> None:
     """#994: both editions record the dead line escaped, capped and flagged alike."""
@@ -1586,6 +1607,8 @@ def _scrub_finish_journal(journal: dict[str, object]) -> str:
     return json.dumps(copy, indent=2, sort_keys=True)
 
 
+@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_HOLDER)
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: host remove census exceeds its item budget under load
 def test_remove_writes_the_same_finish_journal_as_python(tmp_path: Path) -> None:
     """#1121: both editions write equivalent finish journals, owner included."""
 

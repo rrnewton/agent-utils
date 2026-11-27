@@ -78,15 +78,15 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
     - `test_census_threads.py` (7) and `test_census_late_fork.py` (2): the real census commands are trusted only in the initial identity user namespace.
     - `test_sandbox_root_spec.py` (5): the real uid and passwd home.
     - `test_cli.py` (4): root-owned git and real scope masks.
-    - `test_remove_write_rust.py` (4): the Rust census names the test's own child as a holder inside the namespace.
+    - `test_remove_write_rust.py` (9): a host git wrapper's detached helper outlives wrkslotsd's own git calls with its working directory in the slot, and the fast census in a PID namespace names it as a holder. See the final-gate note below.
     - `test_classify_journals_rust.py` (3), `test_recover_abort_own.py` (1) and `test_eden_restart.py` (1): host-visible PIDs.
     - `test_slice_fallbacks.py` (2): root-owned sudo and host scopes.
     - `test_seal_recover_scoped_census.py` (2) and `test_recover_late_census_rollback.py` (1): the real census.
     - `test_release_frozen_rust.py` (1): a root-owned sticky /tmp parent.
-  - In all, 282 cases run on the host (104, 83 and 95 per host shard).
+  - In all, 282 cases run on the host (101, 94 and 87 per host shard). The 9 `test_remove_write_rust.py` cases are also `load_quarantine`, so they run there only on opt-in.
 - **`load_quarantine` additions.** Each has a #2065 pointer and stays runnable with `WRKSLOTS_INCLUDE_QUARANTINED=1` or `-m load_quarantine`.
   - Host cases that need a live census inside the remove budget:
-    - `test_remove_write_rust.py`: 4 cases;
+    - `test_remove_write_rust.py`: 9 cases;
     - `test_seal_recover_scoped_census.py`: 2 cases;
     - `test_recover_late_census_rollback.py::test_early_census_refusal_with_fenced_holder_retains_journal_and_retry_removes`;
     - `test_slice_fallbacks.py::test_teardown_without_a_slice_falls_back_to_the_census`;
@@ -98,7 +98,13 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
 - **Not un-quarantined in this commit.** Quarantined cases are deselected in gates, so none passed in this gate, as the coordinator's rule requires.
   - Local evidence for a later step: 12 of the 21 existing #2065 Python cases passed inside the namespace on 2026-11-27. They are `test_batch_lock_scope` x2, `test_dead_fuse_entry` x2, `test_remove_fenced_lock_scope` x6, `test_journal_actor_liveness::test_remove_waits_for_a_live_finish_journal_then_proceeds` and `test_audit_state_rust::test_audit_size_unknown_text_matches_python`.
   - `test_wait_lock_waits_for_a_live_journal_then_proceeds` still failed: a 300 s wall-clock thread join.
-- **Coverage.** Removal-path coverage for the quarantined set now rests on #2392's new tests and on this on-demand set.
+- **Final gate (aa943857, `1795818591782702449-bc4ab3a5`).** Two more `test_remove_write_rust.py` cases refused in the namespace: `live process N uses slot ... (working directory)`.
+  - The holder was identified with a sampler of every process whose working directory was in a test slot. In all 9 refusals seen (2 in the gate, 7 in local namespace runs) it was the same thing: a detached helper that the host's git wrapper leaves after a git call, running `git remote get-url origin` in the checkout, orphaned to the namespace init.
+  - Each Rust remove's own git calls leave about 30-65 such helpers in its slot. The Rust post-fence census runs right after those calls and, among few processes, reaches one while it lives. The Python census walks the fenced tree first, and the host census is slow, so both usually miss it.
+  - The discovery note's cause ("the census names the test's own child") was an inference. It is replaced by this named cause, and the mark reasons say so.
+  - Five more cases get the same pair of marks: `test_remove_with_cache_globs_matches_python`, `test_remove_ignored_cache_target_still_removes_in_both_editions`, `test_remove_event_log_replays_through_rust_reader`, `test_remove_writes_the_same_finish_journal_as_python` and `test_remove_ignored_file_discards_in_both_editions`. The last one has not refused yet but leaves the same helpers in its slot.
+  - The product side is #2418: wrkslots waits for its own commands' descendants before a census.
+- **Coverage.** Removal-path coverage for the quarantined set now rests on #2392's new tests and on this on-demand set. The 9 `test_remove_write_rust.py` Rust/Python remove differentials come back to the namespaced shards when #2418 lands.
 - **Related.**
   - Two `test_worktrees_image` busy-holder tests hit the 600 s per-test timeout inside `scan_mount_holders` on another gate. #2372's test fix (906b54fc) gives them a fixture proc root, and its production change (#2372 50a174b4, pending) parses each distinct mount table once.
   - Outside #2065, noted for #2382's audit annex: `cross.herdr-run.differential`, `rust.merge-queue.test` and `vibe-talk.check.documents-browser` were red in the discovery gate.
