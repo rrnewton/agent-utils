@@ -17,7 +17,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import ParamSpec, TypeVar
 
@@ -26,11 +26,13 @@ import pytest
 from wrkslots import cli
 from wrkslots.tests.test_lifecycle import (
     active_slots,
+    checkout,
     command,
     control_directory,
     create,
     make_project,
 )
+from wrkslots.tests.test_transfer_lock_scope import _scan_running_a_second_writer
 
 _Parameters = ParamSpec("_Parameters")
 _Result = TypeVar("_Result")
@@ -344,3 +346,119 @@ def test_heartbeat_at_many_rows_still_counts_zero_fleet_work_under_the_lock(
     assert ledger.count("storage-scan", held=True) == 0
     assert ledger.count("log-load", held=True) == 0
     assert ledger.count("log-list", held=True) == 0
+
+
+def test_heartbeat_busy_fallback_scan_never_blocks_a_second_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2353 acceptance 1: no registry storage scan runs under the locks.
+
+    The only lock-free round's scan admits a second writer, which
+    overtakes the round (a hold is not a heartbeat the classifier
+    tolerates), so the heartbeat falls back to its locked body. That
+    body used to run the fleet validation and the storage scan again
+    with the registry locks held; the second writer it then admitted
+    refused as busy. Now every second writer acquires the locks.
+    """
+    project = _project_with_slots(tmp_path)
+    monkeypatch.setattr(cli, "REGISTRY_VALIDATION_ATTEMPTS", 1)
+    ledger = _LockLedger(monkeypatch, project)
+    outcomes: list[tuple[int, str]] = []
+    _scan_running_a_second_writer(monkeypatch, project, outcomes)
+    before = _row(project, "slot01")["heartbeat_at"]
+
+    rc = cli.main(_heartbeat_argv(project))
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "heartbeat slot=slot01" in captured.out
+    assert outcomes, "the lock-free round ran no registry storage scan"
+    assert [code for code, _err in outcomes] == [0] * len(outcomes), outcomes
+    # One overtaken lock-free round, then the locked fallback.
+    assert ledger.exclusive_rounds == 2
+    assert ledger.count("storage-scan", held=True) == 0
+    assert ledger.count("validate", held=True) == 0
+    assert _row(project, "slot01")["heartbeat_at"] != before
+
+
+def test_heartbeat_busy_fallback_still_refuses_its_own_broken_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2353 acceptance 2: the touched row is still judged under the lock."""
+    project = _project_with_slots(tmp_path)
+    monkeypatch.setattr(cli, "REGISTRY_VALIDATION_ATTEMPTS", 1)
+    target = checkout(project, "slot01")
+    moved = target.with_name(target.name + ".moved")
+
+    def break_the_target() -> None:
+        target.rename(moved)
+
+    outcomes: list[tuple[int, str]] = []
+    _scan_running_a_second_writer(
+        monkeypatch, project, outcomes, after_first_scan=break_the_target
+    )
+    before = _row(project, "slot01")["heartbeat_at"]
+
+    rc = cli.main(_heartbeat_argv(project))
+
+    captured = capsys.readouterr()
+    assert rc == 3, (captured.out, captured.err)
+    assert moved.is_dir()
+    assert "slot directory does not match its record" in captured.err, captured.err
+    assert "missing checkouts product" in captured.err, captured.err
+    assert _row(project, "slot01")["heartbeat_at"] == before
+
+
+def test_heartbeat_busy_fallback_still_refuses_a_release_that_overtook_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2353 acceptance 2: a release in the window refuses in the fallback.
+
+    The release lands right after the only lock-free round judged the
+    record unreleased, so that round is overtaken and the heartbeat
+    falls back to its locked body, which judges the release from the
+    record's event chain under the lock.
+    """
+    project = _project_with_slots(tmp_path)
+    monkeypatch.setattr(cli, "REGISTRY_VALIDATION_ATTEMPTS", 1)
+    notes = tmp_path / "handoff.md"
+    notes.write_text("done\n", encoding="utf-8")
+    handed = command(
+        project, "write-handoff", "slot01", "--agent", "codex-1",
+        "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        "--from-file", str(notes),
+    )
+    assert handed.returncode == 0, handed.stderr
+    ledger = _LockLedger(monkeypatch, project)
+    writes: list[int] = []
+    judge_release = cli._owner_release_in_effect
+
+    def release_after_the_round_judged(
+        config: cli.Config,
+        record: cli.ActiveRecord,
+        events: Sequence[Mapping[str, object]],
+    ) -> cli._OwnerRelease | None:
+        judged = judge_release(config, record, events)
+        if not writes:
+            completed = command(
+                project, "release", "slot01", "--agent", "codex-1",
+                "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+            )
+            assert completed.returncode == 0, completed.stderr
+            writes.append(completed.returncode)
+        return judged
+
+    monkeypatch.setattr(
+        cli, "_owner_release_in_effect", release_after_the_round_judged
+    )
+    before = _row(project, "slot01")["heartbeat_at"]
+
+    rc = cli.main(_heartbeat_argv(project))
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert "was released by its owner" in captured.err
+    assert writes == [0]
+    assert ledger.exclusive_rounds == 2
+    assert ledger.count("validate", held=True) == 0
+    assert _row(project, "slot01")["heartbeat_at"] == before

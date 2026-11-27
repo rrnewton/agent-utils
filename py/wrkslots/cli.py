@@ -18581,10 +18581,10 @@ def _target_git_registrations(
     )
 
 
-def _assert_transfer_only_slot_changed(
+def _assert_local_only_slot_changed(
     before: ActiveState, after: ActiveState, transferred: ActiveRecord
 ) -> None:
-    """The locked transfer fallback changed only its record (#2174).
+    """A locked single-row fallback changed only its record (#2174, #2353).
 
     Compares the local ACTIVE snapshots around the write instead of
     revalidating the fleet: under the mutation locks, the snapshot
@@ -18605,7 +18605,7 @@ def _assert_transfer_only_slot_changed(
             )
     if after_rows.get(transferred.slot) != transferred:
         raise StateError(
-            f"mutation of slot {transferred.slot!r} did not record the transfer"
+            f"mutation of slot {transferred.slot!r} did not record its change"
         )
 
 
@@ -51162,7 +51162,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             evidence=evidence,
         )
         after_state = _load_active_snapshot(config)
-        _assert_transfer_only_slot_changed(state, after_state, transferred)
+        _assert_local_only_slot_changed(state, after_state, transferred)
         outcome = "reopened" if action == "owner-reopened" else "transferred"
         return (outcome, transferred, basis, previous_state, tuple(nested), ignored)
 
@@ -51877,6 +51877,38 @@ class _HeartbeatPrevalidated:
     warnings: tuple[str, ...]
 
 
+def _heartbeat_nested_warnings(
+    record: ActiveRecord, details: Sequence[str]
+) -> tuple[str, ...]:
+    """The #1492 warnings for nested worktrees Git registers in the slot.
+
+    Only a PRESENT nested worktree is tolerated: a registration whose path
+    was deleted is stale bookkeeping the owner must repair, and heartbeat
+    still refuses it (the deliberate own-slot half of
+    test_status_reports_git_registration...).
+    """
+
+    warnings: list[str] = []
+    for detail in details:
+        marker = " registers "
+        start = detail.find(marker)
+        end = detail.find(" inside", start) if start >= 0 else -1
+        registered = (
+            Path(detail[start + len(marker):end])
+            if start >= 0 and end > start
+            else None
+        )
+        if registered is not None and not registered.exists():
+            raise Refusal(detail)
+        warnings.append(
+            f"WARNING: slot {record.slot} has a nested worktree Git "
+            f"registers without a checkout row: {detail}. "
+            "state: heartbeat recorded anyway; the nested worktree is "
+            "retained and not inspected"
+        )
+    return tuple(warnings)
+
+
 def _resolved_wait_seconds(wait_seconds: float | None) -> float:
     """A lock wait with the #1808-C default applied.
 
@@ -51966,6 +51998,11 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
     # round and printed once by the caller, never once per round (#1808-A
     # review). The latest round's notes are the ones that judged the outcome.
     captured_notes: list[tuple[str, str]] = []
+    # What the latest lock-free round established, or None when it
+    # deferred to the locked body (#2353): the busy fallback reuses that
+    # round's fleet facts and storage findings instead of recomputing
+    # them with the registry locks held.
+    last_prepared: list[_HeartbeatPrevalidated | None] = [None]
 
     def validate() -> _HeartbeatPrevalidated:
         states, archives = _validate_global_state(config)
@@ -52003,28 +52040,9 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         findings = _assert_command_registry_storage(
             config, states, args, tolerate_target_git_registrations=True
         )
-        warnings: list[str] = []
-        for detail in findings.target_git_registrations:
-            # Only a PRESENT nested worktree is tolerated: a registration
-            # whose path was deleted is stale bookkeeping the owner must
-            # repair, and heartbeat still refuses it (the deliberate
-            # own-slot half of test_status_reports_git_registration...).
-            marker = " registers "
-            start = detail.find(marker)
-            end = detail.find(" inside", start) if start >= 0 else -1
-            registered = (
-                Path(detail[start + len(marker):end])
-                if start >= 0 and end > start
-                else None
-            )
-            if registered is not None and not registered.exists():
-                raise Refusal(detail)
-            warnings.append(
-                f"WARNING: slot {record.slot} has a nested worktree Git "
-                f"registers without a checkout row: {detail}. "
-                "state: heartbeat recorded anyway; the nested worktree is "
-                "retained and not inspected"
-            )
+        warnings = _heartbeat_nested_warnings(
+            record, findings.target_git_registrations
+        )
         release = _owner_release_in_effect(
             config, record, _load_events(config, record.machine)
         )
@@ -52038,7 +52056,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
                 "'wrkslots create'"
             )
         return _HeartbeatPrevalidated(
-            states=tuple(states), archives=tuple(archives), warnings=tuple(warnings)
+            states=tuple(states), archives=tuple(archives), warnings=warnings
         )
 
     def prepare() -> _HeartbeatPrevalidated | None:
@@ -52049,6 +52067,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         # The partial-state refusal is read-only, so it runs first here too,
         # keeping its old precedence over every other refusal; it is
         # re-checked under the locks before the write.
+        last_prepared[0] = None
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         if _outstanding_journals(config):
             # An outstanding journal may need dead-actor repair, which only
@@ -52061,30 +52080,60 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
                 stderr_buffer
             ):
-                return validate()
+                prepared = validate()
         finally:
             captured_notes[:] = [
                 (stdout_buffer.getvalue(), stderr_buffer.getvalue())
             ]
+        last_prepared[0] = prepared
+        return prepared
 
-    def locked_body() -> tuple[ActiveRecord, tuple[str, ...]]:
-        """The pre-#1808 heartbeat, run with the mutation locks already held.
+    def locked_body(
+        prepared: _HeartbeatPrevalidated | None,
+    ) -> tuple[ActiveRecord, tuple[str, ...]]:
+        """The heartbeat judged with the mutation locks already held.
 
         Used when a journal is outstanding (its classification and any
         dead-actor repair belong under the lock) and as the fallback when
         every lock-free round was overtaken: a heartbeat must not refuse
         as busy merely because other lanes kept mutating, so it waits for
-        the lock and does the whole thing there, as it always did.
+        the lock. Only the touched record is judged here (#2353, as
+        #2174 does for transfer-owner): the fleet validation and the
+        registry storage scan stay in the lock-free prepare, as the Rust
+        edition's commit re-judges only its record. Under the locks run
+        the record's owner, seal and journal checks, its own storage
+        check (the refusal the scan raises for the slot it names), its
+        machine's event chain, the write, and a snapshot comparison
+        proving no other local row moved. The nested-worktree warnings
+        and the fleet facts the cleanup-journal check reads come from
+        ``prepared``, the latest lock-free round; with no such round (a
+        journal was outstanding) the warnings are derived from this
+        record's own repositories, and the fleet is read only when a
+        validation-batch seal is also live, the one case whose check
+        reads it.
         """
 
         _refuse_partial_state(config, allow_validate_batch_seals=True)
-        states, archives = _validate_global_state(config)
         state = _load_active(config)
         record = _find_record(state, args.slot)
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         _assert_validate_batch_seals_disjoint_from_record(
             config, record, action="heartbeat"
         )
+        if prepared is not None:
+            # This machine's state as it is now; other machines' shards
+            # and the archives as the latest lock-free round read them.
+            states: Sequence[ActiveState] = tuple(
+                state if item.machine == state.machine else item
+                for item in prepared.states
+            )
+            archives: Sequence[ArchiveState] = prepared.archives
+        elif _validate_batch_seal_journals(config):
+            states, archives = _validate_global_state(config)
+        else:
+            # Without a seal the check reads no fleet fact: it runs the
+            # journal phase for this slot alone.
+            states, archives = (state,), ()
         _assert_validate_cleanup_journals_disjoint_from_record(
             config,
             states,
@@ -52092,27 +52141,14 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             record,
             action="heartbeat",
         )
-        findings = _assert_command_registry_storage(
-            config, states, args, tolerate_target_git_registrations=True
+        _assert_record_storage_consistent(config, record)
+        warnings = (
+            prepared.warnings
+            if prepared is not None
+            else _heartbeat_nested_warnings(
+                record, _target_git_registrations(config, state, record)
+            )
         )
-        warnings: list[str] = []
-        for detail in findings.target_git_registrations:
-            marker = " registers "
-            start = detail.find(marker)
-            end = detail.find(" inside", start) if start >= 0 else -1
-            registered = (
-                Path(detail[start + len(marker):end])
-                if start >= 0 and end > start
-                else None
-            )
-            if registered is not None and not registered.exists():
-                raise Refusal(detail)
-            warnings.append(
-                f"WARNING: slot {record.slot} has a nested worktree Git "
-                f"registers without a checkout row: {detail}. "
-                "state: heartbeat recorded anyway; the nested worktree is "
-                "retained and not inspected"
-            )
         release = _owner_release_in_effect(
             config, record, _load_events(config, record.machine)
         )
@@ -52126,9 +52162,8 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
                 "'wrkslots create'"
             )
         _report_dead_mounts(
-            config, states, slot=record.slot, slot_type=record.slot_type
+            config, [state], slot=record.slot, slot_type=record.slot_type
         )
-        before = _global_rows(states, archives)
         updated = dataclasses.replace(record, heartbeat_at=_utc_now())
         _write_active_state(
             config,
@@ -52137,15 +52172,14 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             slot=updated.slot,
             evidence={"heartbeat_at": updated.heartbeat_at},
         )
-        after_states, after_archives = _validate_global_state(config)
-        _assert_only_slot_changed(
-            before,
-            _global_rows(after_states, after_archives),
-            args.slot,
+        _assert_local_only_slot_changed(
+            state, _load_active_snapshot(config), updated
         )
-        return updated, tuple(warnings)
+        return updated, warnings
 
-    def locked_body_captured() -> tuple[ActiveRecord, tuple[str, ...]]:
+    def locked_body_captured(
+        prepared: _HeartbeatPrevalidated | None,
+    ) -> tuple[ActiveRecord, tuple[str, ...]]:
         # The locked body's own notes join the once-only printing, so a
         # journal or fallback path never prints them twice (#1808 review).
         stdout_buffer = io.StringIO()
@@ -52154,7 +52188,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
                 stderr_buffer
             ):
-                return locked_body()
+                return locked_body(prepared)
         finally:
             captured_notes[:] = [(stdout_buffer.getvalue(), stderr_buffer.getvalue())]
 
@@ -52170,7 +52204,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         # classifier refreshed it across other slots' heartbeats).
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         if prepared is None:
-            return locked_body_captured()
+            return locked_body_captured(None)
         states, archives = list(prepared.states), list(prepared.archives)
         before = _global_rows(states, archives)
         local = (
@@ -52240,12 +52274,14 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             )
         except _RegistryBusy:
             # Every lock-free round was overtaken by writers the classifier
-            # could not tolerate: fall back to the old behaviour — wait for
-            # the lock and validate there — instead of refusing a heartbeat
-            # as busy (#1808-A review). The fallback body also runs
-            # without the configuration locks while it queues (#2000):
-            # it validates from the in-memory configuration and writes
-            # only the heartbeat time under the ACTIVE locks.
+            # could not tolerate: wait for the lock and re-judge the one
+            # record there instead of refusing a heartbeat as busy
+            # (#1808-A review); the latest round's fleet validation and
+            # storage scan are not repeated under the lock (#2353). The
+            # fallback body also runs without the configuration locks
+            # while it queues (#2000): it validates from the in-memory
+            # configuration and writes only the heartbeat time under the
+            # ACTIVE locks.
             fallback_config_sha256 = _registry_identity(config).config_sha256
             with _mutation_locks(
                 config, wait_seconds, release_config_after_check=True
@@ -52265,7 +52301,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
                         remedy="retry 'wrkslots heartbeat' after the other "
                         "wrkslots mutations exit",
                     )
-                updated, warnings = locked_body_captured()
+                updated, warnings = locked_body_captured(last_prepared[0])
     finally:
         for stdout_text, stderr_text in captured_notes:
             if stdout_text:
