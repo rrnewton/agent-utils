@@ -162,7 +162,9 @@
  * move from the group to the section, so a group inside a section draws none of its own.
  */
 .settings-section {
-  margin: 0 0 0.65rem;
+  /* `#2301 vibe-talk-ui-review-findings-11-26` (R10): 12px between the cards, the 4/8 scale's step
+     the head already keeps above the first card (it was 10.4px, off the scale). */
+  margin: 0 0 0.75rem;
   padding: 0.45rem 0.7rem 0.1rem;
   background: var(--panel);
   border: 1px solid var(--edge);

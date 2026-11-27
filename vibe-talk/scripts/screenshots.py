@@ -4031,6 +4031,16 @@ SETTINGS_HEAD_FILLS_JS = (
     "&& Math.abs(b[2].right - panes.right) <= 1 && b.every((x) => Math.abs(x.top - b[0].top) <= 1) "
     "&& b[0].right <= b[1].left && b[1].right <= b[2].left && b[2].bottom <= panes.top; })()"
 )
+# `#2301 vibe-talk-ui-review-findings-11-26` item 10 (R10): every two Settings cards stacked in one
+# column of the panes stand 12 px apart (the 4/8 scale's step the head keeps above the first card),
+# 0.5 px. The server line's section above the head's buttons is the head's, not a card.
+SETTINGS_CARD_GAP_JS = (
+    "(() => { const cards = [...document.querySelectorAll('#settings-panes > .settings-section')]"
+    ".filter((c) => c.getClientRects().length).map((c) => c.getBoundingClientRect());"
+    " const gaps = []; for (const a of cards) { const b = cards.filter((c) => Math.abs(c.left - a.left) < 1 && c.top > a.bottom - 1)"
+    ".sort((x, y) => x.top - y.top)[0]; if (b) gaps.push(b.top - a.bottom); }"
+    " return gaps.length > 0 && gaps.every((g) => Math.abs(g - 12) <= 0.5); })()"
+)
 # `#2297` (liaison): "Channel Settings: [channel] ?" is one line; on a phone the ? used to drop to its own line.
 SETTINGS_CHANNEL_ROW_JS = (
     "(() => { const r = (id) => document.getElementById(id).getBoundingClientRect(); "
@@ -9368,6 +9378,7 @@ SCENES: tuple[Scene, ...] = (
             ("the server line is one line, its host whole in its tooltip", SETTINGS_SERVER_ONE_LINE_JS),
             ("the server line is the chip's 2rem tall, chip or no chip, so the chip coming up moves nothing", SETTINGS_SERVER_LINE_RESERVED_JS),
             ("Channel Settings, its select and its ? are one line, the ? at the row's end", SETTINGS_CHANNEL_ROW_JS),
+            ("#2301 every two Settings cards stacked in a column stand 12 px apart", SETTINGS_CARD_GAP_JS),
             (
                 "the real server reported this page's own build, the head says nothing about it, and Storage and connection names it",
                 "window.__serverPageBuild.length === 32 "
