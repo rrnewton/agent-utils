@@ -1158,6 +1158,27 @@ def test_command_output_read_failure_cleans_the_complete_group(
         _assert_command_child_gone(int(value), "output read failure")
 
 
+class _ClockPastDeadlinesOnPublication:
+    """The chat module's clock: real time, jumped past every deadline once `path` exists.
+
+    A command timeout under test then fires on a condition (the adapter has
+    published its pid) instead of after a fixed interval that a loaded host may
+    need just to start the supervisor and adapter (#2362). Deadlines taken after
+    the jump, such as the cleanup waits, count normally from there; the real
+    timeout is only a backstop for an adapter that never starts.
+    """
+
+    def __init__(self, path: Path, jump: float) -> None:
+        self._path = path
+        self._jump = jump
+
+    def monotonic(self) -> float:
+        return time.monotonic() + (self._jump if self._path.exists() else 0.0)
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
 def test_command_final_wait_failure_always_wakes_anchor_then_reaps_supervisor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1198,12 +1219,19 @@ def test_command_final_wait_failure_always_wakes_anchor_then_reaps_supervisor(
     monkeypatch.setattr(signal, "pidfd_send_signal", record_signal)
     monkeypatch.setattr(subprocess.Popen, "wait", wait_failure)
     pid_path = tmp_path / "wait-failure-adapter"
+    # The adapter publishes its pid, then prints a line so the command's select
+    # loop wakes and sees the clock past its deadline (#2362).
     command = (sys.executable, "-c", "import os,pathlib,sys,time; "
                "pathlib.Path(sys.argv[1]+'.tmp').write_text(str(os.getpid())); "
-               "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); time.sleep(60)",
+               "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); "
+               "print('published',flush=True); time.sleep(60)",
                str(pid_path))
+    backstop = 30.0
+    monkeypatch.setattr(
+        chat_module, "time", _ClockPastDeadlinesOnPublication(pid_path, jump=2 * backstop),
+    )
     with pytest.raises(subprocess.TimeoutExpired):
-        _run_command(command, timeout=0.5)
+        _run_command(command, timeout=backstop)
     assert failed and woke_after_failure
     for pid in [*(pid for pid, _ in handles[1:]), int(pid_path.read_text())]:
         _assert_command_child_gone(pid, "final wait failure")
