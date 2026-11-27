@@ -1154,7 +1154,63 @@ agentctl chat close \
 
 Closure is the provider-neutral terminal route lifecycle; idle/done status and
 the first reply do not close a route because a request may send later progress
-updates. A closed request remains active until its prompt delivery is confirmed,
+updates. `chat run` also closes reply windows by itself (#2338
+chat-bridge-reply-window-retire), so requests retire without a hand close and a
+busy bridge never fills up:
+
+- an answered request (at least one reply sent to the chat, every reply sent
+  or permanently failed, its prompt delivered and its acknowledgement settled)
+  closes 24 hours after its last reply, so a progress reply within that time
+  still posts;
+- an unanswered request (delivered and acknowledged, no reply sent: none
+  captured, or every one permanently failed) closes 48 hours after its
+  admission, well past the reply reminders' 24-hour window; a turn's end never
+  closes it;
+- a request whose prompt is pending, being submitted or uncertain, or which has
+  a reply not sent yet, never closes by these rules;
+- at the 2,048-request limit, answered requests close oldest last reply first,
+  whatever their age, then unanswered requests admitted more than 24 hours ago,
+  oldest first, until the new messages fit.
+
+The service sweeps every 10 minutes. The windows are set in the bridge
+configuration (`bridge.json`), each in seconds and absent for its default:
+
+```json
+"reply_windows": {
+  "answered_quiet_seconds": 86400,
+  "unanswered_max_age_seconds": 172800,
+  "pressure_unanswered_age_seconds": 86400,
+  "high_water_percent": 90,
+  "low_water_percent": 80
+}
+```
+
+Before any refusal, once the store is 90% full (`high_water_percent`) the
+service queues one `[chat-bridge WARNING]` to its agent naming the fill and how
+to free space, at most once an hour, and one all-clear once it falls below 80%
+(`low_water_percent`).
+
+An unanswered request is never closed silently. Before closing any, the bridge
+lists them in `reply-window-closures.json` (one batch per sweep or per forced
+close: request key, reply ID, message number, first line of the message,
+sender, whether an owner sent it, admission time), then logs each one, queues
+one notice listing them to the bridge's agent (queue ID
+`chat-window-closed-<batch>`), and posts one owner-alarm notice listing the
+owner's own. Each step is recorded once done, so a restart neither repeats nor
+skips one, and the file is removed when every batch is told.
+
+When nothing can close, admission refuses as before: the provider batch stays
+uncommitted, the cursor does not move, and the provider delivers it again after
+each reconnect until space frees. `request-capacity.json` records the hold
+(`held_since_millis`, `last_refused_at_millis`, `refusals`, `request_count`,
+`request_bytes`, `waiting_messages`, `max_requests`, `max_request_bytes`) and is
+removed at the next admission. While it exists `chat health` is DOWN, the
+bridge log has an error line, and the owner alarm posts a
+`[chat-bridge WARNING]` once an hour (saved as `capacity` in
+`owner-alarm.json`) and one resolved line when it clears; `chat status` shows
+it under `request_capacity`, and `chat health` is DEGRADED from 90% full.
+
+A closed request remains active until its prompt delivery is confirmed,
 its reaction is disabled or confirmed, and every captured reply is sent. It is
 also retained while it belongs to the current inclusive replay cursor. Once all
 conditions hold and a later cursor is durable, the bridge fsyncs a retirement
@@ -1489,7 +1545,8 @@ prompt the agent received, the block's closing line raises no event, and the
 read when the pane settles comes too late. So while outbound replies are on and
 some request is open, the service also reads the pane in the same way every 2
 seconds for as long as it counts the agent as working. A request stays open
-until `chat close`, so in practice these reads run whenever the agent works, and
+until its reply window closes, so in practice these reads run whenever the
+agent works, and
 each costs what the reads above cost. The service counts the agent as working
 while any of these holds:
 

@@ -397,6 +397,12 @@ pub(crate) mod test_clock {
         pub(super) static ZONE: RefCell<Option<Zone>> = const { RefCell::new(None) };
     }
 
+    /// Render this thread's prompts by the real clock and zone again.
+    pub(crate) fn clear() {
+        NOW.with(|now| now.set(None));
+        ZONE.with(|zone| *zone.borrow_mut() = None);
+    }
+
     /// Render this thread's prompts at `now_millis` in a fixed zone `offset_seconds` from UTC.
     pub(crate) fn set(now_millis: u64, offset_seconds: i64, name: &str) {
         NOW.with(|now| now.set(Some(now_millis)));

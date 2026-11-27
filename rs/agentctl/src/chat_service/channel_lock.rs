@@ -233,6 +233,7 @@ mod tests {
             long_markdown_route: false,
             relay_channels: Vec::new(),
             labels: None,
+            reply_windows: None,
         }
     }
 

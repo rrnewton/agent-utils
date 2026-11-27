@@ -51,6 +51,7 @@ pub mod owner_alarm;
 mod rejection_tests;
 mod reply_reminders;
 mod reply_source;
+pub(crate) mod reply_windows;
 mod repoint;
 mod sender_grants;
 
@@ -6088,6 +6089,8 @@ fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
     let mut reply_watch = reply_source::ReplySourceWatch::default();
     let mut reminders = reminders;
     let mut health = health;
+    // Kept across passes, so a restarted pass does not sweep again at once (#2338).
+    let mut windows = reply_windows::ReplyWindowWatch::default();
     let mut backoff = ProviderBackoff::new();
     // The state of the agent the bridge serves now: a repoint replaces it between passes.
     let mut state = state.clone();
@@ -6125,6 +6128,8 @@ fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
                 reply_wakes,
                 transport,
                 &mut reminders,
+                &mut owner_alarm,
+                &mut windows,
                 &mut health,
             ),
             Ok(false) => owner_loop_pass(
@@ -6143,6 +6148,7 @@ fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
                 &mut owner_alarm,
                 &mut reply_watch,
                 &mut reminders,
+                &mut windows,
                 &mut health,
             ),
         };
@@ -6625,6 +6631,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
     let mut reply_watch = reply_source::ReplySourceWatch::default();
     let mut reminders = reminders;
     let mut health = ServiceHealth::new(manager.registry());
+    let mut windows = reply_windows::ReplyWindowWatch::default();
     owner_loop_pass(
         state,
         client,
@@ -6641,6 +6648,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
         &mut owner_alarm,
         &mut reply_watch,
         &mut reminders,
+        &mut windows,
         &mut health,
     )
 }
@@ -6775,6 +6783,7 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
     owner_alarm: &mut Option<owner_alarm::OwnerAlarm>,
     reply_watch: &mut reply_source::ReplySourceWatch,
     reminders: &mut Option<ReplyReminders>,
+    windows: &mut reply_windows::ReplyWindowWatch,
     health: &mut ServiceHealth,
 ) -> Result<(), ChatServiceError> {
     let owner_runtime = StopRuntime::new(stop);
@@ -7165,6 +7174,14 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             }
         }
 
+        // Reply windows: sweep, tell about closed unanswered requests, and warn about a full
+        // request store (#2338).
+        windows.step(
+            state,
+            manager,
+            owner_alarm.as_mut(),
+            outbound(control.transport),
+        );
         if Instant::now() >= next_reconciliation {
             let _step = SlowStep::new("reconciliation");
             let problem = state.reply_alias_problem();
@@ -7947,6 +7964,8 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
     reply_wakes: &mpsc::Receiver<String>,
     transport: &mut Option<CommandOutboundTransport>,
     reminders: &mut Option<ReplyReminders>,
+    owner_alarm: &mut Option<owner_alarm::OwnerAlarm>,
+    windows: &mut reply_windows::ReplyWindowWatch,
     health: &mut ServiceHealth,
 ) -> Result<(), ChatServiceError> {
     let mut routes = RouteCache::from_entries(state.reply_route_entries()?);
@@ -8106,6 +8125,14 @@ fn headless_owner_loop_pass<A: ManagedApi + ?Sized>(
                 &mut notes,
             );
         }
+        // Reply windows: sweep, tell about closed unanswered requests, and warn about a full
+        // request store (#2338).
+        windows.step(
+            state,
+            manager,
+            owner_alarm.as_mut(),
+            outbound(control.transport),
+        );
         if Instant::now() >= next_reconciliation {
             // A forced capture scan before the capture-miss check, so a block that became
             // answerable since the last scan is captured, not warned about (#1974).
@@ -8185,14 +8212,7 @@ fn owner_alarm_step(
     let Some(alarm) = alarm else {
         return;
     };
-    if !alarm.restored {
-        let saved = state
-            .small_document(owner_alarm::STATE_FILE)
-            .and_then(|document| crate::forward_compat::decode::<owner_alarm::Saved>(document).ok())
-            .filter(|(saved, _)| saved.schema == owner_alarm::STATE_SCHEMA)
-            .and_then(|(saved, _)| saved.episode);
-        alarm.restore(saved);
-    }
+    restore_owner_alarm(alarm, state);
     let silence = read_alarm_silence(state).unwrap_or_default();
     let before = alarm.episode().cloned();
     let configuration = state.config();
@@ -8205,24 +8225,46 @@ fn owner_alarm_step(
     );
     post_alarm_notices(alarm, notices, state, transport);
     if alarm.episode() != before.as_ref() {
-        let saved = owner_alarm::Saved {
-            schema: owner_alarm::STATE_SCHEMA.to_owned(),
-            episode: alarm.episode().cloned(),
-            unknown: crate::forward_compat::KeptKeys::default(),
-        };
-        let written = serde_json::to_value(&saved)
-            .map_err(|error| error.to_string())
-            .and_then(|document| {
-                state
-                    .write_small_document(owner_alarm::STATE_FILE, &document)
-                    .map_err(|error| error.to_string())
-            });
-        if let Err(error) = written {
-            service_log(format_args!(
-                "agentctl: the owner alarm's episode could not be saved, so a restart may warn \
-                 at the top level again: {error}"
-            ));
-        }
+        save_owner_alarm(alarm, state);
+    }
+}
+
+/// Read back the episode and full-population hold a run before saved, once per run.
+fn restore_owner_alarm(alarm: &mut owner_alarm::OwnerAlarm, state: &BridgeState) {
+    if alarm.restored {
+        return;
+    }
+    let saved = state
+        .small_document(owner_alarm::STATE_FILE)
+        .and_then(|document| crate::forward_compat::decode::<owner_alarm::Saved>(document).ok())
+        .filter(|(saved, _)| saved.schema == owner_alarm::STATE_SCHEMA)
+        .map(|(saved, _)| saved);
+    match saved {
+        Some(saved) => alarm.restore(saved.episode, saved.capacity),
+        None => alarm.restore(None, None),
+    }
+}
+
+/// Save the owner alarm's episode and full-population hold, so a restarted bridge carries on.
+fn save_owner_alarm(alarm: &owner_alarm::OwnerAlarm, state: &BridgeState) {
+    let saved = owner_alarm::Saved {
+        schema: owner_alarm::STATE_SCHEMA.to_owned(),
+        episode: alarm.episode().cloned(),
+        capacity: alarm.capacity().cloned(),
+        unknown: crate::forward_compat::KeptKeys::default(),
+    };
+    let written = serde_json::to_value(&saved)
+        .map_err(|error| error.to_string())
+        .and_then(|document| {
+            state
+                .write_small_document(owner_alarm::STATE_FILE, &document)
+                .map_err(|error| error.to_string())
+        });
+    if let Err(error) = written {
+        service_log(format_args!(
+            "agentctl: the owner alarm's episode could not be saved, so a restart may warn \
+             at the top level again: {error}"
+        ));
     }
 }
 
@@ -9996,6 +10038,7 @@ mod tests {
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state");
@@ -11664,6 +11707,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state");
@@ -12324,6 +12368,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state without opening helper");
@@ -12403,6 +12448,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state");
@@ -12480,6 +12526,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state without opening helper");
@@ -12583,6 +12630,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state");
@@ -12677,6 +12725,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state");
@@ -13115,6 +13164,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state");
@@ -14944,6 +14994,7 @@ esac
             long_markdown_route: false,
             relay_channels: Vec::new(),
             labels: None,
+            reply_windows: None,
         };
         let outbound = configured_outbound_join_timeout(&configuration);
         assert_eq!(outbound, Duration::from_secs(67));
@@ -15411,6 +15462,7 @@ esac
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state");
@@ -17290,6 +17342,7 @@ esac
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state")

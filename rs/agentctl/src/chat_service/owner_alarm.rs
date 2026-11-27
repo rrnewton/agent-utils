@@ -55,7 +55,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::chat_runtime::{DeliveryEntry, RequestPhase};
+use crate::chat_runtime::reply_windows::{ClosureBatch, ClosureCause};
+use crate::chat_runtime::{DeliveryEntry, RequestCapacityHold, RequestPhase};
 use crate::forward_compat::KeptKeys;
 
 /// The default `--owner-alarm-after`.
@@ -75,6 +76,10 @@ pub(crate) const SILENCE_SCHEMA: &str = "agentctl-chat-owner-alarm-silence/v1";
 const WARNING: &str = "[chat-bridge WARNING] ";
 /// Characters of a delivery error a notice quotes.
 const REASON_CHARS: usize = 600;
+/// How often the warning about a full request population repeats while it stays full (#2338).
+pub(crate) const CAPACITY_REPEAT: Duration = Duration::from_secs(60 * 60);
+/// Closed requests one closure notice lists by name; it counts the rest.
+const MAX_LISTED_CLOSURES: usize = 20;
 
 /// Where a notice is posted.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -141,12 +146,30 @@ pub(crate) struct Episode {
     pub(crate) unknown: KeptKeys,
 }
 
+/// One hold of a full request population, from its first warning until it clears (#2338), as
+/// `owner-alarm.json` saves it.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CapacityEpisode {
+    /// The hold's start, as the capacity record gives it: a different start is a new hold.
+    pub(crate) held_since_millis: u64,
+    /// When the latest warning was posted.
+    pub(crate) last_post_millis: u64,
+    /// Warnings posted for this hold.
+    #[serde(default)]
+    pub(crate) posts: usize,
+    #[serde(flatten)]
+    pub(crate) unknown: KeptKeys,
+}
+
 /// `owner-alarm.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Saved {
     pub(crate) schema: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) episode: Option<Episode>,
+    /// The current full-population hold the owner was warned about (#2338).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capacity: Option<CapacityEpisode>,
     #[serde(flatten)]
     pub(crate) unknown: KeptKeys,
 }
@@ -186,6 +209,8 @@ pub(crate) struct OwnerAlarm {
     stale_after: Option<Duration>,
     /// The current episode of held requests, if any.
     episode: Option<Episode>,
+    /// The full-population hold the owner was warned about, if any (#2338).
+    capacity: Option<CapacityEpisode>,
     /// Whether the saved episode has been read back, once per run.
     pub(crate) restored: bool,
     /// Quarantined requests already known: told, or found when the service started.
@@ -290,6 +315,64 @@ fn hint(agent: &str, reason: &str) -> String {
     }
 }
 
+/// The one notice telling the owner which of their messages a reply window closed unanswered
+/// (#2338), or `None` when `batch` closed none of theirs. One notice per batch, never one per
+/// request.
+pub(crate) fn closure_notice(
+    batch: &ClosureBatch,
+    agent: &str,
+    unanswered_max_age_millis: u64,
+) -> Option<Notice> {
+    let owned: Vec<_> = batch
+        .requests
+        .iter()
+        .filter(|request| request.from_owner)
+        .collect();
+    if owned.is_empty() {
+        return None;
+    }
+    let listed = owned
+        .iter()
+        .take(MAX_LISTED_CLOSURES)
+        .map(|request| {
+            format!(
+                "reply ID {} (sent {}): \"{}\"",
+                request.reply_id,
+                crate::chat_trace::et_clock((request.admitted_at_millis / 1_000) as f64),
+                request.first_line
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = owned.len().saturating_sub(MAX_LISTED_CLOSURES);
+    let more = if more > 0 {
+        format!("; and {more} more")
+    } else {
+        String::new()
+    };
+    let (count, verb) = if owned.len() == 1 {
+        ("1 of your messages".to_owned(), "has")
+    } else {
+        (format!("{} of your messages", owned.len()), "have")
+    };
+    let why = match batch.cause {
+        ClosureCause::Age => format!(
+            "got no reply for {} h, so the bridge closed their reply windows",
+            unanswered_max_age_millis / 3_600_000
+        ),
+        ClosureCause::Capacity => "got no reply, and the bridge closed their reply windows early \
+             to make room for new messages (its request store was full)"
+            .to_owned(),
+    };
+    Some(Notice {
+        text: format!(
+            "{WARNING}{count} to {agent} {verb} {why}: {listed}{more}. {agent} was told. Send a \
+             message again if you still need an answer."
+        ),
+        place: Place::TopLevel,
+    })
+}
+
 impl OwnerAlarm {
     /// An alarm for requests held `after` or longer.
     #[cfg(test)]
@@ -303,21 +386,99 @@ impl OwnerAlarm {
             after,
             stale_after,
             episode: None,
+            capacity: None,
             restored: false,
             quarantines_known: BTreeSet::new(),
             seeded: false,
         }
     }
 
-    /// Carry on with `episode`, the one a run before saved.
-    pub(crate) fn restore(&mut self, episode: Option<Episode>) {
+    /// Carry on with `episode` and `capacity`, the ones a run before saved.
+    pub(crate) fn restore(&mut self, episode: Option<Episode>, capacity: Option<CapacityEpisode>) {
         self.restored = true;
         self.episode = episode;
+        self.capacity = capacity;
     }
 
     /// The current episode, to save.
     pub(crate) fn episode(&self) -> Option<&Episode> {
         self.episode.as_ref()
+    }
+
+    /// The current full-population hold the owner was warned about, to save.
+    pub(crate) fn capacity(&self) -> Option<&CapacityEpisode> {
+        self.capacity.as_ref()
+    }
+
+    /// The notices due at `now_millis` about a full request population (#2338): a warning when a
+    /// hold begins, again every [`CAPACITY_REPEAT`] while it lasts, and one all-clear once
+    /// admission works again. `hold` is the bridge's capacity record, absent when admission is
+    /// not refusing. Each is counted as posted, as for [`Self::due`].
+    pub(crate) fn capacity_due(
+        &mut self,
+        hold: Option<&RequestCapacityHold>,
+        agent: &str,
+        now_millis: u64,
+    ) -> Vec<Notice> {
+        let repeat = u64::try_from(CAPACITY_REPEAT.as_millis()).unwrap_or(u64::MAX);
+        let Some(hold) = hold else {
+            let Some(episode) = self.capacity.take() else {
+                return Vec::new();
+            };
+            if episode.posts == 0 {
+                return Vec::new();
+            }
+            return vec![Notice {
+                text: format!(
+                    "[chat-bridge] Resolved {}: the bridge admits new messages to {agent} again. \
+                     New messages were held from {} for {} min because the bridge's request \
+                     store was full; the held messages are admitted and delivered now, in order.",
+                    crate::chat_trace::et_clock((now_millis / 1_000) as f64),
+                    crate::chat_trace::et_clock((episode.held_since_millis / 1_000) as f64),
+                    minutes(now_millis.saturating_sub(episode.held_since_millis)),
+                ),
+                place: Place::TopLevel,
+            }];
+        };
+        let due = match &self.capacity {
+            Some(episode) if episode.held_since_millis == hold.held_since_millis => {
+                now_millis.saturating_sub(episode.last_post_millis) >= repeat
+            }
+            _ => true,
+        };
+        if !due {
+            return Vec::new();
+        }
+        let posts = match &self.capacity {
+            Some(episode) if episode.held_since_millis == hold.held_since_millis => {
+                episode.posts + 1
+            }
+            _ => 1,
+        };
+        self.capacity = Some(CapacityEpisode {
+            held_since_millis: hold.held_since_millis,
+            last_post_millis: now_millis,
+            posts,
+            unknown: KeptKeys::default(),
+        });
+        vec![Notice {
+            text: format!(
+                "{WARNING}New messages to {agent} are being held: the bridge's request store is \
+                 full ({} of {} requests kept) and none of them can be retired yet, so {} new \
+                 message(s) wait unacknowledged, since {} ({} min, {} refusal(s)). They are not \
+                 lost: they are admitted as soon as space frees. See `agentctl chat health`; \
+                 `agentctl chat close --request KEY` frees old answered requests. This warning \
+                 repeats every {} min while the store stays full.",
+                hold.request_count,
+                hold.max_requests,
+                hold.waiting_messages,
+                crate::chat_trace::et_clock((hold.held_since_millis / 1_000) as f64),
+                minutes(now_millis.saturating_sub(hold.held_since_millis)),
+                hold.refusals,
+                minutes(repeat),
+            ),
+            place: Place::TopLevel,
+        }]
     }
 
     /// The episode's first warning was posted as `message_id`, starting the thread `thread_id`.

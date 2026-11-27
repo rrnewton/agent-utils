@@ -538,6 +538,42 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         }
     }
 
+    // #2338: a full request store holds new messages uncommitted, unacknowledged; nearly full
+    // means the reply windows are not keeping up.
+    let capacity = &status["request_capacity"];
+    if let Some(hold) = capacity["hold"].as_object() {
+        problems.down.push(format!(
+            "new owner messages are held: the request store is full ({} of {} requests kept), \
+             {} new message(s) wait uncommitted since {} ({} refusal(s)); they are admitted as \
+             soon as space frees (old answered requests: `agentctl chat close --request KEY`)",
+            hold.get("request_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            hold.get("max_requests")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            hold.get("waiting_messages")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            when(hold.get("held_since_millis").and_then(Value::as_u64), now),
+            hold.get("refusals")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        ));
+    } else if let (Some(count), Some(limit)) = (
+        capacity["request_count"].as_u64(),
+        capacity["max_requests"].as_u64(),
+    ) {
+        let high = capacity["reply_windows"]["high_water_percent"]
+            .as_u64()
+            .unwrap_or(chat_runtime::reply_windows::DEFAULT_HIGH_WATER_PERCENT);
+        if limit > 0 && count.saturating_mul(100) >= limit.saturating_mul(high) {
+            problems.degraded.push(format!(
+                "the request store is nearly full: {count} of {limit} requests kept (warned \
+                 from {high}%)"
+            ));
+        }
+    }
     let stale_millis = u64::try_from(options.stale_after.as_millis()).unwrap_or(u64::MAX);
     if status["runtime_evidence"]["healthy"] == Value::Bool(false) {
         problems.down.push(format!(
@@ -1193,6 +1229,49 @@ mod tests {
         HealthOptions {
             stale_after: Duration::from_secs(300),
         }
+    }
+
+    #[test]
+    fn a_full_request_store_is_down_and_a_nearly_full_one_degraded() {
+        // #2338: a held message is an owner message nobody acknowledged.
+        let mut observed = healthy();
+        observed.status["request_capacity"] = json!({
+            "request_count": 2048,
+            "max_requests": 2048,
+            "hold": {
+                "request_count": 2048,
+                "max_requests": 2048,
+                "waiting_messages": 12,
+                "held_since_millis": NOW - 600_000,
+                "refusals": 40,
+            },
+        });
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "down", "{}", health.text);
+        assert!(
+            health
+                .text
+                .contains("the request store is full (2048 of 2048")
+                && health.text.contains("12 new message(s) wait uncommitted"),
+            "{}",
+            health.text
+        );
+
+        let mut observed = healthy();
+        observed.status["request_capacity"] =
+            json!({"request_count": 1900, "max_requests": 2048, "hold": null});
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(
+            health.text.contains("nearly full: 1900 of 2048"),
+            "{}",
+            health.text
+        );
+
+        let mut observed = healthy();
+        observed.status["request_capacity"] =
+            json!({"request_count": 1800, "max_requests": 2048, "hold": null});
+        assert_eq!(assess(observed, options()).verdict, "ok");
     }
 
     #[test]

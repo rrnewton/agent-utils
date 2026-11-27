@@ -507,6 +507,7 @@ fn a_bridge_configuration_for_slack_is_accepted_by_the_plugin() {
         long_markdown_route: false,
         relay_channels: Vec::new(),
         labels: None,
+        reply_windows: None,
     };
     let request = configuration
         .subscribe_request(Some("slack1:seq:42"))

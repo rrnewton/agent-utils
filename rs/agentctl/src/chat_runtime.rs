@@ -41,6 +41,8 @@ mod observe;
 mod raw;
 mod rejections;
 mod reply_reminders;
+pub(crate) mod reply_windows;
+pub use reply_windows::{ReplyWindowSettings, RequestCapacityHold};
 mod repoint;
 pub(crate) mod screen_layout;
 
@@ -65,6 +67,8 @@ const STATE_VERSION: u32 = 1;
 // incompatible wire shapes from silently sharing STATE_VERSION.
 const RETIREMENT_RECORD_VERSION: u32 = 2;
 const MAX_REQUESTS: u64 = 2_048;
+/// [`MAX_REQUESTS`], for the service's high-water check (#2338).
+pub(crate) const MAX_REQUESTS_LIMIT: u64 = MAX_REQUESTS;
 const MAX_REQUEST_BYTES: u64 = 128 * 1_024 * 1_024;
 const MAX_REQUEST_RECORD_BYTES: usize = 512 * 1_024;
 const MAX_PLUGIN_NAME_BYTES: usize = 128;
@@ -801,6 +805,11 @@ pub struct BridgeConfiguration {
     /// provider IDs: see [`PromptLabels`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<PromptLabels>,
+    /// When requests' replies close by themselves so they retire (#2338
+    /// chat-bridge-reply-window-retire): see [`reply_windows`]. Absent, every window is at its
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_windows: Option<reply_windows::ReplyWindowSettings>,
     /// Top-level keys this build does not know: kept when the configuration is written back,
     /// otherwise ignored.
     #[serde(flatten)]
@@ -1068,6 +1077,9 @@ impl BridgeConfiguration {
         if let Some(labels) = &self.labels {
             labels.validate()?;
         }
+        if let Some(windows) = &self.reply_windows {
+            windows.validate()?;
+        }
         if let Some(workspace) = &self.slack_workspace_url {
             if crate::chat_links::workspace_origin(workspace).is_none() {
                 return Err(ChatRuntimeError::invalid(
@@ -1208,6 +1220,9 @@ impl BridgeConfiguration {
         if let Some(labels) = &self.labels {
             add("labels.", &labels.unknown.0);
         }
+        if let Some(windows) = &self.reply_windows {
+            add("reply_windows.", &windows.unknown.0);
+        }
         for (index, relay) in self.relay_channels.iter().enumerate() {
             add(&format!("relay_channels[{index}]."), &relay.unknown.0);
         }
@@ -1225,6 +1240,9 @@ impl BridgeConfiguration {
         }
         if let Some(labels) = self.labels.as_mut() {
             labels.unknown.0.clear();
+        }
+        if let Some(windows) = self.reply_windows.as_mut() {
+            windows.unknown.0.clear();
         }
         for relay in &mut self.relay_channels {
             relay.unknown.0.clear();
@@ -9228,10 +9246,27 @@ impl BridgeState {
             .checked_add(request_bytes)
             .ok_or_else(|| ChatRuntimeError::invalid("request byte count overflow"))?;
         if next_count > MAX_REQUESTS || next_bytes > MAX_REQUEST_BYTES {
-            return Err(ChatRuntimeError::invalid(
-                "chat request population limit reached; no safely retired request can free enough capacity",
-            ));
+            // The batch stays uncommitted, so the provider delivers it again from the saved
+            // cursor; the hold is recorded so health and the owner alarm say so (#2338).
+            let waiting = u64::try_from(candidate_records.len()).unwrap_or(u64::MAX);
+            let noted = self.note_capacity_refusal_locked(
+                &checkpoint,
+                waiting,
+                crate::prompt_time::now_millis(),
+            );
+            return Err(ChatRuntimeError::invalid(format!(
+                "chat request population limit reached ({} of {MAX_REQUESTS} requests retained, \
+                 {waiting} new message(s) held uncommitted in the provider stream); no safely \
+                 retired request can free enough capacity{}",
+                checkpoint.request_count,
+                noted
+                    .err()
+                    .map(|error| format!("; the hold could not be recorded: {error}"))
+                    .unwrap_or_default()
+            )));
         }
+        // A hold left behind is only a stale report: never let it stop an admission.
+        let _ = self.clear_capacity_hold_locked();
         let new_records = candidate_records
             .iter()
             .map(|record| record.key.clone())
@@ -9728,6 +9763,27 @@ impl BridgeState {
         // The replies a restart held back as stale (#781 chat-no-stale-replies-on-restart).
         status["held_replies"] = serde_json::to_value(self.held_replies_locked()?)
             .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        // The request population against its limit, the hold while it is full, and the reply
+        // window closures not yet told about (#2338 chat-bridge-reply-window-retire).
+        let rules = self.reply_window_rules();
+        let (closure_batches, dropped_closure_batches) =
+            self.read_closure_outbox_unlocked().unwrap_or_default();
+        status["request_capacity"] = json!({
+            "request_count": checkpoint.request_count,
+            "max_requests": MAX_REQUESTS,
+            "request_bytes": checkpoint.request_bytes,
+            "max_request_bytes": MAX_REQUEST_BYTES,
+            "hold": self.request_capacity_hold(),
+            "reply_windows": {
+                "answered_quiet_seconds": rules.answered_quiet_millis / 1_000,
+                "unanswered_max_age_seconds": rules.unanswered_max_age_millis / 1_000,
+                "pressure_unanswered_age_seconds": rules.pressure_unanswered_age_millis / 1_000,
+                "high_water_percent": rules.high_water_percent,
+                "low_water_percent": rules.low_water_percent,
+            },
+            "closures_untold": closure_batches.len(),
+            "closures_dropped": dropped_closure_batches,
+        });
         // Bare-number guard hits (#658): how many, and the most recent few.
         let bare_refs: BareRefRecord =
             read_document(&self.root.join(BARE_REF_WARNINGS_FILE), 16_384).unwrap_or_default();
@@ -13492,24 +13548,10 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
         let mut checkpoint = self.read_checkpoint()?;
         self.complete_pending_retirement_locked(&mut checkpoint)?;
-        let mut request = match self.read_request(key) {
-            Ok(request) => request,
-            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                if self.retired_key(key)?.is_some() {
-                    return Ok(());
-                }
-                return Err(ChatRuntimeError::Io(error));
-            }
-            Err(error) => return Err(error),
-        };
-        if !request.reply_closed {
-            request.reply_closed = true;
-            self.write_request_accounted(&request, &mut checkpoint)?;
-            // Retirement is deliberately the next fallible phase. Persist the exact mutated
-            // record size first so an in-process retry never subtracts from stale accounting.
-            self.persist_checkpoint(&mut checkpoint)?;
+        if self.close_and_retire_locked(&mut checkpoint, key)? && !self.request_path(key).exists() {
+            // Retired now or before: a retirement persists its own checkpoint.
+            return Ok(());
         }
-        let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
         self.persist_checkpoint(&mut checkpoint)
     }
 
@@ -13884,10 +13926,16 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             if checkpoint.request_count.saturating_add(additional_count) <= MAX_REQUESTS
                 && checkpoint.request_bytes.saturating_add(additional_bytes) <= MAX_REQUEST_BYTES
             {
-                break;
+                return Ok(());
             }
         }
-        Ok(())
+        // Still full: close reply windows early, answered requests first (#2338).
+        self.close_for_capacity_locked(
+            checkpoint,
+            additional_count,
+            additional_bytes,
+            crate::prompt_time::now_millis(),
+        )
     }
 
     fn retire_if_eligible_locked(&self, checkpoint: &mut Checkpoint, key: &str) -> Result<bool> {
@@ -23544,6 +23592,7 @@ pub(crate) mod tests {
             long_markdown_route: false,
             relay_channels: Vec::new(),
             labels: None,
+            reply_windows: None,
         }
     }
 
@@ -46003,4 +46052,6 @@ them.\n❯\u{a0}\n"
         assert!(REPLY_COMMAND_HINT.contains("agentctl chat reply ID --file FILE"));
         fs::remove_dir_all(root).expect("cleanup");
     }
+
+    mod reply_window_tests;
 }

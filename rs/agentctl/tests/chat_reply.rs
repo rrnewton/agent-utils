@@ -80,6 +80,7 @@ impl Scratch {
                 long_markdown_route: false,
                 relay_channels: Vec::new(),
                 labels: None,
+                reply_windows: None,
             },
         )
         .expect("initialize state");
@@ -1071,6 +1072,7 @@ fn chat_publish_removes_the_file_once_posted_and_keeps_it_when_refused() {
             long_markdown_route: false,
             relay_channels: Vec::new(),
             labels: None,
+            reply_windows: None,
         },
     )
     .expect("initialize state");
