@@ -346,17 +346,23 @@
 /* `#1524`: when the head cannot hold the whole bound on one row, drop the
  * whole "since HH:MM" part and never the hours. The fit is the head's own
  * inline size (a container query), so a dragged-narrow desk panel and a
- * phone sheet both lose it exactly when they cannot hold it. */
-@container (max-width: 480px) {
+ * phone sheet both lose it exactly when they cannot hold it.
+ * `#2349`: 500px, the room the row needs with a whole 12-hour time in the
+ * since field and the days field beside it (at 480 the since field ran a few
+ * pixels past the panel's edge, its clock button cut); tests/discuss_browser.py
+ * sweeps the widths and holds every part inside the panel. */
+@container (max-width: 500px) {
   .discuss-since-part {
     display: none;
   }
 }
 
 /* The time's picker button gets its own space at the right, so the HH:MM
- * digits are never underneath it. */
+ * digits are never underneath it. `#2349 vibe-talk-discuss-since-field-clips-meridiem`:
+ * wide enough for a 12-hour clock's whole "HH:MM AM" (eight characters, in ch so it
+ * follows the type size) beside that button and its room (it cut "04:22 AM" to "04:22 AI"). */
 #discuss-since {
-  width: 6.2rem;
+  width: calc(8ch + 2.75rem);
   min-width: 0;
   padding: 2px 4px;
 }
@@ -1087,7 +1093,7 @@
   }
 
   #discuss-since {
-    width: 5.6rem;
+    width: calc(8ch + 2.5rem);
   }
 }
 

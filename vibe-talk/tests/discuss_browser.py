@@ -424,6 +424,54 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     else:
         check(not bound_row["sinceHidden"] and abs(bound_row["sinceMid"] - bound_row["countMid"]) <= 3,
               f"since HH:MM did not stand on the desk row: {bound_row}")
+        # `#2349 vibe-talk-discuss-since-field-clips-meridiem`: the time as the browser draws it
+        # (a 12-hour "HH:MM AM" here) fits whole beside its picker button: its text width plus the
+        # button's room is within the field's inner width ("04:22 AM" used to show as "04:22 AI").
+        # The room: the picker button's 16 px icon, its 6 px margin and 2 px padding each side
+        # (22-discuss.css), and the browser's 1 px padding each side of the hour, minute and AM/PM
+        # fields: 32 px. Main's field (89 px inside) fails this; it drew the cut.
+        since_fit = page.evaluate("""() => {
+          const el = document.getElementById('discuss-since');
+          const cs = getComputedStyle(el);
+          const [h, m] = (el.value || '04:22').split(':').map(Number);
+          const shown = new Date(2026, 0, 1, h, m).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+          const ctx = document.createElement('canvas').getContext('2d');
+          ctx.font = cs.font;
+          const inner = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+          return {shown, text: ctx.measureText(shown).width, inner, room: 32};
+        }""")
+        check(since_fit["text"] + since_fit["room"] <= since_fit["inner"] + 0.5,
+              f"the since field cuts its time: {since_fit}")
+        # ...and at every Discuss width a reader can drag to, the bound is either one row or
+        # without its "since" part (`#1524`), every part of it inside the panel: never a wrapped
+        # row with the time on a line of its own, nor a field cut at the panel's edge.
+        sweep = page.evaluate("""() => {
+          // Where the page itself puts the reader's width (panel.ts applyWidth): the panel, the
+          // root and the main screen, each kept and put back after.
+          const holders = [document.getElementById('discuss-panel'), document.documentElement,
+            document.getElementById('screen-main')].filter(Boolean);
+          const kept = holders.map((h) => h.style.getPropertyValue('--discuss-width'));
+          const mid = (id) => { const r = document.getElementById(id).getBoundingClientRect(); return r.top + r.height / 2; };
+          const bad = [];
+          let widths = [];
+          for (let w = 440; w <= 640; w += 4) {
+            for (const h of holders) h.style.setProperty('--discuss-width', w + 'px');
+            widths.push(Math.round(document.getElementById('discuss-panel').getBoundingClientRect().width));
+            const part = document.querySelector('.discuss-since-part');
+            const hidden = !part || getComputedStyle(part).display === 'none';
+            const oneRow = Math.abs(mid('discuss-count') - mid('discuss-summarize')) <= 3
+              && (hidden || Math.abs(mid('discuss-since') - mid('discuss-count')) <= 3);
+            // ...and every part of the row inside the panel: none cut at its edge.
+            const panel = document.getElementById('discuss-panel').getBoundingClientRect();
+            const inside = (id) => { const r = document.getElementById(id).getBoundingClientRect(); return r.left >= panel.left - 0.5 && r.right <= panel.right + 0.5; };
+            const contained = inside('discuss-summarize') && inside('discuss-count') && inside('discuss-hours') && (hidden || inside('discuss-since'));
+            if (!oneRow || !contained) bad.push(w);
+          }
+          holders.forEach((h, i) => { if (kept[i]) h.style.setProperty('--discuss-width', kept[i]); else h.style.removeProperty('--discuss-width'); });
+          return {bad, moved: new Set(widths).size};
+        }""")
+        check(sweep["moved"] > 10, f"fixture: the sweep did not change the panel's width: {sweep}")
+        check(sweep["bad"] == [], f"the bound row wraps or runs past the panel at Discuss widths {sweep['bad']}")
     # `#1817 vibe-talk-summarize-inputs-free-typing`: typing "1" in hours
     # stays "1" (the old feedback loop rewrote it), the count follows as
     # the (here empty) range's 0, and typing past the old 99 cap is kept.
