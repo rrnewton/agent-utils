@@ -7,7 +7,7 @@ labels:
 - vibe-talk
 - testing
 created_at: 2026-11-21T14:50:00-05:00
-updated_at: 2026-11-21T14:50:00-05:00
+updated_at: 2026-11-26T22:00:00-05:00
 ---
 
 # Description
@@ -54,3 +54,8 @@ Load proof (27-step union of every browser check red in the six recent gates, ga
 Quarantined under this issue (`disabled-optin`, still runnable with `--include-disabled`): `check.send-flash-browser` (frame-sampled anchor movement during a send/late-read race; 27.7px in 3 of 4 proof runs) and `check.scroll-layout-browser` (its deterministic counts are fine, but "at most 2 long tasks" is a 50ms wall-duration verdict). Each returns only as a behaviour-only check proved under load.
 
 Follow-up worth its own look (not fixed here): the Documents view overflowing to a 518px layout at 150% root type on a 360px phone, and a host-wide browser cap across concurrent gates (the per-gate cap is process-local; three gates can still run 12 Chromiums — halved from 24 by A, and each now has a four-core box). A host-wide cap is worth a follow-up only if gates still starve each other after A+B; the load proof above ran beside other gates without timeout reds, so measure first rather than serialize gates against each other by default.
+
+## read-aloud-blocks-browser (2026-11-26, cl-flaketriage, numbers from the coordinator)
+
+`vibe-talk.check.read-aloud-blocks-browser` (listed in the known-red list against this issue) was red in 86 of 542 full gates in the 7 days to 2026-11-27 (84 distinct heads), and the ONLY red step on 2 heads (`d74edc93`, `c64a2248`). Latest failure text: "the list runs 93.0 px under the strip at 375x812" (`check_phone_layout` while playing), at load1 about 130-185, which is below the hot bar (load1 237 = 75% of 316 threads). A main control (5 solo runs on current main, load1 per run) follows below. Related: `#998` (the earlier load-robustness work on the read-aloud checks) and `#1250` vibe-talk-timing-robust.
+
