@@ -357,6 +357,9 @@ export const DISCUSS_UNAVAILABLE_HINT = "Discuss needs a direct LLM summarizer (
 /** Why Discuss cannot work over Documents (`#1812`): its scope is the channel or thread on screen. */
 export const DISCUSS_DOCUMENTS_HINT = "Discuss is not available in Documents";
 
+/** `#2301 vibe-talk-ui-review-findings-11-26` item 9: why a cut-short window covers the newest part only (`#1875`), behind the status's (i). */
+export const DISCUSS_NEWEST_ONLY_DETAIL = "Older messages weren't fetched, so this covers the newest part only — summarize again later to include more of them.";
+
 /**
  * Whether a catch-up failure is the deployment refusing for want of a direct LLM
  * summarizer (503 `discuss_not_available_on_this_backend`, or the summarizer's own
@@ -2429,11 +2432,29 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   }
 
   /** Say one thing on the panel's status line, as progress. */
-  function sayStatus(text: string): void {
+  function sayStatus(text: string, detail: string = ""): void {
     const line = deps.byId("discuss-status");
     line.textContent = text;
     line.className = "";
     line.setAttribute("role", "status");
+    sayStatusDetail(detail);
+  }
+
+  /**
+   * `#2301 vibe-talk-ui-review-findings-11-26` item 9 (R5): the status says the short thing, and
+   * what it needs explaining stands one tap away behind its (i) (closed each time the status
+   * changes); with nothing to explain both are down.
+   */
+  function sayStatusDetail(detail: string): void {
+    const info = maybe("discuss-status-info");
+    const more = maybe("discuss-status-detail");
+    if (info === null || more === null) return;
+    more.textContent = detail;
+    more.hidden = true;
+    info.hidden = detail === "";
+    info.setAttribute("aria-expanded", "false");
+    info.setAttribute("aria-label", detail === "" ? "" : `More: ${detail}`);
+    info.setAttribute("title", detail);
   }
 
   /**
@@ -2446,6 +2467,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     line.textContent = text;
     line.className = "discuss-status--error";
     line.setAttribute("role", "alert");
+    sayStatusDetail("");
   }
 
   /** Say whether a request is in flight, here and on the page's entry points. */
@@ -2648,9 +2670,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const count = answer.window?.count ?? answer.unread_ids.length;
         // `#1761`: a window cut short of the thread's start says so, visibly —
         // never a partial window presented as the whole.
-        sayStatus(answer.window?.truncated === true
-          ? `Read ${unread} unread of ${count}. Older messages weren't fetched, so this covers the newest part only — summarize again later to include more of them.`
-          : `Read ${unread} unread of ${count}`);
+        // `#2301` item 9 (R5): the status is short, and why it is the newest part only, and what to
+        // do about it, is behind its (i).
+        if (answer.window?.truncated === true) {
+          sayStatus(`Read ${unread} unread of ${count} · newest part only`, DISCUSS_NEWEST_ONLY_DETAIL);
+        } else {
+          sayStatus(`Read ${unread} unread of ${count}`);
+        }
         drawAnswer(answer, null);
         drawTerms(answer);
         drawFooter(answer, scope);
@@ -2823,6 +2849,15 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           if (missed === null) return;
           fetchFor(lastScope, missed.firstMissedMs, missed.ids);
         });
+        // `#2301` item 9: the status's (i) opens and closes what the short status leaves out.
+        const statusInfo = maybe("discuss-status-info");
+        const statusDetail = maybe("discuss-status-detail");
+        if (statusInfo !== null && statusDetail !== null) {
+          listening.listen(statusInfo, "click", () => {
+            statusDetail.hidden = !statusDetail.hidden;
+            statusInfo.setAttribute("aria-expanded", String(!statusDetail.hidden));
+          });
+        }
         listening.listen(deps.byId("discuss-summarize"), "click", () => {
           if (pending || lastScope === null || previewUnread.length === 0) return;
           if (currentBound().count === 0) return;

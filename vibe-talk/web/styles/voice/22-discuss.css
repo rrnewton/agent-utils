@@ -393,6 +393,47 @@
   color: var(--summary-fail-ink);
 }
 
+/* `#2301 vibe-talk-ui-review-findings-11-26` item 9 (R5): the status and its (i), the seam's
+ * mark (R15), on one row: the line takes its words' width and the mark stands right after it;
+ * what the mark opens stands under the row, with the 4/8 scale's room before what follows. */
+.discuss-status-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0 8px;
+}
+
+.discuss-status-row > #discuss-status {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+#discuss-status-info {
+  align-self: center;
+  /* The scale's 4 px under the ring, so it never stands on the divider below the row (R10). */
+  margin: 8px 0 4px;
+  padding: 0;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+/* Open, it wears the pressed chip's dress (`#421 chip-states`, 01-top-bar.css), so the mark
+ * says the line under it is its own. */
+#discuss-status-info[aria-expanded="true"] {
+  border-color: var(--accent);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+}
+
+/* The reason itself: a plain line in the status's own type and ink, no box (a bordered box
+ * read as an empty field; R15), 4 px under the row and 8 px above what follows. */
+#discuss-status-detail {
+  margin: 4px 0 8px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 /* The model's words: the server's rendered Markdown (`discuss-markdown-render`),
  * or its shaped text plain (newlines kept) when no render came. Only the plain
  * fallback keeps newlines (`discuss-answer--plain`, #1391): with `pre-wrap` on
@@ -1874,8 +1915,15 @@ stay its owner's (#1524). The pane itself already ends above the
  * head and the composer stand close (every pixel here is a line of the Latest answer on a
  * phone's half sheet), and the composer, which no longer floats over scrolled content, needs
  * neither the gap nor the padding of the old whole-panel scroll. */
-#discuss-panel > #discuss-status {
+#discuss-panel > #discuss-status,
+#discuss-panel > .discuss-status-row > #discuss-status {
   margin-top: 2px;
+}
+
+/* The (i) in this layout: 4 px above its ring and 4 px under it (above), so the ring stands
+ * level with the words and clear of the divider under the row (R10). */
+#discuss-panel > .discuss-status-row > #discuss-status-info {
+  margin-top: 4px;
 }
 
 #discuss-panel > .discuss-compose {

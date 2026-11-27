@@ -6176,6 +6176,16 @@ def _act_discuss_preview(driver: Driver) -> None:
     _open_discuss(driver)
 
 
+def _act_discuss_summary_status_detail(driver: Driver) -> None:
+    """`#2301 vibe-talk-ui-review-findings-11-26` item 9: scene 74's summary, then the status's (i)
+    pressed: the explanation of a cut-short window under the short status."""
+    _act_discuss_summary(driver)
+    driver.page.wait_for_function("() => window.__visible('discuss-status-info')", timeout=15_000)
+    driver.click("discuss-status-info")
+    driver.page.wait_for_function("() => window.__visible('discuss-status-detail')", timeout=5_000)
+    driver.settle(200)
+
+
 def _act_discuss_summary(driver: Driver) -> None:
     _open_discuss(driver)
     # The bound is the reader's own field: a channel already read shows zero unread, and
@@ -10713,6 +10723,19 @@ SCENES: tuple[Scene, ...] = (
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
             ("the switcher cards are not over the page", "!window.__visible('view-cards')"),
+        ),
+    ),
+    Scene(
+        name="74-discuss-summary-status-detail",
+        what="#2301 item 9: Discuss summarized with a cut-short window: the short status, its (i) pressed, the explanation under it",
+        act=_act_discuss_summary_status_detail,
+        after=_after_discuss_summary,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            ("the status is short and its (i) stands", "/newest part only$/.test(window.__text('discuss-status') || '') && window.__visible('discuss-status-info')"),
+            ("the (i) opened the explanation", "window.__visible('discuss-status-detail') && document.getElementById('discuss-status-info').getAttribute('aria-expanded') === 'true'"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
     Scene(

@@ -176,6 +176,8 @@ export interface ElementById {
   "discuss-stale-text": HTMLSpanElement;
   "discuss-stamp": HTMLParagraphElement;
   "discuss-status": HTMLParagraphElement;
+  "discuss-status-detail": HTMLParagraphElement;
+  "discuss-status-info": HTMLButtonElement;
   "discuss-summarize": HTMLButtonElement;
   "discuss-terms": HTMLDetailsElement;
   "discuss-terms-list": HTMLUListElement;

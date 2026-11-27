@@ -547,7 +547,15 @@
               <span class="discuss-bound"><input id="discuss-count" type="number" step="1" inputmode="numeric" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Number of unread messages"> unread, <input id="discuss-hours" type="number" step="1" inputmode="decimal" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Hours since the bound"> <span id="discuss-hours-unit">hours</span> <span class="discuss-since-part">since <input id="discuss-since" type="time" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Since time"></span></span>
             </div>
             <p id="discuss-scope"></p>
-            <p id="discuss-status" role="status"></p>
+            <!-- `#2301 vibe-talk-ui-review-findings-11-26` item 9 (R5): a status that needs explaining
+                 keeps the explanation one tap away, behind the page's (i) mark (the seam's, R15),
+                 at the end of the status's own line (the panel is a column flex, so the line and
+                 its mark share one row box). -->
+            <div class="discuss-status-row">
+              <p id="discuss-status" role="status"></p>
+              <button id="discuss-status-info" class="seam-info discuss-status-info" type="button" aria-expanded="false" aria-controls="discuss-status-detail" hidden>i</button>
+            </div>
+            <p id="discuss-status-detail" class="discuss-status-detail" hidden></p>
             <!-- `#1912 vibe-talk-discuss-summary-timeline-layout`: the current
                  summary stands under its own headed section, then Terms, then
                  the Timeline under its own heading, with separators between. -->

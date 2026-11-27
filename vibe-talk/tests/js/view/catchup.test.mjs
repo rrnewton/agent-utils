@@ -115,6 +115,7 @@ const IDS = [
   "discuss-search", "discuss-search-toggle", "discuss-search-input", "discuss-search-results", "discuss-search-status",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
   "discuss-summarize", "discuss-count", "discuss-since", "discuss-hours", "discuss-hours-unit",
+  "discuss-status-info", "discuss-status-detail",
   // `#1531 discuss-top-bar-slim-fixed`: no #discuss-read in the top bar; the
   // bottom toolbar's #read-aloud (with #read-steer as its standing strip).
   "read-aloud", "read-steer",
@@ -838,9 +839,36 @@ test("catchup: a cut-short window says it covers the newest part only and what t
     view.mountControls();
     await openAndSummarize(view, fx);
     await flush();
-    assert.equal(
-      fx.els["discuss-status"].textContent,
-      "Read 2 unread of 99. Older messages weren't fetched, so this covers the newest part only — summarize again later to include more of them.");
+    // `#2301 vibe-talk-ui-review-findings-11-26` item 9 (R5): the status is short, and the
+    // explanation is one tap away behind its (i), closed until pressed.
+    assert.equal(fx.els["discuss-status"].textContent, "Read 2 unread of 99 · newest part only");
+    const info = fx.els["discuss-status-info"];
+    const detail = fx.els["discuss-status-detail"];
+    assert.equal(info.hidden, false, "the (i) is not up beside a status that needs explaining");
+    assert.equal(detail.hidden, true, "the explanation stood before it was asked for");
+    assert.equal(detail.textContent,
+      "Older messages weren't fetched, so this covers the newest part only — summarize again later to include more of them.");
+    assert.equal(info.getAttribute("aria-expanded"), "false");
+    click(info);
+    assert.equal(detail.hidden, false, "the (i) did not open the explanation");
+    assert.equal(info.getAttribute("aria-expanded"), "true");
+    click(info);
+    assert.equal(detail.hidden, true, "the (i) did not close it again");
+  } finally { fx.restore(); }
+});
+
+test("catchup: a status with nothing to explain has no (i) (#2301 item 9)", async () => {
+  const fx = fixture({
+    respond: () => Promise.resolve(answer({ window: { count: 12, unread_count: 2, truncated: false } })),
+  });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    assert.equal(fx.els["discuss-status"].textContent, "Read 2 unread of 12");
+    assert.equal(fx.els["discuss-status-info"].hidden, true, "an (i) stood beside a status with nothing behind it");
+    assert.equal(fx.els["discuss-status-detail"].hidden, true);
   } finally { fx.restore(); }
 });
 
