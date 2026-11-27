@@ -9,7 +9,7 @@ labels:
 - cgroup
 - validation
 created_at: 2026-11-27T03:17:00-05:00
-updated_at: 2026-11-27T03:17:00-05:00
+updated_at: 2026-11-27T03:40:00-05:00
 ---
 
 # Description
@@ -60,6 +60,12 @@ On every route, exit 1 came from the run-timeout abort.
    - Rust treats `=1` as an opt-in route: teardown only, no caps, run kept inside the current cgroup.
    - Python uses the same name internally for a path and silently ignores `=1`.
 4. **There is no whole-run CPU-seconds budget.**
+5. **The default route's run outlives its caller.** Found by a consuming harness's lead after this probe.
+   - The re-exec scope is created with `systemd-run --user --scope --collect --unit=dagrun-<pid> --slice=dagrun.slice -p Delegate=yes`, on both engines (`py/dagrun/cgroup.py` near line 1419, `rs/dagrun/src/cgroup.rs`).
+   - The scope has no `BindsTo=` or `PartOf=` naming the caller's unit, and no signal forwarding.
+   - The runner's process now lives in its own scope, so stopping the caller's unit kills only what remains in the caller's cgroup.
+   - The run is orphaned, bounded only by its scope's `RuntimeMaxSec`.
+   - The delegated route (finding 1) avoids this: there, every step is a descendant of the caller's unit and dies with it.
 
 # Design
 
@@ -75,6 +81,9 @@ On every route, exit 1 came from the run-timeout abort.
     - the controllers;
     - the environment variable;
     - which bounds apply (the table above).
+- **A default-route run that dies with its caller.** Add an option naming the caller's unit, for example `--bind-to-unit UNIT`, with an environment-variable form. The re-exec scope then gets `BindsTo=UNIT` and `PartOf=UNIT` (After= as systemd requires), so stopping or restarting the caller stops the run. The runner's existing teardown still reaps every step, and the scope's `RuntimeMaxSec` stays the backstop.
+  - If dagrun can name its caller's unit itself (its own unit before the re-exec), it binds by default.
+  - Where binding isn't possible, the runner watches its original parent, for example with a pidfd on the caller, and tears the run down when the caller goes.
 - **One meaning for `DAGRUN_DIRECT_CGROUP`.** Both engines either honour `=1` with the same documented semantics, or refuse a value that isn't a path, instead of silently re-execing. The internal path variable moves to a name of its own.
 
 # Acceptance Criteria
@@ -87,6 +96,7 @@ On every route, exit 1 came from the run-timeout abort.
   Integration tests prove this on both engines; they skip with a stated reason where user units can't be delegated.
 - A delegated run whose unit lacks controllers either enables them and runs, or refuses naming the missing controllers. It never fails with a bare EACCES.
 - The run summary reports total CPU-seconds.
+- Default route, both engines: stopping the caller's unit (or, where binding is impossible, killing the caller) stops the run's scope and every step within seconds. An integration test proves it by checking that the scope is gone. Without the option, today's behaviour is documented as orphaning.
 - A parity test pins one behaviour for `DAGRUN_DIRECT_CGROUP=1` on both engines.
 - `dagrun run --help` and the dagrun docs carry the caller recipe and the per-route bounds table.
 
