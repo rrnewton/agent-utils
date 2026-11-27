@@ -76,6 +76,7 @@ from types import FrameType
 from typing import NamedTuple
 
 import case_timings
+import private_tmp
 from run_component_tests import (
     Manifest,
     components_for_paths,
@@ -2422,7 +2423,42 @@ def record_local_validate_pass(root: Path | None = None) -> None:
         pass
 
 
+def _terminate(signum: int, _frame: FrameType | None) -> None:
+    raise SystemExit(128 + signum)
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Run validation inside one private temp root (`#2383 private-run-tmpdir`).
+
+    Every step, and this process's own scratch, gets `TMPDIR`/`TMP`/`TEMP` pointing at a root
+    under `private_tmp.base_dir()` (default ``~/.aut``), never the host temp dir; the root is
+    removed when the run ends, passed, failed or SIGTERMed (kept after a failure only under
+    AGENT_UTILS_KEEP_TEST_TMP=1, and named). A root an outer gate made is reused.
+    ``AGENT_UTILS_PRIVATE_TMP=0`` opts out.
+    """
+    keep = os.environ.get("AGENT_UTILS_KEEP_TEST_TMP") == "1"
+    previous: object = None
+    with contextlib.suppress(ValueError, OSError):
+        previous = signal.signal(signal.SIGTERM, _terminate)
+    try:
+        with private_tmp.activate(keep_on_failure=keep) as private:
+            if private.root is not None:
+                how = "made" if private.owned else "reused"
+                print(
+                    f"validate: private temp root {private.root} ({how}; #2383, "
+                    f"{private_tmp.SWITCH_ENV}=0 opts out)",
+                    flush=True,
+                )
+            code = _main(argv, private.root)
+            private.failed = code != 0
+            return code
+    finally:
+        if previous is not None:
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(signal.SIGTERM, previous)  # type: ignore[arg-type]
+
+
+def _main(argv: list[str] | None, run_root: Path | None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base", default="origin/main", help="compare against this ref (default: origin/main)")
     parser.add_argument(
@@ -2643,7 +2679,9 @@ def main(argv: list[str] | None = None) -> int:
     with (
         tempfile.TemporaryDirectory(prefix="validate-cross-coverage-") as coverage,
         tempfile.TemporaryDirectory(prefix="validate-case-timings-") as timings,
-        pytest_temp_root() as pytest_root,
+        # #2383: inside a private root, pytest numbers its basetemps there directly (no extra
+        # nesting, so socket paths stay as short as before); otherwise the #941 private root.
+        pytest_temp_root() if run_root is None else contextlib.nullcontext(run_root) as pytest_root,
     ):
         code = run(
             selected,

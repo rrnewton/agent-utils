@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Run one command inside a private temp root, never the host temp dir (`#2383 private-run-tmpdir`).
+
+    scripts/with-private-tmp COMMAND [ARG...]
+
+The command (and everything it starts) gets TMPDIR, TMP and TEMP pointing at a fresh root under
+$AGENT_UTILS_TMP_BASE (default ~/.aut), the same root validate and gate.py give a run. The root
+is removed when the command ends, passed or failed; SIGTERM, SIGINT and SIGHUP are passed to the
+command and the root is removed after it exits. A root an outer run passed down
+(AGENT_UTILS_RUN_TMP) is reused, not nested. The exit status is the command's (128+N when a
+signal N ended it). AGENT_UTILS_PRIVATE_TMP=0 runs the command unchanged. Use it for focused
+test runs outside a gate:
+
+    scripts/with-private-tmp cargo test -p agentctl --lib -- chat_
+"""
+
+from __future__ import annotations
+
+import signal
+import subprocess
+import sys
+from pathlib import Path
+from types import FrameType
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import private_tmp  # noqa: E402
+
+FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    with private_tmp.activate() as private:
+        # The handlers go in before the child starts, so a signal in between is held and
+        # passed on once it runs, never left to kill this wrapper and strand the root.
+        started: list[subprocess.Popen[bytes]] = []
+        pending: list[int] = []
+
+        def forward(signum: int, _frame: FrameType | None) -> None:
+            if started:
+                started[0].send_signal(signum)
+            else:
+                pending.append(signum)
+
+        previous = {sig: signal.signal(sig, forward) for sig in FORWARDED}
+        try:
+            try:
+                child = subprocess.Popen(argv)
+            except OSError as error:
+                print(f"with-private-tmp: cannot run {argv[0]}: {error}", file=sys.stderr)
+                return 127
+            started.append(child)
+            for signum in pending:
+                child.send_signal(signum)
+            code = child.wait()
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+        private.failed = code != 0
+        return 128 - code if code < 0 else code
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

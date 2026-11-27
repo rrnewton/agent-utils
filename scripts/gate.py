@@ -437,12 +437,83 @@ def _cleanup_child_registries() -> None:
                 f"gate: kept test temp tree at {path} ({KEEP_TEST_TMP_ENV}=1)",
                 file=sys.stderr,
             )
+        _finish_gate_tmp_root(keep=True)
         return
     for path in registries:
         shutil.rmtree(path, ignore_errors=True)
+    _finish_gate_tmp_root(keep=False)
 
 
 atexit.register(_cleanup_child_registries)
+
+_PRIVATE_TMP_MODULE: ModuleType | None = None
+_GATE_TMP_ROOT: Path | None = None
+_GATE_TMP_ROOT_OWNED = False
+
+
+def _private_tmp() -> ModuleType:
+    """The sibling private temp root helper (scripts/private_tmp.py, #2383), loaded once."""
+    global _PRIVATE_TMP_MODULE
+    if _PRIVATE_TMP_MODULE is not None:
+        return _PRIVATE_TMP_MODULE
+    import importlib.util
+    path = Path(__file__).with_name("private_tmp.py")
+    spec = importlib.util.spec_from_file_location("agent_utils_private_tmp", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses look their module up there
+    spec.loader.exec_module(module)
+    _PRIVATE_TMP_MODULE = module
+    return module
+
+
+def _gate_tmp_root() -> Path | None:
+    """This gate's private temp root (`#2383 private-run-tmpdir`), made on first use.
+
+    Every child gets TMPDIR/TMP/TEMP pointing at it (validate reuses it rather than making its
+    own), and the gate's own scratch lives in it, so nothing of the run lands in the host temp
+    dir. A root an outer run passed down is reused and left to its maker. None when the run
+    opted out (AGENT_UTILS_PRIVATE_TMP=0) or no root could be made (said loudly). Removed with
+    the gate's other scratch, by `_cleanup_child_registries`.
+    """
+    global _GATE_TMP_ROOT, _GATE_TMP_ROOT_OWNED
+    if _GATE_TMP_ROOT is not None:
+        return _GATE_TMP_ROOT
+    module = _private_tmp()
+    if not module.enabled():
+        return None
+    inherited: Path | None = module.inherited_root()
+    if inherited is not None:
+        _GATE_TMP_ROOT = inherited
+        return inherited
+    base: Path = module.base_dir()
+    module.sweep_stale(base)
+    try:
+        root: Path = module.make_root(base)
+    except OSError as error:
+        print(f"gate: warning: no private temp root under {base} ({error}); children use the "
+              "inherited TMPDIR", file=sys.stderr)
+        return None
+    _GATE_TMP_ROOT, _GATE_TMP_ROOT_OWNED = root, True
+    print(f"gate: private temp root {root} (#2383; {module.SWITCH_ENV}=0 opts out)",
+          file=sys.stderr, flush=True)
+    return root
+
+
+def _finish_gate_tmp_root(*, keep: bool) -> None:
+    """Remove the root this gate made (a kept one is named); a reused root is left alone."""
+    global _GATE_TMP_ROOT, _GATE_TMP_ROOT_OWNED
+    root, owned = _GATE_TMP_ROOT, _GATE_TMP_ROOT_OWNED
+    _GATE_TMP_ROOT, _GATE_TMP_ROOT_OWNED = None, False
+    if root is None or not owned:
+        return
+    if keep:
+        print(f"gate: kept private temp root {root} ({KEEP_TEST_TMP_ENV}=1)", file=sys.stderr)
+        return
+    try:
+        _private_tmp().remove_root(root)
+    except Exception as error:  # noqa: BLE001 - a kept root is reported, never fatal
+        print(f"gate: {error}", file=sys.stderr)
 
 
 def _child_environment(**overrides: str) -> dict[str, str]:
@@ -470,8 +541,13 @@ def _child_environment(**overrides: str) -> dict[str, str]:
     # with auto-migrate off, unless the caller already chose a registry.
     # A scratch made here is tracked for removal when the gate ends
     # (#1917); a caller-chosen registry is left alone.
+    # #2383: every child runs inside this gate's private temp root.
+    tmp_root = _gate_tmp_root()
+    if tmp_root is not None:
+        tmp_env: dict[str, str] = _private_tmp().environment(tmp_root)
+        env.update(tmp_env)
     if "AGENTCTL_REGISTRY" not in env:
-        registry_base = Path(tempfile.mkdtemp(prefix="agent-utils-gate-agentctl-"))
+        registry_base = Path(tempfile.mkdtemp(prefix="agent-utils-gate-agentctl-", dir=tmp_root))
         _CHILD_REGISTRIES.append(registry_base)
         env["AGENTCTL_REGISTRY"] = str(registry_base / "registry")
     env.setdefault("AGENTCTL_LAYOUT_AUTO_MIGRATE", "0")
@@ -2730,7 +2806,7 @@ def _working_tree_hash(root: Path) -> str | None:
     index is never touched."""
     try:
         import tempfile
-        with tempfile.TemporaryDirectory(prefix="gate-tree-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="gate-tree-", dir=_gate_tmp_root()) as tmp:
             env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
             def git(*argv: str) -> str:
                 done = subprocess.run(["git", "-C", str(root), *argv],

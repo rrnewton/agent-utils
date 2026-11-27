@@ -19,6 +19,7 @@ through the top-level `bin/` command surface while that family is still evolving
 | `dagrun_profile_chart.py` | Render deterministic, dependency-free SVG speedup and within-step parallelism charts from dagrun model/trace data. |
 | `agent-log-archive/fetch_agent_logs.py` | Strict-typed, non-deleting local/SSH archive fetcher with manifests, metrics, and immutable receipts (`.sh` is its compatibility launcher). |
 | `irq_survey.py` | Re-derive the per-CPU interrupt numbers the core allocator's ranking rests on: is there a signal, does it change placement, and how far does an independent window drift. |
+| `with-private-tmp` | Run one command with `TMPDIR`, `TMP` and `TEMP` pointing at a private root under `$AGENT_UTILS_TMP_BASE` (default `~/.aut/<pid>`, kept short for Unix socket paths), removed when the command ends, passed, failed or signalled; `validate.py` and `gate.py` give every run the same kind of root, so no step writes to the host temp dir (`AGENT_UTILS_PRIVATE_TMP=0` opts out; #2383). Use it for focused test runs outside a gate. |
 | `rebase-delta-guard` | Bracket a rebase and prove its complete text and binary delta is unchanged. `record` captures the exact intended onto SHA; recorded series must be linear and descend from their base, while `check` accepts four explicit snapshot revisions. During a stopped rebase, use `conflict-files` instead of raw `git diff --name-only --diff-filter=U`: it reads index modes and omits conflicted submodule gitlinks before file-oriented tools can recurse into them. |
 
 Run the focused checks directly:

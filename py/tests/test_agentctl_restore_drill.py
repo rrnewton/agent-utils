@@ -186,7 +186,9 @@ class Drill:
         self.log_dir = root / "fake-logs"
         self.tools_dir = root / "drill-tools"
         self.env_file = root / "launch-env.sh"
-        self.session = f"restore-drill-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        # Short (#2383): the session name is part of the session socket path, which must fit
+        # sockaddr_un's 108 bytes even under a run's private temp root.
+        self.session = f"d{uuid.uuid4().hex[:8]}"
         self.socket: Path | None = None
         self.server: subprocess.Popen[bytes] | None = None
         self._server_log: io.BufferedWriter | None = None
@@ -204,8 +206,10 @@ class Drill:
         (self.root / "xdg-data").mkdir()
         (self.root / "xdg-state").mkdir()
         # A short scratch HOME: under the deep pytest root the Herdr
-        # session socket path would exceed the sockaddr_un limit.
-        self.home = Path(tempfile.mkdtemp(prefix="agentctl-drill-home-"))
+        # session socket path ($HOME/.config/herdr/sessions/<session>/herdr.sock)
+        # would exceed the sockaddr_un limit; the prefix is short too, because TMPDIR
+        # itself is a run's private root (#2383), longer than /tmp.
+        self.home = Path(tempfile.mkdtemp(prefix="h"))
         self.env_file.write_text("# drill launch env\n", encoding="utf-8")
         subprocess.run(
             ["git", "init", "-q", str(self.project)],

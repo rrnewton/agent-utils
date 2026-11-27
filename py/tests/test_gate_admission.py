@@ -2078,6 +2078,8 @@ def test_a_finished_gate_prunes_its_own_targets_and_records_the_bytes(tmp_path: 
     checkout = tmp_path / "checkout"
     (checkout / "scripts").mkdir(parents=True)
     shutil.copy(GATE, checkout / "scripts/gate.py")
+    # gate.py loads its private temp root helper from beside itself (#2383).
+    shutil.copy(GATE.with_name("private_tmp.py"), checkout / "scripts/private_tmp.py")
     old = time.time() - 7200
     stale: list[Path] = []
     for top in (checkout / "rs/target", tmp_path / "other/rs/target"):

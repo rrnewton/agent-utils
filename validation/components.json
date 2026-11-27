@@ -334,12 +334,14 @@
         "scripts/gate_stats.py",
         "scripts/memory_floor.py",
         "scripts/pid_namespace_init.py",
+        "scripts/private_tmp.py",
         "scripts/pytest_shard_weights.json",
         "scripts/rebase-delta-guard",
         "scripts/run_component_tests.py",
         "scripts/run_pytest_shard.py",
         "scripts/sweep_test_mounts.py",
         "scripts/validate.py",
+        "scripts/with-private-tmp",
         "setup",
         "validation.dag.yaml",
         "validation/",
@@ -363,6 +365,7 @@
         "py/tests/test_gitconfig_guard.py",
         "py/tests/test_memory_floor.py",
         "py/tests/test_pid_namespace_init.py",
+        "py/tests/test_private_tmp.py",
         "py/tests/test_rebase_delta_guard.py",
         "py/tests/test_rust_only.py"
       ]

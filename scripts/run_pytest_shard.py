@@ -27,6 +27,7 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import signal
 import shutil
 import stat
@@ -49,6 +50,12 @@ _CANCELLATION_SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
 #: its basetemp when it starts).
 _TEMP_PREFIX = "agent-utils-pytest-"
 _OWNER_SUFFIX = ".owner"
+#: `#2383 private-run-tmpdir`: when TMPDIR is the run's private root (named by
+#: AGENT_UTILS_RUN_TMP), that root is already unique to the run and removed as a whole, so a
+#: shard's basetemp takes the short name ``<root>/s<shard><4 hex>``. Socket-binding tests have
+#: only a few bytes to spare under the 108-byte Unix socket path limit, and the long shared-temp
+#: name (kept for the host temp dir, where the sweep below needs it) would use them up.
+_PRIVATE_ROOT_ENV = "AGENT_UTILS_RUN_TMP"
 #: Keep a failed shard's basetemp for inspection when this is set to 1; it is removed otherwise.
 KEEP_ENV = "AGENT_UTILS_KEEP_PYTEST_BASETEMP"
 #: Keep a failing run's isolated agentctl registry when this is 1 (#1917);
@@ -585,6 +592,24 @@ def _hold_owner_lock(temp_root: Path) -> int:
     return descriptor
 
 
+def _make_basetemp(index: int) -> Path:
+    """A shard's private basetemp, mode 0700: ``<root>/s<shard><4 hex>`` inside the run's private
+    root (#2383), else ``<tmp>/agent-utils-pytest-<pid>-<shard>-<random>``, which the sweep
+    below recognises in a shared temp dir."""
+    directory = Path(tempfile.gettempdir())
+    private = os.environ.get(_PRIVATE_ROOT_ENV, "")
+    if private and directory == Path(private):
+        for _ in range(1000):
+            candidate = directory / f"s{index}{secrets.token_hex(2)}"
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            return candidate
+        raise FileExistsError(f"run_pytest_shard: no free basetemp name under {directory}")
+    return Path(tempfile.mkdtemp(prefix=f"{_TEMP_PREFIX}{os.getpid()}-{index}-"))
+
+
 def _sweep_stale_temp_roots(directory: Path, now: float | None = None) -> list[Path]:
     """Remove basetemps whose wrapper is gone; return what was removed.
 
@@ -700,7 +725,7 @@ def _run_supervised(
         signal.signal(signum, record_cancellation)
     try:
         _sweep_stale_temp_roots(Path(tempfile.gettempdir()))
-        temp_root = Path(tempfile.mkdtemp(prefix=f"{_TEMP_PREFIX}{os.getpid()}-{index}-"))
+        temp_root = _make_basetemp(index)
         owner = _hold_owner_lock(temp_root)
         if pending:
             return 128 + pending[0]

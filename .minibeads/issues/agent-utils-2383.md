@@ -63,3 +63,28 @@ Covered here, not fixed one by one: three agentctl library tests leave entries e
 - `rs/agentctl/src/chat_history.rs:887` `tempfile_dir()`: it removes `agentctl-chat-history-test-<pid>` before use but never after.
 - `rs/agentctl/src/chat_event_sink.rs:1105`: the inline `temp_dir("carry-fresh3")` is missing from the cleanup loop.
 - `rs/agentctl/src/chat_runtime.rs:39655`: the first `temporary("receipt-check-mark-ack")` root is shadowed by the `-old` root at 39666 and never removed.
+
+## Socket path measurement (before any gate)
+
+[opus 5.5] cl-tmpfix, 2026-11-27, load1 110-178. Each entry is the longest AF_UNIX path a suite bound or connected to. Python paths were logged by a `socket` hook in every Python process, Rust and Herdr paths by `strace -e bind,connect`. The maximum usable length is 107 bytes.
+
+- Candidate root `~/.cache/agent-utils/tmp/v<pid>-XXXX` (49 characters), plain pytest: 222 `AF_UNIX path too long` failures in the agentctl chat and socket suites, plus 4 in the restore drill ("local socket name length exceeds capacity"). Rejected.
+- agentctl headless Rust library tests (measured by a sibling lane on its existing build):
+  - 9 failed at a 46-character `TMPDIR` and passed at 35.
+  - At 26 characters all 9 passed, and the longest path was 93 bytes, so 14 were left (`<root>/agentctl-wrap-console-refused-<pid>-<n>/reg/agent/control.sock`).
+  - In a gate they run under `rust.agentctl.test`'s own `/dev/shm` scratch, which this change leaves as it is.
+- Chosen root `~/.aut/<pid>` (25 characters, 26 with a clash letter). Every suite below ran in the gate's own layout (`run_component_tests.py` shards and the sharder):
+  - Python agentctl component, both shards, 2917 tests: all passed. The longest path was 93 bytes (`<root>/s0<4 hex>/test_existing_over_cap_inbound0/disabled-over-cap/.wake.sock`), so 14 were left. The same test in today's `/tmp` layout is 103 bytes, leaving 4.
+  - The sharder's basetemp inside a private root is `<root>/s<shard><4 hex>`. The long `agent-utils-pytest-<pid>-<shard>-<random>` name is kept for a shared temp dir, where its sweep needs it.
+  - Restore drill (`$HOME/.config/herdr/sessions/<session>/herdr-client.sock` under a short scratch HOME): about 105 bytes today, leaving 2. With the HOME prefix `h` and the session name `d<8 hex>` it is about 87 bytes, leaving 20, and all 4 drill tests pass.
+  - wrkslots socket tests (`test_proc_status`, `test_direct_census_found_evidence`) and the archive fetcher: 218 passed.
+- chat-subscription-slack warm sockets are `<root>/slack-warm-<name>-<pid>-<n>/w.sock`, about 85 bytes. agent-teams prefers `$XDG_RUNTIME_DIR`.
+
+## Findings along the way
+
+- The restore drill's `test_restore_drill_missing_slot_bind_refuses_only_that_lane` mounts slot images with fuse2fs (user-level `fuse.ext4`, no root).
+  - In one run under strace, its own `fusermount -u` failed, and two mounts and their fuse2fs daemons were left behind. The mount guard kept the root, as designed, instead of removing through the mounts. The leftovers were released with a user-level `fusermount -u` and a SIGTERM to each daemon.
+  - One run without strace: all 4 passed, with no mounts left. The daemons exited on their own within minutes.
+  - So the leak came from strace, not the change. Hardening (not done here): the test should unmount in a `finally` block and verify that the mount is gone.
+- On at least one host, home is also visible through a bind at `/data/users/<user>/dotsync-home`, so every mount under `~` appears twice in `/proc/self/mountinfo`. The mount guard matches by the root's path as given and as resolved, and an unmount by the `~` path works.
+- A test that copies `scripts/gate.py` into a scratch checkout must now copy `scripts/private_tmp.py` beside it.
