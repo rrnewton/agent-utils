@@ -735,7 +735,10 @@ fn shared_bot_signed_identity_admits_forgery_is_stranger() {
     assert_eq!(outcome["outcome"], "known", "{outcome}");
     assert!(world.ledger_has("tools", &id), "exactly once");
     // A tampered body fails the hash check: from this confirmed sender
-    // it is filed under the integrity kind, never delivered (#794).
+    // it is filed under the integrity kind, never delivered (#794). Its
+    // message was already delivered, so since #2160 it is kept with
+    // `twin` and raises no alarm; a tampered copy of an undelivered
+    // message alarms (a_damaged_relay_copy_with_no_delivered_copy_...).
     let mut forged: serde_json::Value = serde_json::from_str(
         post.split("```agent-teams-envelope\n")
             .nth(1)
@@ -749,10 +752,17 @@ fn shared_bot_signed_identity_admits_forgery_is_stranger() {
     let outcome = world.relay_in(SHARED, &agent_teams::relay::render_post(&forged));
     assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
     assert!(
+        agent_teams::relay::quarantined_posts(&world.state)
+            .iter()
+            .any(|post| post["id"] == id.as_str() && post["twin"]["state"].is_string()),
+        "kept as evidence with its delivered twin: {:?}",
+        agent_teams::relay::quarantined_posts(&world.state)
+    );
+    assert!(
         agent_teams::relay::alarms(&world.state)
             .iter()
-            .any(|a| a["kind"] == "integrity" && a["state"] == "open"),
-        "integrity alarm: {:?}",
+            .all(|a| a["kind"] != "integrity"),
+        "no integrity alarm for a copy of a delivered message: {:?}",
         agent_teams::relay::alarms(&world.state)
     );
     // An unsigned post while a key is trusted is a stranger too.
@@ -2522,21 +2532,280 @@ fn slack_link_markup_is_rescued_and_hash_mismatch_is_integrity_not_stranger() {
     let fresh = posts.last().expect("fresh post").clone();
     let (head, tail) = fresh.split_at(fresh.find("```").expect("fence"));
     let tampered = format!("{head}{}", tail.replace("again", "agaim"));
+    let fresh_id = serde_json::from_str::<serde_json::Value>(&out).expect("send json")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
     let outcome = world.relay_in(BOT1, &tampered);
     assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
-    let alarms = agent_teams::relay::alarms(&world.state);
-    let alarm = alarms
-        .iter()
-        .find(|a| a["kind"] == "integrity" && a["state"] == "open")
-        .expect("integrity alarm for hash mismatch");
-    let qid = alarm["quarantine_id"].as_str().expect("qid").to_string();
-    let (code, out, err) = world.run(&["relay", "quarantine", "dismiss", &qid]);
-    assert_eq!(code, 0, "dismiss: {out} {err}");
+    // #2160: the same message was delivered directly, so the damaged relay copy is kept as
+    // integrity evidence without an alarm, now and after the grace period.
+    let kept = agent_teams::relay::quarantined_posts(&world.state)
+        .into_iter()
+        .find(|post| post["id"] == fresh_id.as_str())
+        .expect("kept as evidence");
+    assert!(kept["twin"]["state"].is_string(), "{kept}");
+    assert!(kept.get("awaiting_twin_until").is_none(), "{kept}");
+    assert!(
+        kept["reason"].as_str().is_some_and(|r| r.contains("hash")),
+        "{kept}"
+    );
+    let later = agent_teams::timeutil::now_unix_ms()
+        + agent_teams::relay::INTEGRITY_TWIN_GRACE_MS
+        + 300_000;
+    agent_teams::relay::raise_due_alarms(&world.state, later).expect("raise");
     assert!(
         agent_teams::relay::alarms(&world.state)
             .iter()
             .all(|a| a["kind"] != "integrity" || a["state"] != "open"),
-        "dismiss closed the integrity alarm"
+        "no integrity alarm for a copy of a delivered message"
+    );
+    let (code, out, err) = world.run(&["relay", "status"]);
+    assert_eq!(code, 0, "status: {out} {err}");
+    assert!(
+        out.contains("1 without an alarm (the same message was delivered)"),
+        "{out}"
+    );
+    let (_, out, _) = world.run(&["relay", "quarantine", "list"]);
+    assert!(
+        out.contains("[the same message was delivered; no alarm]"),
+        "{out}"
+    );
+    let (code, out, err) = world.run(&["relay", "quarantine", "dismiss", &fresh_id]);
+    assert_eq!(code, 0, "dismiss: {out} {err}");
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+}
+
+/// A body with the bullet shapes Slack rewrote on 2026-11-27 (#2160: every U+2022 in a relay
+/// fence became `-`): at a line's start, indented, inline, next to a quote, mixed with genuine
+/// hyphens.
+const BULLETED: &str = "Status for the lead.\n\u{2022} first point - with a dash\n  \u{2022} indented sub-point\n- a genuine item, re-gated at -1 ms\ninline \u{2022} separators \u{2022} between\nthe glyph \"\u{2022}\" quoted, and '\u{2022} quoted too";
+
+/// What an older sender's post looks like after Slack: its fence carried the bullets raw
+/// (no `\u2022` escape) and Slack turned every one into a hyphen.
+fn old_sender_slack_rewrite(post: &str) -> String {
+    post.replace("\\u2022", "\u{2022}").replace('\u{2022}', "-")
+}
+
+#[test]
+fn an_old_senders_post_with_slack_rewritten_bullets_is_restored_and_delivered() {
+    // #2160, signed: the message was also delivered directly, so the restored relay copy is a
+    // known duplicate. Without the restore it would be a body-hash quarantine.
+    let world = World::new();
+    world.write_teams(MIRROR_TEAMS_LOCAL);
+    let post = world.root.join("bin/post.sh");
+    world.write_relay_route(true, &post.to_string_lossy());
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let public = world.ensure_signing_key("sim");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-a", &public, "test").expect("trust");
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools@host-a",
+        "--from-team",
+        "sim",
+        "--text",
+        BULLETED,
+        "--key",
+        "bullets-1",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    let posts = world.channel_posts();
+    assert_eq!(posts.len(), 1);
+    let fence = posts[0]
+        .split("```agent-teams-envelope")
+        .nth(1)
+        .expect("fence");
+    assert!(
+        !fence.contains('\u{2022}'),
+        "a new sender escapes bullets: {fence}"
+    );
+    // A new sender's post survives Slack's rewrite untouched.
+    let outcome = world.relay_in(BOT1, &posts[0].replace('\u{2022}', "-"));
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
+    // An older sender's post, bullets rewritten, is restored to the exact signed body.
+    let outcome = world.relay_in(BOT1, &old_sender_slack_rewrite(&posts[0]));
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+
+    // #2160, unsigned and relay-only: the restored body is what gets delivered.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let now = agent_teams::timeutil::now_unix_ms();
+    let envelope = agent_teams::envelope::build_envelope(
+        "tm-sim-2160b0b0b0b0b0b0",
+        "k",
+        "sim",
+        "host-a",
+        3,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        now,
+        now + 7_200_000,
+        None,
+        BULLETED,
+    );
+    let rewritten = old_sender_slack_rewrite(&agent_teams::relay::render_post(&envelope));
+    let outcome = world.relay_in(BOT1, &rewritten);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1);
+    assert!(
+        delivered[0].contains("\u{2022} first point - with a dash"),
+        "{}",
+        delivered[0]
+    );
+    assert!(
+        delivered[0].contains("- a genuine item"),
+        "{}",
+        delivered[0]
+    );
+}
+
+/// Build an unsigned (legacy, mapping-admitted) envelope from sim to tools, and its relay post
+/// with one word of the fence's body changed, as no restore can undo.
+fn damaged_legacy_post(id: &str, now: i64) -> (String, String) {
+    let envelope = agent_teams::envelope::build_envelope(
+        id,
+        "k",
+        "sim",
+        "host-a",
+        4,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        now,
+        now + 7_200_000,
+        None,
+        "alpha report for tools",
+    );
+    let post = agent_teams::relay::render_post(&envelope);
+    let (head, tail) = post.split_at(post.find("```").expect("fence"));
+    let damaged = format!("{head}{}", tail.replace("alpha", "alphb"));
+    (post, damaged)
+}
+
+fn open_integrity_alarms(world: &World) -> Vec<serde_json::Value> {
+    agent_teams::relay::alarms(&world.state)
+        .into_iter()
+        .filter(|a| a["kind"] == "integrity" && a["state"] == "open")
+        .collect()
+}
+
+#[test]
+fn a_damaged_relay_copy_with_no_delivered_copy_alarms_after_the_grace_under_its_own_team() {
+    // #2160: a body that is genuinely different and whose message was never delivered still
+    // quarantines and alarms, once the grace period for a delivered copy has passed. A second
+    // local team on the same route and channel sorts before `tools`; the alarm is still filed
+    // under the team the message was addressed to.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let pid = std::process::id().to_string();
+    let relay = format!("relay-coord:{CHAN}:{BOT1}=sim@host-a");
+    let (code, out, err) = world.run(&[
+        "init",
+        "plain",
+        "--coordinator-self",
+        "--coordinator-pid",
+        &pid,
+        "--deliver",
+        "hook-inbox",
+        "--accepts-from",
+        "sim",
+        "--relay",
+        &relay,
+    ]);
+    assert_eq!(code, 0, "init plain: {out} {err}");
+    let now = agent_teams::timeutil::now_unix_ms();
+    let id = "tm-sim-2160a1a1a1a1a1a1";
+    let (_, damaged) = damaged_legacy_post(id, now);
+    let outcome = world.relay_in(BOT1, &damaged);
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    assert!(
+        outcome["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("alarms at")),
+        "{outcome}"
+    );
+    let kept = |world: &World| {
+        agent_teams::relay::quarantined_posts(&world.state)
+            .into_iter()
+            .find(|post| post["id"] == id)
+            .expect("kept")
+    };
+    assert!(kept(&world)["awaiting_twin_until"].is_string());
+    assert_eq!(kept(&world)["local_team"], "tools");
+    let grace = agent_teams::relay::INTEGRITY_TWIN_GRACE_MS;
+    agent_teams::relay::raise_due_alarms(&world.state, now + grace - 60_000).expect("raise");
+    assert!(
+        open_integrity_alarms(&world).is_empty(),
+        "no alarm within the grace"
+    );
+    let (_, out, _) = world.run(&["relay", "status"]);
+    assert!(
+        out.contains("and 1 waiting for a delivered copy before alarming"),
+        "{out}"
+    );
+    agent_teams::relay::raise_due_alarms(&world.state, now + grace + 300_000).expect("raise");
+    let alarms = open_integrity_alarms(&world);
+    assert_eq!(alarms.len(), 1, "{alarms:?}");
+    assert_eq!(alarms[0]["local_team"], "tools", "{alarms:?}");
+    assert_eq!(alarms[0]["quarantine_ids"], serde_json::json!([id]));
+    assert!(kept(&world).get("awaiting_twin_until").is_none());
+    assert!(kept(&world).get("twin").is_none());
+    let notices = world.hook_inbox_texts("tools");
+    assert!(
+        notices
+            .iter()
+            .any(|text| text.contains("body does not match its signed hash")
+                || text.contains("[relay alarm: body does not match")),
+        "{notices:?}"
+    );
+    assert!(
+        world.hook_inbox_texts("plain").is_empty(),
+        "not the other team"
+    );
+}
+
+#[test]
+fn a_damaged_relay_copy_that_arrives_before_its_message_is_delivered_never_alarms() {
+    // #2160: the relay copy can come first. Once the same message is delivered, the waiting
+    // quarantine is settled as a damaged duplicate and no alarm is ever raised.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let now = agent_teams::timeutil::now_unix_ms();
+    let id = "tm-sim-2160c2c2c2c2c2c2";
+    let (intact, damaged) = damaged_legacy_post(id, now);
+    let outcome = world.relay_in(BOT1, &damaged);
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    let outcome = world.relay_in(BOT1, &intact);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let grace = agent_teams::relay::INTEGRITY_TWIN_GRACE_MS;
+    agent_teams::relay::raise_due_alarms(&world.state, now + grace + 300_000).expect("raise");
+    assert!(open_integrity_alarms(&world).is_empty());
+    let kept = agent_teams::relay::quarantined_posts(&world.state)
+        .into_iter()
+        .find(|post| post["id"] == id)
+        .expect("kept as evidence");
+    assert!(kept["twin"]["state"].is_string(), "{kept}");
+    assert!(kept.get("awaiting_twin_until").is_none(), "{kept}");
+    let (_, out, _) = world.run(&["relay", "status"]);
+    assert!(
+        out.contains("1 without an alarm (the same message was delivered)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("and 0 waiting for a delivered copy before alarming"),
+        "{out}"
     );
 }
 

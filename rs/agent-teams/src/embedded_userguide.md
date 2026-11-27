@@ -389,10 +389,26 @@ records `mirror-skipped`. `check` warns when `max_envelope_bytes` exceeds
 `max_post_bytes`. Inside the fence the envelope JSON escapes the
 characters Slack auto-links (`.`, `:`, `@`, `<`, `>`, `&`), so a body
 naming a file like `cli.rs`, a URL or an email survives Slack intact;
-a receiver also undoes Slack link markup from older posts and accepts
-only when the body hash then verifies. A body-hash mismatch that
-survives that undo, from a confirmed sender, is quarantined under its
-own integrity alarm kind (dismissable, kept as evidence). A
+it escapes the bullet glyphs `•` `‣` `⁃` `▪` `●` `◦` too, because Slack
+turned every `•` inside a relay fence into `-` (#2160). A receiver
+also undoes both rewrites in older posts and accepts only when the body
+hash then verifies. It undoes Slack link markup, then restores bullets.
+A `-` followed by a space, a quote or the end of the body may have been
+a `•`, so every combination of those positions is tried, up to 16 of
+them and 256 MiB of hashing. Past that, only two bodies are tried:
+every one a bullet, and only the line-leading ones. A body-hash mismatch that survives these undos,
+from a confirmed sender, is quarantined under its own integrity alarm
+kind (dismissable, kept as evidence), with one exception. When the
+receiving team's ledger already holds the same message (same ID, same
+hash), the post is kept with a `twin` field naming that copy's state:
+a provider damaged a duplicate and nothing is lost, so it raises no
+alarm. Any other mismatch waits 10 minutes for such a copy, because a
+relay copy can arrive before the direct one, and is marked
+`awaiting_twin_until`. If the copy arrives in time the post is settled
+the same way. Otherwise its alarm is raised at the next `relay-in`,
+`pump` or `relay alarms` after the wait. The alarm goes to the team the
+message was addressed to. `relay status` counts the posts kept without
+an alarm and those still waiting. A
 signed envelope whose tag line was lost (the fence-only piece of a
 split) is still delivered: the signature, not the tag, is the authority. The envelope is authoritative — a provider may rewrite
 visible text, so the receiver re-derives the tag from the envelope and

@@ -146,6 +146,10 @@ fn sanitize_preview(body: &str) -> String {
 /// ordinary envelopes past the post cap for no linkable gain (#919).
 /// Costs 5 extra bytes per escaped character, which the post-size
 /// measurement includes because it measures this fence.
+///
+/// Bullet glyphs ([`SLACK_REWRITTEN_GLYPHS`]) are escaped too (#2160): Slack turned every
+/// U+2022 inside a relay fence into `-`, so an old sender's body failed its signed hash although
+/// nothing was tampered with. Each costs 3 more bytes than its UTF-8 form, only where present.
 pub fn fence_json(envelope: &Value) -> String {
     let raw = envelope.to_string();
     let chars: Vec<char> = raw.chars().collect();
@@ -249,6 +253,9 @@ pub fn fence_json(envelope: &Value) -> String {
                 '|' => out.push_str("\\u007c"),
                 '-' if linkable[index] => out.push_str("\\u002d"),
                 '0'..='9' if linkable[index] => out.push_str(&format!("\\u003{}", ch)),
+                glyph if SLACK_REWRITTEN_GLYPHS.contains(&glyph) => {
+                    out.push_str(&format!("\\u{:04x}", u32::from(glyph)));
+                }
                 _ => out.push(ch),
             }
             continue;
@@ -309,6 +316,107 @@ pub fn undo_slack_link_markup(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Bullet glyphs [`fence_json`] escapes so a provider cannot rewrite them (#2160). Slack turned
+/// every U+2022 in a relay fence into `-`; the others are the same kind of list glyph.
+pub const SLACK_REWRITTEN_GLYPHS: [char; 6] = [
+    '\u{2022}', '\u{2023}', '\u{2043}', '\u{25aa}', '\u{25cf}', '\u{25e6}',
+];
+
+/// Most candidate hyphens [`restore_slack_bullets`] tries every subset of (2^16 bodies).
+pub const BULLET_RESTORE_MAX_CANDIDATES: usize = 16;
+
+/// Most body bytes one [`restore_slack_bullets`] call hashes over all its subsets.
+const BULLET_RESTORE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Undo Slack's bullet rewrite in a received body (#2160). An older sender's fence carried
+/// U+2022 raw and Slack turned each one into `-`, at a line's start, indented, inline or next to
+/// a quote. A hyphen followed by a space, a quote or the end of the body may have been a bullet,
+/// so every subset of those positions is tried, bullets first, until one hashes to
+/// `expected_sha256`. Only an exact match is returned, so no other change can pass. Past
+/// [`BULLET_RESTORE_MAX_CANDIDATES`] positions, or when the subsets would hash more than 256 MiB,
+/// only two bodies are tried: every candidate a bullet, and only the line-leading ones.
+pub fn restore_slack_bullets(body: &str, expected_sha256: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    const BULLET: &str = "\u{2022}";
+    let expected = hex_bytes(expected_sha256).filter(|bytes| bytes.len() == 32)?;
+    let bytes = body.as_bytes();
+    let candidates: Vec<usize> = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(index, &byte)| {
+            byte == b'-'
+                && bytes
+                    .get(index + 1)
+                    .is_none_or(|next| b" \"'".contains(next))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let rebuild = |bullets: &[bool]| -> String {
+        let mut out = String::with_capacity(body.len() + 2 * candidates.len());
+        let mut from = 0;
+        for (&at, &bullet) in candidates.iter().zip(bullets) {
+            out.push_str(&body[from..at]);
+            out.push_str(if bullet { BULLET } else { "-" });
+            from = at + 1;
+        }
+        out.push_str(&body[from..]);
+        out
+    };
+    let matches = |text: &str| Sha256::digest(text.as_bytes()).as_slice() == expected.as_slice();
+    let within_budget = candidates.len() <= BULLET_RESTORE_MAX_CANDIDATES
+        && (1usize << candidates.len()).saturating_mul(bytes.len()) <= BULLET_RESTORE_MAX_BYTES;
+    if !within_budget {
+        let all = rebuild(&vec![true; candidates.len()]);
+        if matches(&all) {
+            return Some(all);
+        }
+        let leading: Vec<bool> = candidates
+            .iter()
+            .map(|&at| {
+                let line_start = body[..at].rfind('\n').map_or(0, |newline| newline + 1);
+                body[line_start..at]
+                    .chars()
+                    .all(|ch| ch == ' ' || ch == '\t')
+            })
+            .collect();
+        let lead = rebuild(&leading);
+        return matches(&lead).then_some(lead);
+    }
+    // Depth-first over the candidates, a bullet before a hyphen at each, carrying the hash of
+    // the prefix so each segment is hashed once per distinct prefix rather than per body.
+    fn search(
+        prefix: Sha256,
+        bytes: &[u8],
+        candidates: &[usize],
+        from: usize,
+        expected: &[u8],
+        chosen: &mut Vec<bool>,
+    ) -> bool {
+        let Some((&at, rest)) = candidates.split_first() else {
+            let mut whole = prefix;
+            whole.update(&bytes[from..]);
+            return whole.finalize().as_slice() == expected;
+        };
+        let mut upto = prefix;
+        upto.update(&bytes[from..at]);
+        for bullet in [true, false] {
+            let mut next = upto.clone();
+            next.update(if bullet { "\u{2022}".as_bytes() } else { b"-" });
+            chosen.push(bullet);
+            if search(next, bytes, rest, at + 1, expected, chosen) {
+                return true;
+            }
+            chosen.pop();
+        }
+        false
+    }
+    let mut chosen = Vec::with_capacity(candidates.len());
+    search(Sha256::new(), bytes, &candidates, 0, &expected, &mut chosen).then(|| rebuild(&chosen))
 }
 
 fn undo_slack_link_markup_value(value: &mut Value) {
@@ -2041,6 +2149,7 @@ fn relay_in_envelope(
             );
             let qid = record_integrity_reason(
                 state,
+                declaration,
                 route,
                 peer_sender,
                 channel,
@@ -2174,6 +2283,44 @@ fn relay_in_envelope(
     )
 }
 
+/// The envelope with its body restored from a provider's rewrite, and the `relay-in` outcome
+/// naming the rewrite, when its body hash fails and a restore reproduces the exact hashed bytes:
+/// Slack link markup undone (#794b), bullets restored (#2160), or both. The signature covers
+/// the hash, never the body, so a signed envelope must still verify; an unsigned one is proven
+/// by the hash alone.
+fn rescued_body(envelope: &Value) -> Option<(Value, &'static str)> {
+    if check_envelope(envelope) != Err("body-hash-mismatch".to_string()) {
+        return None;
+    }
+    let body = envelope.get("body").and_then(Value::as_str).unwrap_or("");
+    let expected = envelope
+        .get("body_sha256")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let accept = |fixed: String| -> Option<Value> {
+        let mut candidate = envelope.clone();
+        candidate["body"] = json!(fixed);
+        (check_envelope(&candidate).is_ok()
+            && (envelope.get("relay").is_none() || verify_envelope(&candidate)))
+        .then_some(candidate)
+    };
+    let unlinked = undo_slack_link_markup(body);
+    if unlinked != body {
+        if let Some(candidate) = accept(unlinked.clone()) {
+            return Some((candidate, "link-markup-restored"));
+        }
+    }
+    if let Some(candidate) = restore_slack_bullets(body, expected).and_then(accept) {
+        return Some((candidate, "bullets-restored"));
+    }
+    if unlinked != body {
+        if let Some(candidate) = restore_slack_bullets(&unlinked, expected).and_then(accept) {
+            return Some((candidate, "link-markup-and-bullets-restored"));
+        }
+    }
+    None
+}
+
 /// Deliver one admitted envelope: malformed checks, then the ledger.
 #[allow(clippy::too_many_arguments)]
 fn relay_deliver(
@@ -2190,35 +2337,20 @@ fn relay_deliver(
     id: &str,
     signed_verified: bool,
 ) -> DataResult<RelayInResult> {
-    // Slack link markup rescue (#794b): if the body hash fails, undo
-    // Slack's auto-link rewriting inside the body and accept only if
-    // the hash (and thus the signature over it) then verifies.
+    // Provider rewrite rescue: if the body hash fails, undo Slack's auto-link rewriting (#794b)
+    // and its bullet rewriting (#2160) inside the body, and accept only if the hash (and thus
+    // the signature over it) then verifies.
     let restored: Value;
-    let envelope = if crate::envelope::check_envelope(envelope)
-        == Err("body-hash-mismatch".to_string())
-    {
-        let body = envelope.get("body").and_then(Value::as_str).unwrap_or("");
-        let fixed = undo_slack_link_markup(body);
-        if fixed != body {
-            let mut candidate = envelope.clone();
-            candidate["body"] = json!(fixed);
-            if crate::envelope::check_envelope(&candidate).is_ok()
-                && (envelope.get("relay").is_none() || verify_envelope(&candidate))
-            {
-                log_event(
-                    state,
-                    &json!({"event": "relay-in", "outcome": "link-markup-restored", "route": route, "peer_sender": peer_sender, "id": id}),
-                );
-                restored = candidate;
-                &restored
-            } else {
-                envelope
-            }
-        } else {
-            envelope
+    let envelope = match rescued_body(envelope) {
+        Some((candidate, outcome)) => {
+            log_event(
+                state,
+                &json!({"event": "relay-in", "outcome": outcome, "route": route, "peer_sender": peer_sender, "id": id}),
+            );
+            restored = candidate;
+            &restored
         }
-    } else {
-        envelope
+        None => envelope,
     };
     let from_team = envelope
         .get("from")
@@ -2270,8 +2402,9 @@ fn relay_deliver(
             // the body differs from what was hashed/signed, so it can
             // never deliver and the post is evidence (#794 review).
             let signed = envelope.get("relay").is_some();
-            let qid = record_integrity_confirmed(
+            let (qid, alarms_at) = record_integrity_confirmed(
                 state,
+                declaration,
                 route,
                 peer_sender,
                 channel,
@@ -2280,13 +2413,19 @@ fn relay_deliver(
                 id,
                 signed,
             )?;
-            return Ok(result(
-                NOT_RECORDED,
-                format!(
-                    "body does not match its hash; quarantined as {qid} — dismiss with: \
+            let detail = match alarms_at {
+                // The same message was delivered another way (#2160): only a damaged copy.
+                None => format!(
+                    "body does not match its hash, but the same message was already \
+                     delivered; kept as {qid} without an alarm"
+                ),
+                Some(at) => format!(
+                    "body does not match its hash; quarantined as {qid}, and it alarms at {at} \
+                     unless the same message is delivered first — dismiss with: \
                      agent-teams relay quarantine dismiss {qid}"
                 ),
-            ));
+            };
+            return Ok(result(NOT_RECORDED, detail));
         }
         record_stranger(
             state,
@@ -2661,15 +2800,58 @@ fn record_unparseable_confirmed(
     Ok(id)
 }
 
-/// Record a body-hash mismatch from an admitted sender under the
-/// `integrity` alarm kind (#794): the body differs from what its sender
-/// hashed (and, when signed, signed), so it can never deliver and the
-/// quarantined raw post is the evidence. Kept apart from the routine
-/// unparseable alarm so one dismiss cannot close both. Returns the
-/// quarantine ID (the envelope's message ID).
+/// How long a body-hash quarantine waits for a delivered copy of the same message before it
+/// alarms (#2160): a relay copy can arrive before the direct one.
+pub const INTEGRITY_TWIN_GRACE_MS: i64 = 10 * 60 * 1000;
+
+/// Ledger states in which a message counts as delivered for a twin check (#2160).
+const TWIN_STATES: [&str; 5] = ["claimed", "accepted", "typing", "presented", "delivered"];
+
+/// Why a body-hash mismatch from an admitted sender was quarantined.
+fn integrity_reason(signed: bool) -> String {
+    format!(
+        "body does not match its {} hash (after undoing Slack link markup and bullets): \
+         possible tampering or an unrecognised provider rewrite; not delivered",
+        if signed { "signed" } else { "declared" }
+    )
+}
+
+/// The delivered copy of the same message, when the receiving team's ledger holds one with
+/// the same id and the same (signed) body hash (#2160): `{state, recorded_at}` for the
+/// quarantine record. Such a relay copy is only a provider's damaged duplicate.
+fn delivered_twin(state: &Path, team: &str, id: &str, envelope: &Value) -> Option<Value> {
+    if !crate::model::valid_team_name(team) || !crate::envelope::valid_message_id(id) {
+        return None;
+    }
+    let expected = envelope.get("body_sha256").and_then(Value::as_str)?;
+    let text = std::fs::read_to_string(crate::ledger::entry_path(state, team, id)).ok()?;
+    let entry: Value = serde_json::from_str(&text).ok()?;
+    let entry_state = entry.get("state").and_then(Value::as_str)?;
+    (TWIN_STATES.contains(&entry_state)
+        && entry.get("body_sha256").and_then(Value::as_str) == Some(expected))
+    .then(|| {
+        json!({
+            "state": entry_state,
+            "recorded_at": entry.get("recorded_at").cloned().unwrap_or(Value::Null),
+        })
+    })
+}
+
+/// Record a body-hash mismatch from an admitted sender under the `integrity` alarm kind
+/// (#794): the body differs from what its sender hashed (and, when signed, signed), so it can
+/// never deliver and the quarantined raw post is the evidence. Kept apart from the routine
+/// unparseable alarm so one dismiss cannot close both. Returns the quarantine ID (the
+/// envelope's message ID).
+///
+/// Since #2160 it alarms only when the message was not delivered another way: when the
+/// receiving team's ledger already holds the same message (same id, same hash) the post is
+/// kept with `twin` and counted, never alarmed; otherwise it waits
+/// [`INTEGRITY_TWIN_GRACE_MS`] (`awaiting_twin_until`) for that copy, and
+/// [`raise_due_alarms`] alarms it if none came.
 #[allow(clippy::too_many_arguments)]
 fn record_integrity_confirmed(
     state: &Path,
+    declaration: &Declaration,
     route: &str,
     peer_sender: &str,
     channel: &str,
@@ -2677,29 +2859,56 @@ fn record_integrity_confirmed(
     envelope: &Value,
     id: &str,
     signed: bool,
-) -> DataResult<String> {
-    let reason = format!(
-        "body does not match its {} hash (after undoing Slack link markup): \
-         possible tampering or an unrecognised provider rewrite; not delivered",
-        if signed { "signed" } else { "declared" }
-    );
-    record_integrity_reason(
+) -> DataResult<(String, Option<String>)> {
+    let reason = integrity_reason(signed);
+    if let Some(twin) = delivered_twin(state, &declaration.team, id, envelope) {
+        let _lock = lock_store(state)?;
+        store_integrity_post(
+            state,
+            declaration,
+            route,
+            peer_sender,
+            channel,
+            text,
+            envelope,
+            id,
+            &reason,
+            json!({"twin": twin}),
+        )?;
+        log_event(
+            state,
+            &json!({"event": "integrity", "outcome": "twin-delivered", "sender_id": peer_sender, "local_team": declaration.team, "id": id}),
+        );
+        return Ok((id.to_string(), None));
+    }
+    let until = format_rfc3339_ms(now_unix_ms() + INTEGRITY_TWIN_GRACE_MS);
+    let _lock = lock_store(state)?;
+    store_integrity_post(
         state,
+        declaration,
         route,
         peer_sender,
         channel,
         text,
         envelope,
         id,
-        reason,
-    )
+        &reason,
+        json!({"awaiting_twin_until": until}),
+    )?;
+    log_event(
+        state,
+        &json!({"event": "integrity", "outcome": "awaiting-twin", "sender_id": peer_sender, "local_team": declaration.team, "id": id, "until": until}),
+    );
+    Ok((id.to_string(), Some(until)))
 }
 
-/// Quarantine one post under the `integrity` alarm kind with a
-/// caller-named reason (a signature downgrade, #800).
+/// Quarantine one post under the `integrity` alarm kind with a caller-named reason (a
+/// signature downgrade, #800) and raise its alarm at once. `declaration` is the receiving
+/// team's, so the alarm is filed under the team the message was addressed to (#2160).
 #[allow(clippy::too_many_arguments)]
 fn record_integrity_reason(
     state: &Path,
+    declaration: &Declaration,
     route: &str,
     peer_sender: &str,
     channel: &str,
@@ -2708,42 +2917,92 @@ fn record_integrity_reason(
     id: &str,
     reason: String,
 ) -> DataResult<String> {
-    let declarations = load_declarations(state).unwrap_or_default();
-    let Some((_, _, declaration)) = declarations.iter().find(|(_, _, declaration)| {
-        declaration.relay_channels.iter().any(|entry| {
-            entry.route == route && (entry.channel.is_empty() || entry.channel == channel)
-        })
-    }) else {
-        return Ok(id.to_string());
-    };
+    let _lock = lock_store(state)?;
+    store_integrity_post(
+        state,
+        declaration,
+        route,
+        peer_sender,
+        channel,
+        text,
+        envelope,
+        id,
+        &reason,
+        json!({}),
+    )?;
+    alarm_integrity(
+        state,
+        declaration,
+        route,
+        peer_sender,
+        envelope.get("from").cloned().unwrap_or(Value::Null),
+        id,
+        &reason,
+        now_unix_ms(),
+    )?;
+    Ok(id.to_string())
+}
+
+/// Keep one integrity post as evidence (the caller holds the store lock). `extra` holds the
+/// #2160 fields: `twin`, or `awaiting_twin_until`. A post already kept for the same ID and
+/// sender stays as it is.
+#[allow(clippy::too_many_arguments)]
+fn store_integrity_post(
+    state: &Path,
+    declaration: &Declaration,
+    route: &str,
+    peer_sender: &str,
+    channel: &str,
+    text: &str,
+    envelope: &Value,
+    id: &str,
+    reason: &str,
+    extra: Value,
+) -> DataResult<()> {
+    let mut quarantine = load_json_list(&quarantine_path(state), "posts");
+    let posts = quarantine
+        .get_mut("posts")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| DataError::new("relay-quarantine", "posts is not a list"))?;
+    if !posts.iter().any(|post| {
+        post.get("id").and_then(Value::as_str) == Some(id)
+            && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender)
+    }) {
+        let mut post = json!({
+            "id": id, "peer_sender": peer_sender, "route": route,
+            "channel": channel, "envelope": envelope, "post": text,
+            "reason": reason, "quarantined_at": format_rfc3339_ms(now_unix_ms()),
+            "local_team": declaration.team,
+        });
+        if let (Some(fields), Some(extra)) = (post.as_object_mut(), extra.as_object()) {
+            fields.extend(extra.clone());
+        }
+        posts.push(post);
+        if posts.len() > 512 {
+            let excess = posts.len() - 512;
+            posts.drain(0..excess);
+        }
+    }
+    write_json_atomic(&quarantine_path(state), &quarantine)
+}
+
+/// Add one quarantined ID to its sender's open integrity alarm for `declaration`'s team (or
+/// open one) and raise it (the caller holds the store lock).
+#[allow(clippy::too_many_arguments)]
+fn alarm_integrity(
+    state: &Path,
+    declaration: &Declaration,
+    route: &str,
+    peer_sender: &str,
+    claimed_from: Value,
+    id: &str,
+    reason: &str,
+    now_ms: i64,
+) -> DataResult<()> {
     let entry = declaration
         .relay_channels
         .iter()
         .find(|entry| entry.route == route);
-    let _lock = lock_store(state)?;
-    {
-        let mut quarantine = load_json_list(&quarantine_path(state), "posts");
-        let posts = quarantine
-            .get_mut("posts")
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| DataError::new("relay-quarantine", "posts is not a list"))?;
-        if !posts.iter().any(|post| {
-            post.get("id").and_then(Value::as_str) == Some(id)
-                && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender)
-        }) {
-            posts.push(json!({
-                "id": id, "peer_sender": peer_sender, "route": route,
-                "channel": channel, "envelope": envelope, "post": text,
-                "reason": reason, "quarantined_at": format_rfc3339_ms(now_unix_ms()),
-            }));
-            if posts.len() > 512 {
-                let excess = posts.len() - 512;
-                posts.drain(0..excess);
-            }
-        }
-        write_json_atomic(&quarantine_path(state), &quarantine)?;
-    }
-    let now_ms = now_unix_ms();
     let mut alarm_index: Option<usize> = None;
     {
         let mut doc = load_json_list(&alarms_path(state), "alarms");
@@ -2783,7 +3042,7 @@ fn record_integrity_reason(
             list.push(json!({
                 "sender_id": peer_sender, "local_team": declaration.team,
                 "kind": "integrity", "quarantine_id": id, "quarantine_ids": [id],
-                "claimed_from": envelope.get("from"), "reason": reason,
+                "claimed_from": claimed_from, "reason": reason,
                 "state": "open", "first_at": format_rfc3339_ms(now_ms),
                 "last_raised_at": Value::Null, "raises": 0,
                 "interval_seconds": entry.map_or(1800, |entry| entry.alarm_interval_seconds),
@@ -2799,7 +3058,93 @@ fn record_integrity_reason(
     if let Some(index) = alarm_index {
         let _ = raise_alarm_at(state, index, now_ms);
     }
-    Ok(id.to_string())
+    Ok(())
+}
+
+/// Settle the integrity posts waiting for a delivered twin (#2160): one whose message has
+/// since been delivered is marked `twin` and never alarms; one still alone at
+/// `awaiting_twin_until` joins its sender's integrity alarm, which is raised. Posts kept before
+/// #2160 carry neither field and are left exactly as they are.
+fn settle_integrity_quarantine(state: &Path, now_ms: i64) -> DataResult<()> {
+    let _lock = lock_store(state)?;
+    let path = quarantine_path(state);
+    let mut quarantine = load_json_list(&path, "posts");
+    let Some(posts) = quarantine.get_mut("posts").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let mut due = Vec::new();
+    let mut changed = false;
+    for post in posts.iter_mut() {
+        let Some(until) = post
+            .get("awaiting_twin_until")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let team = post.get("local_team").and_then(Value::as_str).unwrap_or("");
+        let id = post.get("id").and_then(Value::as_str).unwrap_or("");
+        let twin = delivered_twin(state, team, id, &post["envelope"]);
+        let alone_past_grace = twin.is_none()
+            && crate::timeutil::parse_rfc3339_ms(&until).is_none_or(|until| now_ms >= until);
+        if twin.is_none() && !alone_past_grace {
+            continue;
+        }
+        if let Some(fields) = post.as_object_mut() {
+            fields.remove("awaiting_twin_until");
+            match twin {
+                Some(twin) => {
+                    fields.insert("twin".to_string(), twin);
+                }
+                None => due.push(Value::Object(fields.clone())),
+            }
+        }
+        changed = true;
+    }
+    if !changed {
+        return Ok(());
+    }
+    write_json_atomic(&path, &quarantine)?;
+    let declarations = load_declarations(state).unwrap_or_default();
+    for post in due {
+        let text = |key: &str| {
+            post.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let team = text("local_team");
+        let Some((_, _, declaration)) = declarations.iter().find(|(name, _, _)| *name == team)
+        else {
+            continue;
+        };
+        alarm_integrity(
+            state,
+            declaration,
+            &text("route"),
+            &text("peer_sender"),
+            post["envelope"].get("from").cloned().unwrap_or(Value::Null),
+            &text("id"),
+            &text("reason"),
+            now_ms,
+        )?;
+    }
+    Ok(())
+}
+
+/// Integrity posts kept without an alarm, for `relay status` (#2160): those whose message was
+/// delivered another way (`twin`), and those still waiting for that copy.
+pub fn integrity_quarantine_counts(state: &Path) -> (usize, usize) {
+    let posts = quarantined_posts(state);
+    let twins = posts
+        .iter()
+        .filter(|post| post.get("twin").is_some())
+        .count();
+    let awaiting = posts
+        .iter()
+        .filter(|post| post.get("awaiting_twin_until").is_some())
+        .count();
+    (twins, awaiting)
 }
 
 /// Record an unparseable post as a STRANGER event. No envelope survived
@@ -3043,7 +3388,7 @@ fn raise_alarm_at(state: &Path, index: usize, now_ms: i64) -> DataResult<bool> {
         format!(
             "[relay alarm: body does not match its signed hash from confirmed sender {sender}]\n\
              [team message: kind alarm; ESCALATE TO OWNER via this team's normal owner channel; reason: {}; post quarantined as evidence, not delivered]\n\
-             A confirmed sender's envelope body differs from the hash it carries, after undoing Slack link markup: possible tampering or an unrecognised provider rewrite. It can never be delivered, and this alarm repeats until it is dismissed.\n\
+             A confirmed sender's envelope body differs from the hash it carries, after undoing Slack link markup and bullets: possible tampering or an unrecognised provider rewrite. It can never be delivered, and this alarm repeats until it is dismissed.\n\
              Quarantined: {}\n\
              Dismiss: agent-teams relay quarantine dismiss {}   Status: agent-teams relay status\n",
             clean(alarm.get("reason").and_then(Value::as_str)),
@@ -3131,7 +3476,9 @@ fn raise_alarm_at(state: &Path, index: usize, now_ms: i64) -> DataResult<bool> {
 /// Raise every open alarm whose repeat is due. Called by `relay-in`,
 /// `pump`, and `relay alarms`, so no daemon is needed: any relay activity
 /// or pump run re-raises overdue stranger alarms.
+/// It first settles integrity posts waiting for a delivered copy of their message (#2160).
 pub fn raise_due_alarms(state: &Path, now_ms: i64) -> DataResult<Vec<String>> {
+    settle_integrity_quarantine(state, now_ms)?;
     let _lock = lock_store(state)?;
     let mut raised = Vec::new();
     let count = alarms(state).len();
@@ -3715,6 +4062,109 @@ mod tests {
             undo_slack_link_markup("keep <https://other|label> apart"),
             "keep <https://other|label> apart",
             "non-matching markup is not rewritten"
+        );
+    }
+
+    /// A body with the bullet shapes Slack rewrote on 2026-11-27 (#2160: every U+2022 in a
+    /// relay fence became `-`, 186 of them in 45 posts): at a line's start, indented, inline
+    /// after a space, and next to a quote, mixed with genuine hyphens a restore must keep.
+    const BULLETED_BODY: &str = "Status for the lead.\n\
+        • first point - with a dash\n\
+        \x20 • indented sub-point\n\
+        - a genuine markdown item, re-gated at -1 ms\n\
+        inline • separators • between items\n\
+        the glyph \"•\" quoted, and '• quoted too\n\
+        ends with a bullet •";
+
+    /// Slack's rewrite of [`BULLETED_BODY`]: every bullet glyph becomes a hyphen.
+    fn slack_rewritten(text: &str) -> String {
+        text.replace('\u{2022}', "-")
+    }
+
+    #[test]
+    fn fence_escapes_bullets_so_a_slack_rewrite_cannot_reach_them() {
+        let envelope = crate::envelope::build_envelope(
+            "tm-sim-0123456789abcdef",
+            "k",
+            "sim",
+            "host-b",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            0,
+            7_200_000,
+            None,
+            &format!("{BULLETED_BODY} \u{25e6} \u{25aa} \u{2023} \u{25cf} \u{2043}"),
+        );
+        let post = render_post(&envelope);
+        let fence = post.split("```agent-teams-envelope").nth(1).expect("fence");
+        for glyph in SLACK_REWRITTEN_GLYPHS {
+            assert!(
+                !fence.contains(glyph),
+                "{glyph} escaped in the fence: {fence}"
+            );
+        }
+        assert!(fence.contains("\\u2022"), "{fence}");
+        // Slack's rewrite of the whole post now only reaches the visible preview, so the
+        // fence still parses to the identical envelope and its hash holds.
+        let parsed = parse_post(&slack_rewritten(&post)).expect("parse");
+        assert_eq!(parsed, RelayPost::Envelope(envelope.clone()));
+        let RelayPost::Envelope(parsed) = parsed else {
+            unreachable!()
+        };
+        assert!(check_envelope(&parsed).is_ok());
+    }
+
+    #[test]
+    fn bullet_restore_accepts_only_the_exact_signed_body() {
+        let hash = sha256_hex(BULLETED_BODY.as_bytes());
+        let rewritten = slack_rewritten(BULLETED_BODY);
+        assert_eq!(
+            restore_slack_bullets(&rewritten, &hash).as_deref(),
+            Some(BULLETED_BODY),
+            "every rewritten shape is restored and every genuine hyphen kept"
+        );
+        assert_eq!(
+            restore_slack_bullets(BULLETED_BODY, &sha256_hex(b"other")),
+            None,
+            "an intact body with a different hash has no restore"
+        );
+        let tampered = rewritten.replace("lead", "load");
+        assert_eq!(
+            restore_slack_bullets(&tampered, &hash),
+            None,
+            "a body changed any other way is never restored"
+        );
+        assert_eq!(restore_slack_bullets("no hyphens here", &hash), None);
+        assert_eq!(restore_slack_bullets(&rewritten, "not-hex"), None);
+    }
+
+    #[test]
+    fn bullet_restore_past_the_candidate_cap_tries_all_and_line_leading_only() {
+        let lines = BULLET_RESTORE_MAX_CANDIDATES + 4;
+        let all = "\u{2022} item\n".repeat(lines);
+        assert_eq!(
+            restore_slack_bullets(&slack_rewritten(&all), &sha256_hex(all.as_bytes())).as_deref(),
+            Some(all.as_str()),
+            "past the cap, every candidate a bullet is still tried"
+        );
+        let leading = "\u{2022} item - genuine dash\n".repeat(lines);
+        assert_eq!(
+            restore_slack_bullets(&slack_rewritten(&leading), &sha256_hex(leading.as_bytes()))
+                .as_deref(),
+            Some(leading.as_str()),
+            "past the cap, only the line-leading candidates as bullets is tried"
+        );
+        let mixed = format!("{leading}inline \u{2022} bullet\n");
+        assert_eq!(
+            restore_slack_bullets(&slack_rewritten(&mixed), &sha256_hex(mixed.as_bytes())),
+            None,
+            "past the cap no other subset is searched"
         );
     }
 

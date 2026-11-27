@@ -2721,8 +2721,16 @@ fn cmd_relay_quarantine(globals: &Globals, args: &[String]) -> Result<i32, DataE
                 println!("quarantine is empty");
             }
             for post in &posts {
+                // #2160: say when the message was delivered another way, or when it alarms.
+                let note = if post.get("twin").is_some() {
+                    " [the same message was delivered; no alarm]".to_string()
+                } else if let Some(until) = post["awaiting_twin_until"].as_str() {
+                    format!(" [alarms at {until} unless the same message is delivered first]")
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{} from {} on {} ({}): {}",
+                    "{} from {} on {} ({}): {}{note}",
                     post["id"].as_str().unwrap_or("?"),
                     post["peer_sender"].as_str().unwrap_or("?"),
                     post["route"].as_str().unwrap_or("?"),
@@ -2906,6 +2914,19 @@ fn cmd_relay_setup(globals: &Globals, args: &[String]) -> Result<i32, DataError>
     Ok(0)
 }
 
+/// The relay quarantine for `relay status` (#2160): every kept post, the body-hash
+/// quarantines kept without an alarm because the same message was delivered another way, and
+/// those still waiting for such a copy before they alarm.
+fn quarantine_summary(globals: &Globals) -> Value {
+    let posts = crate::relay::quarantined_posts(&globals.state).len();
+    let (delivered_elsewhere, awaiting) = crate::relay::integrity_quarantine_counts(&globals.state);
+    json!({
+        "posts": posts,
+        "delivered_elsewhere": delivered_elsewhere,
+        "awaiting_delivered_copy": awaiting,
+    })
+}
+
 fn cmd_relay_status(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let defs = relay_route_defs(globals)?;
     let declarations = load_declarations(&globals.state).unwrap_or_default();
@@ -2928,6 +2949,7 @@ fn cmd_relay_status(globals: &Globals, args: &[String]) -> Result<i32, DataError
         "declaration_channels": channels,
         "candidates": store.get("candidates").cloned().unwrap_or(json!([])),
         "confirmed": store.get("confirmed").cloned().unwrap_or(json!([])),
+        "quarantine": quarantine_summary(globals),
         "notes": [
             "A provider that cannot deliver other bots' posts cannot carry a relay on its live stream; the Slack rescan (90s by default, 24h window) is the fallback path and bounds latency.",
             "Candidates are never admitted. Only declaration/bridge peer mappings and confirmed peers speak for a team.",
@@ -2978,6 +3000,11 @@ fn cmd_relay_status(globals: &Globals, args: &[String]) -> Result<i32, DataError
             row["repo_id"].as_str().unwrap_or("?"),
         );
     }
+    let quarantine = &value["quarantine"];
+    println!(
+        "quarantined posts: {}, of them {} without an alarm (the same message was delivered) and {} waiting for a delivered copy before alarming",
+        quarantine["posts"], quarantine["delivered_elsewhere"], quarantine["awaiting_delivered_copy"]
+    );
     println!("note: candidates are never admitted until confirmed (relay confirm).");
     Ok(0)
 }
@@ -3531,6 +3558,12 @@ fn cmd_relay_alarms(globals: &Globals, args: &[String]) -> Result<i32, DataError
     println!(
         "quarantined posts: {}",
         crate::relay::quarantined_posts(&globals.state).len()
+    );
+    // #2160: damaged relay copies of messages delivered another way are kept without an
+    // alarm, and a body-hash quarantine waits a grace period for that copy before alarming.
+    let (twins, awaiting) = crate::relay::integrity_quarantine_counts(&globals.state);
+    println!(
+        "of them {twins} without an alarm (the same message was delivered) and {awaiting} waiting for a delivered copy before alarming"
     );
     Ok(0)
 }
