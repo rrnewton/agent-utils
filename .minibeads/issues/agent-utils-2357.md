@@ -1,13 +1,13 @@
 ---
 title: 'vibe-talk-search-unmatched-count-race: search_unmatched_browser reads the search count once right after a seam press and can catch it mid-change'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 - flaky-test
 created_at: 2026-11-27T01:10:00-05:00
-updated_at: 2026-11-27T01:10:00-05:00
+updated_at: 2026-11-27T14:00:00-05:00
 ---
 
 # Description
@@ -31,4 +31,8 @@ Filed at the coordinator's request from the #2346 lane's checks (issue file only
 Cause (2026-11-27, 20 runs at 4-parallel on main plus an instrumented copy recording every count and server-line change): the walk's `server_settled` waited on the scope text, but the busy words ("Searching the server…") are the server line's, so steps 1 and 2 always ran with the server's answer still out (at the seam press the line still said "Searching the server…" in every run). When the answer landed, its older hits folded into the count ("7 found (4 loaded, 3 older)", `#2200`, the page's correct count), so a slow run in which the answer landed between the press and the one read of the count went red. Forcing the answer to land before the read turns the old check red every time. Not a page fault.
 
 Fix (test only): the fixture server holds the lantern answer through steps 1 and 2 (they are about the loaded rows and their gaps), the walk waits for the ask to be out instead of a settle that cannot see it, the count check compares the count after the press with the count read just before it, and the answer is let through and waited for before step 3, which already expects the fold. `server_settled` now counts the server line's busy words too.
+
+## Resolution
+
+[opus 5.5, cl-signpost3] Landed as f07c2d98 (test only, tests/search_unmatched_browser.py): the fixture holds the server's answer until the loaded-rows steps are done, the count check compares across the seam press instead of reading once after it, and the answer is waited for before the next step. Gate on e0cb22bc: the only red was the known-red read-aloud-blocks-browser, the single-read jump race #2371 fixed (fd5666ae), which that base predated. The search-unmatched step passed. Landed under the coordinator's recorded waiver for that row; the replay onto main carries the #2371 fix.
 
