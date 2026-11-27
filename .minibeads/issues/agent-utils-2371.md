@@ -1,6 +1,6 @@
 ---
 title: 'read-aloud-jump-check-race: read_aloud_blocks_browser reads the fake server once at the jump''s paint, and fails on a busy host when the request lands just after'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - tests
 - read-aloud
 created_at: 2026-11-27T06:25:00-05:00
-updated_at: 2026-11-27T06:25:00-05:00
+updated_at: 2026-11-27T10:50:00-05:00
 ---
 
 # Description
@@ -33,3 +33,8 @@ Cause: after the tap the step waits only for the painted "6 of 7", then reads th
 # Notes
 
 Filed at the coordinator's request (issue file only). The fix is a separate test-only commit. Related: #2058, #2351, #2367, #1250 vibe-talk-timing-robust.
+
+## Resolution
+
+[opus 5.5, cl-signpost3] Landed as fd5666ae: the walk's step 3 waits for the jump's request to reach the fake server (a condition wait on its read log, the state timeout as the bound) instead of reading the log once at the jump's paint, and checks that the first new read asks for block 5. Validated before the gate: the walk 10 of 10 above load 150, and a negative control with the old single read failing. Gate: full, head 7211ced2, exit 0, no failed or incomplete steps. The row was PARTIAL only for the 7 delegated-live-scope cross skips, landed on the liaison's OK under that waiver.
+
