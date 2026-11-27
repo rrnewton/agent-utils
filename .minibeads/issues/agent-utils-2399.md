@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-muse-delivery-unrecorded-paste: a Muse delivery stopped after its paste leaves the prompt pending with no attempt, and the next drain calls its own paste foreign'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-27T14:59:01-05:00
-updated_at: 2026-11-27T14:59:01-05:00
+updated_at: 2026-11-27T17:10:39-05:00
+closed_at: 2026-11-27T17:10:39-05:00
 ---
 
 # Description
@@ -156,3 +157,32 @@ promises that "a prompt being typed is finished first", but the deadline
 runtime also cancels a delivery that has already typed, on every
 harness. This fix makes that cut recorded and recoverable. It doesn't
 stop the cut.
+
+## Resolution
+
+[Claude Opus 5.5] Landed on main as 14d09442 (full gate PASS, 54/54
+steps, on 4d617093). The Muse follow-up path, the Muse idle path and
+the native-prompt branch now call the new fallible
+`AgentRuntime::record_input_started` just before the paste, after every
+pre-typing check. The queue drain's tracking runtimes write
+`paste_started_at` through the durable JSON write and return its error.
+If the stamp can't be written, nothing is typed and the prompt stays
+pending. A stop after the paste is now filed as typed (`failed/`,
+`possibly_submitted`, one attempt), and a drainer that dies is
+recovered as stranded and flushed with Enter. `recover_muse_draft`
+also recognises the prompt being delivered
+(`stale_draft::prompt_being_delivered`): a framed draft that is its
+exact text, or a `[Pasted Content N chars]` placeholder whose size no
+other typed record in the lookback shares. The delivery then submits
+the copy already in the editor instead of typing again, busy or idle,
+and a readiness wait that finds that draft staged goes on to deliver.
+A placeholder whose size another record shares is refused, and the
+refusal names both candidates. Foreign and unframed drafts are still
+refused untouched. Tests in
+`rs/agentctl/src/subagents/tests/unrecorded_paste.rs` (5) and one
+`stale_draft` unit test cover these cases. All 5 fail on the parent
+with the incident's wording ("a draft that agentctl did not type",
+`delivery_attempts` 0); the parent also typed the prompt again under a
+shared-size placeholder. The harness support matrix's Muse stuck-paste
+cell says so. No new persisted fields. The deadline follow-up above is
+still open.
