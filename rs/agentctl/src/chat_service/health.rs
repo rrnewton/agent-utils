@@ -362,9 +362,60 @@ struct PluginLogEvidence {
     /// First and last `... the stream did not carry` find lines.
     first_uncarried_found_at: Option<u64>,
     last_uncarried_found_at: Option<u64>,
-    /// First and last `rescan: the host listing budget holds ...` lines.
+    /// The first `rescan: the host listing budget holds ...` line since the last rescan pass
+    /// that made a listing call, and the last such line: a continuous hold (#2338). A pass that
+    /// listed something between two holds ends the first, so intermittent back-offs between
+    /// working passes never add up to one long hold.
     first_budget_hold_at: Option<u64>,
     last_budget_hold_at: Option<u64>,
+}
+
+/// Whether a plugin log message is a rescan pass that made at least one listing call:
+/// `rescan: pass made N history and M thread listing call(s); ...` with N + M above zero.
+fn productive_rescan_pass(message: &str) -> bool {
+    let Some(rest) = message
+        .split_once("rescan: pass made ")
+        .map(|(_, rest)| rest)
+    else {
+        return false;
+    };
+    let number = |text: &str| -> Option<u64> {
+        let digits: String = text.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    let history = number(rest);
+    let threads = rest
+        .split_once(" history and ")
+        .and_then(|(_, rest)| number(rest));
+    matches!((history, threads), (Some(history), Some(threads)) if history + threads > 0)
+}
+
+/// [`PluginLogEvidence`] from the lines of a plugin diagnostics log, oldest first.
+fn parse_plugin_log(text: &str) -> PluginLogEvidence {
+    let mut evidence = PluginLogEvidence::default();
+    for line in text.lines() {
+        let Some((millis, message)) = line.split_once(' ') else {
+            continue;
+        };
+        let Ok(at) = millis.parse::<u64>() else {
+            continue;
+        };
+        if message.contains(": request ") {
+            evidence.last_stream_request_at = Some(at);
+        }
+        if message.contains("the stream did not carry") {
+            evidence.first_uncarried_found_at.get_or_insert(at);
+            evidence.last_uncarried_found_at = Some(at);
+        }
+        if productive_rescan_pass(message) {
+            evidence.first_budget_hold_at = None;
+        }
+        if message.contains("rescan: the host listing budget holds") {
+            evidence.first_budget_hold_at.get_or_insert(at);
+            evidence.last_budget_hold_at = Some(at);
+        }
+    }
+    evidence
 }
 
 /// Read the tail of the plugin diagnostics log the bridge configuration
@@ -386,27 +437,7 @@ fn plugin_log_evidence(
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut text = String::new();
     file.read_to_string(&mut text).ok()?;
-    let mut evidence = PluginLogEvidence::default();
-    for line in text.lines() {
-        let Some((millis, message)) = line.split_once(' ') else {
-            continue;
-        };
-        let Ok(at) = millis.parse::<u64>() else {
-            continue;
-        };
-        if message.contains(": request ") {
-            evidence.last_stream_request_at = Some(at);
-        }
-        if message.contains("the stream did not carry") {
-            evidence.first_uncarried_found_at.get_or_insert(at);
-            evidence.last_uncarried_found_at = Some(at);
-        }
-        if message.contains("rescan: the host listing budget holds") {
-            evidence.first_budget_hold_at.get_or_insert(at);
-            evidence.last_budget_hold_at = Some(at);
-        }
-    }
-    Some(evidence)
+    Some(parse_plugin_log(&text))
 }
 
 /// What `chat health` read, before it judges it.
@@ -416,6 +447,9 @@ struct Observed {
     status: Value,
     runner: Option<u64>,
     runner_comm: Option<String>,
+    /// The runner lease is held, by a process this one cannot see (another PID namespace),
+    /// when `runner` is `None` (#2338).
+    runner_hidden: bool,
     /// [`channel_holders`].
     channels: Vec<Value>,
     checkpoint_age: Option<u64>,
@@ -452,11 +486,13 @@ pub fn health<A: ManagedApi + ?Sized>(
     let state = BridgeState::inspect(state_root)?;
     let now = chat_runtime::unix_millis();
     let runner = state.runner_pid();
+    let runner_hidden = runner.is_none() && state.runner_lease_held();
     let plugin_log = plugin_log_evidence(state.config());
     let observed = Observed {
         status: state.status()?,
         runner,
         runner_comm: runner.and_then(crate::lock_wait::comm_of),
+        runner_hidden,
         channels: channel_holders(state.config()),
         checkpoint_age: state.checkpoint_age_millis(now),
         alive_age: state.provider_alive_age_millis(now),
@@ -486,6 +522,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         status,
         runner,
         runner_comm,
+        runner_hidden,
         channels,
         checkpoint_age,
         alive_age,
@@ -511,8 +548,11 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         .filter(|agent| *agent != configuration.agent_name)
         .map(str::to_owned);
     let reply_source = reply_source.filter(|_| stale_source_agent.is_none());
+    // Running, whether or not this process can see the runner (#2338).
+    let running = runner.is_some() || runner_hidden;
     let process = match runner {
         Some(pid) => json!({"running": true, "pid": pid, "comm": runner_comm}),
+        None if runner_hidden => json!({"running": true, "pid": null, "visible": false}),
         None => {
             problems
                 .down
@@ -582,7 +622,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
                 .as_str()
                 .unwrap_or("see chat status")
         ));
-    } else if runner.is_some() && alive_age.is_some_and(|age| age > stale_millis) {
+    } else if running && alive_age.is_some_and(|age| age > stale_millis) {
         problems.degraded.push(format!(
             "the event stream has delivered nothing, not even a heartbeat, for {} (stale after \
              {})",
@@ -669,7 +709,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
         .and_then(|record| record["capture_misses"].as_array())
         .map(|misses| misses.iter().collect())
         .unwrap_or_default();
-    if runner.is_some() && !misses.is_empty() {
+    if running && !misses.is_empty() {
         problems.degraded.push(format!(
             "{} reply block(s) in {}'s transcript were never captured (reply ID {}); the owner \
              and {} were warned",
@@ -694,7 +734,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
     // is an owner rescan held back by the listing budget past
     // RESCAN_BUDGET_HOLD_AFTER. Both signals are lines the plugin already
     // writes, so a pinned older bridge is judged the same way.
-    if runner.is_some() {
+    if running {
         if let Some(evidence) = plugin_log {
             let silence_millis = u64::try_from(OWNER_SILENCE_AFTER.as_millis()).unwrap_or(u64::MAX);
             let admitted_silent = match last_admitted {
@@ -867,11 +907,15 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
 
     // A running service whose owner loop has not turned for its stall bound delivers and sends
     // nothing, whatever its saved records say.
-    if let (Some(pid), Some((age, Some(bound)))) = (runner, owner_loop) {
+    if let (true, Some((age, Some(bound)))) = (running, owner_loop) {
         if u128::from(age) > bound.as_millis() {
             problems.stalled.push(format!(
-                "the owner loop of service process {pid} has not turned for {} (bound {}); \
-                 chat run stops and its unit starts it again",
+                "the owner loop of {} has not turned for {} (bound {}); chat run stops and its \
+                 unit starts it again",
+                runner.map_or_else(
+                    || "the service".to_owned(),
+                    |pid| format!("service process {pid}")
+                ),
                 age_text(age),
                 age_text(u64::try_from(bound.as_millis()).unwrap_or(u64::MAX))
             ));
@@ -930,6 +974,9 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
                     .map(|comm| format!(" ({comm})"))
                     .unwrap_or_default()
             ),
+            None if runner_hidden => "running, its process not visible from here (another PID \
+                 namespace: its runner lease is held)"
+                .to_owned(),
             None => "not running".to_owned(),
         }
     );
@@ -941,6 +988,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
             match channel["holder_pid"].as_u64() {
                 Some(pid) if Some(pid) == runner => "served by this bridge".to_owned(),
                 Some(pid) => format!("held by process {pid}"),
+                None if runner_hidden => "holder not visible from here".to_owned(),
                 None if runner.is_some() =>
                     "lock not held (the running build predates one bridge per channel)".to_owned(),
                 None => "no bridge".to_owned(),
@@ -1182,6 +1230,7 @@ mod tests {
             }),
             runner: Some(42),
             runner_comm: Some("agentctl".to_owned()),
+            runner_hidden: false,
             channels: vec![
                 json!({"channel_id": "C1", "lock": "/l", "holder_pid": 42, "holder_bridge_state": "/s"}),
             ],
@@ -1229,6 +1278,104 @@ mod tests {
         HealthOptions {
             stale_after: Duration::from_secs(300),
         }
+    }
+
+    #[test]
+    fn a_runner_this_process_cannot_see_is_running_not_down() {
+        // #2338: from a sandboxed shell with its own PID namespace, /proc/locks leaves out the
+        // runner's lock; the lease probe still finds it held.
+        let mut observed = healthy();
+        observed.runner = None;
+        observed.runner_comm = None;
+        observed.runner_hidden = true;
+        observed.channels = vec![json!({"channel_id": "C1", "lock": "/l", "holder_pid": null})];
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "ok", "{}", health.text);
+        assert!(
+            health.text.contains("not visible from here"),
+            "{}",
+            health.text
+        );
+        assert_eq!(health.document["service"]["running"], true);
+        assert_eq!(health.document["service"]["visible"], false);
+
+        let mut observed = healthy();
+        observed.runner = None;
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "down", "{}", health.text);
+        assert!(
+            health.text.contains("runner lock is free"),
+            "{}",
+            health.text
+        );
+    }
+
+    #[test]
+    fn the_lease_probe_sees_a_held_lease_and_leaves_it_takeable() {
+        let root = crate::chat_runtime::tests::temporary("health-lease-probe");
+        let state = BridgeState::initialize(&root, crate::chat_runtime::tests::config())
+            .expect("initialize state");
+        assert!(!state.runner_lease_held());
+        let lease = state.acquire_runner_lease().expect("lease");
+        assert!(state.runner_lease_held());
+        drop(lease);
+        assert!(!state.runner_lease_held());
+        // The probe released its shared lock: a runner can take the lease.
+        drop(state.acquire_runner_lease().expect("lease after the probe"));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn only_a_continuous_budget_hold_is_reported() {
+        // #2338: a pass that lists between holds ends the hold. One bridge's log held a back-off
+        // after most passes for a day while every pass listed, and health said "held 24.1 h".
+        let mut log = String::new();
+        let start = NOW - 24 * 60 * 60 * 1_000;
+        let mut at = start;
+        while at < NOW - 60_000 {
+            log.push_str(&format!(
+                "{at} slack-plugin: rescan: pass made 3 history and 1 thread listing call; 0 \
+                 threads postponed\n{at} slack-plugin: rescan: the host listing budget holds \
+                 every bridge back after a rate limit after 4 listings; next pass in 90 s\n"
+            ));
+            at += 90_000;
+        }
+        let evidence = parse_plugin_log(&log);
+        let since = evidence.first_budget_hold_at.expect("a hold");
+        assert!(
+            NOW - since < 120_000,
+            "the hold restarts at each listing pass"
+        );
+        let mut observed = healthy();
+        observed.plugin_log = Some(evidence);
+        assert_eq!(assess(observed, options()).verdict, "ok");
+
+        // Holds with only empty passes between them for 45 minutes: one continuous hold.
+        let mut held = String::from(
+            "1 slack-plugin: rescan: pass made 2 history and 0 thread listing calls; ok\n",
+        );
+        let mut at = NOW - 45 * 60 * 1_000;
+        while at < NOW - 60_000 {
+            held.push_str(&format!(
+                "{at} slack-plugin: rescan: pass made 0 history and 0 thread listing calls; \
+                 held\n{at} slack-plugin: rescan: the host listing budget holds every bridge \
+                 back; next pass in 90 s\n"
+            ));
+            at += 90_000;
+        }
+        let evidence = parse_plugin_log(&held);
+        assert_eq!(evidence.first_budget_hold_at, Some(NOW - 45 * 60 * 1_000));
+        let mut observed = healthy();
+        observed.plugin_log = Some(evidence);
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(
+            health
+                .text
+                .contains("held back by the host listing budget for 43"),
+            "{}",
+            health.text
+        );
     }
 
     #[test]

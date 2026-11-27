@@ -364,6 +364,26 @@ impl BridgeState {
         crate::lock_wait::holder_of(&self.root.join(".run.lock"))
     }
 
+    /// Whether this state's runner lease is held, when [`Self::runner_pid`] found no holder.
+    /// `/proc/locks` leaves out a lock whose holder is in a PID namespace the reader cannot see,
+    /// as from a sandboxed shell with its own `/proc`, so `chat health` there called a running
+    /// bridge down (#2338). This tries a shared lock on the lease without waiting and releases
+    /// it at once: refused means a runner holds the lease. A runner starting in that instant
+    /// tries its lease again ([`BridgeState::acquire_runner_lease`]).
+    #[must_use]
+    pub fn runner_lease_held(&self) -> bool {
+        let Ok(file) = fs::File::open(self.root.join(".run.lock")) else {
+            return false;
+        };
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => {
+                let _ = fs2::FileExt::unlock(&file);
+                false
+            }
+            Err(error) => error.raw_os_error() == fs2::lock_contended_error().raw_os_error(),
+        }
+    }
+
     /// How long ago the checkpoint, which the provider worker rewrites with each batch it commits,
     /// was last written, in milliseconds.
     #[must_use]

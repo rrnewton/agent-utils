@@ -69,6 +69,10 @@ const RETIREMENT_RECORD_VERSION: u32 = 2;
 const MAX_REQUESTS: u64 = 2_048;
 /// [`MAX_REQUESTS`], for the service's high-water check (#2338).
 pub(crate) const MAX_REQUESTS_LIMIT: u64 = MAX_REQUESTS;
+/// More tries of a contended runner lease, and the pause before each: a `chat health` probe
+/// holds it for an instant only (#2338).
+const RUNNER_LEASE_RETRIES: u32 = 5;
+const RUNNER_LEASE_RETRY_DELAY: Duration = Duration::from_millis(40);
 const MAX_REQUEST_BYTES: u64 = 128 * 1_024 * 1_024;
 const MAX_REQUEST_RECORD_BYTES: usize = 512 * 1_024;
 const MAX_PLUGIN_NAME_BYTES: usize = 128;
@@ -8334,9 +8338,26 @@ impl BridgeState {
     /// Acquire the generation-wide owner lease. The wrapper must remain live until shutdown.
     pub fn acquire_runner_lease(&self) -> Result<RunnerLease> {
         let lock = agent::open_private_lock(&self.root.join(".run.lock"), "chat runner lock")?;
-        lock.try_lock_exclusive().map_err(|error| {
-            ChatRuntimeError::invalid(format!("another chat runtime owns this state: {error}"))
-        })?;
+        // `chat health` may hold a shared lock on the lease for an instant to learn whether a
+        // runner it cannot see holds it (#2338), so a contended lease is tried a few more times.
+        let mut attempts = 0;
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error)
+                    if attempts < RUNNER_LEASE_RETRIES
+                        && error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(RUNNER_LEASE_RETRY_DELAY);
+                }
+                Err(error) => {
+                    return Err(ChatRuntimeError::invalid(format!(
+                        "another chat runtime owns this state: {error}"
+                    )));
+                }
+            }
+        }
         Ok(RunnerLease { file: lock })
     }
 

@@ -3509,14 +3509,22 @@ last repoint: coord-old -> coordinator by ops-agent, 2026-10-28T19:02:11Z (17.4 
 
 The verdict is `OK`, `DEGRADED` or `DOWN`, followed by every problem found.
 It is `DOWN` when no `chat run` holds the state (its runner lock, as
-`/proc/locks` lists it), another bridge holds one of its channels, the event
+`/proc/locks` lists it; `/proc/locks` leaves out a lock whose holder is in a
+PID namespace the reader cannot see, as from a sandboxed shell with its own
+`/proc`, so when it lists no holder `chat health` also tries a shared lock on
+the lease without waiting and releases it at once, and a refused try reports
+the service as running with its process not visible), the request store is
+full and new messages are held (#2338), another bridge holds one of its channels, the event
 stream stopped on a gap or boundary mismatch, or the target agent is not
 registered, its pane is not alive, or Herdr detects no harness there. It is
 `DEGRADED` when the event stream has delivered nothing, not even a heartbeat,
 for `--stale-after` (default 5 minutes; the Slack provider sends a heartbeat
 every 30 seconds while idle), the subscription or send path is down, the owner
 loop is failing, requests are stalled untyped or have uncertain delivery, a
-reply was retried 20 or more times or will never be sent, a captured reply is
+reply was retried 20 or more times or will never be sent, the request store
+is 90% full, the owner rescan has been held back by the host listing budget
+for over 30 minutes without a pass that made a listing call (back-offs between
+passes that list are not one hold), a captured reply is
 still unsent after 10 minutes (one held back after a restart is reported as
 held instead), the reply breaker holds a thread back, a restart held replies
 back as stale, a repoint is not applied yet, the target's record names no native session and its
