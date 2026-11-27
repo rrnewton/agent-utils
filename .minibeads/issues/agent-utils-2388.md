@@ -10,7 +10,7 @@ labels:
 - cross
 - dagrun
 created_at: 2026-11-27T10:47:00-05:00
-updated_at: 2026-11-27T10:47:00-05:00
+updated_at: 2026-11-27T18:16:00-05:00
 ---
 
 # Description
@@ -106,3 +106,32 @@ Measure the seven cases in every full gate instead of relabelling the verdict.
 - Owner rule 346: every gating check passes on a hot host and none depends on wall-clock time.
 - Until this lands, the coordinator's standing waiver 1046 treats a gate row that is PARTIAL only for these seven skips as green for a held conditional landing. The waiver excludes changes to dagrun, cpuset-alloc or their cross harnesses.
 - Found by cl-shardcap from the gate ledger, the kept gate logs and `validation/cross.dag.yaml`, on 2026-11-27.
+
+## Landed; two criteria still owed
+
+Landed as 3372b6f6 on 2026-11-27. The landing replayed 668e988f, gated on 0d40c24f. This issue stays open until the two criteria under "Still owed" are shown.
+
+What the change does:
+
+- `cross/differential.py --only-kind delegated-live-scope` runs only the live-scope cases, for `--tool dagrun` or `--tool cpuset-alloc`.
+- The new node `cross.dagrun.live-scope` runs both tools outside the delegated validation cgroup, with the same labels as the two delegated nodes.
+- validate counts a `delegated-live-scope` skip as measured only when a passing live-scope record of the same tool, from the same run, lists that check as passed.
+
+Evidence per acceptance criterion, as of the landing:
+
+- **Gate result.** In full gate `1795799002114893727-6977b0d9` on 668e988f, `cross.dagrun.live-scope` passed: "cross[dagrun]: OK - 2 live-scope checks agree", "cross[cpuset-alloc]: OK - 5 live-scope checks agree".
+  - That gate was red on six steps this change cannot reach. All six were covered by passing reruns or step waivers (exclusive reruns `1795818247349059183-4dfc30a8` and `1795818236045163001-470a97e4`).
+  - So the `validate: OK` summary and the `pass` verdict are not yet shown. validate returns before its summary on a red DAG (#2407).
+  - The first all-green full gate on a tree with this change is the check. `test_validate_says_ok_when_the_live_scope_node_measured_every_delegated_skip` pins the outcome.
+- **Both directions.** `test_validate_counts_a_delegated_skip_as_measured_only_by_a_passing_live_record` covers merged against missing, skipped or failed live-scope records; the failing cases end PARTIAL and name the labels. `test_a_live_scope_run_inside_a_delegated_cgroup_still_skips_and_is_incomplete` covers the delegated nodes run alone.
+- **No host ledger writes.** `test_a_live_scope_cpuset_run_measures_exactly_the_five_live_cases` runs the cases with a sentinel host ledger. Every engine call, the holder included, used a scratch `DAGRUN_CORE_LEDGER`, and the sentinel is unchanged afterwards.
+- **No wall-clock hold.** The interop holder now keeps its core until its stdin closes, replacing `sleep 2`. `test_a_live_scope_interop_holder_that_never_reserves_is_reported_not_raced` checks that a holder which never reserves gets a named failure, not a race.
+  - 20 consecutive live runs of both tools all passed, but at load1 146-160. That is below the 237 that counts as a hot host, so the hot-host repetition is not yet shown.
+- **Path selection.** `test_the_live_scope_node_runs_both_tools_outside_the_delegated_cgroup` shows the node is selected with the two nodes it measures, and only with them. The graph contract treats it as their complement, not as a second copy.
+
+Still owed:
+
+- A full gate in which every step is green ends `validate: OK` with ledger verdict `pass`, and its journal shows the seven labels as checks that ran. The first all-green full gate on a tree containing 3372b6f6 is the check.
+- The interop live cases pass 20 times in a row at load1 of at least 237 throughout, with load1 recorded per run.
+
+Waiver 1046 (a gate PARTIAL only for these seven skips counts as green) was put to the liaison for retirement on the evidence above.
