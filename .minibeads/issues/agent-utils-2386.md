@@ -96,5 +96,5 @@ Design items 1 and 2 are fixed. They landed as c44bb561 (prompt) and 0da4e909 (m
 - The new persisted file and log lines were reported to the downstream team before the gate, with no objection.
 
 Not done here:
-- Design item 3, the diagnostics: an `assistant.message` event per assistant message and the thinking-only count in `chat sent`. It still needs its own design note, and moves to its own issue with its acceptance criterion.
+- Design item 3, the diagnostics: an `assistant.message` event per assistant message and the thinking-only count in `chat sent`. It moves to #2417, with its acceptance criterion.
 - Design item 4 is the consumer team's turnover.
