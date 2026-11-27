@@ -1,6 +1,6 @@
 ---
 title: 'systemd-run-expands-environment-in-args: pass --expand-environment=no wherever a launcher hands systemd-run text it did not write'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-sysdexpand
@@ -10,7 +10,8 @@ labels:
 - wrkslots
 - gate
 created_at: 2026-11-26T21:31:00+00:00
-updated_at: 2026-11-26T21:31:00+00:00
+updated_at: 2026-11-27T08:35:00+00:00
+closed_at: 2026-11-27T08:35:00+00:00
 ---
 
 # Description
@@ -92,3 +93,41 @@ paths, numbers and step names only); restore wake timers and services
 refresh checks are unaffected; herdr-run there runs with the direct
 broker. Remaining candidates are `cpuset-alloc run` and `wrkslots run`
 fallback uses whose command text held `${...}` or `$$`.
+
+## Resolution
+
+Fixed on main in four changes, each with its own gate:
+
+- 5eb2d864: `dagrun run`'s re-exec into its outer scope and
+  `cpuset-alloc run` (both editions) pass `--expand-environment=no`
+  through one small probe-and-cache helper per edition. Live probes:
+  a DAG step that prints an `--args` payload, and a `cpuset-alloc`
+  scope that echoes it, each byte-identical under a real
+  `systemd-run`.
+- d302cf63: `herdr-run` with `broker: systemd-run` (both editions)
+  doubles every `$` in the command and the Herdr binary path instead
+  of passing the flag. Service mode is expanded by the manager on
+  every systemd version, so doubling needs no probe, works where the
+  flag is unsupported, and leaves `$`-free argv unchanged. Live probe:
+  a broker call through a real transient service delivers the payload
+  byte-identical.
+- f35fe5f0: the `wrkslots run` scope fallback passes the flag; the
+  wrkslotsd plan mirror takes the same argv. Live probe through a real
+  scope.
+- 5888dba1 (with dfa74c15, the `reserve_cores` docstring example):
+  `gate.py` passes the flag to the contained gate command and the
+  `GATE_PREFLIGHT_COMMAND` shell text. Live probe: both reach their
+  commands byte-identical, plus a local end-to-end contained gate run.
+
+Every fixed site has an argv test for both probe answers (flag
+present when supported; absent, with one note, when refused), and
+the payload `A:${PROBE}`, `B:$$`, `C:${x%% *}`, `$PROBE`,
+`D:$PROBE` in its live test. `agentctl services refresh` is
+unchanged on purpose (a faithful replay of a unit's own ExecStart).
+
+Exposure: no gate row since the 262 upgrade carried a `$` in its
+contained command, and restore wake timers, services refresh checks
+and the direct herdr-run broker were never exposed. Past
+`cpuset-alloc run` or `wrkslots run` fallback uses with `${...}` or
+`$$` in their command text cannot be ruled out from the available
+logs.
