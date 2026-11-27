@@ -95,6 +95,10 @@ test("#1859: an idle confirmation is marked to wait, action words are not", () =
   assert.equal(el("status-line").attrs["data-idle"], "", "the reading notice was not marked to wait");
   notices.setStatus("Reading with the device voice.");
   assert.equal(el("status-line").attrs["data-idle"], "", "the device-voice notice was not marked to wait");
+  // `#2350`: Back's return says so to a screen reader alone.
+  notices.setStatus("Back where you were.");
+  assert.equal(el("status-line").attrs["data-idle"], "", "Back's return was floated over the row it returned to");
+  assert.equal(el("status").textContent, "Back where you were.", "Back's return was not announced");
   notices.dismissStatus();
   assert.equal(el("status-line").attrs["data-idle"], undefined, "a taken-away line kept the idle mark");
 });

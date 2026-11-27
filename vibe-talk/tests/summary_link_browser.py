@@ -656,6 +656,25 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
     # on the first frame drawn with the place put back, and on every frame
     # after it through the landing's re-assert window. Frames, not time:
     # the wait is for that many frames to be drawn, however slowly.
+    # `#2350 vibe-talk-back-toast-covers-returned-row`: what the status line is the moment Back
+    # says its return, recorded by an observer as the words land (no clock): an idle word,
+    # announced (the polite live region holds it, not hidden from the tree) and drawn nowhere,
+    # so no toast stands over the row it returned to.
+    page.evaluate("""() => {
+      window.__backSaid = null;
+      const said = document.getElementById('status');
+      const line = document.getElementById('status-line');
+      const look = () => {
+        if (window.__backSaid !== null || said.textContent !== 'Back where you were.' || line.hidden) return;
+        const style = getComputedStyle(line);
+        const box = line.getBoundingClientRect();
+        window.__backSaid = {idle: line.hasAttribute('data-idle'), visibility: style.visibility,
+          saidVisibility: getComputedStyle(said).visibility, clip: style.clipPath,
+          width: box.width, height: box.height, live: said.getAttribute('aria-live')};
+      };
+      window.__backSaidWatch = new MutationObserver(look);
+      window.__backSaidWatch.observe(line, {subtree: true, childList: true, characterData: true, attributes: true});
+    }""")
     page.evaluate("() => { const t = window.__backTrace; t.mark('go_back'); t.backAt = t.frames.length; }")
     page.go_back()
     expected = float(anchor_top)
@@ -683,6 +702,13 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
                            f"put back at frame {settled['first']}, then moved: {settled['moved']}")
     page.evaluate("() => window.__backTrace.mark('back settled')")
     trace = back_trace_stop()
+    back_said: object = page.evaluate("() => { window.__backSaidWatch.disconnect(); return window.__backSaid; }")
+    check(isinstance(back_said, dict) and back_said["idle"] and back_said["live"] == "polite"
+          and back_said["visibility"] != "hidden" and back_said["saidVisibility"] != "hidden",
+          f"{label}: Back's return was not said as an idle word in the polite live region: {back_said}")
+    assert isinstance(back_said, dict)
+    check(back_said["clip"] == "inset(50%)" and back_said["width"] <= 1 and back_said["height"] <= 1,
+          f"{label}: Back's return is drawn as a toast over the row it returned to: {back_said}")
     # `#2270`: the bubble came back with the view: on the row returned to, off the reply.
     after_linked: object = page.evaluate(linked_probe)
     check(isinstance(after_linked, list) and ids["main_msg"] in after_linked and ids["reply_msg"] not in after_linked,
