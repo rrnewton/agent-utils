@@ -10,7 +10,7 @@ labels:
 - slack
 - bridge
 created_at: 2026-11-27T05:31:21-05:00
-updated_at: 2026-11-27T05:39:34-05:00
+updated_at: 2026-11-27T05:57:09-05:00
 ---
 
 # Description
@@ -31,26 +31,34 @@ Found while investigating #2366 on a consumer team's partner-channel bridge, fro
 
 # Design
 
-The failing client exits about 20 ms after it resolves the user, before it prints a port, so it fails at the bind of the address it reports with "Using port". The same failure repeats for 24 minutes while the reopen that worked printed its port 1 ms after "Resolved user". So each failing attempt tried an address that something still held. Hypotheses, in order:
+The failing client exits about 20 ms after it resolves the user, before it prints a port. So it fails at the bind of the port it would report with "Using port". That port is sticky, not random: the three clients that started in the window printed 45591 (05:35:57Z), 45591 again (07:41:08Z) and 48731 (10:10:29Z).
 
-1. The client closed at the refresh outlived its close. The plugin stops a stream client by sending SIGTERM to its direct child, then SIGKILL after 3 s (`TAIL_STOP_GRACE`, `stop_child` in `rs/chat-subscription-slack/src/cli.rs`). The child is not started in its own process group, and the group is never signalled. If the client runs its listener in a helper process, that helper keeps the port after the close. A new client that reuses a saved or derived port then fails to bind until the helper exits.
-   - Discriminator: the port the 07:41:03Z client printed. If it was 48731, the old client's listener held the port from 09:46Z to about 10:10Z.
-2. Another process on the host, for example a second tail for the same identity, held the same address for those minutes.
-3. The client picked its port from a small range or from saved state, and repeatedly picked one in use.
+So every client started from 09:46Z on most likely tried 45591 while the 07:41 client, or a helper process of it, still held that port after the 09:46:14Z refresh closed it, until about 10:09Z. The 10:10:29Z client got another port, 48731: either the holder had exited by then, or the tool fell back to a fresh port.
 
-Fix plan, once the cause is named:
+Leading cause, consistent with every line: the client closed at the refresh outlived its close.
 
-- Start the stream client as the leader of its own process group. On close, send SIGTERM to the group, SIGKILL it after the grace period, and reap the child. Then no helper outlives a refresh or a dropped subscription.
+- The plugin stops a stream client by sending SIGTERM to its direct child, then SIGKILL after 3 s (`TAIL_STOP_GRACE`, `stop_child` in `rs/chat-subscription-slack/src/cli.rs`).
+- The child is not started in its own process group, and the group is never signalled.
+- The plugin opens the new client without waiting for the old one's port to be free.
+- A listener in a helper process of the client therefore keeps the port, and each new client that reuses the sticky port fails to bind until the helper exits (here about 23 min).
+
+Ruled out: a random port collision, since two clients in a row printed the same port. Less likely but not excluded: another process on the host, for example a second tail for the same identity, held 45591 for those minutes.
+
+Fix plan (a separate lane task; not started):
+
+- Start the stream client as the leader of its own process group. On close, send SIGTERM to the group, SIGKILL it after the grace period, and wait until the whole group has exited before the new client starts. Then no helper outlives a refresh or a dropped subscription.
+- If the stream tool can be told to pick a free port at each start, use that too, so that no leftover holder can block a reopen.
 - Classify an Errno 98 exit as its own failure code (`stream_address_in_use`) and log it in the bridge log, not only the plugin log.
 - Let `chat health` report the stream as DEGRADED after 5 consecutive failed reconnects, and DOWN after 15 minutes with no working stream.
 
 # Acceptance Criteria
 
-- The cause is named from the raw plugin log lines (identifiers only), including the port of the client the 09:46Z refresh closed, and from the process tree at a refresh.
+- The cause is confirmed from the process tree at a refresh: whether the closed client, or a helper of it, still holds its port after the close.
 - A deterministic test with a fake stream client that starts a child holding a local port: after the plugin closes the stream, the child is gone and a new client can bind the port at once. The test fails on the current code.
 - A reconnect loop that fails on Errno 98 is logged in the bridge log with its cause, and shown by `chat health` per the thresholds above, with a test.
 
 # Notes
 
 - Sibling of #2366. Same window, separate cause and fix.
+- Ports from the raw plugin log windows, supplied by the consumer team: 05:35:57Z 45591, 07:41:08Z 45591, 10:10:29Z 48731; no other "Using port" line in 04:30Z to 10:20Z.
 - The bridge's state and logs were read-only for agent-utils lanes. The consumer team extracted them, redacted.
