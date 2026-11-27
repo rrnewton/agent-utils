@@ -10,7 +10,7 @@ labels:
 - slack
 - bridge
 created_at: 2026-11-27T05:20:51-05:00
-updated_at: 2026-11-27T05:31:21-05:00
+updated_at: 2026-11-27T05:38:55-05:00
 ---
 
 # Description
@@ -21,16 +21,19 @@ On 2026-11-27 a partner member's question (bridge message 1528) was posted at 04
 
 Evidence comes from the bridge's `bridge.log`, `plugin.log` (a pattern summary plus every rescan pass that made a thread listing) and `slack-rescan-ledger.json` for 04:30Z to 10:20Z, extracted read-only by the consumer team. Identifiers only, no message text.
 
-(a) The live stream never delivered 1528. This part is PARTIAL: where the message was lost is known, why is not yet.
+(a) The live stream never delivered 1528. The event service never published it to the owner's event topic; the plugin received nothing to drop. This part is PARTIAL: where the message was lost is known, why is not, and the cause is outside agent-utils.
 
-- The owner's event topic carried nothing for the channel from 04:30Z to 10:10Z.
-- The two cursor refreshes in the window (05:35:53Z and 07:41:03Z) each caught up from a sequence before 1528 and fetched 0 events. So the event service never published 1528 to the topic; the plugin did not drop it.
-- Earlier and later replies in the same thread from the same sender were published: 1526 at 01:30:37Z, and 1527 at 10:02:22Z.
-- Why 1528 was not published is still open. Leading guess: it carried a file, the class of message the stream never publishes (#415). The rescue line's file count settles it.
+- The plugin logged no event at all for 1528: no request, no checkpoint and no rejection line. The only stream event for the channel from 04:30Z to 10:20Z was 1527.
+- Two cursor refreshes caught up over the time 1528 was posted, and each fetched 0 events: 05:35:53Z (from sequence 314936) and 07:41:03Z (from 315008). Position proofs then moved the cursor to 317669 with nothing for the channel.
+- The catch-up at 10:10:29Z, from 317669, fetched exactly one event: 317752, which is 1527.
+- Other replies in the same thread were published: 1526 (01:30:37Z), and 1527 (10:02:22Z, from the same partner member as 1528).
+- It is not the file-message class (#415): the rescue line reads "(0 files)".
+- It was not a reply also sent to the channel. Such a reply is a history row, and the first pass after 04:50:39Z would have rescued it.
+- So this is a publish gap for one plain thread reply in the event topic. The bridge can only bound the delay through the rescan, which is the fix below.
 
 (b) The rescan did not find 1528 for 5 h 20 min. 192 of the window's 198 passes made 1 history listing and 0 thread listings. A pass lists a thread only when either:
 
-- the history listing (top-level messages of the last `rescan_window_seconds`, 24 h by default, newest 5 pages) shows its root with a reply newer than its last listing, not all of them carried by the stream; or
+- the history listing (top-level messages of the last `rescan_window_seconds`, 24 h by default and on this bridge, newest 5 pages) shows its root with a reply newer than its last listing, not all of them carried by the stream; or
 - the stream carried a reply in the thread in the last 30 min (`active_threads`, `ACTIVE_THREAD_MILLIS`).
 
 The thread's root (38.3 h old) was past the window, so no history row showed it. The stream's last reply in it before 1528 was 1526, 200 min earlier, so the thread was no longer active. The bridge's own 04:49:05Z post never counts: the stream never carries bot posts. So nothing made the thread due.
@@ -44,15 +47,20 @@ Two separate faults in the same window, not causes of the 5 h:
 
 # Design
 
-Watched threads, durable, within the host listing budget:
+Watched threads, durable, within the host listing budget (the Slack plugin alone; no other component writes the file):
 
-1. The outbound helper records each thread the bridge posts or replies in (channel, root, time of its last post there) in a small durable file beside the rescan ledger. For a top-level post, the root is the post itself.
-2. A rescan pass lists each watched thread from its listed-through point while the watch lasts: 48 h after the bridge's last post in it, configurable.
+1. Each thread in which an allowed sender's message reached the bridge, by the stream or by the rescan, is watched. For a top-level message, the root is the message itself. The plugin keeps the watch in `slack-watched-threads.json` beside its diagnostics log, next to the rescan ledger.
+   - Each watched thread holds the timestamp of its newest known message, its listed-through point and when it was last listed.
+   - A listing raises the newest known message to the newest message the listing returned, whoever posted it, so the bridge's own reply in a thread counts as activity once a listing has seen it.
+   - In the observed case the stream carried 1526 at 01:30Z, so the thread would have been watched and 1528 listed within 10 min of its grace period.
+2. A rescan pass lists each watched thread from its listed-through point while the watch lasts: `rescan_watch_seconds` after its newest known message, 48 h by default, 0 to turn it off.
    - A thread whose root the history listing shows is still decided by that row, as today. So the extra cost applies only to watched threads with an older root.
-   - Quiet watched threads back off: every pass for the first hour after the bridge's post, then at most every 10 min.
-   - Watched-thread listings spend the host-wide listing budget like every other listing, after the owner channel's history, and each pass logs how many it made. If a hold or the per-minute budget stops a pass, the remaining watched threads stay due for the next pass.
-   - Bound: at most 8 watched-thread listings per pass (the existing `MAX_THREADS_PER_PASS`), newest bridge post first.
-3. The listed-through point of each watched thread is stored in the same durable file, not per subscription.
+   - Back-off: every pass while the thread's newest known message is under an hour old, then at most every 10 min.
+   - Watched-thread listings spend the host-wide listing budget like every other listing, after the channel's history, and each pass logs how many it made. If a hold or the per-minute budget stops a pass, the remaining watched threads stay due for the next pass.
+   - Bound: they share the existing per-pass cap of 8 thread listings (`MAX_THREADS_PER_PASS`), newest activity first. At most 1,024 threads are watched; past that, the oldest is forgotten.
+   - Steady cost: one listing per quiet watched thread per 10 min, about 6 calls an hour per thread, against a host budget of 20 calls a minute.
+3. The listed-through point and the time of the last listing are kept in the same durable file, not per subscription.
+4. A rescue found by a watched-thread listing is logged with its delay ("rescued N min after it was posted").
 
 Interaction with the request-population refusal window (2048 cap, #2338):
 
@@ -69,14 +77,15 @@ Also:
 
 # Acceptance Criteria
 
-- A deterministic plugin test (fake transport, injected clock): a partner member's reply in a thread whose root is older than the rescan window, where only the bridge's app has posted recently, is rescued by the first pass after its grace period, with no stream activity in the thread. The test fails on the current code.
+- A deterministic plugin test (fake transport, injected clock) reproduces the observed case. The stream carried a person's reply in a thread whose root is older than the rescan window. Hours later another reply, which the stream never carries, is rescued within 10 min of its grace period, with no stream activity in the thread in between. The test fails on the current code.
 - A second test: the same reply arrives while the store is full (a refusal and resubscribe every minute). It is listed once, held as the pending rescue across the resubscribes, and admitted exactly once when capacity frees. Watched threads are not re-listed from the window floor at each resubscribe.
 - Watched-thread listings stay within the host listing budget, are capped per pass, and are counted in each pass's log line.
-- A watch ends 48 h (configurable) after the bridge's last post in the thread.
+- A watch ends 48 h (configurable) after the thread's newest known message.
 - The rule and its setting are documented in the chat user guide.
 
 # Notes
 
 - Reported on 2026-11-27 by the consumer team's lead through coordb; investigation lane cl-bridgeretire. The bridge's state and logs were read-only for agent-utils lanes, and the consumer team extracted them, redacted.
-- Open for (a): the raw rescue line with its file count, and the plugin's configured rescan window line.
+- (a) is open upstream: why the event topic did not publish one plain thread reply. The bridge-side fix bounds the delay either way.
+- The plugin's configured rescan window was the default, 86400 s (its subscription log line).
 - Related: #2369 (the Errno 98 reconnect loop in the same window), #415 (file messages never reach the stream), #615 (stream activity pulls the next pass forward), #690 (rescan intake and the shared host budget), #769 and #1892 (relay poll), #2338 (request population cap).
