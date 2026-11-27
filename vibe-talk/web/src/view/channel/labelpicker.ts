@@ -207,8 +207,9 @@ export function createLabelPicker(deps: LabelPickerDependencies): LabelPicker {
       if (row.count !== undefined) {
         const count = document.createElement("span");
         count.className = "label-picker-count";
-        count.textContent = String(row.count);
-        count.title = `${row.count} in loaded history`;
+        // `#2301 vibe-talk-ui-review-findings-11-26` (R5): the count says what it counts, in the
+        // words the Labels filter and Settings already use for the same number.
+        count.textContent = `${row.count} in loaded history`;
         item.append(count);
       }
       item.setAttribute("aria-label", row.kind === "new" ? `Add new label ${row.name}` :

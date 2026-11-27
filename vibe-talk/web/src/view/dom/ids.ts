@@ -410,6 +410,7 @@ export interface ElementById {
   "label-picker-close": HTMLButtonElement;
   "label-picker-current": HTMLDivElement;
   "label-picker-error": HTMLParagraphElement;
+  "label-picker-hint": HTMLParagraphElement;
   "label-picker-input": HTMLInputElement;
   "label-picker-list": HTMLUListElement;
   "label-picker-note": HTMLParagraphElement;

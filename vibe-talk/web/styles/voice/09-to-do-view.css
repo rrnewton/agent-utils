@@ -1167,6 +1167,9 @@ li[data-labels-below] > .meta > .label-chips {
   background: transparent;
   color: var(--muted);
   font-size: 1.05rem;
+  /* `#2301 vibe-talk-ui-review-findings-11-26` (R8): one dismiss glyph drawn one way. The chip's
+     600 made its × a heavy cross beside the sheet's plain one, reading as a second glyph. */
+  font-weight: 400;
   cursor: pointer;
 }
 
@@ -1176,7 +1179,8 @@ li[data-labels-below] > .meta > .label-chips {
 }
 
 .label-picker-note,
-.label-picker-error {
+.label-picker-error,
+.label-picker-hint {
   margin: 0;
   font-size: 0.85rem;
 }
@@ -1234,10 +1238,9 @@ li[data-labels-below] > .meta > .label-chips {
   font-weight: 700;
 }
 
-.label-picker-pinned .label-picker-name {
-  color: var(--pin-ink);
-  font-weight: 700;
-}
+/* `#2301 vibe-talk-ui-review-findings-11-26` (R5): Pinned is a row like the labels under it, in
+   the same ink, and bold only when it is on, as they are; a gold, always-bold Pinned said nothing
+   the ✓ does not. */
 
 .label-picker-new .label-picker-name {
   color: var(--accent);

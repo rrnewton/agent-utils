@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 
-import { backlog, channelReads, channelRow, hold, message, newPage, reReadChannel, rowMoreButton, showDiscord, signIn, test, unfiltered } from "./fixture.mjs";
+import { CSS_CODE, HTML_CODE, backlog, channelReads, channelRow, hold, message, newPage, reReadChannel, rowMoreButton, showDiscord, signIn, test, unfiltered } from "./fixture.mjs";
 
 const labelItem = (li) => li.descendants().find((node) => node.className === "row-label-button");
 const chipTexts = (li) => li.descendants().filter((node) => node.hasClass && node.hasClass("label-chip")).map((node) => node.textContent);
@@ -106,6 +106,34 @@ test("`#2279`: a label the message text carries has no × and the picker says wh
   await page.settle();
   assert.equal(page.labelCalls.filter((call) => call.method !== "GET").length, 0, "a text label was written");
   assert.match(page.el("label-picker-note").textContent, /stays while the text has it/);
+});
+
+test("`#2301 vibe-talk-ui-review-findings-11-26`: the picker's field says Find or add, the # syntax is its own hint, and each count says what it counts", async () => {
+  const messages = backlog(3);
+  messages[0].labels = ["kvm"];
+  messages[2].labels = ["kvm"];
+  const { page } = await labelledPage({ messages });
+  await openPicker(page, channelRow(page, String(messages[1].id)));
+  // The markup's half (this fixture builds no attributes from it): the field and its hint.
+  const field = /<input id="label-picker-input"([^>]*)>/.exec(HTML_CODE);
+  assert.ok(field, "the picker's field is gone from web/voice.html");
+  assert.match(field[1], /\splaceholder="Find or add"/, "the placeholder still carries prose");
+  assert.match(field[1], /\saria-describedby="label-picker-hint"/, "the field is not described by its hint");
+  const hint = /<p id="label-picker-hint"([^>]*)>([^<]*)<\/p>/.exec(HTML_CODE);
+  assert.ok(hint, "the # hint is not in the picker's markup");
+  assert.doesNotMatch(hint[1], /\shidden\b/, "the # hint is hidden until typing");
+  assert.match(hint[2], /#.*hashtag label/, "the hint does not say what # does");
+  assert.equal(page.el("label-picker-hint").hidden, false, "the # hint is not up without typing");
+  // `R5`/`R8`: Pinned in the rows' own ink, and the chip's × at the sheet's weight.
+  assert.doesNotMatch(CSS_CODE, /\.label-picker-pinned \.label-picker-name\s*\{[^}]*--pin-ink/, "Pinned is still gold");
+  assert.match(CSS_CODE, /\.label-picker-remove\s*\{[^}]*font-weight:\s*400/, "the chip's × is not drawn at the plain weight");
+  const kvm = pickerRowNamed(page, "#kvm");
+  assert.ok(kvm, "the loaded history's #kvm is not offered");
+  const count = kvm.children.find((node) => node.className === "label-picker-count");
+  assert.equal(count.textContent, "2 in loaded history", "the row's count is bare");
+  assert.equal(pickerRows(page)[0].getAttribute("data-value"), "pinned", "Pinned is still the first row");
+  assert.equal(pickerRows(page)[0].children.find((node) => node.className === "label-picker-count"), undefined,
+    "Pinned grew a count");
 });
 
 test("`#2279`: the picker's Pinned row toggles the message's pin, pin and labels in one place", async () => {

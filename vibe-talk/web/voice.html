@@ -4584,7 +4584,10 @@ writable = true</pre>
       <div id="label-picker-current" class="label-picker-current" aria-label="Labels on this message" hidden></div>
       <p id="label-picker-note" class="hint label-picker-note" role="status"></p>
       <label class="labels-panel-filter-label" for="label-picker-input">Find or add a label</label>
-      <input id="label-picker-input" class="label-picker-input" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="done" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="Find or add · # for a hashtag label" />
+      <input id="label-picker-input" class="label-picker-input" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="done" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="Find or add" aria-describedby="label-picker-hint" />
+      <!-- `#2301 vibe-talk-ui-review-findings-11-26` (R4): the # syntax as its own hint, visible
+           without typing, out of the field's placeholder. -->
+      <p id="label-picker-hint" class="hint label-picker-hint">Start with # for a hashtag label</p>
       <p id="label-picker-error" class="hint label-picker-error" role="status"></p>
       <ul id="label-picker-list" class="label-picker-list" role="listbox" aria-label="Labels for this message"></ul>
     </div>
