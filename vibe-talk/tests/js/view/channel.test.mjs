@@ -4926,3 +4926,58 @@ test("`#2276` channel rows: with the debug hooks the dress loop is one span, its
     "close tally label-measure", "note rows 4", "close rows-dress",
   ]);
 });
+
+test("`#2259` thread-view parking, forced order: an answer that leaves the first result wholly above the screen parks nothing; a covered one is parked once per search and row", () => {
+  // The state the server's answer leaves (`#2259 vibe-talk-thread-search-older-hit-above-reader`), set
+  // up directly instead of waited for: a thread's own view under a standing search, the chip panel up,
+  // and the answer's older hit placed as the first result ABOVE the screen, the reader's row below it.
+  // The count redraw that follows the answer then runs. Before `#2258` it parked that hit through the
+  // scroll owner, taking the reader's row down by the hit's height; the parking is for a result the
+  // panel covers in part, and nothing else.
+  const { createSearchRows } = CHANNEL_VIEW;
+  const box = (top, bottom) => ({ top, bottom, left: 0, right: 400, width: 400, height: bottom - top });
+  const row = (id, top, bottom) => ({
+    id, top, bottom, hidden: false, className: "",
+    getAttribute: (name) => (name === "data-search" ? "" : name === "data-id" ? id : null),
+    getBoundingClientRect() { return box(this.top, this.bottom); },
+  });
+  const panel = { hidden: false, bottom: 327, getBoundingClientRect() { return box(240, this.bottom); } };
+  const log = { children: [] };
+  const nodes = { "search-bucket-row": panel, "discord-log": log };
+  const parked = [];
+  let open = true;
+  let key = "lantern";
+  const nothing = () => {};
+  const given = {
+    byId: (id) => nodes[id], leftById: (id) => nodes[id],
+    searchField: { open: () => open, markSoon: nothing, markNow: nothing, query: () => key, links: () => false },
+    language: { parsedQueries: new Map(), searchQueryTree: () => null, searchFold: (text) => text },
+    threadListOnScreen: () => false, selectionView: () => "thread", searchKey: () => key,
+    intoView: (element, block) => parked.push(`${element.id} ${block}`),
+    mainColumnRecord: () => ({ searched: null }),
+  };
+  const deps = new Proxy(given, { get: (target, name) => (name in target ? target[name] : nothing) });
+  const rows = createSearchRows(deps);
+
+  // The answer's older hit wholly above the screen (the panel's bottom at 327), the reader's row below it.
+  log.children = [row("151", -180, -84), row("201", 323, 403)];
+  rows.renderSearchCount(true, false);
+  rows.renderSearchCount(true, false);
+  assert.deepStrictEqual(parked, [], "a first result wholly above the screen was parked, moving the row being read");
+
+  // A first result the panel covers in part is parked below it, once per search and row: a later pass
+  // (the server ask, the answer) after a redraw's restore never parks it again.
+  log.children = [row("201", 300, 380), row("204", 388, 468)];
+  rows.renderSearchCount(true, false);
+  rows.renderSearchCount(true, false);
+  assert.deepStrictEqual(parked, ["201 start"], "a covered first result was not parked exactly once");
+  // A new search parks its own first result again; a closed search forgets what it parked.
+  key = "lantern battery";
+  rows.renderSearchCount(true, false);
+  assert.deepStrictEqual(parked, ["201 start", "201 start"], "a new search did not park its covered first result");
+  open = false;
+  rows.renderSearchCount(false, false);
+  open = true;
+  rows.renderSearchCount(true, false);
+  assert.deepStrictEqual(parked, ["201 start", "201 start", "201 start"], "a reopened search did not park its covered first result");
+});
