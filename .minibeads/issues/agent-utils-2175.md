@@ -7,7 +7,7 @@ labels:
 - vibe-talk
 - flaky-test
 created_at: 2026-11-24T06:00:00-05:00
-updated_at: 2026-11-26T19:30:00-05:00
+updated_at: 2026-11-26T19:56:00-05:00
 ---
 
 # Description
@@ -35,3 +35,10 @@ Runs on main (tree = main ecbdb8f1 plus test-only DAG files, the same page and h
 - The early `TargetClosedError ... Future exception` lines appear in passing desk walks too; the failure signature is the `state ... was NOT reached ... (TimeoutError)` line.
 - discuss-browser: 5 of 5 runs under the bar passed (load1 178-193, about 22 s each). Its learned-cap OOM NO_RESULTs (18 in lane gate output) are `#2319`. Its other failures in lane gate output: 4 `wait_for_function` timeouts on heads that do not touch the Discuss page (load) and 2 `close/reopen prepared a different key` assertions, not reproduced on main.
 - Over the 7 days to 2026-11-26 the screenshots-desks reds fall on 62 heads that change page code (vibe-talk/web, src or the harness) against 34 that do not, and most of those 34 are wholesale browser deaths (9 or more steps red in one gate).
+
+## Scene 82 rate on the #2258 head, 2026-11-26 (cl-signpost3)
+
+Desk screenshot walk on #2258's head (tip) against unmodified main, alternating, a run counted only when load1 stayed under 237 for the whole run (sampled every 5 s):
+- Scene 82-agent-replies-jump alone (`run.sh --screenshots --only 82-agent-replies-jump`, desk profiles): tip 5/5, main 5/5 (load1 194-228).
+- Full desk walk (the step's own arguments): tip 5/5, main 5/5 (load1 134-214), scene 82 ok in all 10.
+- Tip total under the bar: scene 82 passed 13 of 14 walks; the one red (load1 193-233) was the walk's `state '82-agent-replies-jump' was NOT reached ... (TimeoutError)` (a 45 s wait). Main: 10 of 10 here plus cl-flaketriage's 6 of 6 above. The tip's only page change is inside the search's thread-view parking, which scene 82 never reaches (it never opens the search), so this reads as a low-rate scene-82 timeout (about 1 in 14 walks, plus one owner-gate red on the same head), not a regression; which of scene 82's waits expires is not yet known.

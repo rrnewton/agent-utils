@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-thread-search-park-first-pass: a thread search parks its first result below the chip panel on the first settled pass'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-25T15:45:00-05:00
-updated_at: 2026-11-25T15:45:00-05:00
+updated_at: 2026-11-26T19:56:00-05:00
+closed_at: 2026-11-26T19:56:00-05:00
 ---
 
 # Description
@@ -36,3 +37,11 @@ Stack notes (from #2262 (b) tracing, 2026-11-25, tip page build ec27ce01; scroll
 - desk 1280x800, lantern thread view, reader at scrollTop 0, key 'lantern': at the key, placeFilterAnchor nudge 0 -> 59 (head row kept, 0.2 px); at the answer, renderServerSearch preservingScroll writeHold 59 -> 125 (server hit row 151 inserted above the head row; row held), then renderSearchCount (refreshSearchCount <- renderServerSearch) intoView of the current hit (row 151) -> 49: head row +75.9 px.
 - phone 412x915 (1 in ~3 runs): applySearch -> renderSearchCount intoView 106 -> 96, markSearchNow redraw preservingScroll restores 96 -> 106 (same task); at the server ask, refreshSearchCount <- renderServerSearch intoView -> 96, scroll event painted at 96 (one frame, +9.6 px) before the answer's hold 96 -> 162 and intoView -> 68.
 - Fix landed here: park only when the first result's rect straddles the panel's bottom, and only once per search and row (parkedFor keyed by search key + row id, cleared when the search closes).
+
+## Resolution
+
+[opus 5.5] Landed in b41730eb (2026-11-26 7:54 PM ET), the liaison's LAND NOW. renderSearchCount's thread-view parking now acts only when the first shown result straddles the chip panel's bottom, and only once per search and row (parkedFor keyed by search key + row id, cleared when the search closes), so a server hit inserted above the reader no longer moves the row being read at the answer, and the one-frame re-park at the server ask is gone.
+
+Evidence (liaison-approved on the first head, re-checked on the landed tree): per-frame rAF trace of the head reader through 30 frames past the answer, lantern thread view, phone 412x915 and desktop 1280x800, light and dark: worst move 0.5 px phone / 0.2 px desktop (whole-pixel placement, threshold 1.0 px), first result never left under the panel (straddle 0); main moved the same row 103.5 px phone / 76.1 px desktop (negative control). The rebased tree's trace and shots matched the approved ones (phone shots pixel-identical, desktop differing only in anti-aliasing). Page test: park_walk in search_typing_fast_browser.py (fails on main's searchrows.ts with "head row moved 103.5 px").
+
+Gate history: the first head's owner gate went red on search-typing-fast-browser because the new walk's probe was named PARK_JS and shadowed the head-room walk's placement probe; renamed THREAD_PARK_JS, and the head-room walk now refuses a non-string row id (the suite then passed 5/5 alone on the tip and on main). The landed head's owner gate was red only on vibe-talk.shots.screenshots-desks (scene 82-agent-replies-jump timing out, #2175); its exclusive rerun passed. Under the liaison's screenshot flake rule: at load1 under 237 throughout, scene 82 passed 13 of 14 walks on the tip (alone 5/5, full desk walk 5/5, plus the rerun and two step runs) and 10 of 10 on unmodified main in the same alternating runs; scene 82 never opens the search, so it cannot reach the changed branch. Scene-82 rate recorded on #2175.
