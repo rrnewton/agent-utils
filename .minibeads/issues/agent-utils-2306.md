@@ -1,14 +1,14 @@
 ---
 title: 'agentctl-python-shards-learned-cap-oom: python.agentctl.shard-0/1 are OOM-killed at their ~2.5 GiB learned memory cap and go unmeasured in full gates'
-status: open
+status: closed
 priority: 1
 issue_type: bug
-assignee: mu-statesync
+assignee: cl-shardcap
 labels:
 - agentctl
 - python
 created_at: 2026-11-26T12:58:00-05:00
-updated_at: 2026-11-26T12:58:00-05:00
+updated_at: 2026-11-26T20:29:00-05:00
 ---
 
 # Description
@@ -36,3 +36,25 @@ Option 1 (with the new cap and its headroom recorded here) is the minimum to res
 # Notes
 
 Filed from the #2280 S3 condition-(b) full gate on `6a13675b` (ticket `1795711962290625226`, PARTIAL solely because of these two NO_RESULT steps; every selected node passed, and the exclusive rerun `1795715632490275083` reproduced the NO_RESULT on both shards). The pre-existing proof is gate `1795615981535044475` on `1e7b149d`, which shows the identical NO_RESULT. S3 itself touches no Python or agentctl code. Related: `#1763` (learned-cap NO_RESULT semantics), `#2280 vibe-talk-state-sync-audit` (the gate that surfaced this).
+
+## Resolution
+
+Option 3: the growth was found, and it was a compile, not a leak. `py/tests/rust_binary.py` release-builds agentctl (and the fake chat plugin) for the shards' Rust differential cases, and it ran that Cargo build inside the shard's own pytest process. On a cold adapter target, that one rustc for the agentctl crate peaked at 2.45 GiB RSS at ab669389, 2.47 GiB at 68a3e938 and 2.69 GiB at abd810bd (with `CARGO_BUILD_JOBS=2`). The shard's cgroup peaked at 2.97 to 3.02 GiB uncapped, so the shard was killed at its 2.5 GiB cap at its first Rust case. Shards that completed before 2026-11-20 had found a warm adapter target and never compiled. From then on they compiled in every gate. The Python tests alone peak at 0.67 to 0.78 GiB, so the description's reading (cumulative growth across hundreds of tests) was wrong.
+
+Landed as 45a8a48c (land-main replayed the gated f775efd9 from base d8cd2667). A new DAG step, `python.agentctl.build-rust`, runs `python3 py/tests/rust_binary.py` before either shard starts. It builds the same target with the same command, and both shards depend on it, so each shard's own Cargo call only checks freshness. The step's hint is a 4 GiB baseline, so its cap is 5 GiB: the 3.02 GiB peak plus max(25%, 512 MiB) (#818's rule) is 3.78 GiB, which leaves room for the crate's growth. The shards' hints are unchanged (2 GiB baseline, 2.5 GiB cap). No cap was raised and no shard was split. No wall-clock budget was added.
+
+Evidence:
+- Before, on abd810bd: both shards were OOM-killed at the 2.5 GiB cap. Uncapped, a shard peaked at 2.97 to 3.02 GiB, and an uncapped shard-1 passed all 1457 of its tests.
+- Local dagrun run of the same patch, load1 159 to 176:
+
+  | Step | Result | Time | Peak / cap | CPU |
+  |---|---|---|---|---|
+  | build-rust | PASS (cold) | 299 s | 2.76 / 5 GiB | 528 CPU-s |
+  | shard-0 | PASS, 1458 passed | 626 s | 0.78 / 2.5 GiB | |
+  | shard-1 | PASS, 1458 passed | 498 s | 0.67 / 2.5 GiB | |
+
+  No rustc ran in either shard's cgroup.
+- Owner-tier gate 1795735968490717874-2a1df79c on f775efd9 (full selection, 335 steps, on a busy host): build-rust passed in 0.6 s on a warm target. Shard-0 passed, 1458 passed in 899 s at a 640 MiB peak; shard-1 passed, 1458 passed in 1289 s at a 611 MiB peak. Both ran under the 2.5 GiB cap with no NO_RESULT. Eighteen steps outside the change went red under host load (wrkslots shards, three CPU-timeouts, vibe-talk browser checks). All eighteen passed on the exclusive owner-tier rerun 1795739990495742438-0ae8e637 on the same head.
+- The whole agentctl Python suite on main's agentctl code: 2916 passed, 0 failed.
+
+Follow-ups: #2317 makes repeated NO_RESULT runs and incomplete suites visible in the ledger and at landing. #2318 applies the same shape to the wrkslots and wrkviz shards, which build Rust inside their steps too. #2253 is closed as a duplicate of this issue.

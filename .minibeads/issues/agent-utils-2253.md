@@ -1,6 +1,6 @@
 ---
 title: 'gate-agentctl-shard0-oom-hides-failures: python.agentctl.shard-0 is often OOM-killed, so the gate reads partial and real failures go unseen'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -9,7 +9,7 @@ labels:
 - agentctl
 - validation
 created_at: 2026-11-25T14:40:00-05:00
-updated_at: 2026-11-25T14:40:00-05:00
+updated_at: 2026-11-26T20:29:00-05:00
 ---
 
 # Description
@@ -42,3 +42,7 @@ These failures were latent on main for four days because the shard almost never 
 # Notes
 
 Related: #1763 (learned step memory caps too tight under gate contention), #2217 (carries the fixes for the three latent failure causes above), 2f703edc (the deadline change whose test fallout went unseen).
+
+Closed 2026-11-26 as a duplicate of #2306 agentctl-python-shards-learned-cap-oom, which found the cause of the same shard OOMs. Each shard release-built agentctl inside its own pytest process (`py/tests/rust_binary.py`). That rustc alone peaked at about 2.7 GiB, which explains the 2957.7 MiB peak above. The fix, 45a8a48c, builds it in a separate DAG step before the shards. In gate 1795735968490717874-2a1df79c on f775efd9, both shards then completed under their 2.5 GiB cap, 1458 passed each, peaking at 640 and 611 MiB. That meets this issue's last acceptance criterion: the shards' 2 GiB hint is above their measured peak.
+
+The three latent failure causes listed above were fixed by #2217 (8a14267b). The visibility part of this design continues under #2317 (the ledger names NO_RESULT steps and flags an incomplete suite, a health alert for repeated NO_RESULT runs, and landing tools refuse such a row without a waiver) and #2207 (a learned-cap NO_RESULT run exits 3). This design's automatic raise of a learned cap after a zero-test OOM is not carried by any open issue. With the build moved out, the shards peak at about a quarter of their cap.
