@@ -577,14 +577,22 @@ async fn no_fill_begins_before_the_providers_account_is_checked() {
     let state = testing::with_message_cache_unverified(d.state.clone(), dir.path(), clock.clone());
     let d = Deployment { state, ..d };
     let cache = d.cache();
+    // `#2245`: no window of wall clock decides this. Wait until both providers were asked and the
+    // second has verified; the first is then unverified because its answer is held, not because
+    // a 200 ms window ran out on a loaded host.
+    until("both providers asked and the second verified", || {
+        d.first.identity_calls() >= 1
+            && d.second.identity_calls() >= 1
+            && d.state.message_cache.verification(SECOND) == Verification::Verified
+    })
+    .await;
     assert!(
         !d.state
             .message_cache
-            .identities_verified(Duration::from_millis(200))
+            .identities_verified(Duration::ZERO)
             .await,
         "the first provider has not answered"
     );
-    assert!(d.first.identity_calls() >= 1 && d.second.identity_calls() >= 1);
     assert_eq!(
         d.state.message_cache.verification(FIRST),
         Verification::Unverified
@@ -635,10 +643,15 @@ async fn an_account_that_cannot_be_asked_for_neither_erases_nor_fills_and_is_ask
     let state = testing::with_message_cache_unverified(d.state.clone(), dir.path(), clock.clone());
     let d = Deployment { state, ..d };
     let cache = d.cache();
+    // `#2245`: wait for the question itself, not for 200 ms of wall clock.
+    until("the first provider was asked", || {
+        d.first.identity_calls() >= 1
+    })
+    .await;
     assert!(
         !d.state
             .message_cache
-            .identities_verified(Duration::from_millis(200))
+            .identities_verified(Duration::ZERO)
             .await
     );
     tokio::time::pause();
@@ -682,6 +695,20 @@ async fn an_account_that_cannot_be_asked_for_neither_erases_nor_fills_and_is_ask
     assert!(d.state.message_cache.identities_verified(WAIT).await);
     assert_eq!(read_main(&d.state, READ_CHANNEL).await, StatusCode::OK);
     assert_eq!(held(&cache, &first_chan()), 11);
+}
+
+/// Wait on a condition, never on a window of wall clock (owner rule 346, `#2245`): poll until
+/// `done` holds. The deadline is the suite's hang backstop on the real clock, so a test that has
+/// paused tokio's clock still cannot wait forever, and it only ever reports a hang.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never happened within {WAIT:?}: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// Let every task woken so far run to where it waits again, including work it handed to the
