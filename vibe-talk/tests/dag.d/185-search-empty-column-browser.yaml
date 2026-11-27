@@ -1,0 +1,19 @@
+steps:
+  # `#2268 vibe-talk-search-none-match-line-overflow`: a search nothing loaded matches puts its
+  # None-match line (and, on Main, the Search All chip) inside the message column's left and right
+  # edges, the line wrapping there, at two desk sizes and a phone. Geometry only, no wall-clock budget.
+  - group: check
+    job: search-empty-column-browser
+    desc: the search's None-match line wraps inside the message column and the Search All chip stands in it, in All and Main, in current Chromium at 1280x800, 1920x1080 and 412x915 by touch (#2268)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/search_empty_column_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 10
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

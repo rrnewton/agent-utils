@@ -5733,6 +5733,50 @@ def _act_search_scope_back_to_all(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#2268`: a word no message of the seeded channel says, in any view.
+NONE_MATCH_WORD = "zebrafinchquill"
+# The server's answer to it has come (pending, the line says "Searching the server…"), so every
+# theme and profile photographs the same settled state.
+NONE_MATCH_SETTLED = (
+    "window.__visible('search-empty') && /None match/.test(window.__text('search-empty') || '') "
+    "&& (window.__text('server-line') || '') !== '' "
+    "&& !/^Searching the server/.test(window.__text('server-line') || '')"
+)
+
+
+def _search_none_match(driver: Driver, view: str) -> None:
+    """`#2268 vibe-talk-search-none-match-line-overflow`: in `view`, a word no loaded message says,
+    the server's answer settled -- the None-match line up at the top of the list, wrapping inside
+    the message column on a desk."""
+    # Through the threaded scope fixture (seeded once per server, cache needed), as 126-128 open,
+    # so the picker offers All and Main however the run began; with them in the cache scene set
+    # (run.sh SHOTS_DISCUSS, `discuss_scenes`), a cacheless wide walk skips them by name (`#2242`).
+    _open_scope_channel(driver)
+    if str(driver.js("document.getElementById('thread-select').value")) != view:
+        _pick_view(driver, view)
+    driver.page.wait_for_function(
+        f"() => document.getElementById('thread-select').value === {json.dumps(view)} "
+        "&& !window.__visible('channel-loading')", timeout=15_000)
+    driver.click("search-toggle")
+    driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
+    driver.page.fill("#search-field", NONE_MATCH_WORD)
+    driver.page.wait_for_function(f"() => {NONE_MATCH_SETTLED}", timeout=30_000)
+    driver.js("document.getElementById('scroll-area').scrollTop = 0")
+    driver.settle(300)
+
+
+def _act_search_none_match_all(driver: Driver) -> None:
+    """`#2268`: in All."""
+    _search_none_match(driver, "flat")
+
+
+def _act_search_none_match_main(driver: Driver) -> None:
+    """`#2268`: in Main, one column -- the line and the Search All chip under it."""
+    _search_none_match(driver, "main")
+    driver.page.wait_for_function("() => window.__visible('search-in-all')", timeout=10_000)
+    driver.settle(200)
+
+
 def _act_search_bucket_main_only(driver: Driver) -> None:
     """`#2200`: the same search with Threads off — only Main's cards stand,
     and the chips and the count still sum. (In Main Threads starts off, in
@@ -11314,6 +11358,29 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
+        name="129-search-none-match-all",
+        what="#2268: in All, a word no loaded message says: the None-match line at the top of the list, inside the message column",
+        act=_act_search_none_match_all,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("All is the view", "document.getElementById('discord-log').getAttribute('data-view') === 'flat'"),
+            ("the None-match line is up and the server's answer has come", NONE_MATCH_SETTLED),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="129-search-none-match-main",
+        what="#2268: in Main, a word no loaded message says: the None-match line and the Search All chip under it, inside the message column",
+        act=_act_search_none_match_main,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("Main is the view", "document.getElementById('thread-select').value === 'main'"),
+            ("the None-match line is up and the server's answer has come", NONE_MATCH_SETTLED),
+            ("the Search All chip stands under it", "window.__visible('search-in-all')"),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
         name="101-search-bucket-main-only",
         what="search with Threads off: only Main's cards stand, chips and count still sum",
         act=_act_search_bucket_main_only,
@@ -12257,7 +12324,7 @@ def run_captures(
     # 91/92, so they skip with them on a cacheless server instead of failing alone.
     discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-", "89-", "90-", "91-", "92-", "93-", "94-", "95-", "96-", "97-", "98-", "99-", "100-", "101-", "102-", "103-",
                                                                         "107-", "108-", "109-", "110-", "111-", "112-", "113-", "114-", "115-", "116-", "117-",
-                                                                        "120-", "121-", "123-", "124-", "125-", "126-", "127-", "128-", "130-", "131-", "138-",
+                                                                        "120-", "121-", "123-", "124-", "125-", "126-", "127-", "128-", "129-", "130-", "131-", "138-",
                                                                         "140-", "141-", "142-", "143-", "144-", "145-", "146-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):

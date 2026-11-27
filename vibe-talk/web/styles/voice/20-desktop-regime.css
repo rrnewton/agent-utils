@@ -71,6 +71,23 @@
     margin-inline: auto;
   }
 
+  /* `#2268 vibe-talk-search-none-match-line-overflow`. The search's None-match line and the
+     Search All chip beside it speak for the column, so they stand in it: the column's width and
+     centring, the line wrapping inside its edges. They sit at the top of the scroll area, beside
+     the panes rather than in one, so without this they took the whole scroll area's width and the
+     line ran past the column on both sides. The line keeps its own side room inside the column
+     (border-box), so its text never touches the edge the cards hold. */
+  #search-empty,
+  #search-in-all {
+    box-sizing: border-box;
+    max-width: var(--reading-width);
+    margin-inline: auto;
+  }
+
+  #search-empty {
+    padding-inline: 0.5rem;
+  }
+
   /* The status pill follows the column, so it sits over the thing it reports on instead of
      floating in the middle of a metre of desk. `max-width` and an auto margin, NOT a new
      `position` — it is already the one overlay in the dock's neighbourhood, and only that. */
@@ -1263,7 +1280,9 @@
   #screen-main[data-columns="two"] #side-heading,
   #screen-main[data-columns="two"] #side-freshness,
   #screen-main[data-columns="two"] #side-list,
-  #screen-main[data-columns="two"] #side-pane {
+  #screen-main[data-columns="two"] #side-pane,
+  #screen-main[data-columns="two"] #search-empty,
+  #screen-main[data-columns="two"] #search-in-all {
     max-width: none;
   }
 
@@ -1408,6 +1427,16 @@ li.discord-message[data-root-continuation] .thread-replies {
 #side-pane {
   max-width: var(--reading-width);
   margin-inline: auto;
+}
+
+/* `#2268`: the right column's None-match line stands in that column's width, as its lists do,
+   its side room as padding inside it (the same text box as the margin gave it where the column is
+   narrower than the reading width). */
+#side-search-empty {
+  box-sizing: border-box;
+  max-width: var(--reading-width);
+  margin-inline: auto;
+  padding-inline: 0.5rem;
 }
 
 /* `#338 column-overscroll`. The room past the foot: none, except at a desk (the desktop regime above). */
