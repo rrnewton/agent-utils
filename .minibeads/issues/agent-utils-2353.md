@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-heartbeat-fallback-scan-under-lock: the heartbeat busy fallback runs the registry storage scan and fleet validation under the registry locks'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-26T23:54:00-05:00
-updated_at: 2026-11-26T23:54:00-05:00
+updated_at: 2026-11-27T16:48:33-05:00
+closed_at: 2026-11-27T16:48:33-05:00
 ---
 
 # Description
@@ -26,3 +27,7 @@ Give the heartbeat fallback the treatment #2174 gives transfer-owner. Under the 
 # Notes
 
 Found while completing #2174 wrkslots-transfer-owner-scan-under-config-lock, whose locked fallback had the same full scan under the lock. To be fixed in the same lane after #2174 lands.
+
+## Resolution
+
+[Claude Opus 5.5] Landed on main as 26ec17b3 (full gate PASS, 72/72 steps, on 5eafbbc7). The heartbeat busy fallback no longer runs fleet validation or the registry storage scan under the registry locks, matching what #2174 did for transfer-owner. Under the locks it judges only the touched record: owner, validate-batch seal and cleanup-journal checks, the record's own storage check, and its release state from its machine's event chain. Then it writes, and a snapshot comparison proves no other local row moved. The nested-worktree warnings come from the latest lock-free round. The cleanup-journal check reads that round's fleet facts, with this machine's current state. With no lock-free round, the fleet is read only when a validation-batch seal is also live. The Rust edition's commit already judged only the record. Tests in test_heartbeat_lock_scope.py: a lock-free scan waits for a second writer with a zero lock wait, and that writer acquires the locks (red on the parent). A checkout that disappears after the scan still refuses in the fallback, with nothing written. A release that lands after the lock-free round still refuses, with zero fleet validation under the lock. No persisted fields. The sibling outage beside a stale row is #2396.
