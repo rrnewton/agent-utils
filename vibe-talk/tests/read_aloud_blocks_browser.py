@@ -1116,8 +1116,12 @@ def main() -> int:
                 press(page, f"{row} .md pre", True)
                 wait_position(page, "6 of 7")
                 check(lit_element(page).startswith("pre:"), f"the code block is not lit: {lit_element(page)!r}")
-                jumped = api.reads_of(LONG)[before:]
-                check(bool(jumped) and jumped[0].block == 5, f"the jump asked for {[r.block for r in jumped]}")
+                # `#2371 read-aloud-jump-check-race`: the page paints the jump before speech answers
+                # (`#2058`), so on a busy host its request can reach this server after the paint. The
+                # request is waited for, not read once at the paint.
+                jumped = wait_for(lambda: api.reads_of(LONG)[before:] or None, STATE_S,
+                                  "the jump asked this server for no block")
+                check(jumped[0].block == 5, f"the jump asked for {[r.block for r in jumped]}")
                 check(jumped[0].selection != boundary_reads[0].selection,
                       "the jump was asked for under the old selection, so it would queue behind the old read")
                 wait_for(lambda: all(r.closed is not None for r in boundary_reads), 2,
