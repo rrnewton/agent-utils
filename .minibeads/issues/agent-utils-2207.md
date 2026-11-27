@@ -90,8 +90,10 @@ in a new `incomplete_steps` ledger field. Planted fake-cgroup tests
 green after, in both editions, and a mutant restoring the old
 unconditional conversion is caught by them. No persisted schema
 change: only verdict values, plus the additive gate-ledger field.
-Landed on main as a617c1c6 under the liaison's standing waiver 965:
-the gate row had no failed steps apart from the known-red
-python.wrkslots.shard-9 family, and its only incomplete steps were
-the pre-existing learned-cap NO_RESULT pair (#2306), which this
-change surfaces as INCOMPLETE rather than masking.
+Landed on main as a617c1c6 by the coordinator on the gate for
+80db906e (red only on python.wrkslots.shard-9, the #2299 family,
+plus a green exclusive rerun of that shard). That row's
+python.agentctl.shard-0/1 were NO_RESULT on a pre-#2306 base; they
+were measured after the fact on the landed main a617c1c6 (both
+shards, 1458 passed, rerun a8e68b8a), and the liaison kept the
+landing.
