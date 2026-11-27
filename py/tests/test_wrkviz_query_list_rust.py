@@ -16,14 +16,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.wrkviz_rust_binary import rust_wrkvizd
+
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
 
 
 def _cli(args: list[str], *, rust: bool) -> subprocess.CompletedProcess[str]:
     if rust:
-        command = ["cargo", "run", "--quiet", "--release", "--manifest-path",
-                   "rs/Cargo.toml", "-p", "wrkviz", "--", *args]
+        command = [str(rust_wrkvizd()), *args]
     else:
         command = [sys.executable, str(PYTHON_WRKVIZ), *args]
     return subprocess.run(

@@ -28,9 +28,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.wrkviz_rust_binary import rust_wrkvizd
+
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 
 Request = tuple[str, str, dict[str, str]]
 Observed = tuple[int, int, str, tuple[tuple[str, str], ...], bytes]
@@ -172,12 +173,7 @@ class _RunningServer:
 
 @pytest.fixture(scope="module")
 def rust_wrkviz() -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkviz"],
-        cwd=AU_ROOT, check=True, capture_output=True, text=True, timeout=900,
-    )
-    return RUST_WRKVIZ
+    return rust_wrkvizd()
 
 
 @pytest.fixture(scope="module")

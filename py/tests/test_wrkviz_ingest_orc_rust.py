@@ -31,9 +31,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.wrkviz_rust_binary import rust_wrkvizd
+
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 ROOT_ID = "11111111-2222-3333-4444-555555555555"
 CHILD_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 CONT_ID = "99999999-8888-7777-6666-555555555555"
@@ -45,12 +46,7 @@ SHA_KEYS = {"sha256", "snapshot_path", "source_manifest_sha256",
 
 @pytest.fixture(scope="module")
 def rust_wrkviz() -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkviz"],
-        cwd=AU_ROOT, check=True, capture_output=True, text=True, timeout=900,
-    )
-    return RUST_WRKVIZ
+    return rust_wrkvizd()
 
 
 def _message(mid: int, role: str, ts: int, text: str) -> str:

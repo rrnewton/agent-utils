@@ -356,10 +356,35 @@ steps:
   # Sixteen shards halve the per-shard CPU so the step stays robust on a hot host
   # (owner rule 346). The 2400 s cap per shard is unchanged headroom, not a budget raise.
   # #696 wrkslots-shard-timeout.
+  # #2318: py/wrkslots/tests/rust_binary.py release-builds wrkslotsd for the shards' Rust
+  # differential cases, which the family weighting spreads over every shard, so whichever
+  # shard reached one first ran that compile inside its own memory cap (shards peaked at
+  # 94-99% of their 1.88 GiB cap from 2026-11-20 on). This step builds the same target with
+  # the same command first, as python.agentctl.build-rust does for agentctl (#2306); each
+  # shard's own Cargo call then only checks freshness.
+  # Cold measurement on 2026-11-26 (load1 186-199, two Cargo jobs): 161 s, 282 CPU-s, cgroup
+  # peak 1.43 GiB, of which the wrkslotsd rustc alone was 1.34 GiB. By #818's rule that needs
+  # 1.43 GiB + 512 MiB = 1.93 GiB; the 2 GiB baseline x 1.25 caps it at 2.5 GiB, leaving room
+  # for the crate's growth.
+  - group: wrkslots
+    job: build-rust
+    desc: wrkslots Rust adapter executable the wrkslots Python shards compare against
+    cmd: python3 py/wrkslots/tests/rust_binary.py
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-wrkslots]
+    timeout: 14400
+    cpu_timeout: 3600
+    hint:
+      est_duration_s: 170
+      classification: cpu-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 2147483648
+
   - group: wrkslots
     job: shard-0
     desc: wrkslots non-lifecycle Python tests, shard 1 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 0/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -375,6 +400,7 @@ steps:
     job: shard-1
     desc: wrkslots non-lifecycle Python tests, shard 2 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 1/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -385,6 +411,7 @@ steps:
     job: shard-2
     desc: wrkslots non-lifecycle Python tests, shard 3 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 2/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -395,25 +422,24 @@ steps:
     job: shard-3
     desc: wrkslots non-lifecycle Python tests, shard 4 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 3/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    # #818: this shard holds test_reanchor_liveness.py, which runs `cargo test -p agentctl`
-    # inside the step; measured uncapped peak inside dagrun is 4.2 GiB, so its baseline is
-    # sized from that peak (cap = baseline x 1.25 keeps the peak + max(25%, 512 MiB) rule),
-    # not from the 1.5 GiB anchor the other shards share.
-    hint:
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 5153960755
+    # #2318: this shard peaked at 1.03 GiB in gate 1795735968490717874-2a1df79c on f775efd9
+    # (2026-11-26) and at 0.97 GiB in its rerun 1795739990495742438-0ae8e637, with no Rust
+    # build inside it. Its old 4.8 GiB hint was sized for test_reanchor_liveness.py's
+    # `cargo test -p agentctl`, which moved to the Rust lane under #883, and
+    # python.wrkslots.build-rust now builds wrkslotsd. By #818's rule it needs
+    # 1.03 GiB + 512 MiB = 1.53 GiB, within the shared 1.5 GiB baseline's 1.88 GiB cap.
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-4
     desc: wrkslots non-lifecycle Python tests, shard 5 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 4/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -424,6 +450,7 @@ steps:
     job: shard-5
     desc: wrkslots non-lifecycle Python tests, shard 6 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 5/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -434,6 +461,7 @@ steps:
     job: shard-6
     desc: wrkslots non-lifecycle Python tests, shard 7 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 6/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -444,24 +472,23 @@ steps:
     job: shard-7
     desc: wrkslots non-lifecycle Python tests, shard 8 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 7/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint:
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      # #851: a test here runs Cargo, so a cold build peaks at 4.1 GiB (16 GiB probe cap,
-      # 166 passed) and a warm one at 3,188,764,672 bytes (2.97 GiB); it was OOM-killed at
-      # ~1.9 GiB. 4.25 GiB x mem_cap_factor 1.25 caps it at 5.31 GiB, above 4.1 GiB + 25%.
-      rss_baseline_bytes: 4563402752
+    # #2318: this shard peaked at 0.83 GiB in gate 1795735968490717874-2a1df79c on f775efd9
+    # (2026-11-26) and at 1.03 GiB in its rerun 1795739990495742438-0ae8e637, with no Rust
+    # build inside it. Its old 4.25 GiB hint (#851) was sized for a Cargo build inside the
+    # shard, which python.wrkslots.build-rust now does. By #818's rule it needs
+    # 1.03 GiB + 512 MiB = 1.53 GiB, within the shared 1.5 GiB baseline's 1.88 GiB cap.
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-8
     desc: wrkslots non-lifecycle Python tests, shard 9 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 8/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -472,6 +499,7 @@ steps:
     job: shard-9
     desc: wrkslots non-lifecycle Python tests, shard 10 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 9/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -482,6 +510,7 @@ steps:
     job: shard-10
     desc: wrkslots non-lifecycle Python tests, shard 11 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 10/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -492,6 +521,7 @@ steps:
     job: shard-11
     desc: wrkslots non-lifecycle Python tests, shard 12 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 11/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -502,6 +532,7 @@ steps:
     job: shard-12
     desc: wrkslots non-lifecycle Python tests, shard 13 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 12/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -512,6 +543,7 @@ steps:
     job: shard-13
     desc: wrkslots non-lifecycle Python tests, shard 14 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 13/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -522,6 +554,7 @@ steps:
     job: shard-14
     desc: wrkslots non-lifecycle Python tests, shard 15 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 14/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
@@ -532,11 +565,33 @@ steps:
     job: shard-15
     desc: wrkslots non-lifecycle Python tests, shard 16 of 16
     cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 15/16 -- -q
+    deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
     hint: *wrkslots_test_hint
+
+  # #2318: every py/tests/test_wrkviz_*_rust.py case runs wrkvizd from
+  # py/tests/wrkviz_rust_binary.py, which builds it into a private target with --locked and
+  # two Cargo jobs. This step builds it first, so the release compile is not charged to a
+  # shard's memory cap and each shard's own Cargo call only checks freshness (#2306's shape).
+  # Cold measurement on 2026-11-26 (load1 186-199, two Cargo jobs): 167 s, 304 CPU-s, cgroup
+  # peak 1.35 GiB, of which the wrkviz rustc alone was 1.18 GiB. By #818's rule that needs
+  # 1.35 GiB + 512 MiB = 1.86 GiB; the 2 GiB baseline x 1.25 caps it at 2.5 GiB.
+  - group: wrkviz
+    job: build-rust
+    desc: wrkviz Rust edition executable the wrkviz Python shards compare against
+    cmd: python3 py/tests/wrkviz_rust_binary.py
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-wrkviz]
+    timeout: 14400
+    cpu_timeout: 3600
+    hint:
+      est_duration_s: 170
+      classification: cpu-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 2147483648
 
   # Shard count 4 (was 2): at 2 shards each ran ~700 s median in gate logs
   # (2026-11-10 measurement, #1288 validate-10min), so one shard alone
@@ -546,6 +601,7 @@ steps:
     job: shard-0
     desc: wrkviz Python tests, shard 1 of 4
     cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 0/4 -- -q
+    deps: [wrkviz.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-wrkviz]
     timeout: 14400
@@ -556,6 +612,7 @@ steps:
     job: shard-1
     desc: wrkviz Python tests, shard 2 of 4
     cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 1/4 -- -q
+    deps: [wrkviz.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-wrkviz]
     timeout: 14400
@@ -566,6 +623,7 @@ steps:
     job: shard-2
     desc: wrkviz Python tests, shard 3 of 4
     cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 2/4 -- -q
+    deps: [wrkviz.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-wrkviz]
     timeout: 14400
@@ -576,6 +634,7 @@ steps:
     job: shard-3
     desc: wrkviz Python tests, shard 4 of 4
     cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 3/4 -- -q
+    deps: [wrkviz.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-wrkviz]
     timeout: 14400

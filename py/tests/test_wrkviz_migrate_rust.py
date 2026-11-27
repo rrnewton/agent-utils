@@ -19,9 +19,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.wrkviz_rust_binary import rust_wrkvizd
+
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 CODEX_ROOT = "root-thread"
 
 TS_KEYS = {
@@ -37,12 +38,7 @@ GEN_KEYS = {"c_bytes", "c_size", "c_sha256", "c_off", "c_len",
 
 @pytest.fixture(scope="module")
 def rust_wrkviz() -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkviz"],
-        cwd=AU_ROOT, check=True, capture_output=True, text=True, timeout=900,
-    )
-    return RUST_WRKVIZ
+    return rust_wrkvizd()
 
 
 def _iso(seconds: float) -> str:
@@ -204,7 +200,7 @@ def _both(
 ) -> None:
     outcomes = {}
     for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
-                           ("rs", [str(RUST_WRKVIZ)])):
+                           ("rs", [str(rust_wrkvizd())])):
         outcomes[label] = _run(command, [
             verb, "--output", str(archives[label]), *args,
         ])

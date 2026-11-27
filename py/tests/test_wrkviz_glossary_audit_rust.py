@@ -17,20 +17,15 @@ from pathlib import Path
 import pytest
 
 from wrkviz.terminology import glossary_term_id
+from tests.wrkviz_rust_binary import rust_wrkvizd
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 
 
 @pytest.fixture(scope="module")
 def rust_wrkviz() -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkviz"],
-        cwd=AU_ROOT, check=True, capture_output=True, text=True, timeout=900,
-    )
-    return RUST_WRKVIZ
+    return rust_wrkvizd()
 
 
 def _term(term: str, status: str = "supported", definition: str = "",
@@ -103,7 +98,7 @@ def _both(archive: Path, args: list[str], expect: int = 0,
           ) -> dict[str, subprocess.CompletedProcess[str]]:
     outcomes = {}
     for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
-                           ("rs", [str(RUST_WRKVIZ)])):
+                           ("rs", [str(rust_wrkvizd())])):
         outcomes[label] = _run(command, ["audit-glossary", *args])
     oracle, result = outcomes["py"], outcomes["rs"]
     assert oracle.returncode == expect, oracle.stderr
@@ -199,7 +194,7 @@ def test_audit_glossary_external_build_state(
 def test_audit_glossary_help(rust_wrkviz: Path) -> None:
     oracle = _run([sys.executable, str(PYTHON_WRKVIZ)],
                   ["audit-glossary", "--help"])
-    result = _run([str(RUST_WRKVIZ)], ["audit-glossary", "--help"])
+    result = _run([str(rust_wrkvizd())], ["audit-glossary", "--help"])
     assert result.returncode == oracle.returncode == 0
     assert result.stdout == oracle.stdout
     assert result.stderr == oracle.stderr

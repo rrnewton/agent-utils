@@ -21,20 +21,16 @@ from pathlib import Path
 
 import pytest
 
+from tests.wrkviz_rust_binary import rust_wrkvizd
+
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 BASE = 1_760_000_000_000
 
 
 @pytest.fixture(scope="module")
 def rust_wrkviz() -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkviz"],
-        cwd=AU_ROOT, check=True, capture_output=True, text=True, timeout=900,
-    )
-    return RUST_WRKVIZ
+    return rust_wrkvizd()
 
 
 def _history(path: Path, rows: list[dict[str, object]], tail: str = "") -> Path:

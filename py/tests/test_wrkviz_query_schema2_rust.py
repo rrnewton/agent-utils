@@ -27,12 +27,13 @@ import pytest
 
 from typing import TYPE_CHECKING
 
+from tests.wrkviz_rust_binary import rust_wrkvizd
+
 if TYPE_CHECKING:
     from wrkviz.archive import JsonValue
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 
 DAY_MS = 24 * 60 * 60 * 1000
 MIDNIGHT = 1777852800000
@@ -41,12 +42,7 @@ TEAMS = ("team-a", "team-b")
 
 @pytest.fixture(scope="module")
 def rust_wrkviz() -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkviz"],
-        cwd=AU_ROOT, check=True, capture_output=True, text=True, timeout=900,
-    )
-    return RUST_WRKVIZ
+    return rust_wrkvizd()
 
 
 def _run(binary: Path, args: list[str]) -> subprocess.CompletedProcess[str]:

@@ -13,14 +13,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.wrkviz_rust_binary import rust_wrkvizd
+
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
 
 
 def _cli(args: list[str], *, rust: bool) -> subprocess.CompletedProcess[str]:
     if rust:
-        command = ["cargo", "run", "--quiet", "--release", "--manifest-path",
-                   "rs/Cargo.toml", "-p", "wrkviz", "--", *args]
+        command = [str(rust_wrkvizd()), *args]
     else:
         command = [sys.executable, str(PYTHON_WRKVIZ), *args]
     return subprocess.run(
@@ -126,8 +127,7 @@ def test_search_opens_each_spine_shard_once(corpus: Path) -> None:
     trace = corpus.parent / "search.strace"
     result = subprocess.run(
         [strace, "-f", "-e", "trace=openat", "-o", str(trace),
-         "cargo", "run", "--quiet", "--release", "--manifest-path",
-         "rs/Cargo.toml", "-p", "wrkviz", "--",
+         str(rust_wrkvizd()),
          "query", "--output", str(corpus), "search", "--in",
          "all-transcript", "the"],
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,

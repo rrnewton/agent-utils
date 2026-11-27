@@ -20,21 +20,17 @@ from pathlib import Path
 
 import pytest
 
+from tests.wrkviz_rust_binary import rust_wrkvizd
+
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 
 T0 = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc).timestamp()
 
 
 @pytest.fixture(scope="module")
 def rust_wrkviz() -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkviz"],
-        cwd=AU_ROOT, check=True, capture_output=True, text=True, timeout=900,
-    )
-    return RUST_WRKVIZ
+    return rust_wrkvizd()
 
 
 def _iso(minutes: float) -> str:
@@ -149,7 +145,7 @@ def _both(args: list[str], expect: int = 0, episodes: bool = False,
     episode_bytes = {}
     root = tmp_path if tmp_path is not None else Path()
     for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
-                           ("rs", [str(RUST_WRKVIZ)])):
+                           ("rs", [str(rust_wrkvizd())])):
         extra = []
         if episodes:
             target = root / f"episodes-{label}.json"
@@ -252,7 +248,7 @@ def test_responsiveness_refusals(tmp_path: Path, rust_wrkviz: Path) -> None:
 
 def test_responsiveness_help(rust_wrkviz: Path) -> None:
     oracle = _run([sys.executable, str(PYTHON_WRKVIZ)], ["responsiveness", "--help"])
-    result = _run([str(RUST_WRKVIZ)], ["responsiveness", "--help"])
+    result = _run([str(rust_wrkvizd())], ["responsiveness", "--help"])
     assert result.returncode == oracle.returncode == 0
     assert result.stdout == oracle.stdout
     assert result.stderr == oracle.stderr

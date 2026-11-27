@@ -19,9 +19,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.wrkviz_rust_binary import rust_wrkvizd
+
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 CODEX_ROOT = "root-thread"
 CLAUDE_ROOT = "11111111-2222-3333-4444-555555555555"
 CLAUDE_CHILD = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -41,12 +42,7 @@ GEN_KEYS = {"c_bytes", "c_size", "c_sha256", "c_off", "c_len",
 
 @pytest.fixture(scope="module")
 def rust_wrkviz() -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkviz"],
-        cwd=AU_ROOT, check=True, capture_output=True, text=True, timeout=900,
-    )
-    return RUST_WRKVIZ
+    return rust_wrkvizd()
 
 
 def _iso(seconds: float) -> str:
@@ -126,7 +122,7 @@ def _both(archives: dict[str, Path], verb: str, args: list[str],
           ) -> dict[str, subprocess.CompletedProcess[str]]:
     outcomes = {}
     for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
-                           ("rs", [str(RUST_WRKVIZ)])):
+                           ("rs", [str(rust_wrkvizd())])):
         outcomes[label] = _run(command, [
             verb, "--output", str(archives[label]), "--team", "widget", *args,
         ], env=env)
@@ -365,7 +361,7 @@ def test_refresh_claude(tmp_path: Path, rust_wrkviz: Path) -> None:
         archives[label + "-session"] = session
     outcomes = {}
     for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
-                           ("rs", [str(RUST_WRKVIZ)])):
+                           ("rs", [str(rust_wrkvizd())])):
         outcomes[label] = _run(command, [
             "refresh-claude", "--output", str(archives[label]),
             "--team", "widget",
@@ -389,7 +385,7 @@ def test_refresh_orc(tmp_path: Path, rust_wrkviz: Path) -> None:
         sources[label] = _orc_upstream(tmp_path / label)
         archives[label] = tmp_path / f"{label}-out"
     for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
-                           ("rs", [str(RUST_WRKVIZ)])):
+                           ("rs", [str(rust_wrkvizd())])):
         outcome = _run(command, [
             "refresh-orc", "--output", str(archives[label]),
             "--team", "widget",

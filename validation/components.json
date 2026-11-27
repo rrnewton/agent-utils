@@ -584,6 +584,7 @@
         "py/tests/timeline_legacy_generations.py",
         "py/tests/timeline_projection.py",
         "py/tests/timeline_snapshots.py",
+        "py/tests/wrkviz_rust_binary.py",
         "py/wrkviz/",
         "rs/bin/wrkvizd",
         "rs/wrkviz/",
@@ -673,6 +674,7 @@
         "py/tests/test_wrkviz_quickstart_rust.py",
         "py/tests/test_wrkviz_refresh_rust.py",
         "py/tests/test_wrkviz_responsiveness_rust.py",
+        "py/tests/test_wrkviz_rust_binary.py",
         "py/tests/test_wrkviz_serve_rust.py",
         "py/tests/test_wrkviz_summarize_rust.py",
         "py/tests/test_wrkviz_userguide_rust.py"

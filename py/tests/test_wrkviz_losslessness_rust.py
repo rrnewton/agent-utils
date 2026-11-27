@@ -26,10 +26,10 @@ import pytest
 from wrkviz.build_store import team_build_root
 from wrkviz.pipeline import ingest_codex
 from tests.timeline_snapshots import snapshot_root
+from tests.wrkviz_rust_binary import rust_wrkvizd
 
 AU_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_WRKVIZ = AU_ROOT / "py" / "bin" / "wrkviz"
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 
 ROOT = "root-thread"
 CHILD = "child-thread"
@@ -40,12 +40,7 @@ STDOUT = "ok\n" * 400 + "warning: /home/private/customer/project is not a reposi
 
 @pytest.fixture(scope="module")
 def rust_wrkviz() -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkviz"],
-        cwd=AU_ROOT, check=True, capture_output=True, text=True, timeout=900,
-    )
-    return RUST_WRKVIZ
+    return rust_wrkvizd()
 
 
 def _iso(seconds: float) -> str:
@@ -239,7 +234,7 @@ def _run(command: list[str], args: list[str]) -> subprocess.CompletedProcess[str
 def _both(args: list[str], expect: int = 0) -> dict[str, subprocess.CompletedProcess[str]]:
     outcomes = {}
     for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
-                           ("rs", [str(RUST_WRKVIZ)])):
+                           ("rs", [str(rust_wrkvizd())])):
         outcomes[label] = _run(command, ["audit-losslessness", *args])
     oracle, result = outcomes["py"], outcomes["rs"]
     assert oracle.returncode == expect, oracle.stderr
@@ -380,7 +375,7 @@ def test_audit_losslessness_refusals(tmp_path: Path, rust_wrkviz: Path) -> None:
 def test_audit_losslessness_help(rust_wrkviz: Path) -> None:
     oracle = _run([sys.executable, str(PYTHON_WRKVIZ)],
                   ["audit-losslessness", "--help"])
-    result = _run([str(RUST_WRKVIZ)], ["audit-losslessness", "--help"])
+    result = _run([str(rust_wrkvizd())], ["audit-losslessness", "--help"])
     assert result.returncode == oracle.returncode == 0
     assert result.stdout == oracle.stdout
     assert result.stderr == oracle.stderr

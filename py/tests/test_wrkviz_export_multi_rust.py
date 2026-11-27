@@ -17,14 +17,14 @@ Fixtures only; no live sources or real model calls.
 from __future__ import annotations
 
 import importlib.util
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from tests.wrkviz_rust_binary import rust_wrkvizd
+
 AU_ROOT = Path(__file__).resolve().parents[2]
-RUST_WRKVIZ = AU_ROOT / "rs" / "target" / "release" / "wrkvizd"
 
 _spec = importlib.util.spec_from_file_location(
     "wrkviz_build_diff", AU_ROOT / "py" / "tests" / "test_wrkviz_build_rust.py"
@@ -39,12 +39,7 @@ TEAMS = ("alpha", "beta", "gamma")
 
 @pytest.fixture(scope="module")
 def rust_wrkviz() -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", "rs/Cargo.toml",
-         "-p", "wrkviz"],
-        cwd=AU_ROOT, check=True, capture_output=True, text=True, timeout=900,
-    )
-    return RUST_WRKVIZ
+    return rust_wrkvizd()
 
 
 def _archives(tmp_path: Path, rust_wrkviz: Path) -> dict[str, Path]:
@@ -79,7 +74,7 @@ def _export(
 ) -> None:
     outcomes = {}
     for label, command in (("py", [sys.executable, str(PYTHON_WRKVIZ)]),
-                           ("rs", [str(RUST_WRKVIZ)])):
+                           ("rs", [str(rust_wrkvizd())])):
         outcomes[label] = B._run(command, [
             "export", "--archive", str(archives[label]),
             "--output", str(targets[label]), *args,

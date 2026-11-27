@@ -17,6 +17,7 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
+from wrkslots.tests.rust_binary import main as rust_binary_main
 from wrkslots.tests.rust_binary import rust_wrkslotsd
 
 
@@ -68,6 +69,61 @@ def test_rust_adapter_failed_build_cannot_use_an_old_binary(
         assert rust_wrkslotsd.cache_info().currsize == 0
     finally:
         rust_wrkslotsd.cache_clear()
+
+
+def test_build_step_builds_the_adapter_and_names_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``python.wrkslots.build-rust`` runs the helper as a script before the shards (#2318)."""
+    binary = tmp_path / "release" / "wrkslotsd"
+    binary.parent.mkdir(parents=True)
+    binary.touch()
+    builds: list[list[str]] = []
+
+    def build(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        builds.append(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps({
+            "reason": "compiler-artifact", "target": {"name": "wrkslotsd", "kind": ["bin"]},
+            "executable": str(binary),
+        }))
+
+    monkeypatch.setattr(subprocess, "run", build)
+    rust_wrkslotsd.cache_clear()
+    try:
+        assert rust_binary_main() == 0
+    finally:
+        rust_wrkslotsd.cache_clear()
+    assert [command[command.index("-p") + 1] for command in builds] == ["wrkslotsd"]
+    assert capsys.readouterr().out == f"{binary}\n"
+
+
+def test_build_step_failure_shows_the_compiler_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rendered = "error[E0425]: cannot find value `x` in this scope\n"
+    stdout = "\n".join([
+        json.dumps({"reason": "compiler-message", "message": {"rendered": rendered}}),
+        "not json",
+        json.dumps({"reason": "build-finished", "success": False}),
+    ])
+
+    def fail(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        raise subprocess.CalledProcessError(
+            101, command, output=stdout, stderr="error: could not compile `wrkslotsd`\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    rust_wrkslotsd.cache_clear()
+    try:
+        assert rust_binary_main() == 1
+    finally:
+        rust_wrkslotsd.cache_clear()
+    err = capsys.readouterr().err
+    assert rendered in err
+    assert "error: could not compile `wrkslotsd`" in err
+    assert "Cargo exited 101" in err
 
 
 AU_ROOT = Path(__file__).resolve().parents[3]
