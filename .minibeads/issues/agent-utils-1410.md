@@ -7,7 +7,7 @@ labels:
 - agentctl
 - validation
 created_at: 2026-11-12T11:05:29+00:00
-updated_at: 2026-11-12T11:05:29+00:00
+updated_at: 2026-11-27T08:30:00-05:00
 ---
 
 # Description
@@ -33,3 +33,8 @@ Evidence gap: the gate ledger entry has no log path, and the lane's slot was rem
 # Notes
 
 Numbered from devbig030's interim block (1400-1469). The devbig014 lead asked for it to be filed (2026-11-12).
+
+- 2026-11-27, gate `1795744310730890743-3856ce00` on faa276a2 (#2318, which touches no agentctl Rust): `rust.agentctl.test` failed on 1 of 3125 cases.
+  - Test: `subagents::tests::lock_rank::a_priority_manager_takes_a_contended_lifecycle_lock_first_and_waiters_are_visible`.
+  - Panic at `agentctl/src/subagents/tests/lock_rank.rs:90:5`: `assertion left == right failed: ["agent-a", "bridge", "agent-c", "agent-b"]`, with left `Some("agent-a")` and right `Some("bridge")`.
+  - The priority manager ("bridge") was expected to take the contended lock first, but came second.
