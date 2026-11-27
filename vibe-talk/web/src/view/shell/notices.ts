@@ -28,7 +28,11 @@ const IDLE_STATUS_WORDS: ReadonlySet<string> = new Set(["Ready.", "ready",
   "Back where you were.",
   // `#2365 vibe-talk-jump-toast-covers-landed-row`: a link jump's landing, row or card. The
   // landed row's Linked bubble already marks the target; announced, not floated over it.
-  "Here is the linked message.", "Here is the linked message's card."]);
+  "Here is the linked message.", "Here is the linked message's card.",
+  // `#2375 vibe-talk-reading-off-toast-covers-sent-row`: reading mode turned off. The reader turned
+  // it off; the Read control already shows it. A toast floated over the row they sent next, its
+  // time and Unarchive under it. Announced, not floated.
+  "reading mode off."]);
 
 /** How long the connection banner stays before it takes itself away, in ms. */
 const BANNER_DISMISS_MS = 8000;

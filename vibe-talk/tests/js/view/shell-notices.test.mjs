@@ -105,6 +105,10 @@ test("#1859: an idle confirmation is marked to wait, action words are not", () =
     assert.equal(el("status-line").attrs["data-idle"], "", `"${landing}" was floated over the landed row`);
     assert.equal(el("status").textContent, landing, `"${landing}" was not announced`);
   }
+  // `#2375`: reading mode turned off, the same way.
+  notices.setStatus("reading mode off.");
+  assert.equal(el("status-line").attrs["data-idle"], "", "\"reading mode off.\" was floated over the row sent next");
+  assert.equal(el("status").textContent, "reading mode off.", "\"reading mode off.\" was not announced");
   notices.dismissStatus();
   assert.equal(el("status-line").attrs["data-idle"], undefined, "a taken-away line kept the idle mark");
 });

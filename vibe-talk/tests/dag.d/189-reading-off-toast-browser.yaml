@@ -1,0 +1,21 @@
+steps:
+  # `#2375 vibe-talk-reading-off-toast-covers-sent-row`: reading mode turned off is announced, not
+  # floated. A read started and stopped, then a message sent from the channel's box: the status line
+  # still says "reading mode off." (a polite live region) but stands clipped like `.sr-only`, over no
+  # row, and the sent row's header is fully on screen. Phones 393x852 and 412x915 by touch and a desk
+  # at 1280x800, light and dark; geometry only, every wait a condition.
+  - group: check
+    job: reading-off-toast-browser
+    desc: reading mode turned off is announced and never floated over the row sent next, its header fully on screen, in current Chromium at 393x852 and 412x915 by touch and 1280x800, light and dark (#2375)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/reading_off_toast_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 480
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824
