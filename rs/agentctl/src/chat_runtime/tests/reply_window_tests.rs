@@ -822,3 +822,105 @@ fn every_request_admitted_before_a_restart_survives_it_and_the_first_sweep() {
     );
     fs::remove_dir_all(root).expect("cleanup");
 }
+
+#[test]
+fn a_request_the_sweep_retires_is_never_reminded_afterwards() {
+    // #2331 reply reminders and #2338 reply windows on the same requests. A configured unanswered
+    // window of 2 h closes requests well inside the reminders' one-day window. Once the sweep
+    // retires them, no reminder may name them again, whether one already did or not, and the
+    // reminder record forgets them, across a restart too.
+    use crate::chat_runtime::reply_reminders::ReminderCandidates;
+    let mut configuration = config_without_reaction();
+    configuration.reply_windows = Some(ReplyWindowSettings {
+        unanswered_max_age_seconds: Some(7_200),
+        ..ReplyWindowSettings::default()
+    });
+    configuration.validate().expect("valid windows");
+    let (state, reminded, root) = state_with_old_request("window-reminders", configuration);
+    let admitted = state
+        .read_request(&reminded)
+        .expect("request")
+        .admitted_at_millis;
+    // Reminders started before either request was delivered.
+    state
+        .update_reply_reminders(admitted.saturating_sub(1), None, |_| (false, ()))
+        .expect("start reminders");
+    let unreminded = state
+        .admit_batch(&indexed_delivery(3, 3))
+        .expect("admit")
+        .new_request_keys
+        .remove(0);
+    for key in [&reminded, &unreminded] {
+        state
+            .set_delivery_phase(key, RequestPhase::Delivered, None)
+            .expect("deliver");
+    }
+    let before = state.reply_reminder_candidates().expect("candidates");
+    let reply_id = before
+        .candidates
+        .iter()
+        .find(|candidate| candidate.key == reminded)
+        .expect("a candidate")
+        .reply_id
+        .clone();
+    let delivered = before
+        .candidates
+        .iter()
+        .map(|candidate| candidate.delivered_at_millis)
+        .max()
+        .expect("delivered");
+    // One of them was reminded half an hour after delivery.
+    let reminded_at = delivered + HOUR / 2;
+    let (record, ()) = state
+        .update_reply_reminders(reminded_at, Some(&before.retained), |record| {
+            record.reminded.push(RemindedRequest {
+                key: reminded.clone(),
+                reply_id,
+                at_millis: reminded_at,
+            });
+            (true, ())
+        })
+        .expect("record the reminder");
+    let at = delivered + 3 * HOUR;
+    let eligible = |found: &ReminderCandidates| {
+        found
+            .eligible(&record, at)
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect::<Vec<_>>()
+    };
+    // Without the sweep, the other one would still be due a reminder at that time.
+    assert_eq!(eligible(&before), std::slice::from_ref(&unreminded));
+
+    let mut logged = Vec::new();
+    sweep(&state, at, &mut |line| logged.push(line));
+    // The older request retires at once. The newer one holds the cursor of an uncommitted
+    // admission, so it closes but stays in the store: closed is enough to stop its reminders.
+    assert!(state
+        .retired_key(&reminded)
+        .expect("retired guard")
+        .is_some());
+    assert!(
+        state
+            .read_request(&unreminded)
+            .expect("closed request")
+            .reply_closed
+    );
+    let after = state.reply_reminder_candidates().expect("candidates");
+    assert!(after.candidates.is_empty(), "{:?}", after.candidates);
+    assert!(!after.retained.contains(&reminded));
+    assert!(eligible(&after).is_empty());
+    // The next write of the record drops the retired request it had reminded.
+    let (pruned, ()) = state
+        .update_reply_reminders(at, Some(&after.retained), |_| (true, ()))
+        .expect("prune the record");
+    assert!(!pruned.reminded(&reminded), "{:?}", pruned.reminded);
+    // A restart reads the same store: nothing to remind, then or later.
+    let reopened = BridgeState::open(&root).expect("reopen");
+    let found = reopened
+        .reply_reminder_candidates()
+        .expect("candidates after a restart");
+    assert!(found.candidates.is_empty(), "{:?}", found.candidates);
+    assert!(eligible(&found).is_empty());
+    fs::remove_dir_all(root).expect("cleanup");
+}

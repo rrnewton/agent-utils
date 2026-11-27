@@ -1165,7 +1165,8 @@ busy bridge never fills up:
 - an unanswered request (delivered and acknowledged, no reply sent: none
   captured, or every one permanently failed) closes 48 hours after its
   admission, well past the reply reminders' 24-hour window; a turn's end never
-  closes it;
+  closes it, and once closed it is never reminded, even when a configured
+  window closes it within that day;
 - a request whose prompt is pending, being submitted or uncertain, or which has
   a reply not sent yet, never closes by these rules;
 - at the 2,048-request limit, answered requests close oldest last reply first,
