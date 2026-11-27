@@ -810,8 +810,12 @@ The bridge delivers through the same queue and submission paths as
   bridge raw messages keep their raw mark there (#1223
   bridge-raw-headless). A request still unanswered 20 s after the turn
   that took it ends, by the event log, is reminded once at the next turn
-  boundary (#2331, `chat_service/headless_reminders.rs`). A TUI target is
-  reminded by the pane rules instead.
+  boundary (#2331, `chat_service/headless_reminders.rs`). While that turn
+  still runs, a request with no reply after 3 tool calls spread over at
+  least 2 minutes (by the event log's timestamps) gets one mid-turn notice,
+  recorded in `reply-notices.json` (#2386, `--reply-notice-tools`,
+  `--reply-notice-after`). A TUI target is reminded by the pane rules instead
+  and gets no mid-turn notice.
 
 ### Watcher notices (DONE / BLOCKED / idle / stalled)
 

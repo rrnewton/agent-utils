@@ -3162,6 +3162,12 @@ struct ChatRun {
         hide_default_value = true
     )]
     claude_bin: PathBuf,
+    /// For a headless coordinator, queue one mid-turn notice of a chat request that still holds no reply after N tool calls in the turn that took it, saying that a reply written only in thinking is not delivered (default: 3; 0 turns notices off; at most 100). The latest of those tool calls must also come --reply-notice-after DURATION past the request's input start, both read from the event log's timestamps. A notice is recorded in reply-notices.json before it is queued, comes once per request, and needs reply reminders on; the turn-end reminder still follows if the turn ends with no reply. A TUI coordinator gets no notice.
+    #[arg(long, value_name = "N", default_value = "3", hide_default_value = true, value_parser = reply_notice_tools)]
+    reply_notice_tools: usize,
+    /// How far past a request's input start, by the event log's clock, the last tool call counted by --reply-notice-tools must come before the mid-turn notice (default: 2m). Units: s, m or h; a bare number is seconds; at least 30s and at most 1h.
+    #[arg(long, value_name = "DURATION", default_value = "2m", hide_default_value = true, value_parser = reply_notice_after)]
+    reply_notice_after: Duration,
     /// Stop chat run with exit status 70 when its owner loop makes no round for DURATION, so that a unit with Restart=on-failure starts it again (default: 5m). Units: s, m or h; a bare number is seconds; at least 60s and at most 1h, and 0 runs no watchdog. Every blocking step of a round is bounded well below it: a delivery waits at most 5 s for the coordinator's queue and target locks and ends --ready-timeout plus 30 s after it starts, leaving the request pending for the next pass. The loop rewrites owner-loop-alive in the state directory as it turns; `chat health` reports a running service whose loop has not turned for DURATION as STALLED. The watchdog records the stall as the owner loop's failure, stops the service (cancelling the Herdr call the loop waits on), and ends the process itself if the loop has not ended 30 s later.
     #[arg(long, value_name = "DURATION", default_value = "5m", hide_default_value = true, value_parser = stall_restart_after)]
     stall_restart_after: StallRestartAfter,
@@ -3435,6 +3441,14 @@ fn stall_restart_after(value: &str) -> Result<StallRestartAfter, String> {
 struct ReplyReminderIdle(Option<Duration>);
 fn reply_reminder_idle(value: &str) -> Result<ReplyReminderIdle, String> {
     crate::chat_service::parse_reply_reminder_idle(value).map(ReplyReminderIdle)
+}
+/// `chat run --reply-notice-tools`: the tool calls that bring a mid-turn notice, 0 for off.
+fn reply_notice_tools(value: &str) -> Result<usize, String> {
+    crate::chat_service::parse_reply_notice_tools(value)
+}
+/// `chat run --reply-notice-after`: how far past the input start the last counted tool call comes.
+fn reply_notice_after(value: &str) -> Result<Duration, String> {
+    crate::chat_service::parse_reply_notice_after(value)
 }
 fn chat_ignored_text_prefix(value: &str) -> Result<String, String> {
     crate::chat_runtime::validate_ignored_text_prefix(value)
@@ -8340,6 +8354,8 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                         crate::chat_service::ReplyReminderSettings {
                             idle,
                             claude_bin: value.claude_bin.clone(),
+                            notice_tools: value.reply_notice_tools,
+                            notice_after: value.reply_notice_after,
                         }
                     }),
                     registry: Some(registry.clone()),
@@ -10177,6 +10193,28 @@ mod tests {
         );
         for bad in ["5s", "13h", "25h", "1d", "soon"] {
             assert!(run(&["--reply-reminder-idle", bad]).is_err(), "{bad}");
+        }
+        // Mid-turn notices for a headless coordinator (#2386): 3 tool calls over 2 minutes by
+        // default, 0 tool calls for off, and bounded both ways.
+        assert_eq!(defaults.reply_notice_tools, 3);
+        assert_eq!(defaults.reply_notice_after, Duration::from_secs(120));
+        let set = run(&["--reply-notice-tools", "5", "--reply-notice-after", "90"]).unwrap();
+        assert_eq!(set.reply_notice_tools, 5);
+        assert_eq!(set.reply_notice_after, Duration::from_secs(90));
+        assert_eq!(
+            run(&["--reply-notice-tools", "0"])
+                .unwrap()
+                .reply_notice_tools,
+            0
+        );
+        for bad in [
+            &["--reply-notice-tools", "101"][..],
+            &["--reply-notice-tools", "x"],
+            &["--reply-notice-after", "29s"],
+            &["--reply-notice-after", "61m"],
+            &["--reply-notice-after", "2d"],
+        ] {
+            assert!(run(bad).is_err(), "{bad:?}");
         }
         for flag in ["--reply-reminder-idle=60s", "--claude-bin=claude"] {
             assert!(Cli::try_parse_from([

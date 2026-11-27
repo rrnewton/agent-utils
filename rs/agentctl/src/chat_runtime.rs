@@ -40,6 +40,7 @@ mod held_replies;
 mod observe;
 mod raw;
 mod rejections;
+mod reply_notices;
 mod reply_reminders;
 pub(crate) mod reply_windows;
 pub use reply_windows::{ReplyWindowSettings, RequestCapacityHold};
@@ -53,6 +54,7 @@ pub use observe::{parse_rfc3339_millis, RequestTimes, UnsentReply};
 pub use rejections::RejectionSaves;
 pub use repoint::{RepointOutcome, RepointRequest, UncertainRequest};
 
+pub(crate) use reply_notices::{compose_notice, PendingNotice};
 #[cfg(test)]
 pub(crate) use reply_reminders::REPLY_REMINDER_FILE;
 pub(crate) use reply_reminders::{

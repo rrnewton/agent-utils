@@ -58,6 +58,9 @@ mod sender_grants;
 pub use repoint::{repoint, validate_target as validate_repoint_target};
 pub use sender_grants::{grant, grant_limit, grants, revoke};
 
+pub(crate) use headless_reminders::{
+    parse_notice_after as parse_reply_notice_after, parse_notice_tools as parse_reply_notice_tools,
+};
 use reply_reminders::ReplyReminders;
 pub use reply_reminders::{
     parse_idle as parse_reply_reminder_idle, ReplyReminderSettings, DEFAULT_REPLY_REMINDER_IDLE,
@@ -19000,6 +19003,288 @@ esac
         let mut restarted = fresh_reminders();
         reminder_check(&fixture, &state, &mut restarted, &mut turn, false);
         assert_eq!(queued_reminders(&fixture).len(), 1);
+    }
+
+    /// The mid-turn notices queued for the fixture's agent `worker` (#2386): each queue file's
+    /// name and text.
+    fn queued_notices(fixture: &crate::subagents::tests::Fixture) -> Vec<(String, String)> {
+        fn walk(directory: &Path, found: &mut Vec<(String, String)>) {
+            for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                    if name.starts_with("chat-notice-") && name.ends_with(".json") {
+                        let text = fs::read_to_string(&path).expect("queued notice");
+                        found.push((name.to_owned(), text));
+                    }
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&fixture.manager().agent_directory("worker"), &mut found);
+        found
+    }
+
+    #[test]
+    fn a_headless_request_still_unanswered_after_three_tool_calls_mid_turn_is_noticed_once() {
+        // #2386: a headless coordinator wrote its replies only in thinking, so the bridge
+        // captured nothing and the turn ran on for minutes. While the turn still runs, a request
+        // with no reply after 3 tool calls (spread over the configured time, by the log) gets one
+        // notice, recorded in reply-notices.json, never a second; a request answered in the turn
+        // gets none; the turn-end reminder still follows.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state_with_log(&fixture);
+        state
+            .update_reply_reminders(1, None, |_| (false, ()))
+            .expect("start reminders");
+        let manager = fixture.manager();
+        let forgotten = admitted_worker_message(&state, 1, "forgotten");
+        let answered = admitted_worker_message(&state, 2, "answered");
+        for key in [&forgotten, &answered] {
+            state.prompt(key, "").expect("prompt");
+        }
+        let delivered = crate::chat_runtime::unix_millis();
+        mark_delivered(&state, &forgotten, delivered);
+        mark_delivered(&state, &answered, delivered);
+        let fresh_reminders = |after: Duration| {
+            ReplyReminders::with_source(
+                Duration::from_secs(60),
+                Box::new(FakeClaude {
+                    idle: Arc::new(AtomicBool::new(true)),
+                    asked: Arc::default(),
+                    script: Arc::default(),
+                    printed: Arc::default(),
+                    delay: Duration::ZERO,
+                }),
+            )
+            .with_headless_timing(Duration::ZERO, Duration::ZERO)
+            .with_notices(3, after)
+        };
+        let mut reminders = fresh_reminders(Duration::ZERO);
+        let mut turn = TurnEvidence::default();
+        let events = crate::headless::events::directory(&manager.agent_directory("worker"));
+        let mut writer =
+            crate::headless::events::EventWriter::open(&events, "worker").expect("event log");
+        for key in [&forgotten, &answered] {
+            writer
+                .append(
+                    "input.started",
+                    None,
+                    json!({"queue_id": format!("chat-{key}"), "mid_turn": true}),
+                )
+                .expect("append");
+        }
+        writer
+            .append(
+                "assistant.text",
+                None,
+                json!({"text": "<CHAT_REPLY_002>\nthe answer\n</CHAT_REPLY_002>"}),
+            )
+            .expect("append");
+        let mut routes = RouteCache::from_entries(state.reply_route_entries().expect("routes"));
+        let mut notes = NoteLog::default();
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        HeadlessCaptureWatch::default()
+            .tick(
+                &state,
+                &manager,
+                DrainOptions::default(),
+                &mut routes,
+                &mut notes,
+                &mut control,
+            )
+            .expect("capture tick");
+        let tool = |writer: &mut crate::headless::events::EventWriter, n: u32| {
+            writer
+                .append(
+                    "tool.started",
+                    None,
+                    json!({"tool_use_id": format!("t{n}"), "tool": "Bash"}),
+                )
+                .expect("append tool");
+        };
+        // Two tool calls, only thinking between them: not yet.
+        tool(&mut writer, 1);
+        tool(&mut writer, 2);
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert!(queued_notices(&fixture).is_empty());
+        assert!(!state.state_root().join("reply-notices.json").exists());
+        tool(&mut writer, 3);
+        // Three, but spread over less than the configured time by the log's clock: not yet.
+        let mut patient = fresh_reminders(Duration::from_secs(3_600));
+        reminder_check(&fixture, &state, &mut patient, &mut turn, false);
+        assert!(queued_notices(&fixture).is_empty());
+        // Three over enough log time: one notice, for the unanswered request only.
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        let queued = queued_notices(&fixture);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        let (_, text) = &queued[0];
+        assert!(text.contains("Chat reply check"), "{text}");
+        assert!(text.contains("reply ID 001"), "{text}");
+        assert!(!text.contains("reply ID 002"), "{text}");
+        assert!(text.contains("3 tool calls into this turn"), "{text}");
+        assert!(
+            text.contains("A reply written only in your thinking is not delivered"),
+            "{text}"
+        );
+        let prompt: Value = serde_json::from_str(text).expect("queued notice JSON");
+        let body = prompt.to_string();
+        for line in body.split("\\n") {
+            let line = line.trim();
+            assert!(
+                !line.starts_with("<CHAT_REPLY_") && !line.starts_with("</CHAT_REPLY_"),
+                "a notice row reads as a marker line: {line}"
+            );
+        }
+        let record: Value = serde_json::from_slice(
+            &fs::read(state.state_root().join("reply-notices.json")).expect("notice record"),
+        )
+        .expect("notice record JSON");
+        assert_eq!(record["schema"], "agentctl-chat-reply-notices/v1");
+        assert_eq!(
+            record["noticed"].as_array().map(Vec::len),
+            Some(1),
+            "{record}"
+        );
+        assert_eq!(record["noticed"][0]["key"], json!(forgotten));
+        assert_eq!(record["noticed"][0]["reply_id"], "001");
+        assert!(
+            record.get("pending").is_none(),
+            "a queued notice is settled: {record}"
+        );
+        // More tool calls, another check and a restarted bridge notice no one again.
+        tool(&mut writer, 4);
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        let mut restarted = fresh_reminders(Duration::ZERO);
+        reminder_check(&fixture, &state, &mut restarted, &mut turn, false);
+        assert_eq!(queued_notices(&fixture).len(), 1);
+        assert!(queued_reminders(&fixture).is_empty(), "the turn still runs");
+        // The turn ends with no reply: the turn-end reminder still follows (#2331).
+        writer
+            .append("turn.completed", None, json!({"outcome": "completed"}))
+            .expect("append");
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert_eq!(queued_reminders(&fixture).len(), 1);
+        assert_eq!(queued_notices(&fixture).len(), 1);
+    }
+
+    #[test]
+    fn a_mid_turn_notice_the_queue_refuses_is_taken_back_and_later_queued_exactly_once() {
+        // #2386: the queue refuses the notice (the agent is paused). The notice and its request
+        // are taken back, so nothing counts as sent; each refusal leaves no record behind; once
+        // the queue takes notices again, the next check records and queues it exactly once, and
+        // no later check queues a duplicate.
+        let fixture = crate::subagents::tests::Fixture::new();
+        let state = headless_worker_state_with_log(&fixture);
+        state
+            .update_reply_reminders(1, None, |_| (false, ()))
+            .expect("start reminders");
+        let manager = fixture.manager();
+        let forgotten = admitted_worker_message(&state, 1, "forgotten");
+        state.prompt(&forgotten, "").expect("prompt");
+        mark_delivered(&state, &forgotten, crate::chat_runtime::unix_millis());
+        let record_path = manager.agent_directory("worker").join("agent.json");
+        let set_paused = |paused: bool| {
+            let mut record: Value =
+                serde_json::from_slice(&fs::read(&record_path).expect("agent record"))
+                    .expect("agent record JSON");
+            record["paused"] = json!(paused);
+            fs::write(
+                &record_path,
+                serde_json::to_vec_pretty(&record).expect("agent record bytes"),
+            )
+            .expect("write agent record");
+        };
+        let mut reminders = ReplyReminders::with_source(
+            Duration::from_secs(60),
+            Box::new(FakeClaude {
+                idle: Arc::new(AtomicBool::new(true)),
+                asked: Arc::default(),
+                script: Arc::default(),
+                printed: Arc::default(),
+                delay: Duration::ZERO,
+            }),
+        )
+        .with_headless_timing(Duration::ZERO, Duration::ZERO)
+        .with_notices(3, Duration::ZERO)
+        .with_notice_retry(Duration::ZERO);
+        let said = reminders.said.clone();
+        let mut turn = TurnEvidence::default();
+        let events = crate::headless::events::directory(&manager.agent_directory("worker"));
+        let mut writer =
+            crate::headless::events::EventWriter::open(&events, "worker").expect("event log");
+        writer
+            .append(
+                "input.started",
+                None,
+                json!({"queue_id": format!("chat-{forgotten}"), "mid_turn": true}),
+            )
+            .expect("append");
+        for n in 1..=3 {
+            writer
+                .append(
+                    "tool.started",
+                    None,
+                    json!({"tool_use_id": format!("t{n}"), "tool": "Bash"}),
+                )
+                .expect("append tool");
+        }
+        let notice_record = || -> Value {
+            serde_json::from_slice(
+                &fs::read(state.state_root().join("reply-notices.json")).expect("notice record"),
+            )
+            .expect("notice record JSON")
+        };
+        set_paused(true);
+        for _ in 0..2 {
+            reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+            assert!(queued_notices(&fixture).is_empty());
+            let record = notice_record();
+            assert_eq!(record["noticed"], json!([]), "taken back: {record}");
+            assert!(record.get("pending").is_none(), "{record}");
+        }
+        let refusals = said
+            .lock()
+            .expect("reminder log")
+            .iter()
+            .filter(|line| line.contains("was not queued and is taken back"))
+            .count();
+        assert_eq!(refusals, 2);
+        // The queue takes notices again: the next check queues exactly one.
+        set_paused(false);
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        let queued = queued_notices(&fixture);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert!(queued[0].1.contains("reply ID 001"), "{queued:?}");
+        let record = notice_record();
+        assert_eq!(
+            record["noticed"].as_array().map(Vec::len),
+            Some(1),
+            "{record}"
+        );
+        assert_eq!(record["noticed"][0]["key"], json!(forgotten));
+        assert!(record.get("pending").is_none(), "{record}");
+        // No later check, and no restarted bridge, queues a duplicate.
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        let mut restarted = ReplyReminders::with_source(
+            Duration::from_secs(60),
+            Box::new(FakeClaude {
+                idle: Arc::new(AtomicBool::new(true)),
+                asked: Arc::default(),
+                script: Arc::default(),
+                printed: Arc::default(),
+                delay: Duration::ZERO,
+            }),
+        )
+        .with_headless_timing(Duration::ZERO, Duration::ZERO)
+        .with_notices(3, Duration::ZERO);
+        reminder_check(&fixture, &state, &mut restarted, &mut turn, false);
+        assert_eq!(queued_notices(&fixture).len(), 1);
     }
 
     #[test]

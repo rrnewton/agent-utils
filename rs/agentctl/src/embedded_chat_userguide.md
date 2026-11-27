@@ -2220,6 +2220,26 @@ queues one reminder for the next turn boundary, as it does for a TUI agent.
 command. `chat status` lists each request reminded and still unanswered
 under `reply_reminders.unanswered_after_reminder`.
 
+A headless agent can write a reply only in its thinking, which never reaches
+the event log, so nothing is captured and the agent believes it answered
+(#2386). The turn-end reminder catches that only once the turn ends, which can
+be many minutes later. So while the turn still runs, the bridge queues one
+mid-turn notice of each request that holds no reply after 3 tool calls
+(`chat run --reply-notice-tools N`; `0` turns notices off, at most 100). The
+latest of those tool calls must come at least 2 minutes after the request's
+input started (`--reply-notice-after DURATION`, 30s to 1h). Both are read from
+the event log's own timestamps, never the bridge's clock, so a slow host cannot
+bring a notice forward. The notice says that a reply written only in thinking
+is not delivered, names the reply IDs and their `chat reply` commands, and
+tells the agent to carry on if it is still working. The bridge records each
+notice in `reply-notices.json` (schema `agentctl-chat-reply-notices/v1`)
+before queueing it, so it comes once per request, across restarts too. One
+the queue refuses is taken back and tried at a later check. Notices need
+reply reminders on (`--reply-reminder-idle` not `0`). The turn-end reminder
+still follows if the turn ends with no reply. Like the reminder, a notice
+cannot catch a lost part of a multi-part reply: one captured part makes the
+request answered.
+
 Give the agent permission to run the printed `chat reply` command and to
 write its reply files, if it is to use them. Restart `chat run` when
 the agent is restarted in the other mode under the same name, since the

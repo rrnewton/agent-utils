@@ -89,6 +89,12 @@ pub struct ReplyReminderSettings {
     pub idle: Duration,
     /// The Claude Code executable whose `agents --json` tells whether the coordinator is idle.
     pub claude_bin: PathBuf,
+    /// For a headless coordinator, how many tool calls in the turn that took a request, with no
+    /// reply to it, bring one mid-turn notice; 0 turns notices off (#2386).
+    pub notice_tools: usize,
+    /// How far past the request's input start, by the event log's clock, the latest of those tool
+    /// calls must come.
+    pub notice_after: Duration,
 }
 
 impl Default for ReplyReminderSettings {
@@ -96,6 +102,8 @@ impl Default for ReplyReminderSettings {
         Self {
             idle: DEFAULT_REPLY_REMINDER_IDLE,
             claude_bin: PathBuf::from("claude"),
+            notice_tools: super::headless_reminders::DEFAULT_NOTICE_TOOLS,
+            notice_after: super::headless_reminders::DEFAULT_NOTICE_AFTER,
         }
     }
 }
@@ -550,13 +558,16 @@ impl ReplyReminders {
     /// Reminders after `settings.idle`, asking `settings.claude_bin` whether the coordinator is
     /// idle.
     pub(super) fn new(settings: &ReplyReminderSettings) -> Self {
-        Self::with_source(
+        let mut reminders = Self::with_source(
             settings.idle,
             Box::new(ClaudeAgents::new(
                 settings.claude_bin.clone(),
                 PathBuf::from("/proc"),
             )),
-        )
+        );
+        reminders.headless = std::mem::take(&mut reminders.headless)
+            .with_notices(settings.notice_tools, settings.notice_after);
+        reminders
     }
 
     pub(crate) fn with_source(idle: Duration, source: Box<dyn ClaudeIdleSource>) -> Self {
@@ -594,7 +605,23 @@ impl ReplyReminders {
     /// `interval` (#2331), so a test never waits the real 20 s.
     #[cfg(test)]
     pub(super) fn with_headless_timing(mut self, grace: Duration, interval: Duration) -> Self {
-        self.headless = super::headless_reminders::HeadlessState::with_timing(grace, interval);
+        let (tools, after) = (self.headless.notice_tools, self.headless.notice_after);
+        self.headless = super::headless_reminders::HeadlessState::with_timing(grace, interval)
+            .with_notices(tools, after);
+        self
+    }
+
+    /// These reminders with mid-turn notice thresholds of `tools` tool calls and `after` (#2386).
+    #[cfg(test)]
+    pub(super) fn with_notices(mut self, tools: usize, after: Duration) -> Self {
+        self.headless = std::mem::take(&mut self.headless).with_notices(tools, after);
+        self
+    }
+
+    /// These reminders with a refused mid-turn notice holding off the next for `after` (#2386).
+    #[cfg(test)]
+    pub(super) fn with_notice_retry(mut self, after: Duration) -> Self {
+        self.headless = std::mem::take(&mut self.headless).with_notice_retry(after);
         self
     }
 
@@ -607,11 +634,21 @@ impl ReplyReminders {
 
     /// What the service logs at startup about these reminders.
     pub(super) fn describe(settings: &ReplyReminderSettings) -> String {
+        let notices = if settings.notice_tools == 0 {
+            "mid-turn notices for a headless coordinator are off".to_owned()
+        } else {
+            format!(
+                "a headless coordinator still in the turn that took a request, {} tool calls and \
+{}s after its input started with no reply to it, is noticed once of that request",
+                settings.notice_tools,
+                settings.notice_after.as_secs()
+            )
+        };
         format!(
             "agentctl: reply reminders: a coordinator idle for {}s after a request's \
 prompt was typed, with no reply to it, is reminded once of that request; the harness in \
 its pane tells whether it is idle (`{} agents --json` for a Claude Code pane, the pane's \
-status for the others)",
+status for the others); {notices}",
             settings.idle.as_secs(),
             settings.claude_bin.display()
         )
@@ -1141,6 +1178,9 @@ seen working and is idle again, or for {}s if it is not seen working",
                 return check;
             }
         };
+        self.notice_mid_turn(
+            state, manager, stop, delivery, &record, &eligible, &mut check,
+        );
         let due = headless::due(&eligible, &ends, now, self.headless.grace);
         if due.is_empty() {
             return check;
@@ -1212,6 +1252,124 @@ seen working and is idle again, or for {}s if it is not seen working",
         );
         check.report.prompt_typed |= outcome.may_have_typed();
         check
+    }
+
+    /// The mid-turn notice for a headless coordinator (#2386): notice once each of `eligible`
+    /// still in the turn that took it after the configured tool calls, by the event log the last
+    /// `turn_ends` read, and queue the notice at once, while the coordinator works. The notice is
+    /// recorded in `reply-notices.json` before it is queued and taken back if the queue refuses
+    /// it; a notice left pending by a crash counts as queued.
+    #[allow(clippy::too_many_arguments)]
+    fn notice_mid_turn<A: ManagedApi + ?Sized>(
+        &mut self,
+        state: &BridgeState,
+        manager: &ManagedAgents<'_, A>,
+        stop: &StopState,
+        delivery: DrainOptions,
+        reminders: &chat_runtime::ReplyReminderRecord,
+        eligible: &[ReminderCandidate],
+        check: &mut ReminderCheck,
+    ) {
+        use super::headless_reminders as headless;
+        if self.headless.notice_tools == 0 || self.headless.notice_held() {
+            return;
+        }
+        let progress = self.headless.progress();
+        let (due, tool_calls) = headless::notice_due(
+            eligible,
+            &progress,
+            self.headless.notice_tools,
+            self.headless.notice_after,
+        );
+        if due.is_empty() {
+            return;
+        }
+        let now = chat_runtime::unix_millis();
+        let record = match state.reply_notices(now) {
+            Ok(record) => record,
+            Err(error) => {
+                self.failed("the notice record", error);
+                return;
+            }
+        };
+        // A reply captured since the candidates were read leaves them; a request already noticed
+        // gets none. Eligibility already holds back requests typed before reminders started.
+        let candidates = match state.reply_reminder_candidates() {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                self.failed("the request records", error);
+                return;
+            }
+        };
+        let still = candidates
+            .eligible(reminders, now)
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect::<BTreeSet<_>>();
+        let due = due
+            .into_iter()
+            .filter(|candidate| still.contains(&candidate.key) && !record.noticed(&candidate.key))
+            .collect::<Vec<_>>();
+        if due.is_empty() && record.pending.is_none() {
+            return;
+        }
+        let notice =
+            (!due.is_empty()).then(|| chat_runtime::compose_notice(state, &due, tool_calls, now));
+        let recorded = state.update_reply_notices(now, Some(&candidates.retained), |record| {
+            // A notice a crash left pending may have been queued: it counts as delivered.
+            if let Some(left) = record.pending.clone() {
+                record.settle(&left.message_id, true);
+            }
+            if let Some(notice) = &notice {
+                record.record(notice, &due, now);
+            }
+            (true, ())
+        });
+        if let Err(error) = recorded {
+            self.failed("the notice record", error);
+            return;
+        }
+        self.worked("the notice record");
+        let Some(notice) = notice else {
+            return;
+        };
+        let agent_name = state.config().agent_name.clone();
+        let queued = headless::deliver_notice(
+            manager,
+            &StopRuntime::new(stop),
+            &agent_name,
+            &notice,
+            delivery,
+        );
+        let ids = due
+            .iter()
+            .map(|request| request.reply_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let settled = state.update_reply_notices(
+            chat_runtime::unix_millis(),
+            Some(&candidates.retained),
+            |record| (record.settle(&notice.message_id, queued.is_ok()), ()),
+        );
+        if let Err(error) = settled {
+            self.failed("the notice record", error);
+        }
+        match queued {
+            Ok(()) => {
+                self.say(format_args!(
+                    "agentctl: mid-turn reply notice queued for reply ID(s) {ids}: no reply after \
+{tool_calls} tool calls in the turn that took them"
+                ));
+                check.report.prompt_typed = true;
+            }
+            Err(why) => {
+                self.headless.notice_refused();
+                self.say(format_args!(
+                    "agentctl: mid-turn reply notice for reply ID(s) {ids} was not queued and is taken \
+back; a later check tries again: {why}"
+                ));
+            }
+        }
     }
 
     /// `due` without each request whose reply ID heads a complete reply block in the transcript of
