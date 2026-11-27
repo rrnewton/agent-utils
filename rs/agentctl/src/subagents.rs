@@ -2974,7 +2974,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         pane_id: &str,
         text: &str,
         runtime: &dyn agent::AgentRuntime,
-    ) -> crate::error::Result<String> {
+    ) -> crate::error::Result<MuseBaseline> {
         let baseline = || {
             if text.contains(['\0', '\u{1b}']) {
                 return Err(AdapterError::unavailable(
@@ -2982,6 +2982,15 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 ));
             }
             let mut info = self.pane_info_with_runtime(pane_id, runtime)?;
+            // This very prompt, pasted by an earlier attempt that left no record of typing
+            // it, is submitted where it is, never typed again (#2399
+            // agentctl-muse-delivery-unrecorded-paste).
+            if info.status == "staged" {
+                let screen = self.verified_muse_screen(pane_id, runtime)?;
+                if self.delivering_draft(pane_id, &screen, text)? {
+                    return Ok(MuseBaseline::Delivering(screen));
+                }
+            }
             // A draft agentctl typed and Muse left unsent is submitted first (#720
             // agentctl-muse-stale-draft); any other draft refuses, naming it.
             if info.status == "staged" && self.recover_muse_draft(pane_id, runtime)?.is_some() {
@@ -3001,7 +3010,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                     "pane {pane_id} does not show an empty Muse editor with one status footer"
                 )));
             }
-            Ok(before)
+            Ok(MuseBaseline::Empty(before))
         };
         baseline().map_err(|error| {
             if error.kind() == AdapterErrorKind::NotStaged {
@@ -3052,7 +3061,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         pane_id: &str,
         text: &str,
         runtime: &dyn agent::AgentRuntime,
-    ) -> crate::error::Result<String> {
+    ) -> crate::error::Result<MuseBaseline> {
         let baseline = || {
             if text.contains(['\0', '\u{1b}']) {
                 return Err(AdapterError::unavailable(
@@ -3067,6 +3076,14 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 )));
             }
             let mut before = self.verified_muse_screen(pane_id, runtime)?;
+            // This very prompt, pasted by an earlier attempt that left no record of typing
+            // it, is submitted where it is, never typed again (#2399
+            // agentctl-muse-delivery-unrecorded-paste).
+            if !crate::harness_tui::muse::MuseTui::editor_empty(&before)
+                && self.delivering_draft(pane_id, &before, text)?
+            {
+                return Ok(MuseBaseline::Delivering(before));
+            }
             if !crate::harness_tui::muse::MuseTui::editor_empty(&before)
                 && self.recover_muse_draft(pane_id, runtime)?.is_some()
             {
@@ -3078,7 +3095,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                      (a draft, an approval form or a panel may be there)"
                 )));
             }
-            Ok(before)
+            Ok(MuseBaseline::Empty(before))
         };
         baseline().map_err(|error| {
             if error.kind() == AdapterErrorKind::NotStaged {
@@ -3087,6 +3104,71 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 AdapterError::not_staged(format!("{error}; nothing was typed"))
             }
         })
+    }
+
+    /// Press Enter on `text`, which `staged` shows as the whole idle Muse editor, and leave
+    /// what the `working` wait needs to confirm it took the prompt: the second half of an idle
+    /// Muse delivery, whether this delivery pasted the prompt or an earlier attempt left its
+    /// paste there unsent (#2399 agentctl-muse-delivery-unrecorded-paste).
+    fn submit_staged_muse_prompt(
+        &self,
+        guarded: &dyn GuardedInput,
+        pane_id: &str,
+        text: &str,
+        staged: String,
+    ) -> crate::error::Result<()> {
+        let journal = self.muse_journal().map(|watch| Arc::new(Mutex::new(watch)));
+        // The guard verifies the pinned Muse process immediately around the Enter.
+        guarded.send_keys(pane_id, "Enter")?;
+        *self
+            .custom_submission
+            .lock()
+            .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
+            prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
+            prior_queued_count: muse_verified_process_prompt_queued_count(&staged, text),
+            journal,
+            enter: EnterRetry::pressed(),
+            staged_screen: staged,
+            text: text.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// Whether `screen`'s Muse editor holds `text`, the prompt being delivered, as an earlier
+    /// attempt of agentctl's pasted it and left it unsent with no record of typing it (#2399
+    /// agentctl-muse-delivery-unrecorded-paste): exactly as this delivery's own paste would
+    /// stage, and agentctl's by [`crate::stale_draft::prompt_being_delivered`]. Such a draft is
+    /// submitted as this delivery. An error refuses a placeholder that may be this prompt or
+    /// another one the queue records as typed: neither is submitted, and nothing is typed.
+    fn delivering_draft(
+        &self,
+        pane_id: &str,
+        screen: &str,
+        text: &str,
+    ) -> crate::error::Result<bool> {
+        use crate::stale_draft::Delivering;
+        let Some(draft) = muse_verified_process_editor_draft(&crate::harness_tui::plain(screen))
+        else {
+            return Ok(false);
+        };
+        if !muse_verified_process_paste_is_exact_composer(screen, text) {
+            return Ok(false);
+        }
+        match crate::stale_draft::prompt_being_delivered(
+            self.queue,
+            &draft,
+            text,
+            SystemTime::now(),
+        ) {
+            Delivering::Ours => Ok(true),
+            Delivering::No => Ok(false),
+            Delivering::Shared(other) => Err(AdapterError::unavailable(format!(
+                "pane {pane_id}: the Muse editor holds {}, the size of this prompt and of one \
+                 {other}; it may be either, so agentctl neither submits it nor types this prompt \
+                 over it: submit or clear it in the pane",
+                draft.describe()
+            ))),
+        }
     }
 
     /// Submit a draft that agentctl itself typed and Muse left unsent in its editor, so that it
@@ -3220,8 +3302,24 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             .goal_objective
             .lock()
             .expect("goal operation lock poisoned") = None;
-        let before = self.muse_followup_baseline(pane_id, text, runtime)?;
+        let before = match self.muse_followup_baseline(pane_id, text, runtime)? {
+            MuseBaseline::Empty(before) => before,
+            // An earlier attempt's paste of this prompt, left unsent: Enter submits it, with the
+            // same proof as a paste of this delivery's own; it is never typed again (#2399).
+            MuseBaseline::Delivering(staged) => {
+                let guarded = self.guarded(runtime)?;
+                note_typing_started(runtime)?;
+                let started = runtime.monotonic();
+                let outcome =
+                    self.muse_followup_submit(&guarded, pane_id, text, &staged, started, runtime);
+                if matches!(outcome, Ok(Submission::Verified(_))) {
+                    self.recheck_muse_submitted(&guarded, pane_id, text, runtime);
+                }
+                return outcome;
+            }
+        };
         let guarded = self.guarded(runtime)?;
+        note_typing_started(runtime)?;
         guarded.send_text(
             pane_id,
             &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
@@ -4480,6 +4578,33 @@ const GOAL_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 const GOAL_SETTLE: Duration = Duration::from_secs(2);
 /// How long a withdrawn Muse paste is watched for drawing late before the editor counts as empty.
 const MUSE_LATE_PASTE: Duration = Duration::from_millis(500);
+/// What a Muse editor holds before a delivery types into it.
+enum MuseBaseline {
+    /// The empty editor, as the screen the paste must change.
+    Empty(String),
+    /// The prompt being delivered, staged by an earlier attempt that left no record of typing
+    /// it (#2399 agentctl-muse-delivery-unrecorded-paste), as the screen showing it staged: the
+    /// delivery submits it and never types the prompt again.
+    Delivering(String),
+}
+
+/// Record that this delivery's input begins, just before its first input effect: a drain
+/// stamps `paste_started_at` durably, so a stop or a crash after the paste is never taken for
+/// a delivery that typed nothing (#2399 agentctl-muse-delivery-unrecorded-paste). A delivery
+/// already cancelled, or one whose stamp cannot be written, types nothing.
+fn note_typing_started(runtime: &dyn agent::AgentRuntime) -> crate::error::Result<()> {
+    if runtime.cancelled() {
+        return Err(AdapterError::not_staged(
+            "delivery was cancelled before typing; nothing was typed",
+        ));
+    }
+    runtime.record_input_started().map_err(|error| {
+        AdapterError::not_staged(format!(
+            "the queue record could not note that typing began ({error}); nothing was typed"
+        ))
+    })
+}
+
 /// How a refusal names a draft in the Muse editor that agentctl did not type.
 const FOREIGN_DRAFT: &str = "holds a draft that agentctl did not type";
 /// Most presses of Enter that submit an unsent draft agentctl typed (#720
@@ -5512,7 +5637,9 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 .lock()
                 .expect("custom submission lock poisoned") = None;
         } else {
-            self.guarded(runtime)?.native_prompt(pane_id, text)?;
+            let guarded = self.guarded(runtime)?;
+            note_typing_started(runtime)?;
+            guarded.native_prompt(pane_id, text)?;
         }
         let objective = (!crate::goal_command::is_subcommand(argument)).then_some(argument);
         // A Codex picker already open before this command was typed is
@@ -6235,6 +6362,18 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             other => other,
         }
     }
+    fn holds_prompt_being_delivered_with_runtime(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<bool> {
+        if !self.uses_muse_composer() || text.trim_start().starts_with('/') {
+            return Ok(false);
+        }
+        let screen = self.verified_muse_screen(pane_id, runtime)?;
+        self.delivering_draft(pane_id, &screen, text)
+    }
     fn working_wait_proves_printed(&self) -> bool {
         // The Muse `working` wait reads the screen for the submitted prompt (see
         // `wait_agent_status_with_runtime_unchecked`), never Herdr's state alone.
@@ -6422,7 +6561,14 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         if !self.uses_muse_composer() {
             return guarded.native_prompt(pane_id, text);
         }
-        let before = self.muse_paste_baseline(pane_id, text, &runtime)?;
+        let before = match self.muse_paste_baseline(pane_id, text, &runtime)? {
+            MuseBaseline::Empty(before) => before,
+            // This prompt is already staged, left unsent by an earlier paste of it (#2399):
+            // Enter submits it there rather than a second paste.
+            MuseBaseline::Delivering(staged) => {
+                return self.submit_staged_muse_prompt(&guarded, pane_id, text, staged);
+            }
+        };
         guarded.send_text(
             pane_id,
             &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
@@ -6452,21 +6598,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
             );
         };
-        let journal = self.muse_journal().map(|watch| Arc::new(Mutex::new(watch)));
-        // The guard verifies the pinned Muse process immediately around the Enter.
-        guarded.send_keys(pane_id, "Enter")?;
-        *self
-            .custom_submission
-            .lock()
-            .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
-            prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
-            prior_queued_count: muse_verified_process_prompt_queued_count(&staged, text),
-            journal,
-            enter: EnterRetry::pressed(),
-            staged_screen: staged,
-            text: text.to_owned(),
-        });
-        Ok(())
+        self.submit_staged_muse_prompt(&guarded, pane_id, text, staged)
     }
     fn wait_agent_status(
         &self,
@@ -6678,58 +6810,58 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         }
         let guarded = self.guarded(runtime)?;
         if !self.uses_muse_composer() {
+            note_typing_started(runtime)?;
             return guarded.native_prompt(pane_id, text);
         }
-        let before = self.muse_paste_baseline(pane_id, text, runtime)?;
-        guarded.send_text(
-            pane_id,
-            &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
-        )?;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let staged = loop {
-            if runtime.cancelled() {
-                return Err(crate::error::AdapterError::cancelled(
-                    "Herdr control operation was cancelled",
-                ));
+        let staged = match self.muse_paste_baseline(pane_id, text, runtime)? {
+            // An earlier attempt's paste of this prompt, left unsent: Enter submits it where it
+            // is, with the same confirmation as a paste of this delivery's own (#2399).
+            MuseBaseline::Delivering(staged) => {
+                note_typing_started(runtime)?;
+                staged
             }
-            self.verify_muse_process_with_runtime(pane_id, runtime)?;
-            let screen = self.muse_status_screen_with_runtime(pane_id, runtime)?;
-            self.verify_muse_process_with_runtime(pane_id, runtime)?;
-            if screen != before && muse_verified_process_paste_is_exact_composer(&screen, text) {
-                break screen;
-            }
-            if Instant::now() >= deadline {
-                if let Some(staged) =
-                    self.await_late_muse_paste(pane_id, text, &before, screen, runtime)?
-                {
-                    break staged;
-                }
-                return Err(self.withdraw_unverified_muse_paste(
-                    &guarded,
+            MuseBaseline::Empty(before) => {
+                note_typing_started(runtime)?;
+                guarded.send_text(
                     pane_id,
-                    "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent",
-                    runtime,
-                ));
+                    &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
+                )?;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if runtime.cancelled() {
+                        return Err(crate::error::AdapterError::cancelled(
+                            "Herdr control operation was cancelled",
+                        ));
+                    }
+                    self.verify_muse_process_with_runtime(pane_id, runtime)?;
+                    let screen = self.muse_status_screen_with_runtime(pane_id, runtime)?;
+                    self.verify_muse_process_with_runtime(pane_id, runtime)?;
+                    if screen != before
+                        && muse_verified_process_paste_is_exact_composer(&screen, text)
+                    {
+                        break screen;
+                    }
+                    if Instant::now() >= deadline {
+                        if let Some(staged) =
+                            self.await_late_muse_paste(pane_id, text, &before, screen, runtime)?
+                        {
+                            break staged;
+                        }
+                        return Err(self.withdraw_unverified_muse_paste(
+                            &guarded,
+                            pane_id,
+                            "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent",
+                            runtime,
+                        ));
+                    }
+                    std::thread::sleep(
+                        Duration::from_millis(50)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
             }
-            std::thread::sleep(
-                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
-            );
         };
-        let journal = self.muse_journal().map(|watch| Arc::new(Mutex::new(watch)));
-        // The guard verifies the pinned Muse process immediately around the Enter.
-        guarded.send_keys(pane_id, "Enter")?;
-        *self
-            .custom_submission
-            .lock()
-            .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
-            prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
-            prior_queued_count: muse_verified_process_prompt_queued_count(&staged, text),
-            journal,
-            enter: EnterRetry::pressed(),
-            staged_screen: staged,
-            text: text.to_owned(),
-        });
-        Ok(())
+        self.submit_staged_muse_prompt(&guarded, pane_id, text, staged)
     }
 
     fn submit_with_runtime(
@@ -18714,6 +18846,7 @@ pub(crate) mod tests {
                     replace_harness_on_read: AtomicBool::new(false),
                     literal_pastes: Mutex::new(Vec::new()),
                     muse_editor: Mutex::new(None),
+                    on_paste: Mutex::new(None),
                     herdr_names: Mutex::new(BTreeMap::new()),
                     expect_supported: AtomicBool::new(false),
                     scrollback: Mutex::new(BTreeMap::new()),
@@ -19215,6 +19348,10 @@ pub(crate) mod tests {
         replace_harness_on_read: AtomicBool,
         literal_pastes: Mutex<Vec<(String, String)>>,
         muse_editor: Mutex<Option<herdr_compatibility::MuseEditor>>,
+        /// Called with each prompt pasted into the Muse editor, once the editor holds it and
+        /// its lock is released: what a test sees of the queue at the moment a paste lands.
+        #[allow(clippy::type_complexity)]
+        pub(crate) on_paste: Mutex<Option<Box<dyn Fn(&str) + Send>>>,
         /// Herdr agent names mapped to their panes.
         herdr_names: Mutex<BTreeMap<String, String>>,
         /// Whether the server advertises `input-expect`.
@@ -20636,8 +20773,8 @@ pub(crate) mod tests {
                     .push((pane.to_owned(), text.to_owned()));
                 return Ok(());
             }
-            let mut editor = self.muse_editor.lock().unwrap();
-            let editor = editor
+            let mut guard = self.muse_editor.lock().unwrap();
+            let editor = guard
                 .as_mut()
                 .ok_or_else(|| AdapterError::unavailable("literal pane input is unavailable"))?;
             let prompt = text
@@ -20649,6 +20786,10 @@ pub(crate) mod tests {
                 .unwrap()
                 .push((pane.to_owned(), text.to_owned()));
             editor.paste(prompt);
+            drop(guard);
+            if let Some(hook) = self.on_paste.lock().unwrap().as_ref() {
+                hook(prompt);
+            }
             Ok(())
         }
         fn close_tab(&self, tab: &str) -> AdapterResult<()> {
@@ -26397,4 +26538,7 @@ fi
     mod stop_advice;
     /// Retirement of headless turn-runner records whose runner is provably dead.
     mod turn_runner;
+    /// A Muse delivery stopped after its paste is recorded typed; its own paste is never
+    /// called foreign (#2399).
+    mod unrecorded_paste;
 }

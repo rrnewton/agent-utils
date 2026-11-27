@@ -442,6 +442,21 @@ pub trait AgentApi: Send + Sync {
     ) -> crate::error::Result<Option<String>> {
         Ok(None)
     }
+    /// Whether the pane's editor holds `text`, the prompt a drain is about to deliver, as an
+    /// earlier attempt of agentctl's pasted it and left it unsent with no record of typing it
+    /// (#2399 agentctl-muse-delivery-unrecorded-paste): see
+    /// [`crate::stale_draft::prompt_being_delivered`]. `Ok(true)` lets the readiness wait take
+    /// the pane as ready, and the delivery then submits that copy instead of typing the prompt
+    /// again; an error says why a draft that may be this prompt is left alone. The default
+    /// cannot tell.
+    fn holds_prompt_being_delivered_with_runtime(
+        &self,
+        _pane_id: &str,
+        _text: &str,
+        _runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<bool> {
+        Ok(false)
+    }
 }
 
 impl AgentApi for HerdrClient {
@@ -789,6 +804,9 @@ impl AgentRuntime for UntilRuntime<'_> {
     fn input_started(&self) {
         self.inner.input_started();
     }
+    fn record_input_started(&self) -> std::result::Result<(), String> {
+        self.inner.record_input_started()
+    }
 }
 
 /// Injectable clock used to make readiness polling deterministic in tests and embedders.
@@ -832,6 +850,17 @@ pub trait AgentRuntime {
     /// path that types on behalf of a drain must call this before its
     /// first input effect. The default ignores the note.
     fn input_started(&self) {}
+    /// [`Self::input_started`], saying whether the note was recorded durably (#2399
+    /// agentctl-muse-delivery-unrecorded-paste). A queue drain's tracking runtime writes
+    /// `paste_started_at` with a durable write and returns that write's error. A caller about
+    /// to type refuses when it fails, with nothing typed: a paste the record does not show
+    /// begun is later taken for one that never began, so a stop after it leaves the prompt
+    /// pending with its paste in the editor, refused there as a draft agentctl did not type.
+    /// The default notes it with [`Self::input_started`] and succeeds.
+    fn record_input_started(&self) -> std::result::Result<(), String> {
+        self.input_started();
+        Ok(())
+    }
     /// Whether a verified submission that the agent never accepts, so that the prompt is still
     /// staged in its composer when the submission deadline passes, should take the prompt back
     /// out of the composer and report it as not typed, rather than leave it there and report the
@@ -956,6 +985,9 @@ impl AgentRuntime for QueueRuntime<'_> {
     fn input_started(&self) {
         self.inner.input_started();
     }
+    fn record_input_started(&self) -> std::result::Result<(), String> {
+        self.inner.record_input_started()
+    }
     fn withdraw_unaccepted_prompt(&self) -> bool {
         self.inner.withdraw_unaccepted_prompt()
     }
@@ -1044,6 +1076,9 @@ impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
     fn input_started(&self) {
         self.inner.input_started();
     }
+    fn record_input_started(&self) -> std::result::Result<(), String> {
+        self.inner.record_input_started()
+    }
 }
 
 impl AgentRuntime for WithdrawingRuntime<'_> {
@@ -1105,6 +1140,9 @@ impl AgentRuntime for WithdrawingRuntime<'_> {
 
     fn input_started(&self) {
         self.inner.input_started();
+    }
+    fn record_input_started(&self) -> std::result::Result<(), String> {
+        self.inner.record_input_started()
     }
 }
 
@@ -1222,6 +1260,20 @@ impl AgentRuntime for PasteTrackingRuntime<'_> {
         document.insert("paste_started_at".to_owned(), json!(unix_seconds()));
         let _ = atomic_json(&self.inflight_path, &Value::Object(document.clone()));
     }
+    /// The stamp, written before the input it reports or not at all: on a failed write the
+    /// caller types nothing, and the item, unstamped, is still provably untyped (#2399).
+    fn record_input_started(&self) -> std::result::Result<(), String> {
+        let mut document = self.document.borrow_mut();
+        if document.contains_key("paste_started_at") {
+            return Ok(());
+        }
+        let mut stamped = document.clone();
+        stamped.insert("paste_started_at".to_owned(), json!(unix_seconds()));
+        atomic_json(&self.inflight_path, &Value::Object(stamped.clone()))
+            .map_err(|error| error.to_string())?;
+        *document = stamped;
+        Ok(())
+    }
 }
 
 /// Stamps `paste_started_at` on every inflight item of one combined batch prompt when its
@@ -1300,6 +1352,18 @@ impl AgentRuntime for BatchTrackingRuntime<'_> {
                 }
             }
         }
+    }
+    /// Every member stamped before the combined paste, or the first failure (#2399).
+    fn record_input_started(&self) -> std::result::Result<(), String> {
+        self.inner.record_input_started()?;
+        for path in &self.inflight_paths {
+            let mut document = load_message(path).map_err(|error| error.to_string())?;
+            if !document.contains_key("paste_started_at") {
+                document.insert("paste_started_at".to_owned(), json!(unix_seconds()));
+                atomic_json(path, &Value::Object(document)).map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2338,6 +2402,11 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             .is_ok_and(|text| !text.trim_start().starts_with('/'))
                             && !options.idle_only,
                         options.deliver_while_working && !options.idle_only,
+                        // A stranded prompt has its own flush; any other is matched as typed.
+                        (!document.contains_key("stranded_at"))
+                            .then(|| typed_text(&document).ok())
+                            .flatten()
+                            .as_deref(),
                     ),
                 )
             })();
@@ -4130,7 +4199,9 @@ fn wait_ready<A: AgentApi + ?Sized>(
     runtime: &dyn AgentRuntime,
     locked_pane_id: &str,
     mut initial_info: Option<AgentPaneInfo>,
-    (allow_followups, allow_working_claude): (bool, bool),
+    // `delivering`: the prompt this drain types, so a staged editor holding it, pasted by an
+    // earlier attempt, counts as ready (#2399).
+    (allow_followups, allow_working_claude, delivering): (bool, bool, Option<&str>),
 ) -> AgentResult<AgentPaneInfo> {
     let deadline = runtime.monotonic().saturating_add(timeout);
     // Why a `staged` pane's draft was left alone, once a recovery refused it (#720
@@ -4225,6 +4296,30 @@ fn wait_ready<A: AgentApi + ?Sized>(
         // agentctl-muse-stale-draft). An idle Codex's composer is looked at once per wait,
         // unless a draft was submitted.
         let codex_unready = info.status == "unknown" && info.agent.as_deref() == Some("codex");
+        // A staged editor holding the very prompt this drain delivers, pasted by an earlier
+        // attempt that left no record of typing it, is ready: the delivery submits that copy
+        // and never types the prompt again (#2399 agentctl-muse-delivery-unrecorded-paste).
+        // A draft that may be this prompt or another one agentctl typed is left alone.
+        if info.status == "staged" && draft_refused.is_none() {
+            if let Some(text) = delivering {
+                match client.holds_prompt_being_delivered_with_runtime(&info.pane_id, text, runtime)
+                {
+                    Ok(true) => return Ok(info),
+                    Ok(false) => {}
+                    Err(error) => {
+                        if timeout > Duration::ZERO {
+                            return Err(composer_occupied_error(
+                                client,
+                                &info,
+                                runtime,
+                                Some(error.to_string()),
+                            ));
+                        }
+                        draft_refused = Some(error.to_string());
+                    }
+                }
+            }
+        }
         if (info.status == "staged" || (codex_unready && !codex_draft_checked))
             && draft_refused.is_none()
             && recovered < MAX_DRAFT_RECOVERIES

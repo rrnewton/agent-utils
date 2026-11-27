@@ -419,6 +419,96 @@ fn recent_records(queue: &Path, now: SystemTime, lookback: Duration) -> Vec<Path
 /// A queue record of a typed prompt: when it was typed, its path, and its document.
 type Record = (f64, PathBuf, Map<String, Value>);
 
+/// The records of prompts agentctl typed into this agent, changed within `lookback` of `now`,
+/// latest typed first: delivered or quarantined ones by `inflight_at`, stranded ones back in
+/// their inbox by `stranded_at`, and digests a drain set aside. A prompt typed into the wrong
+/// program was never this agent's and is left out.
+fn typed_records(queue: &Path, now: SystemTime, lookback: Duration) -> Vec<Record> {
+    let mut records: Vec<Record> = recent_records(queue, now, lookback)
+        .into_iter()
+        .filter_map(|path| match crate::agent::read_private_json(&path) {
+            Ok(Value::Object(document))
+                if document.get("probable_misroute") != Some(&Value::Bool(true)) =>
+            {
+                let pending = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|phase| STRANDED_PHASES.iter().any(|lane| phase == *lane));
+                // A stranded prompt is back in its inbox without `inflight_at`; it was typed
+                // when it was stranded.
+                let at = if pending {
+                    document.get("stranded_at")
+                } else {
+                    document.get("inflight_at")
+                }
+                .and_then(Value::as_f64)?;
+                Some((at, path, document))
+            }
+            _ => None,
+        })
+        .collect();
+    records.extend(recent_cancelled_digests(queue, now, lookback));
+    records.sort_by(|left, right| right.0.total_cmp(&left.0));
+    records
+}
+
+/// Whether a draft is the prompt a drain is delivering now, as one of its own earlier attempts
+/// pasted it and left it unsent (#2399 agentctl-muse-delivery-unrecorded-paste).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Delivering {
+    /// The draft is that prompt: the delivery submits it, and never types the prompt again.
+    Ours,
+    /// A `[Pasted Content N chars]` placeholder of that prompt's size, a size a prompt agentctl
+    /// recorded typing also has: it may be either, so the draft is neither submitted nor typed
+    /// over. The other prompt, described.
+    Shared(String),
+    /// Not that prompt.
+    No,
+}
+
+/// Whether `draft` is `text`, the prompt a drain is about to deliver to this agent, pasted by
+/// an earlier attempt that left the editor holding it and no record of having typed it (an
+/// older drainer stopped after its paste, or one whose typing stamp could not be written): see
+/// [`find`] for the prompts the queue records as typed, which are looked for separately.
+///
+/// Only a framed prompt (a sender header, one of agentctl's own `[agentctl ...]` notices, or a
+/// batch) can be agentctl's, as for any draft. A draft whose text shows is that prompt when it
+/// is the whole prompt, wrapping and the `sent:` field ignored. A character-count placeholder
+/// shows only a size: it is that prompt when the size is the prompt's paste length and no
+/// prompt the queue records as typed within [`PLACEHOLDER_LOOKBACK`] has that size too
+/// ([`Delivering::Shared`] otherwise). A numbered placeholder is never taken for it.
+pub(crate) fn prompt_being_delivered(
+    queue: Option<&Path>,
+    draft: &Draft,
+    text: &str,
+    now: SystemTime,
+) -> Delivering {
+    if !framed(text) {
+        return Delivering::No;
+    }
+    match draft {
+        Draft::Text(rows) if text_matches(rows, text) => Delivering::Ours,
+        Draft::Placeholder(length) if shows_paste_length(text, *length) => {
+            let shared = queue.and_then(|queue| {
+                typed_records(queue, now, PLACEHOLDER_LOOKBACK)
+                    .into_iter()
+                    .find(|(_, _, document)| {
+                        typed_texts(document)
+                            .into_iter()
+                            .any(|typed| shows_paste_length(typed, *length))
+                    })
+            });
+            match shared {
+                Some((_, path, document)) => {
+                    Delivering::Shared(typed_prompt(&path, &document, Vec::new()).describe())
+                }
+                None => Delivering::Ours,
+            }
+        }
+        _ => Delivering::No,
+    }
+}
+
 /// The prompt agentctl typed into this agent that `draft` is, or the run of prompts it typed one
 /// after another that `draft` holds in that order, looked for in the queue at `queue` among the
 /// records changed within the draft's lookback of `now`; `None` when agentctl typed no such
@@ -443,32 +533,7 @@ pub(crate) fn find(
     };
     // The records of the latest deliveries, latest first: a batch's members share one
     // `inflight_at`, so they count as one delivery.
-    let mut records: Vec<Record> = recent_records(queue, now, lookback)
-        .into_iter()
-        .filter_map(|path| match crate::agent::read_private_json(&path) {
-            // A prompt typed into the wrong program was never this agent's.
-            Ok(Value::Object(document))
-                if document.get("probable_misroute") != Some(&Value::Bool(true)) =>
-            {
-                let pending = path
-                    .parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|phase| STRANDED_PHASES.iter().any(|lane| phase == *lane));
-                // A stranded prompt is back in its inbox without `inflight_at`; it was typed
-                // when it was stranded.
-                let at = if pending {
-                    document.get("stranded_at")
-                } else {
-                    document.get("inflight_at")
-                }
-                .and_then(Value::as_f64)?;
-                Some((at, path, document))
-            }
-            _ => None,
-        })
-        .collect();
-    records.extend(recent_cancelled_digests(queue, now, lookback));
-    records.sort_by(|left, right| right.0.total_cmp(&left.0));
+    let mut records = typed_records(queue, now, lookback);
     // A character-count placeholder may name an older delivery by a unique
     // size (#1732); keep every record for that second look.
     let all_records = if matches!(draft, Draft::Placeholder(_)) {
@@ -868,6 +933,70 @@ mod tests {
         let path = directory.join(format!("{id}.json"));
         crate::agent::atomic_json(&path, document).unwrap();
         path
+    }
+
+    #[test]
+    fn the_prompt_being_delivered_is_its_own_paste_unless_unframed_or_its_size_is_shared() {
+        // #2399 agentctl-muse-delivery-unrecorded-paste: an earlier attempt pasted the prompt a
+        // drain now delivers and left no record of typing it.
+        let directory = Scratch::new("delivering");
+        let queue = directory.0.as_path();
+        let now = SystemTime::now();
+        let prompt = format!("{HEADER}\nstep 2 measurements are in");
+        let length = crate::client::muse_paste_length(&prompt);
+        // Its whole text, wrapped anywhere, and the placeholder of its size.
+        let wrapped = prompt.replace(' ', "\n");
+        for draft in [Draft::Text(wrapped), Draft::Placeholder(length)] {
+            assert_eq!(
+                prompt_being_delivered(Some(queue), &draft, &prompt, now),
+                Delivering::Ours,
+                "{draft:?}"
+            );
+        }
+        // Another prompt's text, a part of this one, another size, or a numbered chip.
+        for draft in [
+            Draft::Text(format!("{HEADER}\nsomething else")),
+            Draft::Text("step 2 measurements are in".to_owned()),
+            Draft::Placeholder(length + 1),
+            Draft::PastedLines("[Pastedtext#1+1lines]".to_owned()),
+        ] {
+            assert_eq!(
+                prompt_being_delivered(Some(queue), &draft, &prompt, now),
+                Delivering::No,
+                "{draft:?}"
+            );
+        }
+        // An unframed prompt is never taken for its own paste: a person may type the same.
+        let bare = "deploy it now please";
+        assert_eq!(
+            prompt_being_delivered(Some(queue), &Draft::Text(bare.to_owned()), bare, now),
+            Delivering::No
+        );
+        // A size a prompt the queue records as typed shares: it may be either.
+        let other = format!(
+            "{HEADER}\n{}",
+            "x".repeat(prompt.chars().count() - HEADER.chars().count() - 1)
+        );
+        assert_eq!(crate::client::muse_paste_length(&other), length);
+        let inflight_at = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        record(
+            queue,
+            "processed",
+            "other",
+            &json!({"text": other, "inflight_at": inflight_at}),
+        );
+        match prompt_being_delivered(Some(queue), &Draft::Placeholder(length), &prompt, now) {
+            Delivering::Shared(described) => assert!(described.contains("other"), "{described}"),
+            found => panic!("expected a shared size, found {found:?}"),
+        }
+        // Its text still names it, whatever sizes other prompts have.
+        assert_eq!(
+            prompt_being_delivered(Some(queue), &Draft::Text(prompt.clone()), &prompt, now),
+            Delivering::Ours
+        );
     }
 
     #[test]

@@ -191,8 +191,9 @@ agentctl-muse-stale-draft; `recover_typed_draft` in
 one it finds later (#731 agentctl-paste-tail-flush, #1546
 agentctl-unsubmitted-paste-backstop; `sweep_editor_drafts` in
 `rs/agentctl/src/agent_watch.rs`). Attribution is deliberately strict:
-only a draft that matches a prompt the queue records as typed is ever
-submitted, under per-harness vouching (Muse `Recent`; Claude Code and
+only a draft that matches a prompt the queue records as typed (or, on
+Muse, the prompt being delivered; see below) is ever submitted, under
+per-harness vouching (Muse `Recent`; Claude Code and
 Codex `Unproven`, because their history keys recall the newest prompt)
 in `rs/agentctl/src/stale_draft.rs`.
 
@@ -204,7 +205,19 @@ in `rs/agentctl/src/stale_draft.rs`.
 - **Muse**: supported (the Muse editor reader; #1546). A placeholder draft
   whose size exactly one typed delivery in its lookback has is attributed
   to that delivery even when later prompts followed it (#1732); a size
-  two deliveries share still names neither.
+  two deliveries share still names neither. Since #2399 the Muse typing
+  paths (the follow-up into a running turn, the idle path, and the native
+  prompt) stamp `paste_started_at` durably before the paste, as
+  `submit_verified` already did for Claude Code and Codex. A stop or a
+  crash after a Muse paste is now recorded as typed (filed possibly
+  submitted, or recovered as stranded) instead of left pending with no
+  attempt. A Muse delivery also recognises the prompt it is delivering
+  when an earlier attempt left that prompt's own paste in the editor with
+  no typing record: the whole framed text, or a placeholder of its size
+  that no typed record shares. It submits that copy, busy or idle, and
+  never types the prompt again. A placeholder whose size a typed record
+  shares is refused untouched. Claude Code and Codex don't get this
+  delivering-prompt recognition: their verified path stamps before typing.
 - **Unknown TUI**: partial — report only from the per-harness sweep,
   which cannot read an unknown editor, so a stranded prompt there
   becomes a `draft: unreadable` blocked finding from that layer. The
