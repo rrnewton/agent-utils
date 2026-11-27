@@ -221,6 +221,10 @@ def _retire_pending(
     return payload
 
 
+@pytest.mark.ordinary_environment(
+    reason="write-handoff verifies the owner by its host-visible PID (#2065)"
+)
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: retire-pending remove proc scan exceeds its 60s budget on the host (red on 50a174b4's gate, 11-27)
 def test_retire_pending_removes_without_candidate_validation_under_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

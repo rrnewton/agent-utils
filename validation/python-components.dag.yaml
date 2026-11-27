@@ -399,10 +399,24 @@ steps:
   # `with-private-tmp --host-temp` (a fresh, owner-recorded, 5 GB-bounded root under
   # /tmp/aut-<uid>, removed at the end). Only private_tmp.HOST_TEMP_STEPS may; a contract
   # test fails any other step that does.
+  # #2065 (owner rule 346): the non-lifecycle wrkslots shards run in their own PID and user
+  # namespace with a private /proc, the unprivileged wrapper the lifecycle shards use, so a
+  # removal census reads the shard's own processes, not the host's (measured 2026-11-27: one
+  # post-fence census over 6,300 host processes took about 30 CPU-s at load1 190-205, and remove
+  # items refused on their 60/75 s budget). Cases that need host-visible process identities or
+  # the initial user namespace are marked ordinary_environment and run in wrkslots.host below.
   - group: wrkslots
     job: shard-0
     desc: wrkslots non-lifecycle Python tests, shard 1 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 0/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 0/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 0/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -418,7 +432,15 @@ steps:
   - group: wrkslots
     job: shard-1
     desc: wrkslots non-lifecycle Python tests, shard 2 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 1/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 1/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 1/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -429,7 +451,15 @@ steps:
   - group: wrkslots
     job: shard-2
     desc: wrkslots non-lifecycle Python tests, shard 3 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 2/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 2/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 2/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -440,7 +470,15 @@ steps:
   - group: wrkslots
     job: shard-3
     desc: wrkslots non-lifecycle Python tests, shard 4 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 3/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 3/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 3/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -457,7 +495,15 @@ steps:
   - group: wrkslots
     job: shard-4
     desc: wrkslots non-lifecycle Python tests, shard 5 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 4/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 4/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 4/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -468,7 +514,15 @@ steps:
   - group: wrkslots
     job: shard-5
     desc: wrkslots non-lifecycle Python tests, shard 6 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 5/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 5/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 5/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -479,7 +533,15 @@ steps:
   - group: wrkslots
     job: shard-6
     desc: wrkslots non-lifecycle Python tests, shard 7 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 6/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 6/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 6/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -490,7 +552,15 @@ steps:
   - group: wrkslots
     job: shard-7
     desc: wrkslots non-lifecycle Python tests, shard 8 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 7/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 7/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 7/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -506,7 +576,15 @@ steps:
   - group: wrkslots
     job: shard-8
     desc: wrkslots non-lifecycle Python tests, shard 9 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 8/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 8/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 8/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -517,7 +595,15 @@ steps:
   - group: wrkslots
     job: shard-9
     desc: wrkslots non-lifecycle Python tests, shard 10 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 9/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 9/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 9/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -528,7 +614,15 @@ steps:
   - group: wrkslots
     job: shard-10
     desc: wrkslots non-lifecycle Python tests, shard 11 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 10/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 10/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 10/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -539,7 +633,15 @@ steps:
   - group: wrkslots
     job: shard-11
     desc: wrkslots non-lifecycle Python tests, shard 12 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 11/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 11/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 11/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -550,7 +652,15 @@ steps:
   - group: wrkslots
     job: shard-12
     desc: wrkslots non-lifecycle Python tests, shard 13 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 12/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 12/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 12/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -561,7 +671,15 @@ steps:
   - group: wrkslots
     job: shard-13
     desc: wrkslots non-lifecycle Python tests, shard 14 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 13/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 13/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 13/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -572,7 +690,15 @@ steps:
   - group: wrkslots
     job: shard-14
     desc: wrkslots non-lifecycle Python tests, shard 15 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 14/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 14/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 14/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
@@ -583,13 +709,37 @@ steps:
   - group: wrkslots
     job: shard-15
     desc: wrkslots non-lifecycle Python tests, shard 16 of 16
-    cmd: scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 15/16 -- -q
+    cmd: >-
+      if command -v unshare >/dev/null 2>&1 &&
+      unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+      test_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" &&
+      exec scripts/with-private-tmp --host-temp unshare --user --map-root-user --pid --fork --mount-proc "$test_python"
+      scripts/pid_namespace_init.py -- python3 scripts/run_component_tests.py --component wrkslots --shard 15/16 --
+      -q -m 'not ordinary_environment';
+      else exec scripts/with-private-tmp --host-temp python3 scripts/run_component_tests.py --component wrkslots --shard 15/16 --
+      -q -m 'not ordinary_environment'; fi
     deps: [wrkslots.build-rust]
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
     hint: *wrkslots_test_hint
+
+  - group: wrkslots
+    job: host
+    desc: wrkslots non-lifecycle Python tests that need host-visible processes or the initial user namespace (ordinary_environment)
+    cmd: python3 scripts/run_component_tests.py --component wrkslots -- -q -m ordinary_environment
+    deps: [wrkslots.build-rust]
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, component-wrkslots]
+    timeout: 19200
+    cpu_timeout: 2400
+    hint:
+      resources: {host-lifecycle: 1, lifecycle-io: 1}
+      est_duration_s: 300
+      classification: latency-bound
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 1610612736
 
   # #2318: every py/tests/test_wrkviz_*_rust.py case runs wrkvizd from
   # py/tests/wrkviz_rust_binary.py, which builds it into a private target with --locked and

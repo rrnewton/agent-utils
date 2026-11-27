@@ -39,12 +39,6 @@ expires = "2026-12-22"
 note = "flash/ring timing under load"
 
 [[known-red]]
-step = "python.wrkslots.shard-*"
-issue = "#2065"
-expires = "2026-12-22"
-note = "census/remove timing under load, already seen on unrelated trees"
-
-[[known-red]]
 step = "rust.dagrun.test"
 issue = "#2170"
 expires = "2026-12-24"

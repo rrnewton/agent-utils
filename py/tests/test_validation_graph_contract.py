@@ -247,13 +247,37 @@ def test_no_step_listens_on_a_fixed_port_unless_it_runs_alone() -> None:
 
 def test_wrkslots_shards_cover_sixteen_way_partition() -> None:
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
-    shards = sorted(
-        shard
+    per_step = {
+        step.tag: set(_flag_values(step.cmd, "--shard"))
         for step in config.steps
         if step.tag.startswith("python.wrkslots.")
-        for shard in _flag_values(step.cmd, "--shard")
-    )
+    }
+    # #2065: a shard's command names its shard in the namespace branch and in the fallback;
+    # each step still runs exactly one shard.
+    assert all(len(values) <= 1 for values in per_step.values()), per_step
+    shards = sorted(value for values in per_step.values() for value in values)
     assert shards == sorted(f"{index}/16" for index in range(16))
+
+
+def test_wrkslots_shards_run_in_a_pid_namespace_and_the_host_step_runs_the_rest() -> None:
+    """#2065 (owner rule 346): the sixteen non-lifecycle wrkslots shards run in their own PID and
+    user namespace with a private /proc (the lifecycle shards' unprivileged wrapper: no sudo, no
+    root mounts), so a removal census reads only the shard's processes; they deselect the
+    ordinary_environment cases, which python.wrkslots.host runs on the host, so no case is lost."""
+    config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    steps = {step.tag: step for step in config.steps if step.tag.startswith("python.wrkslots.")}
+    shards = [step for tag, step in steps.items() if tag.startswith("python.wrkslots.shard-")]
+    assert len(shards) == 16
+    for step in shards:
+        assert "unshare --user --map-root-user --pid --fork --mount-proc" in step.cmd, step.tag
+        assert "scripts/pid_namespace_init.py" in step.cmd, step.tag
+        assert "-m 'not ordinary_environment'" in step.cmd, step.tag
+        assert "sudo" not in step.cmd and "WRKSLOTS_ALLOW_ROOT_TESTS" not in step.cmd, step.tag
+        assert "validation-python-namespace-tests" in step.labels, step.tag
+    host = steps["python.wrkslots.host"]
+    assert "-m ordinary_environment" in host.cmd
+    assert "--component wrkslots" in host.cmd and "--shard" not in host.cmd
+    assert "unshare" not in host.cmd
 
 
 def test_wrkslots_component_selection_includes_every_lifecycle_shard() -> None:
