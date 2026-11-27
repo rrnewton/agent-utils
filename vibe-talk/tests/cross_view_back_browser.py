@@ -48,7 +48,6 @@ import re
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -57,6 +56,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from playwright.sync_api import Page, Route, sync_playwright
 
+import browser_scratch
 import browser_waits
 from summary_link_browser import BACK_DUMP, BACK_TRACE_START
 
@@ -562,8 +562,8 @@ def main() -> int:
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     results: list[Json] = []
-    with tempfile.TemporaryDirectory(prefix="cross-view-back-") as tmp:
-        work = Path(tmp)
+    # `#2382 summary-link-test-host-tmp`: never the host temp dir; see browser_scratch.
+    with browser_scratch.run_scratch("cross-view-back-") as work:
         (work / "vibe-talk.toml").write_text(
             f'[server]\nbind = "127.0.0.1:{port}"\n'
             '[discord]\nbot_token = "cross-view-back-bot-token-never-sent"\n'

@@ -60,13 +60,14 @@ import argparse
 import json
 import os
 import subprocess
-import tempfile
 import time
 import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from playwright.sync_api import Locator, Page, Route, sync_playwright
+
+import browser_scratch
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -589,7 +590,10 @@ def walk(page: Page, base: str, label: str, shots: Path | None) -> None:
         """`#2261`: what a failed Back check leaves in the step's log, and a screenshot."""
         dump: object = page.evaluate(BACK_DUMP, [row_id, expected])
         back_trace_stop()
-        folder = shots if shots is not None else Path(tempfile.gettempdir())
+        # `#2382`: never the host temp dir; without --screenshots the picture stays in the
+        # build area's scratch, outside the run's own directory, which the run removes.
+        folder = shots if shots is not None else browser_scratch.SCRATCH_ROOT
+        folder.mkdir(parents=True, exist_ok=True)
         shot = folder / f"summary-link-back-{label}-{os.getpid()}.png"
         try:
             page.screenshot(path=str(shot))
@@ -909,8 +913,10 @@ def main() -> int:
         shots.mkdir(parents=True, exist_ok=True)
     port = free_port()
     base = f"http://127.0.0.1:{port}"
-    with tempfile.TemporaryDirectory(prefix="summary-link-check-") as tmp:
-        work = Path(tmp)
+    # `#2382 summary-link-test-host-tmp`: the server's files, Chromium's profile and
+    # Playwright's artifacts stay in this run's own directory in the build area, removed
+    # when the run ends, passed or failed, after the server has exited.
+    with browser_scratch.run_scratch("summary-link-check-") as work:
         (work / "vibe-talk.toml").write_text(
             f'[server]\nbind = "127.0.0.1:{port}"\n'
             '[discord]\nbot_token = "summary-link-check-bot-token-never-sent"\n'
@@ -951,6 +957,11 @@ def main() -> int:
             return 0
         finally:
             server.terminate()
+            try:
+                server.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait()
 
 
 if __name__ == "__main__":
