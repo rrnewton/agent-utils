@@ -11424,6 +11424,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 &self.registry,
             )?);
         }
+        // Coordinator-lean rendering (#2322), from the named profile's setting.
+        if let Some(policy) = self.lean_policy(options.profile.as_deref(), &cwd) {
+            structured_arguments =
+                self.lean_arguments(&structured_arguments, &policy, agent_name)?;
+        }
         // #1158: a launch that can park on an in-TUI question says so at once,
         // while someone is still watching the start.
         if let Some(warning) =
@@ -13146,6 +13151,49 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         profiles.get(profile_name).cloned()
     }
 
+    /// The coordinator-lean setting of launch profile `profile` as seen from `cwd` (#2322).
+    fn lean_policy(&self, profile: Option<&str>, cwd: &Path) -> Option<crate::lean::LeanPolicy> {
+        let root = crate::profiles::configuration_root(cwd, &self.registry, false).ok()?;
+        let (_, profiles) = crate::profiles::load_profiles(&root, false).ok()?;
+        profiles.get(profile?)?.coordinator_lean.clone()
+    }
+
+    /// Render a coordinator-lean launch of `agent_name` (#2322): write its settings file under
+    /// the registry and return `arguments` with that one `--settings`. The hook runs this
+    /// agentctl executable.
+    pub(crate) fn lean_arguments(
+        &self,
+        arguments: &[String],
+        policy: &crate::lean::LeanPolicy,
+        agent_name: &str,
+    ) -> Result<Vec<String>> {
+        let agentctl = std::env::current_exe().map_err(|error| {
+            fail(format!(
+                "cannot name this agentctl executable for the coordinator-lean hook: {error}"
+            ))
+        })?;
+        // A first start renders before anything else has made the registry.
+        agent_queue::registry::prepare(&self.registry).map_err(|error| {
+            fail(format!(
+                "cannot prepare the agent registry for a coordinator-lean launch: {error}"
+            ))
+        })?;
+        crate::lean::apply_launch(
+            arguments,
+            &crate::lean::LeanLaunch {
+                policy,
+                agentctl: &agentctl,
+                registry: &self.registry,
+                agent: agent_name,
+            },
+        )
+        .map_err(|error| {
+            fail(format!(
+                "coordinator-lean launch of {agent_name:?}: {error}"
+            ))
+        })
+    }
+
     /// Declared masks: the profile's current `masked_paths` (#2163).
     fn declared_masked_paths(&self, record: &AgentRecord) -> Vec<String> {
         self.profile_for_record(record)
@@ -13247,6 +13295,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // Direct children in this registry (#1904), beside the managed_by
         // edge record_row already carries, for a per-lieutenant scan.
         result["children_count"] = json!(self.children_count(agent_name));
+        // A coordinator-lean agent says so (#2322), from its profile's current setting,
+        // which every launch renders.
+        if let Some(policy) = self
+            .profile_for_record(&record)
+            .and_then(|profile| profile.coordinator_lean)
+        {
+            result["coordinator_lean"] = json!(policy);
+        }
         // Name a terminal another registry also records (#1683): two
         // registries driving one pane is easy to miss from either side.
         let shared_terminals = self.shared_terminal_findings(std::slice::from_ref(&record));
@@ -26300,6 +26356,8 @@ fi
     mod identity;
     /// Launch specs written at start, read at adopt and anchor, and replayed by revive.
     mod launch_spec;
+    /// Coordinator-lean launches render their settings and status names them (#2322).
+    mod lean;
     /// Priority and visibility of waits for an agent's lifecycle lock.
     mod lock_rank;
     /// Recovery-manifest record facts judged from raw records (#1559).

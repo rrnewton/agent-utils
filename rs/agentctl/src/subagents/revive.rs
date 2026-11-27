@@ -2584,6 +2584,31 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         native: NativeSession,
         cwd: PathBuf,
     ) -> Result<LaunchPlan> {
+        // Coordinator-lean rendering (#2322): every interactive relaunch (revive, restore,
+        // restart in a fresh tab, turnover) renders the settings again from the current
+        // profile, so the hook names a live agentctl. Headless records render at the
+        // wrapper launch instead.
+        let arguments = match self
+            .profile_for_record(record)
+            .and_then(|profile| profile.coordinator_lean)
+        {
+            Some(policy) if !record.is_headless() => {
+                let mut arguments = self.lean_arguments(&arguments, &policy, &record.name)?;
+                // A lean profile implies no MCP servers; a relaunch that replays arguments
+                // recorded before the profile gained the key has no strict-MCP flags yet.
+                if !arguments
+                    .iter()
+                    .any(|argument| argument == "--strict-mcp-config")
+                {
+                    arguments.extend(crate::profiles::no_mcp_arguments(
+                        &record.harness,
+                        &self.registry,
+                    )?);
+                }
+                arguments
+            }
+            _ => arguments,
+        };
         // #1822: a relaunch (revive, restore, restart in a fresh tab,
         // turnover) from arguments with no bypass flag refuses, as a start
         // would; headless records are exempt (wrapper-mediated approvals).
@@ -3195,6 +3220,19 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if let Some(refreshed) = refreshed.as_ref() {
             effectives.insert(0, refreshed);
         }
+        // A coordinator-lean candidate carries the agentctl-rendered lean and
+        // no-MCP arguments (#2322), which no recorded or refreshed spec need
+        // hold; they are compared without them.
+        let lean = self
+            .profile_for_record(old)
+            .is_some_and(|profile| profile.coordinator_lean.is_some());
+        let comparable = |arguments: &[String]| -> Vec<String> {
+            if lean {
+                crate::lean::without_rendered(arguments, &self.registry, &old.name)
+            } else {
+                arguments.to_vec()
+            }
+        };
         for effective in effectives {
             // An unrebuildable recorded generation is no match, not
             // an error: the refusal stays the ordinary one (#1992).
@@ -3217,7 +3255,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 && record.profile == old.profile
                 && record.model == effective.model
                 && record.reasoning_effort == effective.reasoning_effort
-                && record.arguments == expected_arguments
+                && comparable(&record.arguments) == comparable(&expected_arguments)
                 && record.environment_names == effective.environment_names
                 && record.slot == old.slot
                 && self.slot_project_matches(record, old)

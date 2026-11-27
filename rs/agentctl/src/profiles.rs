@@ -62,6 +62,10 @@ pub(crate) struct LaunchProfile {
     /// agentctl-owned empty config; Codex per-server disables). Off by
     /// default; a profile opts in explicitly.
     pub(crate) no_mcp_servers: bool,
+    /// Coordinator-lean launch (#2322): agentctl renders a settings file with a Bash
+    /// time ceiling, tool denies and the `lean-hook`. Claude only; implies
+    /// `no_mcp_servers`. `None` launches as before.
+    pub(crate) coordinator_lean: Option<crate::lean::LeanPolicy>,
 }
 
 /// The roles a launch profile may give its agents (#897 chat-latency-stamps).
@@ -198,6 +202,9 @@ pub(crate) struct PublicProfile {
     unset_env: Vec<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     no_mcp_servers: bool,
+    /// The coordinator-lean setting (#2322), when the profile has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coordinator_lean: Option<crate::lean::LeanPolicy>,
 }
 
 impl LaunchProfile {
@@ -223,6 +230,7 @@ impl LaunchProfile {
             masked_paths: self.masked_paths.clone(),
             unset_env: self.unset_env.clone(),
             no_mcp_servers: self.no_mcp_servers,
+            coordinator_lean: self.coordinator_lean.clone(),
         }
     }
 }
@@ -377,6 +385,8 @@ struct RawProfile {
     unset_env: Option<Value>,
     #[serde(default)]
     no_mcp_servers: Option<bool>,
+    #[serde(default)]
+    coordinator_lean: Option<Value>,
     #[serde(default)]
     muse_hooks_trust: Option<Value>,
     /// The agent's role, one of [`ROLES`], and its protocol, one of [`PROTOCOLS`]: checked here,
@@ -1250,6 +1260,16 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
     )
     .map_err(fail)?;
     let unset_env = unset_names(raw.unset_env.as_ref(), &format!("profile {name:?}"))?;
+    let coordinator_lean =
+        crate::lean::policy_from_value(raw.coordinator_lean.as_ref(), &format!("profile {name:?}"))
+            .map_err(fail)?;
+    if coordinator_lean.is_some() && raw.harness != "claude" {
+        return Err(fail(format!(
+            "profile {name:?} coordinator_lean applies only to harness claude (agentctl enforces it \
+             through Claude Code settings and a PreToolUse hook; {} has neither)",
+            raw.harness
+        )));
+    }
     Ok(LaunchProfile {
         name,
         harness: raw.harness,
@@ -1266,7 +1286,9 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
         required_env,
         masked_paths,
         unset_env,
-        no_mcp_servers: raw.no_mcp_servers.unwrap_or(false),
+        // A lean coordinator starts with no MCP servers: their tools have no time bound.
+        no_mcp_servers: raw.no_mcp_servers.unwrap_or(false) || coordinator_lean.is_some(),
+        coordinator_lean,
     })
 }
 

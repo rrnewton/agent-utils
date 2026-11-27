@@ -84,8 +84,9 @@ pub const ALIASES: &str = "aliases";
 /// `restore` (its `reports/` collection) and `restore-reports`
 /// joined when an older migration moved the former into `agents/` as if it
 /// were an agent (#1425): every known registry directory belongs here, in
-/// one list shared by migration, listing, and doctor.
-pub const RESERVED_NAMES: [&str; 8] = [
+/// one list shared by migration, listing, and doctor. `lean-settings` holds
+/// the rendered settings of coordinator-lean agents (#2322).
+pub const RESERVED_NAMES: [&str; 9] = [
     "archive",
     AGENTS,
     LOCKS,
@@ -94,6 +95,7 @@ pub const RESERVED_NAMES: [&str; 8] = [
     "turnover-pins",
     "restore",
     "restore-reports",
+    "lean-settings",
 ];
 /// The registry-wide lock files, `REGISTRY/.<stem>.lock`, that are fixed items, not agents'
 /// layout-1 locks. Layout 1 shared `.coordinator.lock` between the designation and an agent
@@ -692,6 +694,8 @@ mod tests {
         // #1425: the restore report collections are registry directories too.
         assert!(!is_agent_name("restore"));
         assert!(!is_agent_name("restore-reports"));
+        // #2322: the coordinator-lean settings collection is a registry directory.
+        assert!(!is_agent_name("lean-settings"));
         assert!(locate(&registry, "restore").is_err());
         assert!(names(&registry).unwrap().is_empty());
         assert!(is_tripwire(&registry.join("agents/agent.json")));

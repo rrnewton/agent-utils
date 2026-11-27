@@ -1970,3 +1970,31 @@ def test_masked_profile_is_refused_at_launch_by_the_python_edition(tmp_path: Pat
         code = cli.main(["start", "trial-agent", "--cwd", str(tmp_path), "--profile", "trial"])
     assert code == 2
     assert "only the Rust edition" in stderr.getvalue()
+
+
+def test_lean_profile_is_refused_at_launch_by_the_python_edition(tmp_path: Path) -> None:
+    # #2322: only the Rust edition renders the coordinator-lean settings and hook,
+    # so this edition refuses the launch rather than starting an unconfined agent.
+    _write_profiles(tmp_path, {
+        "lean": {"harness": "claude", "mode": "interactive", "reasoning_effort": "high",
+                 "argv": ["--dangerously-skip-permissions"],
+                 "coordinator_lean": {"bash_timeout_seconds": 30}},
+    })
+    _path, profiles = load_profiles(tmp_path)
+    assert profiles["lean"].coordinator_lean is True
+    assert profiles["lean"].no_mcp_servers is True
+    assert profiles["lean"].public()["requires_edition"] == "rust"
+    import io, contextlib
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        code = cli.main(["start", "lean-agent", "--cwd", str(tmp_path), "--profile", "lean"])
+    assert code == 2
+    assert "coordinator_lean" in stderr.getvalue()
+    other = tmp_path / "other"
+    other.mkdir()
+    _write_profiles(other, {
+        "bad": {"harness": "codex", "mode": "interactive", "reasoning_effort": "high",
+                "argv": ["--yolo"], "coordinator_lean": True},
+    })
+    with pytest.raises(AgentDeliveryError, match="only to harness claude"):
+        load_profiles(other)

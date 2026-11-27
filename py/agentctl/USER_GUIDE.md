@@ -3795,6 +3795,65 @@ last turn's prose has a `DONE:` or `BLOCKED:` line is `child-done`, otherwise
 there is no approval episode, and the auto-interrupt policy, which reads a
 screen, does not apply (`send --urgent` already delivers mid-turn).
 
+**Delivery, interrupts and cancelled inputs.** `agentctl send` queues a
+`turn-boundary` input, which runs when the agent is idle. `send --urgent`
+and a chat bridge with `--deliver-while-working` queue a `deliver: now`
+input instead. That input is written into the running turn and starts at
+the next tool boundary, so a long tool call still holds it; it does not
+interrupt the turn.
+
+`agentctl interrupt` ends the running turn (`turn N interrupted`) and
+holds delivery for 30 s. Inputs still queued stay queued. An input that
+had already started in that turn is shown as `cancelled [ID] after the
+model saw it` and is not delivered again. One the harness dropped before
+the model started it is `cancelled [ID] before the model saw it; returned
+to the queue`. The harness support matrix row "Headless delivery,
+interrupt and cancelled inputs" has the details.
+
+**Coordinator-lean launches and the hands lane (#2322).** A coordinator
+should answer the owner within seconds, and a 400 s build in its own
+Bash call holds every owner message queued behind it. Give its launch
+profile `"coordinator_lean": true`, or `{"bash_timeout_seconds": 30,
+"lanes": ["lead-hands"], "extra_commands": ["/path/to/report prompts"]}`.
+Claude only; it implies `no_mcp_servers`; the Python edition refuses to
+launch it. At every launch agentctl renders
+`REGISTRY/lean-settings/NAME.json` and passes it as the harness's only
+`--settings`, merging the profile's own `--settings`. The file:
+
+- caps every Bash call: Claude Code kills it at the ceiling (exit 143);
+  background Bash is off;
+- removes the file-writing, web, scheduling and subagent tools;
+- runs `agentctl lean-hook` before every tool call.
+
+The hook passes short read-only commands:
+
+- `cat`, `sed -n 'N,Mp'`, `head`, `tail` without `-f`, `rg`, `grep`,
+  `find` without actions, `wc`, `ls` and `jq`;
+- the read-only git subcommands;
+- `agentctl status`, `list`, `read`, `tail`, and `chat sent`, `chat
+  thread`, `chat help`;
+- `agentctl send --queue-only` and `agentctl interrupt` to the agent's own
+  lanes (agents whose managed_by chain leads to it, or the profile's
+  `lanes`), and `send --to-manager`;
+- `agent-teams send` and `reply`.
+
+Pipes, `&&`, `;` and redirection to `/dev/null` are fine. Everything
+else is refused with a reason that names the hands lane, including
+command substitution, writes, network commands, installers and `chat
+reply --file`. A lean coordinator replies to chat between the
+`CHAT_REPLY` marker lines.
+
+The hands lane does the long work: a persistent, pinned lane on an
+ordinary profile, named for example `lead-hands`. If it is a Claude
+lane, give it the strict-MCP flags, and use the harness root as its
+`--cwd`. Start it beside the coordinator, give it a managed_by edge
+(`agentctl manage lead-hands --by lead`), or list it in `lanes`. The
+coordinator sends it work with `agentctl send lead-hands --queue-only
+'H17: run the gate in DIR; reply with agentctl send --to-manager: verdict
+in at most 15 lines and the log path'`, and the answer comes back as an
+ordinary queued input. `agentctl status NAME` shows `coordinator_lean` for
+a lean agent.
+
 ## Headless worker extension
 
 When listed by `agentctl capabilities`, headless workers use the same names and

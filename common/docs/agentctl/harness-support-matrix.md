@@ -88,6 +88,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Boxed launch (`--slot`, userns) | none | none | supported | none | n/a |
 | Masked paths (`masked_paths`, #2163) | none | none | supported | none | partial (Muse only) |
 | No MCP servers (`no_mcp_servers`, #2163) | supported | partial | none | none | partial (Claude only) |
+| Coordinator-lean launch (`coordinator_lean`, #2322) | supported | none | none | none | partial (Claude only) |
 | Transient-failure recovery | supported | supported | none | none | none |
 | Stalled-goal resume | none | supported | none | none | none |
 
@@ -962,6 +963,46 @@ structured model or effort):
 - **Muse**: none — Muse has no per-launch MCP-off form, so a Muse
   profile with the key refuses at launch.
 - **Headless**: Claude only, through the same rendering.
+
+### Coordinator-lean launch (`coordinator_lean`, #2322)
+
+A launch profile may make its agent a lean coordinator: it answers the
+owner and steers its lanes, and hands long or writing work to a helper
+lane. The setting (`coordinator_lean` in `rs/agentctl/src/profiles.rs`,
+`true` or `{bash_timeout_seconds, extra_commands, lanes}`) implies
+`no_mcp_servers`. At every launch, agentctl renders one settings file,
+`REGISTRY/lean-settings/NAME.json` (`rs/agentctl/src/lean.rs`), and
+passes it as the harness's only `--settings`, merging any `--settings`
+the profile carries. The file holds:
+
+- a Bash ceiling that Claude Code enforces itself:
+  `BASH_MAX_TIMEOUT_MS` and `BASH_DEFAULT_TIMEOUT_MS`, with
+  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` so a call that reaches the
+  ceiling is killed (exit 143) rather than moved to the background;
+- deny rules that remove the file-writing, web, scheduling and
+  subagent tools;
+- a PreToolUse hook (`agentctl lean-hook`, ending in `|| exit 2` so a
+  hook that cannot run blocks the call) that passes only short
+  read-only commands, `agentctl send --queue-only` and `interrupt` to
+  the agent's own lanes (managed_by chain, or the profile's `lanes`),
+  and agent-teams messaging, and refuses anything else with a reason
+  that names the hands lane.
+
+Confinement does not rest on allow-lists: installed plugin hooks can
+answer `allow` and bypass them. A hook `deny` and a settings `deny`
+rule hold even under `--dangerously-skip-permissions`, so the profile
+keeps its bypass flag (#1822) and nothing parks on a prompt (measured
+with Claude Code 2.1.319).
+
+- **Claude Code**: supported. It is rendered at `start`, and again at
+  every relaunch through `finish_launch_plan` (revive, restore, restart,
+  turnover), so the hook always names a live agentctl.
+- **Codex, Muse, agentcloud, Unknown TUI**: none. A profile that sets the
+  key for another harness is refused at load, and the Python edition
+  refuses to launch any lean profile.
+- **Headless**: Claude only. It is rendered at every wrapper launch, like
+  the no-MCP arguments. A takeover's interactive session is the owner's
+  own and is not lean.
 
 ### Transient-failure recovery; stalled-goal resume
 

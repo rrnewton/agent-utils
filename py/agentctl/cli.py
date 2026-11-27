@@ -718,6 +718,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "of agentctl implements; start the agent with the Rust agentctl rather than "
                     "launching unmasked"
                 )
+            if profile is not None and profile.coordinator_lean:
+                raise ValueError(
+                    f"profile {profile.name!r} declares coordinator_lean, which only the Rust "
+                    "edition of agentctl enforces; start the agent with the Rust agentctl rather "
+                    "than launching it unconfined"
+                )
             if profile is not None and profile.no_mcp_servers:
                 raise ValueError(
                     f"profile {profile.name!r} declares no_mcp_servers, which only the Rust edition "

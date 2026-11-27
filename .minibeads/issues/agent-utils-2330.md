@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-send-queue-only-headless-wait: send --queue-only to a headless agent waits up to --ready-timeout instead of returning once journaled'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: cl-leanprofile
@@ -8,7 +8,7 @@ labels:
 - agentctl
 - headless
 created_at: 2026-11-26T19:40:00-05:00
-updated_at: 2026-11-26T19:40:00-05:00
+updated_at: 2026-11-26T20:10:00-05:00
 ---
 
 # Description
@@ -29,3 +29,7 @@ In the headless branch of the send dispatch, pass a zero wait to `send_headless`
 # Notes
 
 Found while designing #2322 agentctl-coordinator-lean-headless-profile (owner request 389), where every coordinator send must finish within about 30 s.
+
+## Resolution
+
+Fixed with #2322: in the send dispatch, a headless send passes a zero wait to `send_headless` when `--queue-only` is given (`headless_send_wait` in `rs/agentctl/src/cli.rs`, unit-tested). The call returns once the input is journaled and the wrapper woken. Without the flag, the send still waits up to `--ready-timeout`. On a scratch headless lane that was busy, `agentctl send NAME --queue-only TEXT` returned in 0.5 s with the input pending, and the lane ran it when its turn ended.

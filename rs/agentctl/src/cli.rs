@@ -365,6 +365,9 @@ enum Commands {
     /// Internal: the headless Muse exec transport's relay (one `muse exec` per prompt, behind the wrapper)
     #[command(hide = true, name = "headless-muse-exec-relay")]
     HeadlessMuseExecRelay(MuseExecRelay),
+    /// Internal: the coordinator-lean PreToolUse hook a lean launch's settings run before every tool call (#2322); reads the hook input on stdin, prints a deny decision or nothing
+    #[command(hide = true, name = "lean-hook")]
+    LeanHook(LeanHook),
     /// Queue /compact for a headless agent; it runs when the current turn ends and the log records compact.started and compact.completed with token counts
     #[command(after_help = "Example: agentctl compact coordinator")]
     Compact(Named),
@@ -1336,6 +1339,22 @@ struct TakeoverHold {
     /// Claude Code executable
     #[arg(long, value_name = "PATH")]
     claude_bin: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct LeanHook {
+    /// The lean agent this hook guards; send and interrupt may name only agents whose managed_by chain leads to it, or a --lane
+    #[arg(long, value_name = "NAME")]
+    agent: String,
+    /// Longest Bash call allowed, in seconds; a call asking for a longer timeout is refused
+    #[arg(long, value_name = "SECONDS", default_value = "30")]
+    bash_timeout: u64,
+    /// An agent send and interrupt may also name (repeatable), such as the hands lane
+    #[arg(long = "lane", value_name = "NAME")]
+    lanes: Vec<String>,
+    /// An operator-added read-only command, as space-separated words that a command must start with (repeatable)
+    #[arg(long = "extra-command", value_name = "WORDS")]
+    extra_commands: Vec<String>,
 }
 
 #[derive(Args)]
@@ -3851,6 +3870,62 @@ fn lineage_action(command: &Commands) -> Option<crate::lineage::Action> {
     })
 }
 
+/// How long a send to a headless agent waits for the model to start the input: `--queue-only`
+/// returns once the input is journaled and the wrapper woken (#2330), anything else waits up to
+/// `--ready-timeout`.
+fn headless_send_wait(queue_only: bool, ready_timeout: Duration) -> Duration {
+    if queue_only {
+        Duration::ZERO
+    } else {
+        ready_timeout
+    }
+}
+
+/// Largest hook input read from stdin, in bytes.
+const LEAN_HOOK_INPUT_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// `agentctl lean-hook` (#2322): decide one PreToolUse call of a coordinator-lean agent. A deny
+/// prints the PreToolUse decision; a pass prints nothing; an input it cannot read fails, which
+/// the settings' `|| exit 2` turns into a blocked call.
+fn run_lean_hook(registry: &Path, herdr_bin: &Path, value: &LeanHook) -> Result<i32, Failure> {
+    use std::io::Read as _;
+    let failed = |message: String| Failure::Agent(AgentError::Delivery(message));
+    let mut text = String::new();
+    std::io::stdin()
+        .take(LEAN_HOOK_INPUT_LIMIT)
+        .read_to_string(&mut text)
+        .map_err(|error| failed(format!("lean-hook: cannot read the hook input: {error}")))?;
+    let input: Value = serde_json::from_str(&text)
+        .map_err(|error| failed(format!("lean-hook: the hook input is not JSON: {error}")))?;
+    let policy = crate::lean::HookPolicy {
+        agent: value.agent.clone(),
+        registry: registry.display().to_string(),
+        bash_timeout_seconds: value.bash_timeout,
+        lanes: value.lanes.clone(),
+        extra_commands: value
+            .extra_commands
+            .iter()
+            .map(|command| command.split_whitespace().map(str::to_owned).collect())
+            .collect(),
+    };
+    let own_lane = |target: &str| -> bool {
+        HerdrClient::with_executable("direct", herdr_bin)
+            .ok()
+            .and_then(|client| {
+                ManagedAgents::new(&client, registry)
+                    .ok()
+                    .map(|manager| manager.manages(&value.agent, target))
+            })
+            .unwrap_or(false)
+    };
+    let decision = crate::lean::decide(&input, &policy, &own_lane)
+        .map_err(|error| failed(format!("lean-hook: {error}")))?;
+    if let Some(output) = decision.output() {
+        write_json(&output).map_err(Failure::Output)?;
+    }
+    Ok(0)
+}
+
 fn run_history(registry: &Path, value: &History) -> Result<i32, Failure> {
     if let Some(session) = &value.session {
         let owners = crate::lineage::session_owners(registry, session).map_err(Failure::Usage)?;
@@ -4433,6 +4508,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Cli::command().print_help().map_err(Failure::Output)?;
         println!();
         return Ok(0);
+    };
+    // The coordinator-lean hook runs before every tool call of a lean agent: it reads
+    // records only for a send or interrupt, and touches nothing else (#2322).
+    let command = match command {
+        Commands::LeanHook(value) => return run_lean_hook(&args.registry, &args.herdr_bin, &value),
+        other => other,
     };
     // Directory and manifest I/O is lazy. Session-control commands never inspect the user plugin
     // home; capability inspection and an actual plugin runtime startup own discovery.
@@ -6751,7 +6832,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         value.urgent,
                         not_after,
                         value.supersede_key.as_deref(),
-                        value.delivery.options().ready_timeout,
+                        headless_send_wait(
+                            value.queue_only,
+                            value.delivery.options().ready_timeout
+                        ),
                     )?))
                 } else if manager.is_cloud(target)? {
                     if value.ttl.is_some() {
@@ -6933,6 +7017,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 value.model.as_deref(),
                 value.provider.as_deref(),
             ));
+        }
+        // Dispatched before any setup at the top of `run`.
+        Commands::LeanHook(value) => {
+            return run_lean_hook(&args.registry, &args.herdr_bin, &value);
         }
         Commands::RunHeadless(value) => {
             let terminate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -8504,6 +8592,47 @@ mod tests {
     use super::*;
     use crate::agent;
     use clap::CommandFactory;
+
+    #[test]
+    fn a_queue_only_send_to_a_headless_agent_returns_once_journaled() {
+        // #2330: --queue-only never waits for the model to start the input.
+        assert_eq!(
+            headless_send_wait(true, Duration::from_secs(900)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            headless_send_wait(false, Duration::from_secs(900)),
+            Duration::from_secs(900)
+        );
+    }
+
+    #[test]
+    fn the_lean_hook_parses_its_policy_and_stays_hidden() {
+        let cli = Cli::try_parse_from([
+            "agentctl",
+            "--registry",
+            "/team/.agentctl",
+            "lean-hook",
+            "--agent",
+            "lead",
+            "--bash-timeout",
+            "20",
+            "--lane",
+            "lead-hands",
+            "--extra-command",
+            "/opt/t report",
+        ])
+        .unwrap();
+        let Some(Commands::LeanHook(hook)) = cli.command else {
+            panic!("not the lean hook")
+        };
+        assert_eq!(hook.agent, "lead");
+        assert_eq!(hook.bash_timeout, 20);
+        assert_eq!(hook.lanes, vec!["lead-hands".to_owned()]);
+        assert_eq!(hook.extra_commands, vec!["/opt/t report".to_owned()]);
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("lean-hook"), "{help}");
+    }
 
     #[test]
     fn tail_follow_refuses_agents_that_will_never_write_an_event_log() {

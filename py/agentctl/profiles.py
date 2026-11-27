@@ -164,6 +164,9 @@ class LaunchProfile:
     #: Start with no MCP servers (#2163); the Rust edition renders the
     #: per-harness form, this edition refuses at launch.
     no_mcp_servers: bool = False
+    #: Coordinator-lean launch (#2322): the Rust edition renders its settings and
+    #: hook; this edition refuses at launch rather than launching unconfined.
+    coordinator_lean: bool = False
 
     def public(self) -> dict[str, object]:
         """Return discovery metadata without argument or environment values."""
@@ -183,6 +186,9 @@ class LaunchProfile:
             result["unset_env"] = list(self.unset_env)
         if self.no_mcp_servers:
             result["no_mcp_servers"] = True
+        if self.coordinator_lean:
+            result["coordinator_lean"] = True
+            result["requires_edition"] = "rust"
         if self.agentcloud is not None:
             result["agentcloud"] = dict(self.agentcloud)
             result["requires_edition"] = "rust"
@@ -704,9 +710,17 @@ def _profile(name: str, raw: object) -> LaunchProfile:
     no_mcp = raw.get("no_mcp_servers")
     if no_mcp is not None and not isinstance(no_mcp, bool):
         raise AgentDeliveryError(f"profile {name!r} no_mcp_servers must be true or false")
+    # #2322: the Rust edition validates the setting in full; this edition only
+    # needs to know it is on, to refuse the launch.
+    lean = raw.get("coordinator_lean")
+    if lean is not None and not isinstance(lean, (bool, dict)):
+        raise AgentDeliveryError(f"profile {name!r} coordinator_lean must be true, false, or an object")
+    if lean and harness != "claude":
+        raise AgentDeliveryError(f"profile {name!r} coordinator_lean applies only to harness claude")
     return LaunchProfile(
         name, harness, mode, model, effort, argv, tuple(environment), agentcloud,
-        required, hooks_trust, tuple(masked or ()), tuple(unset or ()), bool(no_mcp),
+        required, hooks_trust, tuple(masked or ()), tuple(unset or ()), bool(no_mcp) or bool(lean),
+        bool(lean),
     )
 
 
@@ -902,7 +916,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots"
 _PROFILE_FIELDS = frozenset({
     "harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud", "record_edges",
     "role", "protocol", "required_env", "muse_hooks_trust", "masked_paths", "unset_env",
-    "no_mcp_servers",
+    "no_mcp_servers", "coordinator_lean",
 })
 _ROLES = ("coordinator", "liaison", "coordinator-hands", "worker")
 _PROTOCOLS = ("self-tooling", "hands-delegating")

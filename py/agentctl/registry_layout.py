@@ -69,7 +69,7 @@ ALIASES = "aliases"
 #: migration, listing and doctor all refuse these as agent names. ``restore``
 #: and ``restore-reports`` joined after an older migration moved the former
 #: into ``agents/`` as if it were an agent.
-RESERVED_NAMES = ("archive", AGENTS, LOCKS, BRIDGES, ALIASES, "turnover-pins", "restore", "restore-reports")
+RESERVED_NAMES = ("archive", AGENTS, LOCKS, BRIDGES, ALIASES, "turnover-pins", "restore", "restore-reports", "lean-settings")
 #: Registry-wide ``.<stem>.lock`` files that are fixed items, not agents' layout-1 locks.
 FIXED_LOCK_STEMS = ("identity", "coordinator", "restore")
 LEGACY_SUPPORT_ENDS = "2026-11-26"

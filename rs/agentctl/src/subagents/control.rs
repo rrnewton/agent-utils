@@ -1520,6 +1520,19 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(direct_children(&nodes, &registry, caller, true))
     }
 
+    /// Whether `target` answers to `ancestor` through recorded managed_by
+    /// edges, at any depth (#2322): the coordinator-lean hook's test for "one
+    /// of your lanes". Unreadable records answer no.
+    pub(crate) fn manages(&self, ancestor: &str, target: &str) -> bool {
+        let Ok((nodes, _, registry)) = self.control_view() else {
+            return false;
+        };
+        target != ancestor
+            && manager_chain(&nodes, &registry, target)
+                .iter()
+                .any(|manager| manager == ancestor)
+    }
+
     /// How many direct children `agent` has in this registry, for the
     /// `children_count` of `list` and `status` rows (#1904).
     pub(crate) fn children_count(&self, agent: &str) -> usize {

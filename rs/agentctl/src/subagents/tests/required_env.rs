@@ -37,6 +37,7 @@ fn required_env_check_names_missing_variables_and_sources() {
         masked_paths: Vec::new(),
         unset_env: Vec::new(),
         no_mcp_servers: false,
+        coordinator_lean: None,
     };
     let empty: BTreeMap<String, String> = BTreeMap::new();
     let error =

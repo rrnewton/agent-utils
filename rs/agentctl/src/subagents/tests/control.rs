@@ -1055,3 +1055,31 @@ fn an_unreachable_herdr_socket_is_an_error_for_the_caller_to_report() {
         .unwrap_err();
     assert!(error.contains("cannot connect"), "{error}");
 }
+
+#[test]
+fn manages_follows_managed_by_edges_at_any_depth() {
+    // #2322: the coordinator-lean hook lets send and interrupt name only an
+    // agent whose managed_by chain leads to the lean agent.
+    let fixture = Fixture::new();
+    register(&fixture, "coordinator", 88);
+    register(&fixture, "lieutenant", 77);
+    register(&fixture, "worker", 66);
+    register(&fixture, "stranger", 55);
+    let manager = fixture.manager();
+    manager
+        .manage("lieutenant", ManageAction::By("coordinator".to_owned()))
+        .unwrap();
+    manager
+        .manage("worker", ManageAction::By("lieutenant".to_owned()))
+        .unwrap();
+    assert!(manager.manages("lieutenant", "worker"));
+    assert!(manager.manages("coordinator", "worker"), "two levels down");
+    assert!(manager.manages("coordinator", "lieutenant"));
+    assert!(
+        !manager.manages("worker", "coordinator"),
+        "edges point up only"
+    );
+    assert!(!manager.manages("coordinator", "stranger"));
+    assert!(!manager.manages("coordinator", "coordinator"));
+    assert!(!manager.manages("coordinator", "nobody"));
+}

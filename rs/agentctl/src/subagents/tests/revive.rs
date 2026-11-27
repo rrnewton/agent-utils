@@ -5160,3 +5160,42 @@ fn a_dead_candidate_in_a_vanished_pane_abandons_only_with_the_pinned_token() {
         candidate.token
     );
 }
+
+#[test]
+fn revive_renders_the_lean_settings_a_profile_gained_after_launch() {
+    // #2322: a coordinator whose profile gains coordinator_lean after its
+    // launch is relaunched with the rendered lean settings and, since the
+    // key implies it, with no MCP servers, though its recorded arguments
+    // have neither.
+    let (fixture, old, path) = profile_fixture();
+    assert!(!old
+        .arguments
+        .iter()
+        .any(|argument| argument == "--settings"));
+    let mut config = agent::read_private_json(&path).unwrap();
+    config["profiles"]["claude-recovery"]["coordinator_lean"] = json!({"lanes": ["worker-hands"]});
+    agent::atomic_json(&path, &config).unwrap();
+    let manager = fixture.manager();
+    manager.revive("worker", false, None, TIMEOUT).unwrap();
+    let new = manager.load("worker").unwrap();
+    let settings = crate::lean::settings_path(&manager.registry, "worker");
+    assert!(
+        new.arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--settings" && pair[1] == settings.display().to_string()),
+        "{:?}",
+        new.arguments
+    );
+    assert!(
+        new.arguments
+            .iter()
+            .any(|argument| argument == "--strict-mcp-config"),
+        "{:?}",
+        new.arguments
+    );
+    let rendered: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    assert!(rendered["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .contains("'--lane' 'worker-hands'"));
+}

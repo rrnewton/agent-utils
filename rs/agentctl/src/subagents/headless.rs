@@ -874,6 +874,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 &self.registry,
             )?);
         }
+        // Coordinator-lean rendering (#2322): from the current profile, re-derived at
+        // every wrapper launch like the no-MCP arguments, so restart, revive, restore and
+        // turnover all start the harness with the Bash ceiling, the denies and the hook.
+        if let Some(policy) = self
+            .profile_for_record(&record)
+            .and_then(|profile| profile.coordinator_lean)
+        {
+            config.arguments = self.lean_arguments(&config.arguments, &policy, agent_name)?;
+        }
         // Masked paths (#2163): wrap the harness command so the wrapper's
         // harness, its MCP children and every restart spawn inside the
         // mask namespace with the real uid/gid. An empty list leaves the

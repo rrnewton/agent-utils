@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-coordinator-lean-headless-profile: a coordinator-lean headless launch allows only short read-only commands and caps every Bash call at about 30 s, with a helper lane as its hands'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-leanprofile
@@ -9,7 +9,7 @@ labels:
 - headless
 - coordinator
 created_at: 2026-11-26T19:20:00-05:00
-updated_at: 2026-11-26T19:20:00-05:00
+updated_at: 2026-11-26T20:10:00-05:00
 ---
 
 # Description
@@ -40,3 +40,18 @@ The design note (in the harness repository's plans) names every file, the exact 
 # Notes
 
 Filed for owner request 389 (2026-11-26). Code waits for the coordinator's GO on the design note.
+
+## Resolution
+
+Delivered in the Rust edition:
+- **Profile and rendering.** The `coordinator_lean` profile key (`true` or `{bash_timeout_seconds, extra_commands, lanes}`; Claude only; implies `no_mcp_servers`). `rs/agentctl/src/lean.rs` renders `REGISTRY/lean-settings/NAME.json` at `start`, at every headless wrapper launch, and at every interactive relaunch (`finish_launch_plan`). The file holds the Bash ceiling (`BASH_MAX_TIMEOUT_MS` / `BASH_DEFAULT_TIMEOUT_MS` with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`), the tool and Bash deny rules, and the PreToolUse hook `agentctl lean-hook ... || exit 2`, merged with the profile's own `--settings`.
+- **The hook.** It allows short read-only commands, the read-only git subcommands, `agentctl status/list/read/tail` and `chat sent/thread/help`, `send --queue-only` and `interrupt` to the agent's own lanes (managed_by chain or `lanes`), and agent-teams send/reply. It refuses everything else with a reason naming the hands lane. It takes about 3 ms per call.
+- **Status and the Python edition.** `status` shows `coordinator_lean`. The Python edition refuses to launch a lean profile.
+- **Docs.** The user guide's headless section and the harness support matrix ("Coordinator-lean launch", and "Headless delivery, interrupt and cancelled inputs").
+- **Live proof.** A scratch headless lead on Claude Code 2.1.319 (haiku), on this build:
+  - `wc -c /dev/zero` was killed at 30 s (exit 143).
+  - `sleep 31`, `timeout: 120000`, `touch`, `curl` and a send to a non-lane were refused by the hook; `run_in_background` was not offered; the Write tool was absent.
+  - `git log`, `rg`, `agentctl status`, `agentctl tail` and `agentctl send --queue-only` to the hands lane worked.
+  - The hands lane's `send --to-manager` reply came back as the lead's next turn.
+
+Not yet verified: the trial on a real coordinator (a consumer team's less critical coordinator first), which that team runs from the profile and restart steps handed to them.

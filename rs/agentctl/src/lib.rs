@@ -34,6 +34,7 @@ pub mod headless;
 pub(crate) mod inbox;
 pub mod kill_pid;
 pub mod landing_queue;
+pub(crate) mod lean;
 pub mod legacy_cli;
 pub mod lineage;
 pub mod lock_wait;
