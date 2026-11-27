@@ -526,7 +526,7 @@
      key's 3.25rem), so a long line wraps before the chip and before the
      floating keyboard Send stands. The side box has no chip and keeps its
      own. */
-  :root[data-keyboard="open"][data-pane="discord"] #channel-compose-text[enterkeyhint="send"]:focus {
+  :root[data-keyboard="open"][data-pane="discord"] #draft-sync-offer[hidden] ~ #channel-compose-text[enterkeyhint="send"]:focus {
     padding-right: 7rem;
   }
 
@@ -562,6 +562,33 @@
   :root[data-keyboard="open"][data-pane="discord"] #reply-text[enterkeyhint="send"]:focus ~ .newline-key {
     grid-row: 2;
     grid-column: 1 / -1;
+  }
+
+  /* `#2301 vibe-talk-ui-review-findings-11-26` (R10). With the new-line key up in the channel
+     box's corner, Save draft stands directly over it in the same corner, one 8px step above it,
+     instead of at the box's top where the fitted box (`#2277`) left too little height for both:
+     the chip's foot met the key's top (1.8px of overlap at 412px). The chip joins the box's grid
+     cell as the key does, end-aligned with a foot margin of the key's own height and foot margin
+     plus the 0.5rem gap, so the gap is the key's top to the chip's foot whatever the box's
+     height; its head and end margins are the inset it had at the box's top corner, and the cell
+     grows to hold both (the box below the reading row, never above it). Neither control's size,
+     place in the corner or action changes, and Send is untouched. */
+  :root[data-keyboard="open"][data-pane="discord"] #channel-compose-text[enterkeyhint="send"]:focus ~ #channel-save-draft {
+    position: static;
+    grid-row: 1;
+    grid-column: 1;
+    align-self: end;
+    justify-self: end;
+    z-index: 1;
+    margin: 0.4rem 0.4rem calc(0.35rem + 2.75rem + 0.5rem) 0;
+  }
+
+  /* While the chip stands (no continue offer up), the box that cell sizes is held to a whole-pixel
+     least height that holds both (`R11`): the chip's own height is its font's line, a fraction of a
+     pixel, and a fractional box put its foot a fraction past the keyboard's top where typing brings
+     the composer back whole (tests/typing_scroll_browser.py). Larger type grows the cell past it. */
+  :root[data-keyboard="open"][data-pane="discord"] #draft-sync-offer[hidden] ~ #channel-compose-text[enterkeyhint="send"]:focus {
+    min-height: 6rem;
   }
 
   /* `#1680 inline-reply-keyboard-clutter`. No floating chips over the form while the keyboard

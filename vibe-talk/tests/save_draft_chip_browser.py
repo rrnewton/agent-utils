@@ -7,6 +7,10 @@ padding, so a long first line wraps before it reaches the chip. The check
 is geometric: the chip's rect against the textarea's text area (its
 content box, padding excluded), with a first line long enough to run
 under where the chip stands.
+
+`#2301 vibe-talk-ui-review-findings-11-26` (R10): on a phone with the
+keyboard up and the new-line key in the box's corner, Save draft stands one
+8px step over that key, the two never touching and both inside the box.
 """
 from __future__ import annotations
 
@@ -179,6 +183,8 @@ def main() -> int:
                   };
                   const chip = read('channel-save-draft');
                   const send = read('channel-send');
+                  const newline = read('channel-newline');
+                  const outer = read('channel-compose-text');
                   const area = document.getElementById('channel-compose-text');
                   const b = area.getBoundingClientRect();
                   const cs = getComputedStyle(area);
@@ -188,7 +194,7 @@ def main() -> int:
                     top: b.top + parseFloat(cs.borderTopWidth) + parseFloat(cs.paddingTop),
                     bottom: b.bottom - parseFloat(cs.borderBottomWidth) - parseFloat(cs.paddingBottom),
                   };
-                  return { chip, send, text };
+                  return { chip, send, newline, outer, text };
                 }""")
                 text = rects["text"]
                 for name in ("chip", "send"):
@@ -199,6 +205,25 @@ def main() -> int:
                         or rect["bottom"] <= text["top"] or rect["top"] >= text["bottom"])
                     check(not overlap,
                           f"phone keyboard open: the {name} covers typed text: {rect} vs {text}")
+                # `#2301 vibe-talk-ui-review-findings-11-26` (R10): Save draft and the new-line key
+                # share the box's corner without touching: the chip stands one 8px step over the
+                # key (0.5 px for sub-pixel rounding), both inside the box.
+                chip, newline, outer = rects["chip"], rects["newline"], rects["outer"]
+                check(newline is not None, "phone keyboard open: no new-line key stands in the box")
+                if chip is not None and newline is not None and outer is not None:
+                    touching = not (
+                        chip["right"] <= newline["left"] or chip["left"] >= newline["right"]
+                        or chip["bottom"] <= newline["top"] or chip["top"] >= newline["bottom"])
+                    check(not touching,
+                          f"phone keyboard open: Save draft and the new-line key overlap: {chip} vs {newline}")
+                    gap = newline["top"] - chip["bottom"]
+                    check(abs(gap - 8) <= 0.5,
+                          f"phone keyboard open: the gap from Save draft down to the new-line key is {gap:.2f}px, not 8px")
+                    inside = all((r["left"] >= outer["left"] - 0.5 and r["right"] <= outer["right"] + 0.5
+                                  and r["top"] >= outer["top"] - 0.5 and r["bottom"] <= outer["bottom"] + 0.5)
+                                 for r in (chip, newline))
+                    check(inside, f"phone keyboard open: the corner controls leave the box: {chip} {newline} in {outer}")
+                    print(f"phone keyboard open: Save draft over the new-line key, gap {gap:.2f}px")
                 page.screenshot(path=str(args.screenshots / "phone-kbopen-chip-clear.png"))
                 print(f"phone keyboard open: chip and the box's own Send clear of the text area, "
                       f"no corner Send {rects}")
