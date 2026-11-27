@@ -187,6 +187,38 @@ def walk_fresh(context: BrowserContext, url: str, shots: Path | None, where: str
         "() => getComputedStyle(document.getElementById('status-line')).visibility === 'visible'",
         timeout=10_000)
     page.evaluate("() => { document.getElementById('status-line').hidden = true; }")
+    # `#2350 vibe-talk-back-toast-covers-returned-row`: an idle word is heard, not seen. Said
+    # the way the page says it (unhidden, then the words, then the idle mark), it stays in the
+    # accessibility tree as the polite live region's words, and draws nothing: clipped to
+    # nothing, its dismiss x hidden. (`visibility: hidden` took it out of the tree.)
+    page.evaluate("""() => {
+        const line = document.getElementById('status-line');
+        line.hidden = false;
+        document.getElementById('status').textContent = 'Ready.';
+        line.setAttribute('data-idle', '');
+    }""")
+    idle = page.evaluate("""() => {
+        const line = document.getElementById('status-line');
+        const said = document.getElementById('status');
+        const style = getComputedStyle(line);
+        const box = line.getBoundingClientRect();
+        return {visibility: style.visibility, saidVisibility: getComputedStyle(said).visibility,
+                display: style.display, clip: style.clipPath, width: box.width, height: box.height,
+                text: said.textContent, role: said.getAttribute('role'), live: said.getAttribute('aria-live'),
+                dismiss: getComputedStyle(document.getElementById('dismiss-status')).visibility};
+    }""")
+    check(idle["visibility"] != "hidden" and idle["saidVisibility"] != "hidden" and idle["display"] != "none"
+          and idle["role"] == "status" and idle["live"] == "polite" and idle["text"] == "Ready.",
+          f"{where}: an idle status word is not in the polite live region a screen reader hears: {idle}")
+    check(idle["clip"] == "inset(50%)" and idle["width"] <= 1 and idle["height"] <= 1 and idle["dismiss"] == "hidden",
+          f"{where}: an idle status word is drawn (or its dismiss x can take the focus): {idle}")
+    heard = page.locator("#status-line").aria_snapshot()
+    check("Ready." in heard, f"{where}: the accessibility tree does not hold the idle word: {heard!r}")
+    page.evaluate("""() => {
+        const line = document.getElementById('status-line');
+        line.removeAttribute('data-idle');
+        line.hidden = true;
+    }""")
     # `#1837` (b): the current freshness pill takes itself away, so at the head of the
     # list the first card's text and top-row buttons are left clear (app landings
     # already measure the pill while it is up, `floatingClearance`); and while the

@@ -2414,3 +2414,22 @@ test("`#649 voice-agent-tools`: Hang up with no answer owed still closes the cal
   await page.el("hang-up").click();
   assert.equal(socket.readyState, 3);
 });
+
+// --- `#2350 vibe-talk-back-toast-covers-returned-row`: an idle status word is heard, not seen ---
+//
+// `#1859` hid an idle confirmation ("Ready.") with `visibility: hidden`, which takes the line out of
+// the accessibility tree: its polite live region then announced nothing. The idle line is clipped to
+// nothing as the page's .sr-only is, so it is still in the tree, and its dismiss x is hidden with it.
+
+test("`#2350`: an idle status line is clipped to nothing as .sr-only is, never hidden from the accessibility tree, and its dismiss x is hidden", () => {
+  const idle = cssBlock("#status-line[data-idle]");
+  assert.doesNotMatch(idle, /visibility:\s*hidden|display:\s*none|opacity:\s*0|aria-hidden/,
+    "the idle status line is taken out of the accessibility tree");
+  assert.match(idle, /clip-path:\s*inset\(50%\)/, "the idle status line is not clipped to nothing");
+  for (const [prop, value] of [["width", "1px"], ["height", "1px"], ["overflow", "hidden"], ["white-space", "nowrap"]]) {
+    assert.match(idle, new RegExp(`${prop}:\\s*${value}`), `the idle status line keeps .sr-only's ${prop}: ${value}`);
+  }
+  assert.match(cssBlock("#status-line[data-idle] > #dismiss-status"), /visibility:\s*hidden/,
+    "the idle line's dismiss x can still take the focus");
+  assert.match(HTML_CODE, /<span id="status" role="status" aria-live="polite">/, "the status words are not a polite live region");
+});

@@ -729,6 +729,8 @@ STUB_JS = r"""
     const box = node.getBoundingClientRect();
     if (box.width <= 0 || box.height <= 0) return false;
     const style = getComputedStyle(node);
+    // `#2350`: clipped to nothing as the page's .sr-only is (an idle status word), it is heard, not seen.
+    if (style.clipPath === "inset(50%)") return false;
     return style.visibility !== "hidden" && style.display !== "none" && style.opacity !== "0";
   };
   window.__text = (id) => {
