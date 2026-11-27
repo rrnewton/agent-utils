@@ -1,6 +1,6 @@
 ---
 title: 'slack-old-thread-reply-late: a reply in a thread older than the rescan window reaches the agent only when the stream later carries another reply there (5 h 20 min late)'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-bridgeretire
@@ -10,7 +10,8 @@ labels:
 - slack
 - bridge
 created_at: 2026-11-27T05:20:51-05:00
-updated_at: 2026-11-27T05:38:55-05:00
+updated_at: 2026-11-27T11:39:18-05:00
+closed_at: 2026-11-27T11:39:18-05:00
 ---
 
 # Description
@@ -89,3 +90,20 @@ Also:
 - (a) is open upstream: why the event topic did not publish one plain thread reply. The bridge-side fix bounds the delay either way.
 - The plugin's configured rescan window was the default, 86400 s (its subscription log line).
 - Related: #2369 (the Errno 98 reconnect loop in the same window), #415 (file messages never reach the stream), #615 (stream activity pulls the next pass forward), #690 (rescan intake and the shared host budget), #769 and #1892 (relay poll), #2338 (request population cap).
+
+## Resolution
+
+(b) is fixed. Landed as efce968b on 2026-11-27, replaying fbad748c, which was gated on 8dbbe0cd.
+
+- **Watched threads:** the Slack plugin keeps a durable record, `slack-watched-threads.json` (schema `agentctl.slack.watched-threads.v1`), of each thread an allowed sender wrote in. A rescan pass lists each watched thread whose root is older than the rescan window, from its listed-through point, for 48 h after the thread's newest message.
+  - A busy thread (newest message under 1 h old) is listed every pass. A quiet one is listed at most every 10 min.
+  - Listings spend the shared host budget and are capped at 8 per pass. They stop while a rescued batch is pending, so the 2,048-request refusal window costs no more than a history listing per pass.
+  - The plugin key `rescan_watch_seconds` sets the watch: 3600-604800 s, or 0 for off.
+- **Invalid files:** garbage, an unknown schema or an unreadable file each give an empty watch plus a log note, never a failure.
+- **Tests:** a plugin test reproduces the observed case (a reply in a 38 h old thread, stream quiet) and fails on the old code. A second test covers refused batches with a resubscribe every minute: one listing, one admission, no re-listing from the window floor.
+
+**Evidence: gate `1795777557928417519-cfaebd8f` on fbad748c** (validate --all). It passed 341 steps with 0 failed and 0 incomplete. The row is PARTIAL only for 7 delegated-live-scope cross skips (cpuset-differential 5, dagrun differential 2; both steps pass), landed under coordb's standing waiver 1046.
+
+(a) stays open upstream and is not fixed here: the event topic never published reply 1528. Both cursor refreshes in the window caught up from before it and fetched 0 events, so the plugin did not drop it. With watched threads, such a gap in a thread an allowed sender wrote in within 48 h now costs at most one quiet-thread interval plus the grace, about 10 min, instead of hours.
+
+The Errno 98 reconnect loop in the same window is #2369, still open.
