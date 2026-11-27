@@ -1,6 +1,6 @@
 ---
 title: 'headless-reply-in-thinking: a headless coordinator wrote five reply blocks only in its thinking, so the bridge had nothing to capture; the request prompt never says a block in thinking is not sent'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-bridgeretire
@@ -10,7 +10,8 @@ labels:
 - headless
 - bridge
 created_at: 2026-11-27T10:25:00-05:00
-updated_at: 2026-11-27T10:25:00-05:00
+updated_at: 2026-11-27T17:43:17-05:00
+closed_at: 2026-11-27T17:43:17-05:00
 ---
 
 # Description
@@ -71,3 +72,29 @@ This is the reply-in-thinking class already found in a Claude Code TUI coordinat
 - Times are UTC.
 - Turn 8368 ran from 14:52:21Z to 15:03:30Z, with an automatic compaction (967k to 31k tokens) at 14:54:42Z just before the replies. Turn 8369 ran from 15:03:30Z to 15:21:00Z and took 12 chat requests mid-turn.
 - Related: #292 (reply-in-thinking reminder), #391 (the same cause in a TUI coordinator), #1974 (headless transcript from the event log), #2331 (headless turn-end reminders), #2338.
+
+## Resolution
+
+Design items 1 and 2 are fixed. They landed as c44bb561 (prompt) and 0da4e909 (mid-turn notice) on 2026-11-27, replaying 51d258cf.
+
+- **Prompt:** every fenced reply footer ends with "A reply written only in your thinking is not delivered: print each pair as ordinary text." The chat help pages say it too, and command-only prompts do not.
+  - Tests pin the exact sentence. The reply-mode test asserts it appears exactly when the prompt is not command-only.
+- **Mid-turn notice:** a headless target only.
+  - Trigger: no reply captured or stored after 3 tool calls in the turn that took the request, spread over at least 2 minutes by the event log's timestamps.
+  - It gets one queued notice, sent at once even while the agent is working. The notice says a reply in thinking is not delivered and gives the `chat reply` command.
+  - The record is `reply-notices.json` (schema `agentctl-chat-reply-notices/v1`, queue IDs `chat-notice-*`). It is written before the notice is queued, and taken back when the queue refuses it, so a later check tries again.
+  - Settings: `chat run --reply-notice-tools N` (default 3, 0 turns it off, at most 100) and `--reply-notice-after DURATION` (default 2m, 30s to 1h).
+  - A reminded, answered, closed or retired request is never noticed. Turn-end reminders (#2331) stay the backstop.
+  - Tests:
+    - `a_headless_request_still_unanswered_after_three_tool_calls_mid_turn_is_noticed_once`: one notice, never a second; none for a request answered in the turn; the turn-end reminder still follows.
+    - `a_mid_turn_notice_the_queue_refuses_is_taken_back_and_later_queued_exactly_once`.
+    - Unit tests for the tool-call count, the trigger and the record.
+- **Docs:** the chat user guide and the harness support matrix describe both.
+
+**Evidence: gate `1795813162382695959-b9e21283` on 51d258cf**, one gate for both commits. Path-selected validate, 54 steps, verdict pass; failed, incomplete and known-red all empty.
+- Main had changed `harness-support-matrix.md` since the gated base (#2399), so the replay landed with `--allow-overlap` on a combined tree verified for that docs-only overlap. On that tree the docs checks, fmt and `chat_reply` all pass.
+- The new persisted file and log lines were reported to the downstream team before the gate, with no objection.
+
+Not done here:
+- Design item 3, the diagnostics: an `assistant.message` event per assistant message and the thinking-only count in `chat sent`. It still needs its own design note, and moves to its own issue with its acceptance criterion.
+- Design item 4 is the consumer team's turnover.
