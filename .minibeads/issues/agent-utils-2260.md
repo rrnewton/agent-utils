@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-search-barely-overflowing-list-clamp: a list that barely overflows follows its foot and clamps back, moving the row being read for a frame'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-25T15:58:00-05:00
-updated_at: 2026-11-25T15:58:00-05:00
+updated_at: 2026-11-26T23:12:00-05:00
+closed_at: 2026-11-26T23:12:00-05:00
 ---
 
 # Description
@@ -34,3 +35,8 @@ Cause (2026-11-26, real throwaway server, reader at the head of the channel list
 
 Fix: a reader at the head with search words typed (`atSearchHead`) gives a head anchor; where the change hides their row, they keep the list's head (`toPosition` 0) instead of a place below it for the nearest row. The entry landing does not take a reader who typed at the head to the newest hits when the newest line already stands within the slack of the screen, so the filter's hold stays and neither the chips' keeper nor a restore follows the foot. Every other reader lands as #1734 has it (its page test and `search_scroll_browser.py` unchanged).
 
+## Resolution
+
+[opus 5.5] Landed in fc355d03 (2026-11-26 11:10 PM ET, liaison LAND NOW, owner gate fully green on the gated head b62861dd). A reader at the head with search words typed now gives a head anchor and keeps the list's head where the change hides their row, and the search entry no longer takes a reader who typed at the head to the newest hits when the newest line already stands within the slack, so the filter's hold stays and neither the chips' keeper nor a restore follows the foot.
+
+Evidence (real throwaway server, reader parked at the head, first key of a fresh search leaving the list a few pixels taller than the screen, every frame until 60 frames after the last change, JSON sidecars): main moved the reading row 20 px on a phone, 31 px on a desk and 15 px on a desk with Discuss open (light and dark); the fix 0.0 px with scrollTop 0 in every frame on phone and desk, light and dark, phone with the keyboard open, and desk with Discuss open (the keyboard-open case did not move on main either). Page test "`#2260 ...`" in tests/js/page/search.mjs passes on the fix and fails on main ("the key's own change moved the head reader to 6"). #1734 unchanged for every reader not at the head and for a head reader of a long list: its page test, #1968's and search_scroll_browser.py pass, with ten more search and filter browser checks. Advisory design review: no finding new against main; the pre-existing ones were left as they are at the coordinator's word. The landed reader who then follows the foot (51 -> 20 -> 5 px) is #2346.

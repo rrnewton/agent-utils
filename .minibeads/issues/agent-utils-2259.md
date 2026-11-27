@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-thread-search-older-hit-above-reader: an older in-thread hit placed above a reader at a short thread''s head moves the row being read'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-25T15:58:00-05:00
-updated_at: 2026-11-25T15:58:00-05:00
+updated_at: 2026-11-26T23:12:00-05:00
+closed_at: 2026-11-26T23:12:00-05:00
 ---
 
 # Description
@@ -29,3 +30,9 @@ Pre-existing, same on main. Found while tracing #2256 vibe-talk-search-head-room
 # Notes
 
 Owner-UI (owner 370). Filed at the coordinator's request from the #2256 traces. Related: #2256 vibe-talk-search-head-room-no-shift, #1901 vibe-talk-search-late-hits-shift-anchor, #2254 vibe-talk-search-chips-cover-first-card, #2258 vibe-talk-thread-search-park-first-pass.
+
+## Resolution
+
+[opus 5.5] Fixed by #2258 (b41730eb, landed 2026-11-26 7:54 PM ET): the thread-view parking now acts only on a first result the chip panel covers in part, once per search and row, so an older in-thread hit the answer places wholly above the reader is never parked and the row being read keeps its top. The liaison accepted closing it as fixed by #2258 on the condition of a gating forced-order check, which landed in 4cc9ea84 (with #2260, fc355d03): vibe-talk/tests/js/view/channel.test.mjs, test "`#2259` thread-view parking, forced order: an answer that leaves the first result wholly above the screen parks nothing; a covered one is parked once per search and row". It sets up the answer's state directly (thread view, search open, chip panel up, the older hit wholly above the screen, the reader's row below), runs the count redraw twice and asserts no park; it fails on the pre-#2258 searchrows.ts ("a first result wholly above the screen was parked, moving the row being read") and runs in the gate under cargo test (tests/page_modules.rs).
+
+Evidence (2026-11-26 evening, main ca7a45fc, page build c8649bfa): per-frame rAF trace in the typing-fast fixture's lantern thread, reader at its head, key 'lantern', the older reply placed above in every run: the head row and every loaded row moved at most 0.5 px on a phone (412x915) and 0.2 px on a desk (1280x800), light and dark, first result never under the chip panel. Honest note: the old move did not reproduce that evening even on the unmodified pre-#2258 page (0 of 3 full test runs, 0 of 5 trace runs, also concurrent and with a faked earlier clock), while it had reproduced deterministically the same day (103.5 px phone / 76.1 px desk at 3:04 PM ET on four viewports, and 103.5 px at about 6 PM ET): a timing-dependent path in the old code that #2258's guard removes structurally. Reopen if the owner sees the move again.
