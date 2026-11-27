@@ -643,11 +643,19 @@ function measureReadSteer() {
   // chip is showing.
   const height = el("read-steer").offsetHeight || 0;
   const grew = Math.max(0, height - readSteerHeight);
+  const resized = height !== readSteerHeight;
   readSteerHeight = height;
   const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
   const area = el("scroll-area");
   const landed = screens.screen() === "main" && screens.view() === "discord" && entryLandingHolds();
-  const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area, grew);
+  // `#2351 vibe-talk-read-strip-foot-reader-moves`, owner 370 (R12): the strip coming, going or
+  // wrapping changes the list's frame; it is not an arrival. In a channel list it never takes a
+  // reader at the foot to the new foot (on a phone the list's end rises by the strip's height, and
+  // the message being read went up with it): the list keeps its scroll position, the row being read
+  // keeps its top, and the end slips below the strip, offered by the jump, as `#2354` holds the other
+  // growth the reader did not cause there. The call transcript follows its foot as before (`#431`).
+  const holdsReader = resized && screens.view() === "discord";
+  const pinned = !landed && !holdsReader && screens.screen() === "main" && chipsFollowFoot(area, grew);
   geometry.write("--read-steer-clearance", room);
   // `scrubber-full-width`. The height itself, without the air: on a phone the strip playing is a
   // row of its own over the dock, and the list ends at its top edge (`data-read-strip`). Held on
@@ -655,6 +663,7 @@ function measureReadSteer() {
   geometry.write("--read-steer-height", `${height}px`);
   if (landed) placeEntryLanding(entryState().landing.row, entryState().landing.first);
   if (pinned) scrollKeeping.toFoot(area);
+  else if (holdsReader && screens.screen() === "main") renderJumpNewest();
   // The strip floats in the same band as the chips over the channel's box, so it moved with it.
   placeChipsOverComposer();
   // `#442 read-strip-order`: a strip moved on a desk that grew is held inside the window again.

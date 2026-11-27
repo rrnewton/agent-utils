@@ -101,6 +101,69 @@ test("tapping Read with no error showing leaves a reader near the newest line wh
   assert.ok(moved > 0, "the negative control did not snap the reader, so the check above proves nothing");
 });
 
+test("`#2351 vibe-talk-read-strip-foot-reader-moves`: the read strip coming and going never moves a reader at the newest line", async () => {
+  // Owner 370 (R12). On a phone the strip playing is a row of its own over the dock and the list ends
+  // at its top, so the list's frame loses the strip's height as a read starts and gets it back as it
+  // stops. The strip's measure took a reader at the foot down to the new foot: the message being read
+  // went up by the strip's height (47 px at 393x852) and came back as the strip went.
+  const STRIP_PX = 47;
+  const readAtTheFoot = async (script) => {
+    // Sizes watched, so the keepers note that the reader follows the foot (`#1185`).
+    const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
+    page.readAloud = DEVICE_SPEECH;
+    page.enableDeviceSpeech();
+    await signIn(page);
+    // Short messages: a long one opens as it is read, which is growth of its own, not the strip's.
+    const messages = Array.from({ length: 30 }, (_, i) => message({
+      id: `10000000000000002${String(i).padStart(2, "0")}`,
+      author: i % 2 ? "ci-bot" : "deploy-bot",
+      author_id: i % 2 ? "1000000000000000001" : "1000000000000000002",
+      content: `strip ${i}: the build finished and the deploy is waiting for a look.`,
+    }));
+    const rows = await inReadingMode(page, messages);
+    const area = page.el("scroll-area");
+    assert.ok(area.scrollHeight > area.clientHeight * 2, "the fixture cannot scroll, so this proves nothing");
+    // The list's first size report takes the keeper's note of where the reader stands (`#1185`);
+    // their scroll to the foot then notes them following it.
+    page.resized(page.el("pane-discord"));
+    area.scrollTop = area.scrollHeight - area.clientHeight;
+    await area.dispatch("scroll", {});
+    await page.settle();
+    const before = area.scrollTop;
+    const frame = area.clientHeight;
+    const strip = page.el("read-steer");
+    assert.equal(strip.hidden, true, "the strip is already up, so this is not the case here");
+    // The phone's layout with the strip up: the strip measures its height and the list's frame is
+    // that much shorter, a frame change with no scroll event.
+    strip.offsetHeight = STRIP_PX;
+    area.clientHeight = frame - STRIP_PX;
+    await rows.at(-1).dispatch("click", {});
+    await page.settle();
+    // The browser's next rendering: the list reports its new size, and the strip its own.
+    page.resized(area);
+    page.resized(strip);
+    await page.settle();
+    assert.equal(page.deviceSpeech.utterances.length > 0, true, "the tap did not start reading");
+    assert.equal(strip.hidden, false, "the read did not bring up the strip, so this is not the case here");
+    const shown = area.scrollTop - before;
+    // ...and with it gone: the strip measures nothing and the frame is whole again.
+    strip.offsetHeight = 0;
+    area.clientHeight = frame;
+    await rows.at(-1).dispatch("click", {});
+    await page.settle();
+    page.resized(area);
+    page.resized(strip);
+    await page.settle();
+    assert.equal(strip.hidden, true, "tapping the row being read did not stop it, so this is not the case here");
+    return { shown, gone: area.scrollTop - before };
+  };
+  const held = await readAtTheFoot(SCRIPT);
+  assert.deepEqual(held, { shown: 0, gone: 0 }, `the strip moved the reader: ${JSON.stringify(held)}`);
+  const moved = await readAtTheFoot(await brokenModule([{ file: "src/app/main.js",
+    find: "  const pinned = !landed && !holdsReader && screens.screen()", replace: "  const pinned = !landed && screens.screen()" }]));
+  assert.ok(moved.shown > 0, `the negative control did not take the reader to the foot (${JSON.stringify(moved)}), so the check above proves nothing`);
+});
+
 test("device speech ignores remote voices and waits for a fresh tap when installed voices appear", async () => {
   const remote = { name: "Cloud voice", lang: "en-US", localService: false, default: true };
   const page = devicePage([remote]);
