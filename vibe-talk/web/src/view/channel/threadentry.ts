@@ -46,6 +46,12 @@ export interface EntryLandingMark {
   top: number;
   first: string[];
   open: boolean;
+  /**
+   * `#2385 vibe-talk-thread-open-layout-first`: where the landing stood on a box for a reply on its
+   * way (`first` then names nothing), the message id of the last row drawn above the boxes. The read
+   * draws the reply the box stood for right after it, and the landing is kept on that reply.
+   */
+  after?: string | null;
 }
 
 /** What entering a thread is handed by the page. */
@@ -80,6 +86,16 @@ export interface ThreadEntryDependencies {
    * box, and holding a message still must not carry that box off screen. Absent: never held.
    */
   composerHeld?(): boolean;
+  /**
+   * `#2385 vibe-talk-thread-open-layout-first`: the first box standing for a reply on its way
+   * (`createPendingReplies`), or null. An entry with nothing unread among the rows it holds lands on
+   * it as on a first unread reply: the reply it stands for is newer than anything read. Absent: none.
+   */
+  pendingBox?(): HTMLElement | null;
+  /** Whether `node` is such a box. Absent: never. */
+  isPendingBox?(node: Element | null | undefined): boolean;
+  /** The message id of the last row drawn above the boxes (`heldBefore`). Absent: none. */
+  pendingHeldBefore?(): string | null;
   /**
    * Whether Read is actively following (`#1856 vibe-talk-read-aloud-follow-not-yanked-up`):
    * a message is playing and not held. While it stands, no entry landing or drill anchor
@@ -338,8 +354,10 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
   function entryLandingMark(): EntryLandingMark | null {
     if (!entryLandingHolds()) return null;
     const { row, first } = entryState().landing as { row: HTMLElement; first: HTMLElement };
+    const onBox = Boolean(deps.isPendingBox && deps.isPendingBox(first));
     return { ids: idsOf(row), top: row.getBoundingClientRect().top, first: idsOf(first),
-      open: first.getAttribute("data-collapsed") === "false" };
+      open: first.getAttribute("data-collapsed") === "false",
+      ...(onBox ? { after: deps.pendingHeldBefore ? deps.pendingHeldBefore() : null } : {}) };
   }
 
   /**
@@ -373,10 +391,15 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
     if (deps.readFollowing && deps.readFollowing()) return true;
     const rows = ([...deps.el("discord-log").children] as HTMLElement[]) as HTMLElement[];
     const rowFor = (ids: readonly string[]) => shownRowFor(rows.find((candidate) => idsOf(candidate).some((id) => ids.includes(id))));
-    const first = rowFor(mark.first);
+    // `#2385`: a landing made on a box keeps to the reply that took the box's place: the first row
+    // drawn on its own after the last one that stood above the boxes.
+    const onBox = !mark.first.length && Boolean(mark.after);
+    const first = onBox ? replyAfter(rows, mark.after as string) : rowFor(mark.first);
     if (!first || first.hidden) return false;
     const fold = childByClass(first, "fold");
-    if (mark.open && fold && !first.hasAttribute("data-read-run") && first.getAttribute("data-collapsed") === "true") {
+    // A landing on a box was a landing on the first unread reply it stood for: that reply is shown
+    // unfolded, as `landOnFirstUnread` shows the first unread (its top stays where the box's was).
+    if ((mark.open || onBox) && fold && !first.hasAttribute("data-read-run") && first.getAttribute("data-collapsed") === "true") {
       fold.click();
     }
     const head = entryHeadRow(first);
@@ -392,6 +415,16 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
     deps.renderScrollTools();
     deps.requestVisibleSummaries();
     return true;
+  }
+
+  /**
+   * `#2385`: the first row drawn on its own after the row holding message `after`: the reply the
+   * read drew where a box stood. Null when that row is gone or nothing follows it.
+   */
+  function replyAfter(rows: readonly HTMLElement[], after: string): HTMLElement | null {
+    const at = rows.findIndex((candidate) => idsOf(candidate).includes(after));
+    if (at < 0) return null;
+    return rows.slice(at + 1).find((row) => drawnOnItsOwn(row)) || null;
   }
 
   /** Whether `row` is drawn as a message of its own: not hidden, not behind a run's line, not filtered out. */
@@ -424,13 +457,30 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
    */
   function landOnFirstUnread(): boolean {
     const first = ([...deps.el("discord-log").children] as HTMLElement[]).find((row) => drawnOnItsOwn(row) && !deps.rowIsRead(row));
-    if (!first) return false;
+    if (!first) return landOnPendingBox();
     // Opened by its own control, as a tap opens it. (It went by the control when the page also kept a
     // list of folds, which a view held and drawn again came back missing from; the rows are the one
     // record now, `foldsOf`.)
     const fold = childByClass(first, "fold");
     if (fold && first.getAttribute("data-collapsed") === "true") fold.click();
     if (!landAtFoot(first)) placeEntryLanding(entryHeadRow(first), first);
+    deps.renderScrollTools();
+    deps.requestVisibleSummaries();
+    return true;
+  }
+
+  /**
+   * `#2385 vibe-talk-thread-open-layout-first`. Nothing unread among the rows held, and boxes stand
+   * below them for replies on their way: those replies are newer than anything read, so the entry
+   * lands on the first box as it would on the first of them — the root brought to the head when it
+   * fits, else the box — and the read keeps the landing on the reply that takes the box's place
+   * (`keepEntryLanding`, by `after`). The box starts right below the rows held, where that reply
+   * will start, so the landing is the one the read would have made. False with no box.
+   */
+  function landOnPendingBox(): boolean {
+    const box = deps.pendingBox ? deps.pendingBox() : null;
+    if (!box) return false;
+    placeEntryLanding(entryHeadRow(box), box);
     deps.renderScrollTools();
     deps.requestVisibleSummaries();
     return true;
@@ -514,7 +564,8 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
     const landing = entryState().landing;
     if (landing === null) return false;
     const holds = deps.screen() === "main" && deps.view() === "discord" && deps.selection().view === "thread" &&
-      !deps.pinsView().only && landing.key === deps.channelContextKey() && landing.row.parentNode === deps.el("discord-log") &&
+      !deps.pinsView().only && landing.key === deps.channelContextKey() &&
+      (landing.row.parentNode === deps.el("discord-log") || Boolean(deps.isPendingBox && deps.isPendingBox(landing.row) && landing.row.parentNode)) &&
       landing.row.getBoundingClientRect().height > 0 && Math.abs(deps.el("scroll-area").scrollTop - landing.at) <= 1;
     if (!holds) entryState().landing = null;
     return holds;

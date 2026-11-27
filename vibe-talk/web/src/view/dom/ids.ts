@@ -513,6 +513,7 @@ export interface ElementById {
   "pane-discord": HTMLDivElement;
   "pane-docs": HTMLDivElement;
   "pane-voice": HTMLDivElement;
+  "pending-replies": HTMLDivElement;
   "pinned-log": HTMLOListElement;
   "post-confirm": HTMLElement;
   "post-confirm-cancel": HTMLButtonElement;
@@ -719,6 +720,7 @@ export interface ElementById {
   "side-overextend": HTMLDivElement;
   "side-overscroll": HTMLDivElement;
   "side-pane": HTMLDivElement;
+  "side-pending-replies": HTMLDivElement;
   "side-pinned-log": HTMLOListElement;
   "side-raw": HTMLInputElement;
   "side-raw-row": HTMLLabelElement;

@@ -143,6 +143,12 @@ export interface ChannelViewsDependencies {
   syncUnreadReplies(): void;
   renderChannelFreshness(): void;
   payThreadEntry(): void;
+  /**
+   * `#2385 vibe-talk-thread-open-layout-first`: draw the boxes the open thread is owed for replies
+   * its root reports and the store lacks, while the read behind its rows is on its way, or take
+   * them away (`createPendingReplies`). Absent: no boxes.
+   */
+  syncPendingReplies?(): void;
   /** `#2251`: re-run the open search over the view just put up from held rows (no read
    * follows a local switch to run it), so its results, count and chips follow the view. */
   refilterSearch?(): void;
@@ -607,6 +613,8 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     deps.selection().view = view;
     deps.selection().threadId = view === "thread" ? threadId : null;
     deps.selection().thread = view === "thread" ? summary : null;
+    // `#2385`: boxes another view (or another thread) had standing go with it.
+    deps.syncPendingReplies?.();
     // `#221 read-modes`. Entering a thread owes the reader its first unread message, unfolded, once
     // its rows are drawn — from what this page holds, or when its read lands (`payThreadEntry`). The
     // thread is laid out afresh, so runs of read messages opened on an earlier visit collapse again.
@@ -703,6 +711,8 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
       if (!caughtUp && (held.readMode !== deps.readMode() || deps.rowsMissDone())) deps.renderCachedTimeline();
       else deps.syncUnreadReplies();
       deps.renderChannelFreshness();
+      // `#2385`: the replies it lacks stand as boxes below its rows from now until the read lands.
+      deps.syncPendingReplies?.();
       // A thread read behind its held rows for replies they lack is entered at its newest, where those
       // will come, unless the landing finds an unread message among the rows held.
       if (outrun) deps.scrollToNewest();
@@ -729,6 +739,8 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
       // Saved rows drawn while the device is offline say so, as the view the reader left did.
       if (!(deps.channelCanon().views.get(deps.viewKey())?.live) && came.freshness === "offline") deps.setChannelFreshness("offline");
       deps.renderChannelFreshness();
+      // `#2385`: a thread whose saved cover lacks replies its root reports shows them as boxes.
+      deps.syncPendingReplies?.();
       if (!(keepPlace && keepReaderPlace(place))) deps.scrollToNewest();
       // A thread lands on its first unread, from the rows just projected. `#221 read-modes`.
       deps.payThreadEntry();
@@ -747,6 +759,7 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     }
     // Covered by nothing, but the store holds some of it: up at once, and read behind it.
     if (deps.drawHeldRows(rows, came.freshAt, came.freshness)) {
+      deps.syncPendingReplies?.();
       if (!(keepPlace && keepReaderPlace(place))) deps.scrollToNewest();
       // A thread lands on its first unread among those rows now, and the read behind them keeps it
       // there, or brings the root to the head above it when both fit (`keepEntryLanding`). `#221

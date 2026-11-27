@@ -165,6 +165,8 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["discussCoverage", "vibe-talk.voice.discuss-coverage", {}, [[{ "chan-1:main": { ranges: [{ start: 100, end: 200 }] } }, "{\"chan-1:main\":{\"ranges\":[{\"start\":100,\"end\":200}]}}"]], {}],
     ["windowedLists", "vibe-talk.voice.windowed-lists", false, [[true, "1"], [false, "0"]], false],
     ["windowedListsOff", "vibe-talk.voice.windowed-lists-off", false, [[true, "1"], [false, "0"]], false],
+    // `#2385 vibe-talk-thread-open-layout-first`: the pending-reply boxes' kill switch, on unless "0".
+    ["threadReplyBoxes", "vibe-talk.voice.thread-reply-boxes", true, [[false, "0"], [true, "1"]], true],
     ["dataReachBack", "vibe-talk.voice.data-reach-back", 0, [[5000, "5000"], [0, "0"]], 0],
     ["renderPrefetchPx", "vibe-talk.voice.render-prefetch-px", 0, [[1600, "1600"], [0, "0"]], 0],
     ["renderRowCap", "vibe-talk.voice.render-row-cap", 0, [[80, "80"], [0, "0"]], 0],

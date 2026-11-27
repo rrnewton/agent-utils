@@ -82,6 +82,8 @@ export interface ReplyCounts {
   rootThreadOf(message: Message, tally: ReplyTally): string | null;
   unseenReplies(id: unknown, message: Message | null, tally: ReplyTally, summary?: unknown): number;
   threadOutrunsStore(id: unknown, summary?: unknown): boolean;
+  /** How many replies thread `id` has that the store has not brought (`threadOutrunsStore`'s count; `#2385`). */
+  unseenReplyCount(id: unknown, summary?: unknown): number;
   storeLacksReplies(id: unknown, summary?: unknown): boolean;
   repliesPartlyHeld(id: unknown, message: Message | null, held: number, tally: ReplyTally): boolean;
   rootReplyState(message: Message, tally: ReplyTally): { id: string | null; unread: number; unseen: number };
@@ -359,9 +361,18 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
    * would show everything but the reply it was tapped for.
    */
   function threadOutrunsStore(id: string, summary: ThreadSummary | null = null) {
+    return unseenReplyCount(id, summary) > 0;
+  }
+
+  /**
+   * How many of thread `id`'s replies were posted since the last read that brought its newest and
+   * are not in the store (`unseenReplies` on its held root): the boxes an open thread is owed while
+   * its read is on its way. `#2385 vibe-talk-thread-open-layout-first`.
+   */
+  function unseenReplyCount(id: string, summary: ThreadSummary | null = null): number {
     const key = String(id);
     const root = deps.channelStore().current().messages.find((message: Message) => threadOf(message) === key && message.thread!.is_root === true);
-    return unseenReplies(key, root || null, replyTally(), summary) > 0;
+    return unseenReplies(key, root || null, replyTally(), summary);
   }
 
   /**
@@ -966,7 +977,7 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
 
   return {
     REPLY_BUTTON_TITLE, unansweredRoot, paintThreadBadge, startThread, unansweredThread,
-    heldUnansweredRoot, replyTally, rootThreadOf, unseenReplies, threadOutrunsStore,
+    heldUnansweredRoot, replyTally, rootThreadOf, unseenReplies, threadOutrunsStore, unseenReplyCount,
     storeLacksReplies, repliesPartlyHeld, rootReplyState, holdsUnreadReplies, readFilterKeeps,
     unpackFilter, drawThreadChips, heldReplies, labelReplyButton, drawReplyLabel,
     renderReplyCounts, nextReplyTarget, labelReplyMarker, replyMarker, jumpToReply, landOnReply,

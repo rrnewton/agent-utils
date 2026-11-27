@@ -913,6 +913,13 @@
               <ol id="thread-list" class="messages" hidden></ol>
               <ol id="discord-log" class="messages"></ol>
               <!--
+                `#2385 vibe-talk-thread-open-layout-first`. The replies an open thread's root reports and
+                the page has not brought yet, as boxes standing where they will land, while the read that
+                brings them is on its way. A list of its own, after the thread's rows: #discord-log's
+                children are the channel's MESSAGES (see #channel-summary above).
+              -->
+              <div id="pending-replies" class="pending-replies"></div>
+              <!--
                 `#206 pin-message`. What the Pinned filter shows, in place of the list above: this
                 channel's pinned messages in the order they were sent, each drawn from the message
                 itself where it is loaded and from what the server kept of it where it is not. A list
@@ -1240,6 +1247,7 @@
                 </p>
                 <ol id="side-thread-list" class="messages" hidden></ol>
                 <ol id="side-log" class="messages"></ol>
+                <div id="side-pending-replies" class="pending-replies"></div>
                 <ol id="side-pinned-log" class="messages" aria-label="Pinned messages" hidden></ol>
                 <ol id="side-outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
                 <div id="side-composer">

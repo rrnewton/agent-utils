@@ -94,6 +94,8 @@ export const COLUMN_IDS = {
   "channel-loading": "side-loading",
   "thread-list": "side-thread-list",
   "discord-log": "side-log",
+  // `#2385 vibe-talk-thread-open-layout-first`: the boxes for a thread's replies on their way.
+  "pending-replies": "side-pending-replies",
   "pinned-log": "side-pinned-log",
   "outgoing-log": "side-outgoing-log",
   "channel-composer": "side-composer",

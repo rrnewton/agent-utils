@@ -89,6 +89,8 @@ export {
 } from "./incremental.ts";
 export { DEFAULT_ROW_PX, correctionFor, estimatedHeightFor, forgetHeight, heightFor, measuredHeight, noteMeasured, rangeHeight, rowClassOf } from "./heights.ts";
 export { createHydrationPacer } from "./hydration.ts";
+export { PENDING_REPLY_BOXES_MAX, PENDING_REPLY_PX_DEFAULT, pendingRepliesLine, pendingReplyPx, planPendingReplies } from "./pending.ts";
+export type { PendingRepliesPlan } from "./pending.ts";
 export type { HydrationPacer } from "./hydration.ts";
 export type { RowClass } from "./heights.ts";
 export {

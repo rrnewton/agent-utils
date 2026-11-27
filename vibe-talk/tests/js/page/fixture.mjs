@@ -556,6 +556,9 @@ const FIXTURE_TREE = {
     "channel-loading",
     "thread-list",
     "discord-log",
+    // `#2385 vibe-talk-thread-open-layout-first`. The boxes for an open thread's replies on their
+    // way, right after its rows: where those replies will stand, so the reader's place counts them.
+    "pending-replies",
     // `#206 pin-message`. The Pinned filter's list, which stands in for the two above while it is on.
     "pinned-log",
     "outgoing-log",
@@ -641,6 +644,7 @@ const FIXTURE_TREE = {
     "side-loading",
     "side-thread-list",
     "side-log",
+    "side-pending-replies",
     "side-pinned-log",
     "side-outgoing-log",
     "side-composer",
@@ -6607,6 +6611,10 @@ const TUNING_BANDS = {
   MIN_RENDER_ROW_CAP: [0, 0, "the least kept row cap (0 = device default)"],
   MAX_RENDER_ROW_CAP: [50, 2000, "the most kept row cap"],
   DEFAULT_RENDER_ROW_CAP: [0, 0, "kept row cap meaning device default"],
+  // `#2385 vibe-talk-thread-open-layout-first`: the boxes for an open thread's replies on their way.
+  PENDING_REPLY_BOXES_MAX: [50, 50, "boxes at once: the bodies read brings the thread's newest page of 50"],
+  PENDING_REPLY_PX_DEFAULT: [40, 200, "a box's height with no reply on screen to measure, px"],
+  REPLY_SAMPLE: [4, 24, "reply rows nearest the boxes a box is priced from (a fixed number of layout reads)"],
 };
 
 /** The fold control on a rendered message, or undefined when it has none. */

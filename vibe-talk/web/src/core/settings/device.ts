@@ -523,6 +523,13 @@ export const DEVICE_SETTINGS = Object.freeze({
   windowedLists: offUnlessOn("vibe-talk.voice.windowed-lists", false),
   /** `#1846` S1: explicit Off on phone (unset = On at phone widths, Off on desktop). */
   windowedListsOff: offUnlessOn("vibe-talk.voice.windowed-lists-off", false),
+  /**
+   * `#2385 vibe-talk-thread-open-layout-first`. Whether an open thread draws boxes for the replies
+   * its root reports and the page has not brought, and reads the thread at once when a late count
+   * says it is short. ON unless off: a rollback kill switch only, kept "0" by hand, never shown in
+   * Settings.
+   */
+  threadReplyBoxes: onUnlessOff("vibe-talk.voice.thread-reply-boxes", true),
   /** `#1846`. Messages held as DATA for local search/filtering; 0 = per-device default. */
   dataReachBack: {
     key: "vibe-talk.voice.data-reach-back",

@@ -96,7 +96,7 @@ import {KEYBOARD_SEND_PARTS,
 import {briefAge, fullLocalAt, stamp} from "../present/time/index.ts";
 import {doneReadWords, failureWords, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, serviceReadWords} from "../present/notices/index.ts";
 import {LINK_KINDS_KEY, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, editedDrawn, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, renderedHtmlOf, savedReadMode, undoLabel, undoName, upstreamUrlOf} from "../present/rows/index.ts";
-import {PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, createCardFlight, createCardPlaces, createColumnSplitter, createColumnReplies, createColumnWork, createColumnStateAccess, createColumns, createElementLookup, createFootRooms, createLayoutShown, createJumpAnchor, createLinkedMark, createPackSlides, screenMotionMs, createPullToRefresh, createQuoting, createReadingColumn, createReplyArrows, createSentRead, createReplyGathering, createReplySession, createChannelViews, createChannelScope, createChannelLoading, createDayTap, createMessageDetails, createNoiseActs, createRichHeaders, createStartsRead, createFilterPlace, createFreshRead, createHeldDone, createReadState, createPendingSends, createOlderPages, createOpeningView, createPlacing, createReplyCounts, createDoneAct, createLiveState, createSideCards, createThreadEntry, createTwoColumns, createRowDrawing, createRowGestures, createScrollKeeping, createAnchorDebug, createUnderLists, createUnpackWatch, FOLLOW_REST_PX, fillCardText, freshenDayTitle, freshComposerState, freshEntryState, freshDoneState, freshLoadState, freshOlderPages, freshPinsView, freshScrollPlace, freshScrollTools, freshSelection, freshTimelineRows, freshFilterState, freshGatherState, freshListState, freshReplyArrows, fromGatheredThread, idsOf, markCardLayout, messageTop, mountChannelViewControls, mountColumnSplitterControls, mountTextSelection, createLabelsFilter, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, shownRowFor, createChannelHead,
+import {PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, createCardFlight, createCardPlaces, createColumnSplitter, createColumnReplies, createColumnWork, createColumnStateAccess, createColumns, createElementLookup, createFootRooms, createLayoutShown, createJumpAnchor, createLinkedMark, createPackSlides, screenMotionMs, createPullToRefresh, createQuoting, createReadingColumn, createReplyArrows, createSentRead, createReplyGathering, createReplySession, createChannelViews, createChannelScope, createChannelLoading, createDayTap, createMessageDetails, createNoiseActs, createRichHeaders, createStartsRead, createFilterPlace, createFreshRead, createHeldDone, createReadState, createPendingSends, createPendingReplies, createOlderPages, createOpeningView, createPlacing, createReplyCounts, createDoneAct, createLiveState, createSideCards, createThreadEntry, createTwoColumns, createRowDrawing, createRowGestures, createScrollKeeping, createAnchorDebug, createUnderLists, createUnpackWatch, FOLLOW_REST_PX, fillCardText, freshenDayTitle, freshComposerState, freshEntryState, freshDoneState, freshLoadState, freshOlderPages, freshPinsView, freshScrollPlace, freshScrollTools, freshSelection, freshTimelineRows, freshFilterState, freshGatherState, freshListState, freshReplyArrows, fromGatheredThread, idsOf, markCardLayout, messageTop, mountChannelViewControls, mountColumnSplitterControls, mountTextSelection, createLabelsFilter, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, shownRowFor, createChannelHead,
   createSearchOpenControl,
   createServiceWords,
   createOpenInView,
@@ -2378,6 +2378,8 @@ const channelViews = createChannelViews({
   syncUnreadReplies: () => syncUnreadReplies(),
   renderChannelFreshness: () => renderChannelFreshness(),
   payThreadEntry: () => payThreadEntry(),
+  // `#2385 vibe-talk-thread-open-layout-first`: boxes for the open thread's replies on their way.
+  syncPendingReplies: () => pendingReplies.sync(),
   rowsMissDone: () => rowsMissDone(),
   scrollToNewest: () => scrollToNewest(),
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
@@ -2733,8 +2735,30 @@ const threadEntry = createThreadEntry({
   pinsView: () => pinsView(),
   composerHeld: () => heldComposer() !== null,
   readFollowing: () => readAloudOwner().readFollowing(),
+  // `#2385`: an entry with nothing unread held lands on the first box for a reply on its way.
+  pendingBox: () => pendingReplies.firstBox(),
+  isPendingBox: (node) => pendingReplies.isBox(node),
+  pendingHeldBefore: () => pendingReplies.heldBefore(),
 });
 const { entryState, payThreadEntry, entryLandingMark, keepEntryLanding, landOnFirstUnread, placeEntryLanding, entryLandingHolds } = threadEntry;
+
+// `#2385 vibe-talk-thread-open-layout-first`. The replies an open thread's root reports and the page
+// has not brought, as boxes below its rows while the read that brings them is on its way; and the
+// thread read at once when a late count says it is short. web/src/view/channel's (`createPendingReplies`).
+const pendingReplies = createPendingReplies({
+  el: (id) => el(id),
+  enabled: () => deviceSettings().get(DEVICE_SETTINGS.threadReplyBoxes) !== false,
+  openThread: () => (selection().view === "thread" && !pinsView().only && selection().threadId
+    ? String(selection().threadId) : null),
+  missingReplies: (id) => replyCounts.unseenReplyCount(id, /** @type {any} */ (selection().thread)),
+  readComing: () => entryState().readOwed === channelContextKey(),
+  oweRead: () => { entryState().readOwed = channelContextKey(); },
+  readThread: () => {
+    timelineView.loadDiscord(/** @type {any} */ ({ keepPosition: true, quiet: true, reason: "enter" }))
+      .catch(() => { /* the read's own failure path has said so (`noteChannelReadFailure`) */ });
+  },
+  isThreadRoot: (row) => isOpenThreadRoot(row, openThreadRootId()),
+});
 
 
 
@@ -7883,6 +7907,7 @@ const timelineView = createTimelineView({
   channelSummary, channelName, clearChannelScreen, holdingReplyArrows, holdingScrollTools,
   renderChannelFreshness, preservingScroll, columnWork, catchUpHeldView, catchUpFromAll, syncUnreadReplies, followInOtherColumn, keepEntryLanding,
   entryLandingMark, payThreadEntry, saveChannelScope, requestVisibleSummaries,
+  syncPendingReplies: (options) => pendingReplies.sync(options),
   seamsAfterMidnight, applySearch, columnSteps: () => /** @type {any} */ (columnSteps()), inColumn, inOtherColumn,
   replyTally, unseenReplies, followPlacement,
   unplacedCount: () => unplacedArrivals.count(), unplacedNext: () => unplacedArrivals.next(),

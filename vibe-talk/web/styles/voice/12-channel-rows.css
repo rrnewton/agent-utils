@@ -413,3 +413,29 @@
 #pinned-log li.discord-message:not([data-archived="true"]) {
   box-shadow: inset 3px 0 0 var(--unread-stripe, transparent);
 }
+
+/* --------------------------------------------------------- replies on their way (#2385) --- */
+/*
+ * `#2385 vibe-talk-thread-open-layout-first`. A box for each reply an open thread's root reports and
+ * the page has not brought yet, standing below the thread's rows where those replies will land,
+ * while the read that brings them is on its way. Drawn as the rows' own boxes (`.messages li`) with
+ * the edge dashed and nothing inside but, in the first, the line that says how many are coming: a
+ * place held, not a message. Each box's height is set where it is drawn, priced from the thread's
+ * replies on screen, and counts its border and padding as a row's measured height does.
+ */
+.pending-replies-list {
+  margin-top: 0;
+}
+
+.messages li.pending-reply {
+  box-sizing: border-box;
+  background: transparent;
+  border-style: dashed;
+  overflow: hidden;
+}
+
+.pending-replies-line {
+  display: block;
+  font-size: 0.78rem;
+  color: var(--muted);
+}

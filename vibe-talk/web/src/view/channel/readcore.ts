@@ -235,6 +235,12 @@ export interface TimelineViewDependencies {
   keepEntryLanding(mark: unknown): boolean;
   entryLandingMark(): unknown;
   payThreadEntry(): void;
+  /**
+   * `#2385 vibe-talk-thread-open-layout-first`: draw or take away the boxes for the open thread's
+   * replies on their way (`createPendingReplies`); `read`, a count may have risen with no read of
+   * the thread on its way: read it now. Absent: no boxes.
+   */
+  syncPendingReplies?(options?: { read?: boolean }): void;
   saveChannelScope(): void;
   requestVisibleSummaries(): void;
   seamsAfterMidnight(): void;
@@ -989,6 +995,7 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const keepEntryLanding = deps.keepEntryLanding;
   const entryLandingMark = deps.entryLandingMark;
   const payThreadEntry = deps.payThreadEntry;
+  const syncPendingReplies = (options?: { read?: boolean }): void => { if (deps.syncPendingReplies) deps.syncPendingReplies(options); };
   const saveChannelScope = deps.saveChannelScope;
   const requestVisibleSummaries = deps.requestVisibleSummaries;
   const seamsAfterMidnight = deps.seamsAfterMidnight;
@@ -1587,8 +1594,12 @@ async function loadTimeline(options?: TimelineReadOptions): Promise<void> {
       renderScrollTools();
     });
     requestVisibleSummaries();
+    // `#2385`: the replies this read brought take their boxes' places; boxes go before the landing
+    // is kept, so its measure is of the rows alone.
+    syncPendingReplies();
     if (entryState().readOwed === context) entryState().readOwed = null;
     payThreadEntry();
+    syncPendingReplies();
     // What it changed in the store may show in the other column too. `#229 desktop-two-column`.
     followInOtherColumn();
   };
@@ -1737,12 +1748,17 @@ async function loadTimeline(options?: TimelineReadOptions): Promise<void> {
         renderScrollTools();
       });
       requestVisibleSummaries();
+      // `#2385`: the replies this read brought take their boxes' places; boxes go before the landing
+      // is kept, so its measure is of the rows alone. Any still standing for replies this read did
+      // not bring go once nothing is on its way for them (the second call).
+      syncPendingReplies();
       // A thread entered with nothing of it on the page lands here, on its first read, and one landed
       // on held rows is landed again on what the read drew: LAST, once the freshness pill and the
       // chips it is measured against are up, as on every other entry. `#221 read-modes`.
       if (owed) entryState().readOwed = null;
       if (landing) keepEntryLanding(landing);
       payThreadEntry();
+      syncPendingReplies();
       followInOtherColumn();
       return;
     }
@@ -1753,6 +1769,8 @@ async function loadTimeline(options?: TimelineReadOptions): Promise<void> {
       if (entryState().threadAwaitsRead) entryState().threadOwed = null;
       entryState().threadAwaitsRead = false;
       if (entryState().readOwed === context) entryState().readOwed = null;
+      // `#2385`: no read is on its way for the boxes any more; they say "loading" of nothing.
+      syncPendingReplies();
       noteChannelReadFailure(error);
       throw error;
     }
@@ -1795,6 +1813,7 @@ function foldLateTimelinePage(payload: TimelineResponse, read: TimelineFoldRead)
     // Words and all, unless a read of this view is queued behind this one: it draws them.
     catchUpHeldView(!channelReads.queued(columnWork.active()));
     renderChannelFreshness();
+    syncPendingReplies();
     if (entryState().readOwed === read.context) entryState().readOwed = null;
     if (landing) keepEntryLanding(landing);
     payThreadEntry();
@@ -1807,6 +1826,11 @@ function foldLateTimelinePage(payload: TimelineResponse, read: TimelineFoldRead)
   syncUnreadReplies();
   if (read.view !== "flat") followInOtherColumn();
   saveChannelScope();
+  // `#2385`: boxes this thread's own late read answered go (nothing is on its way for them now); and
+  // a read of another view that raised the open thread's count above what is held (Main's first read,
+  // landing after the reader went into a thread drawn from the saved copy) reads the thread now and
+  // draws its boxes, rather than leaving the replies to the next poll.
+  syncPendingReplies(read.context !== channelContextKey() ? { read: true } : {});
 }
 
 /**

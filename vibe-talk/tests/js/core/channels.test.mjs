@@ -973,3 +973,23 @@ test("`#1846` step 2: heights are measured per bucket, estimated by class median
   assert.equal(rowClassOf({ ...m("1", "x"), thread: { is_root: true } }, false), "root");
   assert.equal(rowClassOf(m("1", "x"), true), "collapsed");
 });
+
+test("`#2385 vibe-talk-thread-open-layout-first`: the boxes for a thread's replies on their way, from the module alone", () => {
+  const { PENDING_REPLY_BOXES_MAX, PENDING_REPLY_PX_DEFAULT, pendingRepliesLine, pendingReplyPx, planPendingReplies } = CHANNELS;
+  // One line for the set, in the reader's words, singular for one.
+  assert.equal(pendingRepliesLine(8), "8 more replies loading");
+  assert.equal(pendingRepliesLine(1), "1 more reply loading");
+  // A box is priced from the thread's replies on screen: their median, so one long reply does not
+  // size every box; the default with none to measure, and nothing unmeasurable counts.
+  assert.equal(pendingReplyPx([]), PENDING_REPLY_PX_DEFAULT);
+  assert.equal(pendingReplyPx([66, 70, 400]), 70);
+  assert.equal(pendingReplyPx([0, NaN, -5, 65.9]), 66);
+  // Boxes only while a read that brings the replies is on its way, never with the switch off,
+  // never for nothing missing; at most the bodies read's page of them.
+  assert.deepStrictEqual(planPendingReplies(8, true, true, [66]), { count: 8, px: 66, line: "8 more replies loading" });
+  assert.equal(planPendingReplies(8, false, true, [66]), null, "boxes with no read on its way say loading of nothing");
+  assert.equal(planPendingReplies(8, true, false, [66]), null, "the kill switch drew boxes");
+  assert.equal(planPendingReplies(0, true, true, [66]), null);
+  assert.equal(planPendingReplies(Number.NaN, true, true, [66]), null);
+  assert.equal(planPendingReplies(500, true, true, []).count, PENDING_REPLY_BOXES_MAX);
+});

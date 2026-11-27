@@ -292,3 +292,5 @@ export * from "./servicewords.ts";
 export * from "./channelhead.ts";
 export * from "./openinview.ts";
 export * from "./freshness.ts";
+export { createPendingReplies } from "./pendingreplies.ts";
+export type { PendingReplies, PendingRepliesDependencies } from "./pendingreplies.ts";
