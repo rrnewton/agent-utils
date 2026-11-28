@@ -16,6 +16,10 @@ a phone (412x915), in light and dark, with the keyboard closed and open (a shrun
   drawn as they were placed (same place and width), and the count line is unchanged;
   two more polls with nothing new -> the same.
 
+`#2435 search-copy-with-placed-hits`: throughout, the copy is true of the cards: the count reads
+"4 found (4 older)" (no "0 loaded"), and the line under the field "No match in the N loaded
+messages; 4 older matches shown below." (never "None match" or "scattered older ones" over them).
+
 Each poll is brought forward on the page's clock (Playwright's `clock.fast_forward` past its 45 s
 timer), and every wait is a condition: the poll's answer received whole, the arrived row drawn.
 
@@ -211,6 +215,7 @@ class Shown(TypedDict):
     count: str
     visibleRows: int
     boxes: list[list[int]]
+    line: str
 
 
 class Walk:
@@ -261,8 +266,21 @@ class Walk:
                                          row.getClientRects().length > 0).length,
                 boxes: cards.map((row) => { const r = row.getBoundingClientRect();
                                             return [Math.round(r.left), Math.round(r.width)]; }),
+                line: (() => { const e = document.getElementById('search-empty');
+                               return e && !e.hidden ? (e.textContent || '').trim() : ''; })(),
             };
         }"""))
+
+
+def copy_true(walk: Walk, shown: Shown, loaded: int) -> None:
+    """`#2435`: the count and the line say what the cards show, and nothing they contradict."""
+    hits = len(HIT_INDICES)
+    walk.check(shown["count"] == f"{hits} found ({hits} older)",
+               f"the count is not '{hits} found ({hits} older)': {shown['count']!r}")
+    walk.check(shown["line"].startswith(f"No match in the {loaded} loaded messages; {hits} older matches shown below."),
+               f"the line does not say what is loaded and what stands below: {shown['line']!r}")
+    walk.check("None match" not in shown["line"] and "scattered" not in shown["line"],
+               f"the line contradicts the cards standing below it: {shown['line']!r}")
 
 
 def walk_through(walk: Walk, keyboard: bool) -> None:
@@ -296,6 +314,7 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
     walk.check(sorted(placed["ids"]) == wanted, f"the placed cards are not the four hits: {placed}")
     walk.check(placed["shown"] == len(HIT_INDICES), f"the four cards are not all drawn: {placed}")
     walk.shot("placed")
+    copy_true(walk, placed, LOADED)
 
     # A message arrives; the page's poll reads it and draws it. The four cards stand, unchanged.
     arrived = api.arrive()
@@ -313,6 +332,7 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
                f"the count line moved on a redraw: {placed['count']!r} -> {after['count']!r}")
     walk.check(after["boxes"] == placed["boxes"],
                f"the redraw restyled the result cards (left, width): {placed['boxes']} -> {after['boxes']}")
+    copy_true(walk, after, LOADED + 1)
 
     # A poll with nothing new, then another: still the four, still the same count.
     for round_ in (1, 2):

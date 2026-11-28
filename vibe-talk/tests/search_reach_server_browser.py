@@ -15,7 +15,8 @@ server says that history is complete; then, in All, at 1280x800 and at 412x915 b
 and dark, searches "zygote" and asserts, with the server's answer settled:
 
   the "1 in main" chip counts the older hit, its card stands in the list, and the None-match
-  line still speaks for the loaded messages ("None match.") but says no reach sentence.
+  line still speaks for the loaded messages ("No match in the N loaded messages; 1 older match
+  shown below.", `#2435`) but says no reach sentence.
 
 Main before the change is the negative control: run with --binary pointing at its build and the
 line still says "does not reach yet" beside the hit. Geometry and text only, no wall-clock budget.
@@ -135,8 +136,11 @@ def walk(page: Page, label: str, touch: bool, shots: Path | None) -> str:
     state = page.evaluate(STATE_JS)
     check(not state["error"], f"{label}: no error banner ({state})")
     check(state["cards"] == 1, f"{label}: the older hit's card stands once ({state})")
-    check(state["empty"] is not None and "None match." in state["empty"],
-          f"{label}: the line still speaks for the loaded messages ({state['empty']!r})")
+    # `#2435`: with the hit's card standing, the line says what the loaded messages hold and what
+    # stands below, never "None match." over the matching card.
+    check(state["empty"] is not None and state["empty"].startswith("No match in the ")
+          and "loaded" in state["empty"] and "1 older match shown below." in state["empty"],
+          f"{label}: the line speaks for the loaded messages and the card below ({state['empty']!r})")
     check(state["empty"] is not None and REACH not in state["empty"],
           f"{label}: no reach sentence beside the server's hit ({state['empty']!r})")
     return f"{label}: chip {state['chip']!r} pressed={state['chipPressed']}, count {state['count']!r}, line {state['empty']!r}"

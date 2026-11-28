@@ -832,8 +832,16 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     if (deps.view() !== "discord" || deps.selectionView() === "threads") return SEARCH_EMPTY_LOADED;
     const view = deps.channelViewWords();
     const reach = deps.historyReach();
+    // `#2435 search-copy-with-placed-hits`: the server's older matches stand below as result cards
+    // (the selected buckets' fresh hits), so "None match" alone would contradict them: say what the
+    // browser's own search found and what stands below.
+    const fold = deps.foldCounts ? deps.foldCounts() : null;
+    const shownBelow = fold !== null && !fold.outsideSelected ? fold.freshSelected : 0;
     let said: string;
-    if (reach.whole && deps.historyReadToStart()) {
+    if (shownBelow > 0) {
+      said = `No match in the ${loaded} loaded message${loaded === 1 ? "" : "s"}; ` +
+        `${shownBelow} older match${shownBelow === 1 ? "" : "es"} shown below.`;
+    } else if (reach.whole && deps.historyReadToStart()) {
       said = `Searched all ${deps.messagesWords(loaded)} of ${view} in this browser, back to the first one` +
         `${reach.from === null ? "" : ` (${deps.searchMomentWords(reach.from)})`}. None match.`;
     } else if (reach.saved) {
@@ -923,7 +931,8 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         ? (outside > 0
           ? `${fold.total} found (${fold.total - outside} in this thread, ${outside} elsewhere)`
           : fold.freshSelected > 0
-          ? `${fold.total} found (${fold.loadedSelected} loaded, ${fold.freshSelected} older)`
+          // `#2435`: a zero part is dropped ("4 found (4 older)"); "0 loaded" read as results gone.
+          ? `${fold.total} found (${fold.loadedSelected > 0 ? `${fold.loadedSelected} loaded, ` : ""}${fold.freshSelected} older)`
           : `${fold.total} of ${loaded} loaded`)
         : `${matched} of ${loaded} loaded`));
   }

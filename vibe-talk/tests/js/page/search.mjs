@@ -3182,9 +3182,11 @@ for (const view of ["flat", "main"]) {
     await searchServer(page, "old theme");
     assert.equal(chipOf(page, "main").textContent, "1 in main", "the server's hit is not counted on its chip");
     assert.equal(chipOf(page, "main").getAttribute("aria-pressed"), "true", "the hit's chip is not pressed");
-    assert.match(page.el("search-count").textContent, /^1 found \(0 loaded, 1 older\)$/, "the count does not say the older hit");
+    // `#2435`: a zero part is dropped, and the line says what stands below instead of "None match.".
+    assert.match(page.el("search-count").textContent, /^1 found \(1 older\)$/, "the count does not say the older hit");
     const said = page.el("search-empty").textContent;
-    assert.match(said, /None match\./, "the loaded messages' part of the line went");
+    assert.match(said, /^No match in the \d+ loaded messages?; 1 older match shown below\./, "the loaded messages' part of the line went");
+    assert.doesNotMatch(said, /None match|scattered/, "the line contradicts the hit's card standing below");
     assert.doesNotMatch(said, REACH, "the line says the search does not reach the history its hit came from");
   });
 }

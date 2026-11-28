@@ -397,7 +397,11 @@ function oldestLoadedMs() {
  */
 
 function historyReach(): { total: number; proven: boolean; saved: boolean; dense: number; scattered: number; from: number | null; start: boolean; whole: boolean; topLevel: boolean; threads: number; full: number } {
-  const rows = [...el("discord-log").children].filter((row) => isMessageRow(row) && !row.hasAttribute("data-absorbed"));
+  // `#2435`: a placed server result (`data-server-hit`) is not part of what this browser holds and
+  // searched: counted here it read as "plus 4 scattered older ones" beside "None match", over the
+  // very cards that match.
+  const rows = [...el("discord-log").children].filter((row) => isMessageRow(row) && !row.hasAttribute("data-absorbed") &&
+    !row.hasAttribute(SERVER_HIT_MARK));
   const weight = (row: Element) => Math.max(1, idsOf(row).length);
   const total = rows.reduce((sum, row) => sum + weight(row), 0);
   // A channel with no thread at all has nothing in All but its top-level messages.
