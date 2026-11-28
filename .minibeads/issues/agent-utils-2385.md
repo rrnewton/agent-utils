@@ -64,3 +64,18 @@ Landed under a one-landing waiver for discuss-browser: a known red with a new me
 
 Still open: S-t1 (the server's layout read, giving each reply its id and size) with S-t2 (b, c) and a fixture that crosses the real router for threads. Related: #2391 (the coverage line shift, pre-existing) and #2393 (the label in view with the keyboard up).
 
+
+## S-t1 landed (2026-11-27)
+
+[opus 5.5, cl-loading] Landed as ae182bb0, 2f1318f0 and d474f915, a replay of gated d065dc8d. Not deployed yet: it waits for the next deploy range.
+- **The layout read:** `GET /api/v1/channels/{id}/threads/{thread_id}/layout?limit=` (default 50) gives the total, its exactness, and one entry per reply: id, time, author, UTF-16 length, lines, flags (attachments, long) and `estimated: true`.
+  - It reads the server's own copy only and starts no provider read. The state-sync tests classify it as Held.
+  - An older server answers 404, and the page keeps the count's price.
+- **The page:** it sends the layout read as the boxes first stand, before the bodies' read. It then re-prices each box from its own entry in one held change: the root, the held reply and the first box move 0.00 px on every frame.
+- **Real router:** `tests/thread_layout_server_browser.py` runs the release binary on its fake upstream, through an opt-in `reply_count` on the fake's seeded roots.
+  - The page's layout read reaches the real route, which answers 200 with all 9 entries.
+  - The boxes match their prices to within 1 px, and the first reply stands where its box stood.
+  - Main's page fails the walk.
+- **The gate:** red only on read-pause-reply and search-unmatched, both off-path (12 of 12 solo runs green on main and on S-t1). Both landed under STEP-WAIVERs.
+- **S-t2(b)** was already done by cabd6987. Nothing small is left of S-t2(c); #2391 and #2393 stay separate.
+- **#2438**, the composer focus taking the reader to the foot, is pre-existing; priced boxes make the jump longer on a phone. It is filed separately and waits for the owner's pick.
