@@ -349,6 +349,25 @@ fn refuse_own_repositories(cfg: &Cfg, record: &Value, slot: &str) -> Result<()> 
     Ok(())
 }
 
+/// A slot record's heartbeat TTL in seconds (600 when it names none).
+fn record_ttl_seconds(record: &Value) -> f64 {
+    record
+        .get("heartbeat_ttl_seconds")
+        .and_then(Value::as_i64)
+        .unwrap_or(600) as f64
+}
+
+/// The heartbeat's lock wait, as the Python edition bounds it (#1808-C):
+/// an explicit WRKSLOTS_WAIT_LOCK wins, otherwise the shorter of 10 s and
+/// a third of the record's TTL.
+fn heartbeat_lock_wait(ttl_seconds: f64) -> std::time::Duration {
+    if std::env::var_os("WRKSLOTS_WAIT_LOCK").is_some() {
+        crate::ensure_states::lock_wait()
+    } else {
+        std::time::Duration::from_secs_f64((ttl_seconds / 3.0).clamp(1.0, 10.0))
+    }
+}
+
 /// Refresh the named slot's heartbeat, printing the outcome.
 pub(crate) fn heartbeat(
     root: Option<&Path>,
@@ -366,14 +385,45 @@ pub(crate) fn heartbeat(
     let supplied = read_process_identity(owner_pid)?;
     assert_caller(&supplied, "owner")?;
     // Lock-free prepare (#1808-A, following the Python edition): the
-    // partial-state refusal first (it is read-only, keeping its old
-    // precedence), then the fleet validation, the storage scan and the
-    // event-log load, holding no lock. Under the locks below only the
-    // touched record is re-checked and written. This edition has no
-    // registry-identity compare yet, so a change that lands between
-    // prepare and the locks is caught by the under-lock record re-check
-    // (generation, agent, owner), never trusted.
-    refuse_partial_state_allow_seals(&cfg.control)?;
+    // partial-state refusal first (keeping its old precedence), then the
+    // fleet validation, the storage scan and the event-log load, holding
+    // no lock. Under the locks below only the touched record is
+    // re-checked and written. This edition has no registry-identity
+    // compare yet, so a change that lands between prepare and the locks
+    // is caught by the under-lock record re-check (generation, agent,
+    // owner), never trusted.
+    //
+    // A partial update found without the locks is judged under them
+    // (#2352): every writer of those temporary files holds the exclusive
+    // registry locks while the file exists, so a file seen lock-free may
+    // be a live peer's write between its fsync and its rename. Still there
+    // under the locks, no live writer can hold it and the refusal stands;
+    // gone, the peer finished and this prepare goes on. The check under
+    // the commit's locks judges any later file the same way.
+    if refuse_partial_state_allow_seals(&cfg.control).is_err() {
+        let ttl_seconds = active_document(root, &cfg, &selected)
+            .ok()
+            .and_then(|active| {
+                active
+                    .get("slots")
+                    .and_then(Value::as_array)
+                    .and_then(|slots| {
+                        slots
+                            .iter()
+                            .find(|item| item.get("slot").and_then(Value::as_str) == Some(slot))
+                            .map(record_ttl_seconds)
+                    })
+            })
+            .unwrap_or(600.0);
+        let _locks = crate::hold_write::acquire_mutation_locks_with_wait_releasing_config(
+            root,
+            machine_override,
+            &cfg,
+            &selected,
+            heartbeat_lock_wait(ttl_seconds),
+        )?;
+        refuse_partial_state_allow_seals(&cfg.control)?;
+    }
     validate_global(root, &cfg)?;
     let prepared_active = active_document(root, &cfg, &selected)?;
     let record = prepared_active
@@ -477,15 +527,7 @@ pub(crate) fn heartbeat(
     // only the touched record before the one write. The wait is bounded
     // like the Python edition's heartbeat: an explicit WRKSLOTS_WAIT_LOCK
     // wins, otherwise the shorter of 10 s and a third of the record's TTL.
-    let ttl_seconds = record
-        .get("heartbeat_ttl_seconds")
-        .and_then(Value::as_i64)
-        .unwrap_or(600) as f64;
-    let heartbeat_wait = if std::env::var_os("WRKSLOTS_WAIT_LOCK").is_some() {
-        crate::ensure_states::lock_wait()
-    } else {
-        std::time::Duration::from_secs_f64((ttl_seconds / 3.0).clamp(1.0, 10.0))
-    };
+    let heartbeat_wait = heartbeat_lock_wait(record_ttl_seconds(&record));
     // Queue for the registry locks without the configuration locks,
     // as the Python edition's heartbeat does (#2000).
     let _locks = crate::hold_write::acquire_mutation_locks_with_wait_releasing_config(

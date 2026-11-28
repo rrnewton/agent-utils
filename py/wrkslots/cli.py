@@ -1306,6 +1306,18 @@ class StateError(Refusal):
     """A corrupt, partial, or incompatible state refusal."""
 
 
+class _PartialUpdateFound(StateError):
+    """A partial atomic update's temporary file in the registry (#2352).
+
+    ``_refuse_partial_state`` raises it. Every writer of those temporary
+    files holds the exclusive mutation locks while the file exists, so the
+    finding proves a leftover only when the reader holds those locks too: seen
+    without them, the file may be a live peer's write between its fsync and
+    its rename. ``_run_prevalidated_mutation`` therefore defers a lock-free
+    finding to its locked round, which judges it again.
+    """
+
+
 #: Highest record schema level this build writes (#1788). Level 1 is every
 #: shape written before handoff ignored-file accounting and seal fs_id;
 #: level 2 is those additions; level 3 is the bounded ignored-evidence
@@ -8058,6 +8070,14 @@ def _run_prevalidated_mutation(
     round: one raised while another writer changed it judged a state that no longer exists,
     and the next round judges the current one (the final round reports it either way).
 
+    A partial atomic update ``prepare`` finds (``_PartialUpdateFound``) is never reported
+    from the lock-free round (#2352): the temporary file may be a live peer's write between
+    its fsync and its rename, which leaves the registry identity unchanged while the peer
+    holds the locks. That round defers to the locks, as an outstanding journal does: when
+    the peer's rename or cleanup changed the identity a new round validates, and when the
+    identity held still ``commit(None, None)`` runs the command's original validation under
+    the locks, whose own partial-state check refuses a file no live writer can still hold.
+
     ``wait_seconds`` bounds the time spent waiting for the locks over all rounds together; the
     clock starts at the first wait.
 
@@ -8074,6 +8094,9 @@ def _run_prevalidated_mutation(
         identity = _registry_identity(config)
         try:
             facts = prepare()
+        except _PartialUpdateFound:
+            # Judged only under the locks (#2352): see the docstring.
+            facts = None
         except Refusal:
             if attempt == REGISTRY_VALIDATION_ATTEMPTS:
                 raise
@@ -44135,7 +44158,7 @@ def _refuse_partial_state(
         if event_directory.is_dir() and not event_directory.is_symlink():
             leftovers += sorted(event_directory.glob("*.json.tmp.*"))
     if leftovers:
-        raise StateError(
+        raise _PartialUpdateFound(
             f"partial atomic update found: {leftovers[0]}; preserve it and use 'wrkslots recover'"
         )
     seal_journals = _validate_batch_seal_journals(config)
@@ -44664,6 +44687,7 @@ def _assert_no_journal(
     allowed: AbstractSet[Path] = frozenset(),
     wait_seconds: float = 0.0,
     target_slot: str | None = None,
+    recover_dead_actors: bool = True,
 ) -> None:
     """Refuse while any mutation journal blocks this command.
 
@@ -44684,11 +44708,17 @@ def _assert_no_journal(
     mutation of the journal's own slot, and every caller that rewrites
     global state (``target_slot=None``), still refuses, naming the
     blocking slot and the exact recover command.
+
+    ``recover_dead_actors=False`` skips the dead-actor journal recovery,
+    which writes and so runs only under a mutation lock: a lock-free
+    caller passes it (#2352), and a journal it finds refuses that round
+    instead of being repaired without the lock.
     """
 
     deadline = time.monotonic() + wait_seconds
     while True:
-        _recover_dead_actor_journals(config)
+        if recover_dead_actors:
+            _recover_dead_actor_journals(config)
         journals = [
             path for path in _outstanding_journals(config) if path not in allowed
         ]
@@ -52056,12 +52086,17 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         _assert_validate_batch_seals_disjoint_from_record(
             config, record, action="heartbeat"
         )
+        # Lock-free (#2352): a dead actor's journal that appears after
+        # prepare's journal check refuses this round instead of being
+        # recovered here; the next round defers to the locked path, which
+        # recovers it under the lock.
         _assert_validate_cleanup_journals_disjoint_from_record(
             config,
             states,
             archives,
             record,
             action="heartbeat",
+            recover_dead_actors=False,
         )
         # #1492: a nested worktree Git registers inside this slot (e.g.
         # <slot>/.muse/worktrees/<name>) is a warning, not a refusal —
@@ -52148,6 +52183,11 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         """
 
         _refuse_partial_state(config, allow_validate_batch_seals=True)
+        # A dead actor's journal (#912) is recovered here, under the lock and
+        # before this record is read (#2352): the recovery advances the
+        # registry, so the heartbeat's write must start from the state it
+        # left. The lock-free prepare never recovers; it defers to this body.
+        _recover_dead_actor_journals(config)
         state = _load_active(config, require_repository=False)
         record = _find_record(state, args.slot)
         _assert_own_record_paths(config, record)
@@ -67333,12 +67373,19 @@ def _assert_validate_cleanup_journals_disjoint_from_record(
     record: ActiveRecord,
     *,
     action: str,
+    recover_dead_actors: bool = True,
 ) -> None:
-    """Allow a slot-local action beside only an exact disjoint cleanup."""
+    """Allow a slot-local action beside only an exact disjoint cleanup.
+
+    A lock-free caller passes ``recover_dead_actors=False`` (#2352): see
+    ``_assert_no_journal``.
+    """
 
     loaded = _load_validate_batch_seal_journal(config)
     if loaded is None:
-        _assert_no_journal(config, target_slot=record.slot)
+        _assert_no_journal(
+            config, target_slot=record.slot, recover_dead_actors=recover_dead_actors
+        )
         return
     _seal_path, _seal_raw, targets = loaded
     paired = _validate_batch_seal_paired_finishes(config, targets)

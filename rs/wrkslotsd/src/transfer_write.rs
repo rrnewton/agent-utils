@@ -642,7 +642,16 @@ pub(crate) fn transfer_owner(
     // This edition has no registry-identity compare yet, so the commit
     // under the locks re-judges only the touched record (generation,
     // agent, owner, release, successor) and never trusts the prepare.
-    refuse_partial_state(&cfg.control)?;
+    //
+    // A partial update found without the locks is judged under them, as
+    // in this edition's heartbeat (#2352): it may be a live peer's write
+    // between its fsync and its rename. Still there under the locks, the
+    // refusal stands; gone, the peer finished and this prepare goes on.
+    if refuse_partial_state(&cfg.control).is_err() {
+        let _locks =
+            acquire_mutation_locks_releasing_config(root, machine_override, &cfg, &selected)?;
+        refuse_partial_state(&cfg.control)?;
+    }
     validate_global(root, &cfg)?;
     let nested = refuse_target_storage_except_nested(root, slot)?;
     crate::hold_write::report_dead_findings(root, slot)?;
