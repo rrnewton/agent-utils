@@ -666,6 +666,75 @@ pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
     }
 }
 
+/// Characters of a live owner's command line shown by status and doctor
+/// (#2466), as the Python edition's `_OWNER_ARGV_DISPLAY_LIMIT`.
+const OWNER_ARGV_DISPLAY_LIMIT: usize = 300;
+
+/// A JSON value as Python's f-string shows it: strings bare, null as None.
+pub(crate) fn display_value(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => "None".to_string(),
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Clock ticks per second from this process's auxiliary vector (AT_CLKTCK).
+fn clock_ticks_per_second() -> Option<i64> {
+    let auxv = std::fs::read("/proc/self/auxv").ok()?;
+    for pair in auxv.chunks_exact(16) {
+        let kind = u64::from_ne_bytes(pair[..8].try_into().ok()?);
+        let value = u64::from_ne_bytes(pair[8..].try_into().ok()?);
+        if kind == 17 {
+            return i64::try_from(value).ok().filter(|hertz| *hertz > 0);
+        }
+        if kind == 0 {
+            break;
+        }
+    }
+    None
+}
+
+/// What the live recorded owner process is, by name only (#2466), as the
+/// Python edition's `_live_owner_process`: PID, start instant (boot start
+/// plus whole seconds of the recorded start ticks), command name, command
+/// line (truncated) and cgroup; null where /proc cannot say.
+pub(crate) fn live_owner_process(identity: &Identity) -> Value {
+    let pid_dir = std::path::PathBuf::from(format!("/proc/{}", identity.pid));
+    let read = |name: &str| {
+        std::fs::read(pid_dir.join(name))
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let comm = read("comm").map(|text| text.trim().to_string());
+    let argv = read("cmdline").map(|text| {
+        text.split('\0')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(OWNER_ARGV_DISPLAY_LIMIT)
+            .collect::<String>()
+    });
+    let cgroup = read("cgroup").and_then(|text| {
+        text.lines()
+            .find_map(|line| line.strip_prefix("0::").map(str::to_string))
+    });
+    let started_at = boot_started_at()
+        .zip(clock_ticks_per_second())
+        .and_then(|(boot, hertz)| {
+            chrono::DateTime::from_timestamp(boot + identity.start_ticks / hertz, 0)
+        })
+        .map(|instant| instant.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    json!({
+        "pid": identity.pid,
+        "started_at": started_at,
+        "comm": comm,
+        "argv": argv,
+        "cgroup": cgroup,
+    })
+}
+
 pub(crate) fn identity_from_value(value: &Value) -> Option<Identity> {
     let raw = value.as_object()?;
     Some(Identity {
@@ -824,6 +893,12 @@ pub(crate) fn status_records(
             object.insert("liveness_detail".to_string(), json!(liveness.detail));
             object.insert("heartbeat_age_seconds".to_string(), json!(age_seconds));
             object.insert("heartbeat_expired".to_string(), json!(age > ttl as f64));
+            if state == "live" && age > ttl as f64 {
+                // Name the process that keeps the owner live (#2466).
+                if let Some(identity) = identity.as_ref() {
+                    object.insert("owner_process".to_string(), live_owner_process(identity));
+                }
+            }
             object.insert("held".to_string(), json!(held));
             object.insert("hold_reason".to_string(), json!(hold_reason));
             object.insert("hold_error".to_string(), json!(hold_error));
@@ -1129,6 +1204,16 @@ fn status_cli_once(
                     .get("event_sequence")
                     .and_then(Value::as_i64)
                     .unwrap_or(0),
+            ));
+        }
+        if let Some(process) = record.get("owner_process").filter(|value| !value.is_null()) {
+            out.push_str(&format!(
+                "  owner process: pid={} comm={} started={} cgroup={} argv={}\n",
+                display_value(process.get("pid")),
+                display_value(process.get("comm")),
+                display_value(process.get("started_at")),
+                display_value(process.get("cgroup")),
+                display_value(process.get("argv")),
             ));
         }
     }

@@ -210,6 +210,8 @@ pub(crate) fn parse_doctor(
                     "recorded owner is not running ({detail}); the slot is held by a row whose owner has exited"
                 ),
             ));
+        } else if let Some(finding) = owner_live_heartbeat_expired(record, slot, machine) {
+            findings.push(finding);
         }
     }
     let journals = parse_journals(root)?;
@@ -270,6 +272,68 @@ pub(crate) fn parse_doctor(
         "max_active_slots": cap,
         "findings": findings,
     }))
+}
+
+/// How long past its time-to-live a live owner's heartbeat must have lapsed
+/// before doctor reports it (#2466), as the Python edition's
+/// `_OWNER_LIVE_EXPIRED_FINDING_FLOOR_SECONDS`.
+const OWNER_LIVE_EXPIRED_FINDING_FLOOR_SECONDS: i64 = 3600;
+
+/// Heartbeat age past which doctor reports a live owner: one more
+/// time-to-live, never less than the floor.
+fn owner_live_expired_finding_threshold(ttl: i64) -> i64 {
+    ttl + ttl.max(OWNER_LIVE_EXPIRED_FINDING_FLOOR_SECONDS)
+}
+
+/// Doctor's finding for a live owner whose heartbeat lapsed (#2466), as the
+/// Python edition's `_owner_live_heartbeat_expired_finding`: only past the
+/// threshold, measured from the recorded heartbeat, and keyed by its slot.
+/// The status row carries `owner_process` whenever its owner is live and
+/// the heartbeat expired.
+fn owner_live_heartbeat_expired(
+    record: &Value,
+    slot: Option<&str>,
+    machine: Option<&str>,
+) -> Option<Value> {
+    if record.get("owner_state").and_then(Value::as_str) != Some("live") {
+        return None;
+    }
+    let process = record
+        .get("owner_process")
+        .filter(|value| !value.is_null())?;
+    let heartbeat_at = record.get("heartbeat_at").and_then(Value::as_str)?;
+    let ttl = record
+        .get("heartbeat_ttl_seconds")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let stamp = crate::schema::parse_timestamp_instant(heartbeat_at, "heartbeat_at").ok()?;
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0);
+    let age = ((now_millis - stamp.timestamp_millis()) as f64 / 1000.0).max(0.0);
+    let threshold = owner_live_expired_finding_threshold(ttl);
+    if age <= threshold as f64 {
+        return None;
+    }
+    let shown = |key: &str| crate::status_state::display_value(process.get(key));
+    let mut finding = note(
+        "owner-live-heartbeat-expired",
+        slot,
+        machine,
+        format!(
+            "recorded owner PID {} ({}, started {}, cgroup {}) is still running although its heartbeat lapsed (last {heartbeat_at}, time-to-live {ttl}s, reported past {threshold}s); command line: {}",
+            shown("pid"),
+            shown("comm"),
+            shown("started_at"),
+            shown("cgroup"),
+            shown("argv"),
+        ),
+    );
+    finding["remedy"] = json!(
+        "if that process is a leftover of the slot's agent, stop it by its PID (never by a name pattern) or have the owner release the slot; if it is the real owner, have it renew its heartbeat; diagnosis alone authorizes no mutation"
+    );
+    Some(finding)
 }
 
 /// The Python `doctor` command's output, envelope and human form.
@@ -541,6 +605,8 @@ fn doctor_cli_once(
                     "recorded owner is not running ({detail}); the slot is held by a row whose owner has exited"
                 ),
             ));
+        } else if let Some(finding) = owner_live_heartbeat_expired(record, slot, machine) {
+            findings.push(finding);
         }
         if let Some(release) = release_for(record) {
             let state = release
