@@ -535,13 +535,40 @@ fn finish_handover(
             findings: Vec::new(),
         });
     }
+    // A failed hand-over (the inbox could not be written, the queue proved the item absent,
+    // the deliverer could not start) is not a refusal of the message (#2420 R8): recording a
+    // terminal `refused` made every later copy `known`, so the message was never delivered.
+    // The claim is released instead, nothing stays recorded, and the answer is `deferred`, a
+    // state every sender's pump retries; the coordinator is told by a notice, as for an
+    // undeliverable target.
+    if let Handover::Refused(reason) = &outcome {
+        let _ = fs::remove_file(&path);
+        unlock(lock);
+        let detail = format!("hand-over failed, nothing recorded; the sender retries: {reason}");
+        let notice = json!({
+            "event": "handover-failed-notice", "team": team, "id": id,
+            "reason": reason, "at": format_rfc3339_ms(now_unix_ms()),
+        });
+        crate::sender::log_event(ctx.state, &notice);
+        write_notice(
+            &ctx.state.join("teams.d").join(team).join("notices"),
+            id,
+            &notice,
+        );
+        return Ok(AcceptAnswer {
+            outcome: "undeliverable".to_string(),
+            state: Some("deferred".to_string()),
+            detail,
+            findings: Vec::new(),
+        });
+    }
     let (new_state, answer_outcome, detail) = match &outcome {
         Handover::Accepted => (
             "accepted",
             "accepted",
             "handed to the deliverer".to_string(),
         ),
-        Handover::Refused(reason) => ("refused", "refused", reason.clone()),
+        Handover::Refused(_) => unreachable!("handled above"),
         Handover::PossiblySubmitted(reason) => ("possibly_submitted", "known", reason.clone()),
     };
     entry["state"] = json!(new_state);

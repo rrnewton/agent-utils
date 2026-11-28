@@ -3171,3 +3171,58 @@ fn own_host_mirror_copy_is_admitted_on_the_local_key_without_trust() {
         "alarm raised"
     );
 }
+
+#[test]
+fn a_failed_hand_over_is_not_a_terminal_refusal_and_the_next_copy_delivers() {
+    // #2420 R8: a hand-over that fails for a transient reason (here the hook inbox cannot be
+    // written) used to record a terminal `refused`, so every later copy of the message was
+    // `known` and it was never delivered. Now nothing is recorded: the answer is `deferred`
+    // (the sender keeps and retries it), and the next copy delivers.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let now = agent_teams::timeutil::now_unix_ms();
+    let envelope = agent_teams::envelope::build_envelope(
+        "tm-sim-2420c3c3c3c3c3c3",
+        "k",
+        "sim",
+        "host-a",
+        5,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        now,
+        now + 7_200_000,
+        None,
+        "deliver me after the inbox is back",
+    );
+    let post = agent_teams::relay::render_post(&envelope);
+    // A file where the inbox directory should be: the hand-over cannot write the item.
+    let inbox = world.state.join("teams.d/tools/hook-inbox");
+    let _ = std::fs::remove_dir_all(&inbox);
+    std::fs::write(&inbox, "not a directory").expect("block the inbox");
+    let outcome = world.relay_in(BOT1, &post);
+    std::fs::remove_file(&inbox).expect("unblock the inbox");
+    assert_ne!(
+        outcome["state"], "refused",
+        "never a terminal refusal: {outcome}"
+    );
+    assert!(
+        outcome["receipt_text"]
+            .as_str()
+            .is_some_and(|receipt| receipt.contains("receipt: deferred")),
+        "the sender is told to retry: {outcome}"
+    );
+    assert!(
+        !world.ledger_has("tools", "tm-sim-2420c3c3c3c3c3c3"),
+        "nothing recorded"
+    );
+    let outcome = world.relay_in(BOT1, &post);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert!(delivered[0].contains("deliver me after the inbox is back"));
+}

@@ -217,7 +217,12 @@ on the receiving host, the message stays in the sender's outbox as
 `pump` retries, so an older sender retries it too), and the receiving host
 records a notice under `teams.d/<team>/notices/`, which `agentctl
 watch-agents` tells the designated coordinator once per message and then
-moves to `notices-told/`. `pump` retries the message after the fix;
+moves to `notices-told/`. A hand-over that fails after the claim (the hook
+inbox cannot be written, the queue proves the item absent, the command
+deliverer cannot start) answers the same way (#2420): the claim is
+released, nothing stays recorded, and the next copy or retry delivers,
+where it used to record a terminal `refused` that every later copy then
+matched. `pump` retries the message after the fix;
 `agentctl watch-agents` starts `pump --deferred` every 10 minutes while the
 outbox holds deferred messages. Senders see exit 75, never a silent
 `accepted` into a dead queue. Over the relay route the same answer comes
