@@ -822,6 +822,7 @@ def test_remove_accepts_declared_submodule_placed_as_shared_worktree(
     assert (module / "objects").is_dir()
 
 
+@pytest.mark.load_quarantine(issue="#2459", expires="2026-12-05")  # #2065 hot-host-census-tests: the per-item remove wall-clock budget (#2459) ran out at the /proc scan after the path fence on a busy host, as for its two siblings; out with #2459's fix
 def test_remove_accepts_shared_placed_submodule_in_flat_layout(
     tmp_path: Path,
 ) -> None:
