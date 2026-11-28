@@ -9,3 +9,10 @@ trailing terminal padding; no question, option, or footer text is changed. Sourc
 The compact state corpus is a reduced terminal-rendering fixture, not a claim
 of a live run against either harness. It covers both supported adapters and
 contradictory/stale screen markers. No live agent was inspected or driven.
+
+`claude-quoting-muse-peer.txt` is a live Claude Code pane read back with
+`agentctl read` on 2026-11-27 (#2421): a tool output quoting the Muse
+peer-dialog detector's doc comment (a `Message from <peer>` heading and all
+four choices) above a running turn. Rows between the quoted block and the
+spinner were dropped so the quote sits in the bottom 24 rows, as it did when
+a running watcher reported the pane at a peer prompt; no row text changed.

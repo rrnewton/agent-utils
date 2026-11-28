@@ -1,0 +1,20 @@
+● Bash(python3 - <<'EOF'
+      p='rs/agentctl/src/harness_tui/muse.rs'…)
+  ⎿  Updated agentctl/src/agent_watch.rs (+2 -2)
+      519  /// The Muse peer-approval dialog at the bottom of `screen` (#974
+      520  /// muse-peer-approval-prompt): a `Message from <peer>` heading with its choices
+      521  /// (`Allow once / Reject once / Allow for this session / Block`). Allowing a peer
+      522 -/// is a human decision, so this only names the dialog; the deny sweep may refuse
+      523 -/// it once (#2421), and nothing ever allows it.
+      522 +/// is a human decision, so this only names the dialog; nothing answers it (the
+      523 +/// #2421 deny sweep reports it only).
+      524  /// Both the heading and at least two choices must show in the prompt window, so
+      525  /// a screen merely quoting a peer message does not count. The returned line
+      526  /// names the dialog and the choices it offers, focused or not (before a Down
+  ⎿  Running…
+
+✢ Discombobulating… (12m 17s · ↓ 34.8k tokens)
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

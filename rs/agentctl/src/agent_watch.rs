@@ -10086,6 +10086,41 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_pane_quoting_the_muse_peer_dialog_is_never_refused() {
+        // coordb's live report (2026-11-27): a running watcher read a Claude
+        // pane quoting the Muse peer-dialog detector as a peer prompt. The
+        // deny sweep picks its recogniser by the agent's harness, and no
+        // recogniser accepts the quote: no attempt, no key, no row.
+        let screen = include_str!("../tests/fixtures/tui/claude-quoting-muse-peer.txt");
+        for harness in ["claude", "muse"] {
+            let passes = (0..3)
+                .map(|_| {
+                    let mut row = observation("lane", "working", Some(screen));
+                    row.harness = Some(harness.to_owned());
+                    vec![row]
+                })
+                .collect();
+            let mut probe = PolicyProbe::new(passes, crate::profiles::PermissionPolicy::default());
+            let mut notifier = RecordingNotifier {
+                deny_ok: true,
+                ..RecordingNotifier::default()
+            };
+            let mut state = WatchState::default();
+            let options = options();
+            for at in [1_000.0, 1_100.0, 1_200.0] {
+                let report = watch_agents_once(&mut probe, &mut notifier, &mut state, at, &options);
+                assert_eq!(
+                    report["permission_denials"].as_array().map(Vec::len),
+                    Some(0),
+                    "{harness}: {report}"
+                );
+            }
+            assert!(notifier.denials.is_empty(), "{harness}");
+            assert!(state.permission_denials.is_empty(), "{harness}");
+        }
+    }
+
+    #[test]
     fn a_pending_refusal_for_an_agent_no_longer_registered_is_pruned() {
         // Review finding 7.
         let mut state = WatchState::default();

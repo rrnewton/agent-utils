@@ -1227,3 +1227,45 @@ fn a_dialog_that_replaces_the_prompt_just_before_the_key_is_refused_not_approved
     assert_eq!(*menu.submitted.borrow(), ["interrupted (esc)"]);
     assert!(!menu.keys.borrow().contains(&"Enter".to_owned()));
 }
+
+/// A live Claude pane (#2421, coordb's live report): a tool output quoting
+/// the Muse peer-dialog detector's doc comment, heading and all four
+/// choices, in the bottom rows while a turn runs.
+const CLAUDE_QUOTING_MUSE_PEER: &str = include_str!("fixtures/tui/claude-quoting-muse-peer.txt");
+
+#[test]
+fn a_claude_pane_quoting_the_muse_peer_dialog_is_never_a_prompt_and_gets_no_key() {
+    use agentctl::harness_tui::permission_denial;
+    assert!(CLAUDE_QUOTING_MUSE_PEER.contains("Message from <peer>"));
+    for harness in ["claude", "muse", "codex", "unknown"] {
+        assert!(
+            permission_denial(Some(harness), CLAUDE_QUOTING_MUSE_PEER).is_none(),
+            "{harness}"
+        );
+        let menu = Menu::new(CLAUDE_QUOTING_MUSE_PEER, harness, Fault::None);
+        assert!(deny_on(&menu, harness).unwrap().is_none(), "{harness}");
+        assert!(menu.keys.borrow().is_empty(), "{harness}");
+    }
+}
+
+#[test]
+fn recognisers_are_chosen_by_the_agent_harness_only() {
+    // A Claude pane is never read by the Muse recogniser, nor a Muse pane
+    // by the Claude one, nor either by any other harness label.
+    use agentctl::harness_tui::permission_denial;
+    for (harness, screen, kind, _) in recognised() {
+        assert!(
+            permission_denial(Some(harness), &screen).is_some(),
+            "{kind}"
+        );
+        for other in ["claude", "muse", "codex", "unknown"] {
+            if other != harness {
+                assert!(
+                    permission_denial(Some(other), &screen).is_none(),
+                    "{kind} drawn by {harness} read as {other}"
+                );
+            }
+        }
+        assert!(permission_denial(None, &screen).is_none(), "{kind}");
+    }
+}
