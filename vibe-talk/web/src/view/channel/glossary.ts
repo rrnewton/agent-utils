@@ -169,6 +169,13 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
   // the button can clear the browser selection before the press reads it
   // (the same hold Quote reply keeps). Its words are read once, at press.
   let lastRange: Range | null = null;
+  /**
+   * `#2429 vibe-talk-typing-never-lags`. The roots a pass left unlinked because a selection stood:
+   * linked when that selection collapses, and nothing else is. The caret in a composer is a collapsed
+   * selection too, moved by every keystroke; relinking the whole list at each one scanned every row's
+   * text against every term, about 90 ms a key on a long channel.
+   */
+  const skippedForSelection = new Set<ParentNode>();
 
   async function pressWtf(): Promise<void> {
     const info = selectionInfo() ?? (lastRange ? selectionInfo(lastRange) : null);
@@ -227,7 +234,11 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
     // it triggers collapsing that selection; the press re-links on landing.
     if (!force) {
       const liveSel = typeof getSelection === "function" ? getSelection() : null;
-      if (liveSel && !liveSel.isCollapsed) return;
+      if (liveSel && !liveSel.isCollapsed) {
+        // `#2429`: linked once the selection lets go (the selectionchange below), and only then.
+        skippedForSelection.add(root);
+        return;
+      }
     }
     // Never rewrite the row the reader is selecting in: replacing its text
     // nodes would collapse the selection the WTF? press stands on. `force`
@@ -349,10 +360,12 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
         lastRange = null;
       }
     }
-    // A collapsed selection frees the row it stood in for linking.
-    if (sel && sel.isCollapsed && terms.length) {
-      const log = document.getElementById("discord-log");
-      if (log) linkTermsIn(log);
+    // A collapsed selection frees what a pass left unlinked while it stood (`#2429`: that, and
+    // nothing else; a caret moving in a box finds nothing left and costs nothing).
+    if (sel && sel.isCollapsed && terms.length && skippedForSelection.size) {
+      const roots = [...skippedForSelection];
+      skippedForSelection.clear();
+      for (const root of roots) if ((root as Node).isConnected) linkTermsIn(root);
     }
     // `#2231 vibe-talk-selection-strip-atomic`. WTF?'s visibility is not decided here: the quoting
     // view shows the whole strip, WTF? included, in one call at its next frame.
@@ -417,20 +430,56 @@ export function createGlossaryView(deps: GlossaryDependencies): GlossaryView {
 
   const log = document.getElementById("discord-log");
   let scheduled = false;
+  // `#2429`: the rows a change touched, linked at the next frame; never the whole list. A row drawn
+  // or a message's words redrawn is linked, as before. A change inside the reply box (the line under
+  // it, the draft's state, the box's own words) links nothing, nor does one that touches no words.
+  const changedRows = new Set<Element>();
+  const rowOf = (node: Node | null): Element | null => {
+    let at: Node | null = node;
+    while (at && at.parentNode && at.parentNode !== log) at = at.parentNode;
+    return at && at.parentNode === log && at.nodeType === 1 ? at as Element : null;
+  };
+  const inComposer = (node: Node | null): boolean => {
+    const element = node && (node.nodeType === 1 ? node as Element : node.parentElement);
+    return Boolean(element && typeof element.closest === "function"
+      && element.closest("#column-reply, #side-reply, textarea, input, [contenteditable]"));
+  };
+  const touchesBody = (record: MutationRecord): boolean => {
+    const target = record.target.nodeType === 1 ? record.target as Element : record.target.parentElement;
+    if (target && typeof target.closest === "function" && target.closest(".body")) return true;
+    for (const added of record.addedNodes) {
+      if (added.nodeType !== 1) continue;
+      const element = added as Element;
+      if (element.classList.contains("body") || (typeof element.querySelector === "function" && element.querySelector(".body"))) return true;
+    }
+    return false;
+  };
+  const linkChanged = (): void => {
+    scheduled = false;
+    const rows = [...changedRows];
+    changedRows.clear();
+    for (const row of rows) if (row.isConnected) linkTermsIn(row);
+  };
   const observer =
     typeof MutationObserver === "function" && log
-      ? new MutationObserver(() => {
-          if (scheduled) return;
-          scheduled = true;
-          if (typeof requestAnimationFrame === "function") {
-            requestAnimationFrame(() => {
-              scheduled = false;
-              if (log) linkTermsIn(log);
-            });
-          } else {
-            scheduled = false;
-            linkTermsIn(log);
+      ? new MutationObserver((records) => {
+          if (!terms.length) return;
+          for (const record of records) {
+            if (inComposer(record.target)) continue;
+            if (record.target === log) {
+              for (const added of record.addedNodes) if (added.nodeType === 1 && !inComposer(added)) changedRows.add(added as Element);
+              continue;
+            }
+            // Only a change to a message's words can need a link: a row's time ticking over, its
+            // chips and controls redrawn, its read state, touch no `.body` and link nothing.
+            if (!touchesBody(record)) continue;
+            const row = rowOf(record.target);
+            if (row && !inComposer(row)) changedRows.add(row);
           }
+          if (!changedRows.size || scheduled) return;
+          scheduled = true;
+          if (typeof requestAnimationFrame === "function") requestAnimationFrame(linkChanged);
+          else linkChanged();
         })
       : null;
   if (observer && log) observer.observe(log, { childList: true, subtree: true });
