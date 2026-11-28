@@ -240,13 +240,17 @@ impl SearchView {
     }
 }
 
-/// A search of what the cache holds: the newest rows first, below `below_ms`.
+/// A search of what the cache holds: the newest rows first, in `[from_ms, below_ms)`.
 pub struct SearchRequest<'a> {
     /// The parsed query; an empty one finds nothing.
     pub query: &'a Query,
     /// Which rows.
     pub view: SearchView,
-    /// Only rows created before this provider time (exclusive): the page's loaded floor.
+    /// Only rows created at or after this provider time (`#2425`: the query's `after:` day);
+    /// `i64::MIN` for no bound. Older rows are never read, so never tested nor counted.
+    pub from_ms: i64,
+    /// Only rows created before this provider time (exclusive): the page's loaded floor, and
+    /// (`#2425`) the query's `before:` day.
     pub below_ms: i64,
     /// Stop after this many hits (more when the last hit shares its millisecond with others:
     /// a search always stops on a whole millisecond). Zero tests nothing.
@@ -305,16 +309,18 @@ pub struct SearchOutcome {
 
 impl SearchOutcome {
     /// How far back this search can say it looked: the oldest provider time from which every
-    /// message of the view, created before `below_ms`, is both held (the horizon) and was tested.
+    /// message of the view, created in `[from_ms, below_ms)`, is both held (the horizon) and was
+    /// tested. Never below `from_ms` (`#2425`): a dated search vouches only for its window.
     /// `None` without a horizon, or when the search stopped above it. On Slack's All, of
     /// top-level messages only ([`SearchView::horizon_scope`]).
     #[must_use]
-    pub fn searched_back_to_ms(&self, below_ms: i64) -> Option<i64> {
+    pub fn searched_back_to_ms(&self, from_ms: i64, below_ms: i64) -> Option<i64> {
         let horizon = self.horizon?;
         let from = self
             .resume_below_ms
             .unwrap_or(i64::MIN)
-            .max(horizon.from_ms);
+            .max(horizon.from_ms)
+            .max(from_ms);
         (from < horizon.to_ms.min(below_ms)).then_some(from)
     }
 }
@@ -324,6 +330,8 @@ impl SearchOutcome {
 pub struct SearchAsk<'a> {
     /// The parsed query.
     pub query: &'a Query,
+    /// Only rows created at or after this provider time (`#2425`); `i64::MIN` for no bound.
+    pub from_ms: i64,
     /// Only rows created before this provider time (exclusive).
     pub below_ms: i64,
     /// Stop after this many hits, on a whole millisecond.

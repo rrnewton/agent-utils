@@ -2,8 +2,13 @@
 // package is private to it. `#624 voice-page-modularity`.
 
 export {
+  searchDateValue,
+  searchDayBefore,
+  searchDayText,
+  searchDaysBack,
   searchFold,
   searchPositiveTerms,
+  searchQueryDateBounds,
   searchQueryExpandLabels,
   searchQueryMatches,
   searchQueryParse,

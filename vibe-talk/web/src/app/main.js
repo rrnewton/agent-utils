@@ -3293,7 +3293,12 @@ const searchRows = createSearchRows({
   searchField,
   expandLabelQuery: (node) => searchQueryExpandLabels(/** @type {any} */ (node), (slug) => labelsView.expand(slug)),
   language: {
-    parsedQueries: createParsedQueries(),
+    // `#2425`: relative days (`after:7d`) are read against the reader's own calendar day, the
+    // zone the page also sends the server as `tz`.
+    parsedQueries: createParsedQueries(() => {
+      const now = new Date();
+      return { year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate() };
+    }),
     openedGaps: createOpenedGaps(),
     searchSubject,
     searchQueryMatches,

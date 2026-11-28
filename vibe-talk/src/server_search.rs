@@ -101,19 +101,30 @@ pub async fn search(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let parsed = crate::search_query::parse(&ask.q);
-    let query = Arc::new(parsed.expand_labels(&|slug| label_groups.expand(slug)));
-    if query.is_empty() {
-        return Err(OpError::EmptyQuery);
-    }
     let zone = ask
         .tz
         .as_deref()
         .and_then(|name| crate::clock::zone(name).ok())
         .unwrap_or_else(|| state.config.timezone.clone());
-    let below_ms = ask.below_ms.unwrap_or(i64::MAX);
-    let limit = ask.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let now_ms = crate::store::now_ms();
+    // `#2425`: relative days (`after:7d`) are read against the reader's today, in the reader's
+    // zone, here, once; past this point every date is an ordinary day.
+    let parsed = match zone.date_at_ms(now_ms) {
+        Some((year, month, day)) => crate::search_query::parse_on(&ask.q, Day { year, month, day }),
+        None => crate::search_query::parse(&ask.q),
+    };
+    let query = Arc::new(parsed.expand_labels(&|slug| label_groups.expand(slug)));
+    if query.is_empty() {
+        return Err(OpError::EmptyQuery);
+    }
+    // `#2425`: the query's own dates bound the rows every channel reads, in SQL, so a row
+    // outside them is never read, tested or counted in `examined`, and the budget is spent only
+    // inside the window. `below` (the page's floor, or a resume point) clamps from above.
+    let (after_day, before_day) = query.date_bounds();
+    let from_ms = after_day.map_or(i64::MIN, |day| day_start_ms(&zone, day));
+    let to_ms = before_day.map_or(i64::MAX, |day| day_start_ms(&zone, day));
+    let below_ms = ask.below_ms.unwrap_or(i64::MAX).min(to_ms);
+    let limit = ask.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     // `#1853`: only a query naming the built-in label owes each channel its
     // pin set; other searches pass an empty set and never read the store here.
     let mut pinned_by_channel: Vec<Arc<std::collections::HashSet<String>>> =
@@ -157,18 +168,16 @@ pub async fn search(
         let id = channel.id.clone();
         async move {
             tokio::task::spawn_blocking(move || {
-                let day_start_ms = |day: Day| {
-                    zone.day_start_ms(day.year, day.month, day.day)
-                        .unwrap_or_else(|| day.start_ms_at_offset(0))
-                };
+                let day_start = |day: Day| day_start_ms(&zone, day);
                 sink.search(
                     &id,
                     &SearchAsk {
                         query: &query,
+                        from_ms,
                         below_ms,
                         limit,
                         budget: BUDGET,
-                        day_start_ms: &day_start_ms,
+                        day_start_ms: &day_start,
                         pinned_ids: &pinned_ids,
                         manual_labels: &manual_labels,
                     },
@@ -183,7 +192,7 @@ pub async fn search(
     // Newest first across every channel: (created, channel index, message).
     let mut found: Vec<(i64, usize, Message)> = Vec::new();
     for (index, (channel, searched)) in channels.iter().zip(searched).enumerate() {
-        scopes.push(scope_of(channel, &searched, below_ms, now_ms));
+        scopes.push(scope_of(channel, &searched, from_ms, below_ms, now_ms));
         if let Ok(searched) = searched {
             for hit in searched.outcome.hits {
                 // As new as the read that put it in the cache, as a served page's copies are.
@@ -247,6 +256,12 @@ pub async fn search(
     })
 }
 
+/// The start of `day` in `zone`, in milliseconds; UTC's for a day the zone cannot place.
+fn day_start_ms(zone: &crate::clock::Zone, day: Day) -> i64 {
+    zone.day_start_ms(day.year, day.month, day.day)
+        .unwrap_or_else(|| day.start_ms_at_offset(0))
+}
+
 /// Cut the hits of every channel (newest first once sorted) to one answer, and say where the next
 /// resumes; each scope is then clamped to it.
 ///
@@ -303,10 +318,12 @@ async fn prepare(
     page.messages
 }
 
-/// What one channel's search says of itself.
+/// What one channel's search says of itself. `[from_ms, below_ms)` is the stretch it was asked
+/// to search (`#2425`: the query's dates and the page's floor).
 fn scope_of(
     channel: &ChannelInfo,
     searched: &Result<ChannelSearch, SearchRefusal>,
+    from_ms: i64,
     below_ms: i64,
     now_ms: i64,
 ) -> SearchScope {
@@ -335,7 +352,7 @@ fn scope_of(
                 state: "searched",
                 reason: None,
                 examined: count(outcome.examined),
-                searched_back_to_ms: outcome.searched_back_to_ms(below_ms),
+                searched_back_to_ms: outcome.searched_back_to_ms(from_ms, below_ms),
                 held_from_ms: horizon.map(|h| h.from_ms),
                 as_of_ms: horizon.map(|h| h.as_of_ms),
                 top_level_only: searched.view == SearchView::All,

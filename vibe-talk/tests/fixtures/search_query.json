@@ -1,5 +1,5 @@
 {
- "about": "#521 server-side-search: the search language's conformance corpus. src/search_query.rs (whose module documentation is the specification) and the page's web/src/core/search/ (searchFold, searchQueryParse, searchQueryMatches, searchUpstreamPlan) must both agree with every case. Trees: [\"word\", t], [\"phrase\", t], [\"from\", folded], [\"in\", \"thread\"|\"main\"], [\"before\"|\"after\", \"YYYY-MM-DD\"], [\"has\", \"link\"], [\"not\", n], [\"and\", ...], [\"or\", ...]; null is no search. A match case's message: author, author_id, text (the drawn text), links, created (RFC 3339), in_thread; days resolve at tz_offset_minutes east of UTC (0 when absent).",
+ "about": "#521 server-side-search: the search language's conformance corpus. src/search_query.rs (whose module documentation is the specification) and the page's web/src/core/search/ (searchFold, searchQueryParse, searchQueryMatches, searchUpstreamPlan) must both agree with every case. Trees: [\"word\", t], [\"phrase\", t], [\"from\", folded], [\"in\", \"thread\"|\"main\"], [\"before\"|\"after\", \"YYYY-MM-DD\"], [\"has\", \"link\"], [\"not\", n], [\"and\", ...], [\"or\", ...]; null is no search. A match case's message: author, author_id, text (the drawn text), links, created (RFC 3339), in_thread; days resolve at tz_offset_minutes east of UTC (0 when absent). #2425: a parse or match case may name \"today\" (YYYY-MM-DD), the reader's calendar day: with it, a relative before:/after: value (Nd, today, yesterday) resolves to the day it names and the tree shows that day; without it, the value is a word.",
  "fold": [
   {
    "in": "Hello World",
@@ -1034,6 +1034,220 @@
     "word",
     "label:"
    ]
+  },
+  {
+   "query": "after:7d",
+   "today": "2026-11-27",
+   "tree": [
+    "after",
+    "2026-11-20"
+   ]
+  },
+  {
+   "query": "after:0d",
+   "today": "2026-11-27",
+   "tree": [
+    "after",
+    "2026-11-27"
+   ]
+  },
+  {
+   "query": "before:30d",
+   "today": "2026-11-27",
+   "tree": [
+    "before",
+    "2026-10-28"
+   ]
+  },
+  {
+   "query": "after:today",
+   "today": "2026-11-27",
+   "tree": [
+    "after",
+    "2026-11-27"
+   ]
+  },
+  {
+   "query": "AFTER:Today",
+   "today": "2026-11-27",
+   "tree": [
+    "after",
+    "2026-11-27"
+   ]
+  },
+  {
+   "query": "after:yesterday",
+   "today": "2026-11-27",
+   "tree": [
+    "after",
+    "2026-11-26"
+   ]
+  },
+  {
+   "query": "before:yesterday",
+   "today": "2026-11-27",
+   "tree": [
+    "before",
+    "2026-11-26"
+   ]
+  },
+  {
+   "query": "-after:7d",
+   "today": "2026-11-27",
+   "tree": [
+    "not",
+    [
+     "after",
+     "2026-11-20"
+    ]
+   ]
+  },
+  {
+   "query": "deploy after:7d",
+   "today": "2026-11-27",
+   "tree": [
+    "and",
+    [
+     "word",
+     "deploy"
+    ],
+    [
+     "after",
+     "2026-11-20"
+    ]
+   ]
+  },
+  {
+   "query": "after:\"7d\"",
+   "today": "2026-11-27",
+   "tree": [
+    "after",
+    "2026-11-20"
+   ]
+  },
+  {
+   "query": "after:2026-11-01 after:7d",
+   "today": "2026-11-27",
+   "tree": [
+    "and",
+    [
+     "after",
+     "2026-11-01"
+    ],
+    [
+     "after",
+     "2026-11-20"
+    ]
+   ]
+  },
+  {
+   "query": "after:1d",
+   "today": "2026-03-01",
+   "tree": [
+    "after",
+    "2026-02-28"
+   ]
+  },
+  {
+   "query": "after:1d",
+   "today": "2028-03-01",
+   "tree": [
+    "after",
+    "2028-02-29"
+   ]
+  },
+  {
+   "query": "before:10d",
+   "today": "2027-01-03",
+   "tree": [
+    "before",
+    "2026-12-24"
+   ]
+  },
+  {
+   "query": "after:365d",
+   "today": "2026-11-27",
+   "tree": [
+    "after",
+    "2025-11-27"
+   ]
+  },
+  {
+   "query": "after:7w",
+   "today": "2026-11-27",
+   "tree": [
+    "word",
+    "after:7w"
+   ]
+  },
+  {
+   "query": "after:d7",
+   "today": "2026-11-27",
+   "tree": [
+    "word",
+    "after:d7"
+   ]
+  },
+  {
+   "query": "after:7",
+   "today": "2026-11-27",
+   "tree": [
+    "word",
+    "after:7"
+   ]
+  },
+  {
+   "query": "after:-7d",
+   "today": "2026-11-27",
+   "tree": [
+    "word",
+    "after:-7d"
+   ]
+  },
+  {
+   "query": "after:100000d",
+   "today": "2026-11-27",
+   "tree": [
+    "word",
+    "after:100000d"
+   ]
+  },
+  {
+   "query": "after:tomorrow",
+   "today": "2026-11-27",
+   "tree": [
+    "word",
+    "after:tomorrow"
+   ]
+  },
+  {
+   "query": "after: 7d",
+   "today": "2026-11-27",
+   "tree": [
+    "and",
+    [
+     "word",
+     "after:"
+    ],
+    [
+     "word",
+     "7d"
+    ]
+   ]
+  },
+  {
+   "query": "after:7d",
+   "tree": [
+    "word",
+    "after:7d"
+   ]
+  },
+  {
+   "query": "before:today",
+   "tree": [
+    "word",
+    "before:today"
+   ]
   }
  ],
  "match": [
@@ -1794,6 +2008,208 @@
     ]
    },
    "matches": true
+  },
+  {
+   "query": "after:7d",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-20T00:00:00Z"
+   },
+   "matches": true
+  },
+  {
+   "query": "after:7d",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-19T23:59:59Z"
+   },
+   "matches": false
+  },
+  {
+   "query": "after:7d",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-27T16:59:00Z"
+   },
+   "matches": true
+  },
+  {
+   "query": "before:7d",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-19T23:59:59Z"
+   },
+   "matches": true
+  },
+  {
+   "query": "before:7d",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-20T00:00:00Z"
+   },
+   "matches": false
+  },
+  {
+   "query": "after:today",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-27T00:00:00Z"
+   },
+   "matches": true
+  },
+  {
+   "query": "after:today",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-26T23:59:59Z"
+   },
+   "matches": false
+  },
+  {
+   "query": "after:yesterday",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-26T00:00:00Z"
+   },
+   "matches": true
+  },
+  {
+   "query": "after:yesterday",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-25T23:59:59Z"
+   },
+   "matches": false
+  },
+  {
+   "query": "after:0d",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-26T12:00:00Z"
+   },
+   "matches": false
+  },
+  {
+   "query": "-after:7d",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-19T00:00:00Z"
+   },
+   "matches": true
+  },
+  {
+   "query": "-after:7d",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-25T00:00:00Z"
+   },
+   "matches": false
+  },
+  {
+   "query": "after:7d before:2026-11-25",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-22T00:00:00Z"
+   },
+   "matches": true
+  },
+  {
+   "query": "after:7d before:2026-11-25",
+   "today": "2026-11-27",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-26T00:00:00Z"
+   },
+   "matches": false
+  },
+  {
+   "query": "after:1d",
+   "today": "2026-11-26",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-25T04:59:59Z"
+   },
+   "matches": false,
+   "tz_offset_minutes": -300
+  },
+  {
+   "query": "after:1d",
+   "today": "2026-11-26",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-25T05:00:00Z"
+   },
+   "matches": true,
+   "tz_offset_minutes": -300
+  },
+  {
+   "query": "before:today",
+   "today": "2026-11-26",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-26T04:59:59Z"
+   },
+   "matches": true,
+   "tz_offset_minutes": -300
+  },
+  {
+   "query": "before:today",
+   "today": "2026-11-26",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-26T05:00:00Z"
+   },
+   "matches": false,
+   "tz_offset_minutes": -300
+  },
+  {
+   "query": "after:7d",
+   "message": {
+    "author": "Ada",
+    "text": "see after:7d",
+    "created": "2026-01-01T00:00:00Z"
+   },
+   "matches": true
+  },
+  {
+   "query": "after:7d",
+   "message": {
+    "author": "Ada",
+    "text": "x",
+    "created": "2026-11-27T00:00:00Z"
+   },
+   "matches": false
   }
  ],
  "upstream": [

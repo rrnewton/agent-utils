@@ -2262,19 +2262,25 @@ function searchCorpusDisagreements(language) {
   const subject = language.searchSubject;
   const plan = language.searchUpstreamPlan;
   const data = (value) => JSON.parse(JSON.stringify(value ?? null));
+  // `#2425`: a case naming the reader's `today` reads relative days against it.
+  const dayOf = (text) => {
+    if (!text) return null;
+    const [year, month, day] = text.split("-").map(Number);
+    return { year, month, day };
+  };
   const wrong = [];
   for (const { in: input, out } of SEARCH_CORPUS.fold) {
     if (fold(input) !== out) wrong.push(`fold ${JSON.stringify(input)} gave ${JSON.stringify(fold(input))}`);
   }
-  for (const { query, tree: expected } of SEARCH_CORPUS.parse) {
-    const got = data(tree(parse(query)));
+  for (const { query, today, tree: expected } of SEARCH_CORPUS.parse) {
+    const got = data(tree(parse(query, dayOf(today))));
     if (JSON.stringify(got) !== JSON.stringify(expected)) wrong.push(`parse ${JSON.stringify(query)} gave ${JSON.stringify(got)}`);
   }
-  for (const { query, message, matches: expected, tz_offset_minutes: offset = 0 } of SEARCH_CORPUS.match) {
+  for (const { query, today, message, matches: expected, tz_offset_minutes: offset = 0 } of SEARCH_CORPUS.match) {
     const folded = subject({ author: message.author ?? "", authorId: message.author_id ?? "", text: message.text ?? "",
       links: message.links ?? [], createdMs: Date.parse(message.created), inThread: message.in_thread ?? false, labels: message.labels ?? [], plainLabels: message.plain_labels ?? [], pinned: message.pinned ?? false });
     const dayStart = (day) => Date.UTC(day.year, day.month - 1, day.day) - offset * 60_000;
-    if (matches(parse(query), folded, dayStart) !== expected) wrong.push(`match ${JSON.stringify(query)} on ${JSON.stringify(message.text)}`);
+    if (matches(parse(query, dayOf(today)), folded, dayStart) !== expected) wrong.push(`match ${JSON.stringify(query)} on ${JSON.stringify(message.text)}`);
   }
   for (const { query, queries, scan } of SEARCH_CORPUS.upstream) {
     const got = data(plan(parse(query)));

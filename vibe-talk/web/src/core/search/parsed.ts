@@ -2,8 +2,8 @@
 // `#624 voice-page-modularity`, moved from the legacy script into core/search): one parse per change of
 // the text, however many rows ask about it.
 
-import { searchPositiveTerms, searchQueryParse } from "./language.ts";
-import type { SearchNode } from "./language.ts";
+import { searchDayText, searchPositiveTerms, searchQueryParse } from "./language.ts";
+import type { SearchDay, SearchNode } from "./language.ts";
 
 /** A query parsed: the text, its tree (null for no search), and its words to mark. */
 export interface ParsedQuery {
@@ -18,14 +18,22 @@ export interface ParsedQueries {
   parsed(query: string): ParsedQuery;
 }
 
-/** Nothing parsed yet. */
-export function createParsedQueries(): ParsedQueries {
+/**
+ * Nothing parsed yet. `today` gives the reader's calendar day (`#2425`), against which relative
+ * days (`after:7d`) are read; a query is parsed again when the day turns, so "the last week"
+ * moves with it. Without it, relative days are words.
+ */
+export function createParsedQueries(today?: () => SearchDay): ParsedQueries {
   let searchParse: ParsedQuery = { query: null, node: null, terms: [] };
+  let parsedOn = "";
   return {
     parsed(query) {
-      if (searchParse.query !== query) {
-        const node = searchQueryParse(query);
+      const day = today ? today() : null;
+      const on = day ? searchDayText(day) : "";
+      if (searchParse.query !== query || parsedOn !== on) {
+        const node = searchQueryParse(query, day);
         searchParse = { query, node, terms: searchPositiveTerms(node) };
+        parsedOn = on;
       }
       return searchParse;
     },

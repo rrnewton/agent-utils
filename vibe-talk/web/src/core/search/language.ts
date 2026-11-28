@@ -120,8 +120,40 @@ function searchDay(text: string): SearchDay | null {
   return value.month >= 1 && value.month <= 12 && value.day >= 1 && value.day <= length ? value : null;
 }
 
-const searchDayText = (day: SearchDay): string =>
+/** A day as `YYYY-MM-DD`: how the tree, and the page's date chooser (`#2425`), write it. */
+export const searchDayText = (day: SearchDay): string =>
   `${String(day.year).padStart(4, "0")}-${String(day.month).padStart(2, "0")}-${String(day.day).padStart(2, "0")}`;
+
+/**
+ * `#2425 vibe-talk-search-date-filter`: how many days back from today a relative `before:` /
+ * `after:` value names: `Nd` (up to five digits), `today` (0) or `yesterday` (1), in any case
+ * (ASCII only, as the server's `days_back`); null for anything else, which stays a word.
+ */
+export function searchDaysBack(value: string): number | null {
+  const lower = value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+  if (lower === "today") return 0;
+  if (lower === "yesterday") return 1;
+  const match = /^([0-9]{1,5})d$/.exec(lower);
+  return match ? Number(match[1]) : null;
+}
+
+/** The day `count` days before `day` (`#2425`), counted on the proleptic Gregorian calendar. */
+export function searchDayBefore(day: SearchDay, count: number): SearchDay {
+  const at = new Date(0);
+  at.setUTCFullYear(day.year, day.month - 1, day.day - count);
+  return { year: at.getUTCFullYear(), month: at.getUTCMonth() + 1, day: at.getUTCDate() };
+}
+
+/**
+ * The day a `before:` / `after:` value names (`#2425`): a calendar date in one of the three
+ * spellings, or, when `today` is known, a day counted back from it; else null (a word).
+ */
+export function searchDateValue(value: string, today: SearchDay | null): SearchDay | null {
+  const day = searchDay(value);
+  if (day || !today) return day;
+  const back = searchDaysBack(value);
+  return back === null ? null : searchDayBefore(today, back);
+}
 
 /** The phrase opening at `chars[at]`: its text as typed, and the index after it. */
 function searchPhraseAt(chars: readonly string[], at: number): { text: string; next: number } {
@@ -143,8 +175,12 @@ function searchTrimSpace(text: string): string {
   return chars.slice(start, end).join("");
 }
 
-/** The field node `raw` names when its value is valid, else null; a bare `from:` before a quote takes the phrase. */
-function searchField(raw: string, chars: readonly string[], cursor: { at: number }, mayTakePhrase: boolean): SearchNode | null {
+/**
+ * The field node `raw` names when its value is valid, else null; a bare `from:` before a quote takes the phrase.
+ * `today`, when known, reads a relative `before:` / `after:` value (`#2425`).
+ */
+function searchField(raw: string, chars: readonly string[], cursor: { at: number }, mayTakePhrase: boolean,
+  today: SearchDay | null): SearchNode | null {
   const colon = raw.indexOf(":");
   if (colon < 0) return null;
   const name = raw.slice(0, colon).replace(/[A-Z]/g, (letter) => letter.toLowerCase());
@@ -171,7 +207,7 @@ function searchField(raw: string, chars: readonly string[], cursor: { at: number
     // in the tree; `#` (quoted or not) names the hashtag label alone; the built-in stands.
     if (slug) node = { kind: "label", slug: afterPhrase !== null && !slug.startsWith("#") && slug !== "pinned" ? `"${slug}"` : slug };
   } else {
-    const day = searchDay(value);
+    const day = searchDateValue(value, today);
     if (day) node = { kind: name as "before" | "after", day };
   }
   if (node && afterPhrase !== null) cursor.at = afterPhrase;
@@ -182,7 +218,7 @@ function searchField(raw: string, chars: readonly string[], cursor: { at: number
 type SearchToken = "(" | ")" | "-" | "OR" | "AND" | "empty" | { readonly atom: SearchNode };
 
 /** Split a query into tokens: "(", ")", "-", "OR", "AND", "empty" (folded to nothing), or an atom. */
-function searchTokens(query: unknown): SearchToken[] {
+function searchTokens(query: unknown, today: SearchDay | null): SearchToken[] {
   const chars = Array.from(String(query));
   const out: SearchToken[] = [];
   let depth = 0;
@@ -220,7 +256,7 @@ function searchTokens(query: unknown): SearchToken[] {
       if (raw === "OR" || raw === "AND") {
         out.push(raw);
       } else {
-        const field = searchField(raw, chars, cursor, closes === 0);
+        const field = searchField(raw, chars, cursor, closes === 0, today);
         if (field) out.push({ atom: field });
         else {
           const word = searchFold(raw);
@@ -244,9 +280,13 @@ function searchCombine(items: readonly SearchNode[], kind: "and" | "or"): Search
   return flat.length === 1 ? flat[0]! : { kind, children: flat };
 }
 
-/** Parse a query into a tree of nodes, or null for no search. Never fails: what is not syntax is words. */
-export function searchQueryParse(query: unknown): SearchNode | null {
-  const tokens = searchTokens(query);
+/**
+ * Parse a query into a tree of nodes, or null for no search. Never fails: what is not syntax is words.
+ * `today` is the reader's calendar day (`#2425`): with it, a relative day (`after:7d`, `before:today`,
+ * `after:yesterday`) resolves here to the day it names; without it, it stays a word, as the server's `parse`.
+ */
+export function searchQueryParse(query: unknown, today: SearchDay | null = null): SearchNode | null {
+  const tokens = searchTokens(query, today);
   let at = 0;
   const and = (inGroup: boolean): SearchNode | null => {
     const items: SearchNode[] = [];
@@ -413,6 +453,30 @@ export function searchPositiveTerms(node: SearchNode | null): string[] {
   };
   walk(node);
   return [...new Set(out)];
+}
+
+/**
+ * `#2425`: the window every match lies in, from the query's top-level dates, as the server's
+ * `date_bounds`: the latest `after:` (or negated `before:`) day and the earliest `before:` (or
+ * negated `after:`) day; a date under OR bounds nothing. What the date chooser and its hint name.
+ */
+export function searchQueryDateBounds(node: SearchNode | null): { after: SearchDay | null; before: SearchDay | null } {
+  let after: SearchDay | null = null;
+  let before: SearchDay | null = null;
+  const order = (day: SearchDay): number => day.year * 10_000 + day.month * 100 + day.day;
+  const take = (at: SearchNode): void => {
+    const negated = at.kind === "not" ? at.child : null;
+    if (at.kind === "after" || (negated && negated.kind === "before")) {
+      const day = at.kind === "after" ? at.day : (negated as { day: SearchDay }).day;
+      if (!after || order(day) > order(after)) after = day;
+    } else if (at.kind === "before" || (negated && negated.kind === "after")) {
+      const day = at.kind === "before" ? at.day : (negated as { day: SearchDay }).day;
+      if (!before || order(day) < order(before)) before = day;
+    }
+  };
+  if (node && node.kind === "and") node.children.forEach(take);
+  else if (node) take(node);
+  return { after, before };
 }
 
 /** The most upstream queries one search sends; the same number as src/search_query.rs. */

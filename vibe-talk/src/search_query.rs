@@ -59,6 +59,12 @@
 //! - A field whose value is not valid is an ordinary word, as Gmail treats an unknown operator:
 //!   `from:` needs a value; `in:` takes `thread` or `main`; `has:` takes `link`; `before:` and
 //!   `after:` take a calendar date `YYYY-MM-DD`, `YYYY/MM/DD` or `MM/DD/YYYY`.
+//! - `#2425`: `before:` and `after:` also take a day counted back from the reader's today:
+//!   `Nd` (N days before today, `0d` is today), `today` and `yesterday` (any case; days only, up
+//!   to five digits). Only a parse that knows the reader's today ([`parse_on`]) reads them, and
+//!   it resolves them there to the calendar day they name, so the tree, the matcher and the
+//!   server's window see an ordinary day; without a today ([`parse`]) they stay words. The same
+//!   saved text therefore names a later day tomorrow: `after:7d` always means the last week.
 //!
 //! # Matching ([`Query::matches`])
 //!
@@ -268,6 +274,56 @@ impl Day {
     #[must_use]
     pub fn start_ms_at_offset(self, offset_minutes: i64) -> i64 {
         self.days_since_epoch() * 86_400_000 - offset_minutes * 60_000
+    }
+
+    /// The day `days` days after 1970-01-01 (Howard Hinnant's `civil_from_days`), the inverse
+    /// of [`Day::days_since_epoch`].
+    #[must_use]
+    pub fn from_days_since_epoch(days: i64) -> Self {
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let day_of_era = z - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let shifted_month = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+        let month = if shifted_month < 10 {
+            shifted_month + 3
+        } else {
+            shifted_month - 9
+        };
+        let year = year_of_era + era * 400 + i64::from(month <= 2);
+        Self {
+            year: i32::try_from(year).unwrap_or(if year < 0 { i32::MIN } else { i32::MAX }),
+            month: u32::try_from(month).unwrap_or(1),
+            day: u32::try_from(day).unwrap_or(1),
+        }
+    }
+
+    /// The day `count` days before this one (`#2425`: what `after:7d` names, from today).
+    #[must_use]
+    pub fn days_before(self, count: u32) -> Self {
+        Self::from_days_since_epoch(self.days_since_epoch() - i64::from(count))
+    }
+}
+
+/// How many days back from today a relative `before:` / `after:` value names (`#2425`): `Nd`,
+/// `today` (0) or `yesterday` (1), in any case; `None` for anything else, so it stays a word.
+#[must_use]
+pub fn days_back(value: &str) -> Option<u32> {
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "today" => Some(0),
+        "yesterday" => Some(1),
+        _ => {
+            let digits = lower.strip_suffix('d')?;
+            if digits.is_empty() || digits.len() > 5 || !digits.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            digits.parse().ok()
+        }
     }
 }
 
@@ -522,6 +578,38 @@ impl Query {
         }
     }
 
+    /// The window every match lies in, from the query's own date terms (`#2425`): the latest
+    /// day an `after:` (or a negated `before:`) standing at the top level names, and the
+    /// earliest day a `before:` (or a negated `after:`) names. Only top-level terms bound it,
+    /// because only they bind every match; a date under `OR` bounds nothing. A message outside
+    /// `[start of the first, start of the second)` cannot match, so a caller may skip it unread.
+    #[must_use]
+    pub fn date_bounds(&self) -> (Option<Day>, Option<Day>) {
+        let mut after: Option<Day> = None;
+        let mut before: Option<Day> = None;
+        let mut take = |node: &Node| match node {
+            Node::After(day) => after = Some(after.map_or(*day, |held| held.max(*day))),
+            Node::Not(inner) if matches!(**inner, Node::Before(_)) => {
+                if let Node::Before(day) = **inner {
+                    after = Some(after.map_or(day, |held| held.max(day)));
+                }
+            }
+            Node::Before(day) => before = Some(before.map_or(*day, |held| held.min(*day))),
+            Node::Not(inner) if matches!(**inner, Node::After(_)) => {
+                if let Node::After(day) = **inner {
+                    before = Some(before.map_or(day, |held| held.min(day)));
+                }
+            }
+            _ => {}
+        };
+        match &self.root {
+            Some(Node::And(children)) => children.iter().for_each(&mut take),
+            Some(node) => take(node),
+            None => {}
+        }
+        (after, before)
+    }
+
     /// Every positive word and phrase, folded, in order: what an index can be asked for.
     #[must_use]
     pub fn positive_terms(&self) -> Vec<String> {
@@ -593,8 +681,9 @@ enum Token {
     Atom(Node),
 }
 
-/// Split a query into tokens. See the module documentation for the rules.
-fn tokens(query: &str) -> Vec<Token> {
+/// Split a query into tokens. See the module documentation for the rules. `today` reads
+/// relative days (`#2425`).
+fn tokens(query: &str, today: Option<Day>) -> Vec<Token> {
     let chars: Vec<char> = query.chars().collect();
     let mut out = Vec::new();
     let mut depth = 0_usize;
@@ -639,7 +728,7 @@ fn tokens(query: &str) -> Vec<Token> {
                 out.push(Token::Or);
             } else if raw == "AND" {
                 out.push(Token::And);
-            } else if let Some(node) = field(&raw, &chars, &mut i, closes == 0) {
+            } else if let Some(node) = field(&raw, &chars, &mut i, closes == 0, today) {
                 out.push(Token::Atom(node));
             } else {
                 let word = fold(&raw);
@@ -672,8 +761,15 @@ fn folded_value(text: &str) -> String {
 
 /// The field `raw` names, when it is one with a valid value. A field with no value directly
 /// followed by a quote (`from:"Ada L"`) takes the phrase as its value, moving `*i` past it, when
-/// `may_take_phrase` (no `)` was cut from the token).
-fn field(raw: &str, chars: &[char], i: &mut usize, may_take_phrase: bool) -> Option<Node> {
+/// `may_take_phrase` (no `)` was cut from the token). `today`, when known, reads a relative
+/// `before:` / `after:` value (`#2425`).
+fn field(
+    raw: &str,
+    chars: &[char],
+    i: &mut usize,
+    may_take_phrase: bool,
+    today: Option<Day>,
+) -> Option<Node> {
     let (name, value) = raw.split_once(':')?;
     let name = name.to_ascii_lowercase();
     if !matches!(
@@ -714,8 +810,16 @@ fn field(raw: &str, chars: &[char], i: &mut usize, may_take_phrase: bool) -> Opt
             };
             (!slug.trim_matches('"').is_empty()).then_some(Node::Label(slug))
         }
-        "before" => Day::parse(&value).map(Node::Before),
-        _ => Day::parse(&value).map(Node::After),
+        _ => {
+            let day = Day::parse(&value).or_else(|| {
+                today.and_then(|today| days_back(&value).map(|back| today.days_before(back)))
+            });
+            if name == "before" {
+                day.map(Node::Before)
+            } else {
+                day.map(Node::After)
+            }
+        }
     }?;
     if let Some(next) = after_phrase {
         *i = next;
@@ -723,10 +827,23 @@ fn field(raw: &str, chars: &[char], i: &mut usize, may_take_phrase: bool) -> Opt
     Some(node)
 }
 
-/// Parse a query. Never fails: whatever cannot be read as syntax is read as words.
+/// Parse a query. Never fails: whatever cannot be read as syntax is read as words. Knows no
+/// today, so a relative day (`after:7d`) is a word; see [`parse_on`].
 #[must_use]
 pub fn parse(query: &str) -> Query {
-    let tokens = tokens(query);
+    parse_with(query, None)
+}
+
+/// [`parse`], reading relative days (`after:7d`, `before:today`, `after:yesterday`) against
+/// `today`, the reader's calendar day in the reader's zone (`#2425`). Each resolves here to the
+/// day it names, so the tree holds ordinary days.
+#[must_use]
+pub fn parse_on(query: &str, today: Day) -> Query {
+    parse_with(query, Some(today))
+}
+
+fn parse_with(query: &str, today: Option<Day>) -> Query {
+    let tokens = tokens(query, today);
     let mut parser = Parser {
         tokens: &tokens,
         at: 0,
@@ -973,6 +1090,15 @@ mod tests {
             .unwrap_or_else(|| panic!("corpus lacks {kind}"))
     }
 
+    /// A corpus case's query, parsed on its `today` when it names one (`#2425`).
+    fn parse_case(case: &Value) -> Query {
+        let query = case["query"].as_str().expect("query");
+        match case["today"].as_str() {
+            Some(today) => parse_on(query, Day::parse(today).expect("today is a date")),
+            None => parse(query),
+        }
+    }
+
     #[test]
     fn the_corpus_folds() {
         let corpus = corpus();
@@ -986,7 +1112,7 @@ mod tests {
     fn the_corpus_parses() {
         let corpus = corpus();
         for case in cases(&corpus, "parse") {
-            let query = parse(case["query"].as_str().expect("query"));
+            let query = parse_case(case);
             let tree = query.root().map_or(Value::Null, Node::to_json);
             assert_eq!(tree, case["tree"], "{case}");
         }
@@ -1039,7 +1165,7 @@ mod tests {
             .with_labels(&msg_labels)
             .with_plain_labels(&msg_plain)
             .with_pinned(message["pinned"].as_bool().unwrap_or(false));
-            let query = parse(case["query"].as_str().expect("query"));
+            let query = parse_case(case);
             let got = query.matches(&subject, &|day| day.start_ms_at_offset(offset));
             assert_eq!(got, case["matches"].as_bool().expect("matches"), "{case}");
         }
@@ -1242,6 +1368,94 @@ process.stdout.write(lines.join("\n"));
             checked += 1;
         }
         assert_eq!(checked, 4000);
+    }
+
+    #[test]
+    fn days_count_back_across_months_years_and_leap_days() {
+        let day = |year, month, day| Day { year, month, day };
+        for days in [
+            -800_000_i64,
+            -1,
+            0,
+            1,
+            59,
+            60,
+            365,
+            11_016,
+            20_784,
+            2_932_896,
+        ] {
+            assert_eq!(Day::from_days_since_epoch(days).days_since_epoch(), days);
+        }
+        assert_eq!(day(2026, 11, 27).days_before(7), day(2026, 11, 20));
+        assert_eq!(day(2026, 3, 1).days_before(1), day(2026, 2, 28));
+        assert_eq!(day(2028, 3, 1).days_before(1), day(2028, 2, 29));
+        assert_eq!(day(2027, 1, 3).days_before(10), day(2026, 12, 24));
+        assert_eq!(day(2026, 11, 27).days_before(0), day(2026, 11, 27));
+        assert_eq!(days_back("7d"), Some(7));
+        assert_eq!(days_back("TODAY"), Some(0));
+        assert_eq!(days_back("Yesterday"), Some(1));
+        assert_eq!(days_back("99999d"), Some(99_999));
+        for word in [
+            "d",
+            "7",
+            "7w",
+            "d7",
+            "-7d",
+            "100000d",
+            "7dd",
+            "\u{0661}d",
+            "tomorrow",
+        ] {
+            assert_eq!(days_back(word), None, "{word}");
+        }
+    }
+
+    #[test]
+    fn the_window_is_the_top_level_dates() {
+        let today = Day {
+            year: 2026,
+            month: 11,
+            day: 27,
+        };
+        let bounds = |q: &str| {
+            let (after, before) = parse_on(q, today).date_bounds();
+            (after.map(|d| d.to_string()), before.map(|d| d.to_string()))
+        };
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(bounds("deploy"), (None, None));
+        assert_eq!(bounds("after:7d"), (some("2026-11-20"), None));
+        assert_eq!(
+            bounds("x after:2026-11-01 after:7d before:2026-11-25 before:today"),
+            (some("2026-11-20"), some("2026-11-25")),
+            "the latest after, the earliest before"
+        );
+        assert_eq!(
+            bounds("-after:7d -before:2026-01-01"),
+            (some("2026-01-01"), some("2026-11-20")),
+            "a negated date bounds the other side"
+        );
+        assert_eq!(
+            bounds("a OR after:7d"),
+            (None, None),
+            "under OR a date binds nothing"
+        );
+        assert_eq!(
+            bounds("(after:7d x) y"),
+            (some("2026-11-20"), None),
+            "an AND group flattens into the top level"
+        );
+        assert_eq!(bounds("(after:7d OR x) y"), (None, None));
+        assert_eq!(
+            bounds("--after:7d"),
+            (None, None),
+            "a double negation is left alone: no bound is only ever wider"
+        );
+        assert_eq!(
+            parse("after:7d").date_bounds(),
+            (None, None),
+            "with no today a relative day is a word"
+        );
     }
 
     #[test]

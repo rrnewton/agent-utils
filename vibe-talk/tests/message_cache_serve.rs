@@ -1409,6 +1409,143 @@ async fn all_channels_searches_every_channel_the_server_answers_for() {
         .any(|scope| scope["channel"]["id"] == READ_CHANNEL && scope["state"] == "searched"));
 }
 
+/// `#2425 vibe-talk-search-date-filter`: what one channel's scope says it examined.
+fn examined(body: &Value) -> i64 {
+    body["scopes"][0]["examined"].as_i64().expect("examined")
+}
+
+#[tokio::test]
+async fn a_dated_search_reads_only_its_window_and_counts_only_what_it_read() {
+    // `#2425 vibe-talk-search-date-filter`: the query's dates bound the rows the server reads,
+    // on the one-channel route and the all-channels route alike: a row outside the window is
+    // not a hit, is not counted in `examined`, and paging never crosses the bound.
+    const DAY: i64 = 24 * HOUR;
+    let d = deployment("cache-search-window").await;
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    // The fixture's twelve rows are on 2026-08-18; three older ones, 3, 9 and 30 days back.
+    for back in [3, 9, 30] {
+        d.fake.seed_at(
+            &read,
+            "Ada",
+            &format!("message old {back}"),
+            T0 - back * DAY,
+        );
+    }
+    d.fill_timeline().await;
+    d.state.message_cache.set_serve(true);
+    let search = |query: &str| {
+        let uri = search_path(READ_CHANNEL, query);
+        let state = d.state.clone();
+        async move { ok(&state, &uri, WRITE_TOKEN).await }
+    };
+
+    let body = search("message").await;
+    assert_eq!(
+        (hit_texts(&body).len(), examined(&body)),
+        (15, 15),
+        "{body}"
+    );
+
+    // after: includes its day; the two rows older than 2026-08-10 are never read.
+    let body = search("message after:2026-08-10").await;
+    assert_eq!(examined(&body), 13, "{body}");
+    assert_eq!(
+        hit_texts(&body).last().map(String::as_str),
+        Some("message old 3")
+    );
+    assert!(body["scopes"][0]["resume_below_ms"].is_null(), "{body}");
+    // before: excludes its day.
+    let body = search("message before:2026-08-18").await;
+    assert_eq!(
+        hit_texts(&body),
+        ["message old 3", "message old 9", "message old 30"]
+    );
+    assert_eq!(examined(&body), 3, "{body}");
+    // Both: a closed range; a negated date bounds the other side.
+    let body = search("message after:2026-08-10 before:2026-08-18").await;
+    assert_eq!(
+        (hit_texts(&body), examined(&body)),
+        (vec!["message old 3".to_owned()], 1)
+    );
+    let body = search("message -after:2026-08-10").await;
+    assert_eq!(hit_texts(&body), ["message old 9", "message old 30"]);
+    assert_eq!(examined(&body), 2, "{body}");
+    // A date alone is a search (Q3), and a date under OR bounds nothing.
+    let body = search("after:2026-08-18").await;
+    assert_eq!(
+        (hit_texts(&body).len(), examined(&body)),
+        (12, 12),
+        "{body}"
+    );
+    let body = search("zzz OR after:2026-08-18").await;
+    assert_eq!(
+        (hit_texts(&body).len(), examined(&body)),
+        (12, 15),
+        "{body}"
+    );
+    // An empty window answers empty, having read nothing; it is not an error.
+    let body = search("message after:2026-08-18 before:2026-08-10").await;
+    assert_eq!((hit_texts(&body).len(), examined(&body)), (0, 0), "{body}");
+    // A relative day is read against the server's today, months after every row here.
+    let body = search("message after:7d").await;
+    assert_eq!((hit_texts(&body).len(), examined(&body)), (0, 0), "{body}");
+    let body = search("message before:yesterday").await;
+    assert_eq!(
+        (hit_texts(&body).len(), examined(&body)),
+        (15, 15),
+        "{body}"
+    );
+    // An invalid date is a word, never an error (and no row holds that word).
+    let body = search("message after:7w").await;
+    assert!(hit_texts(&body).is_empty(), "{body}");
+    assert_eq!(body["scopes"][0]["state"], "searched", "{body}");
+
+    // Paging stays inside the window: a limit cuts, and the next answer goes on below it,
+    // never past the bound.
+    let first = ok(
+        &d.state,
+        &format!(
+            "{}&limit=12",
+            search_path(READ_CHANNEL, "message after:2026-08-10")
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(hit_texts(&first).len(), 12);
+    let resume = first["resume_below_ms"].as_i64().expect("more to search");
+    let next = ok(
+        &d.state,
+        &format!(
+            "{}&below={resume}",
+            search_path(READ_CHANNEL, "message after:2026-08-10")
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(hit_texts(&next), ["message old 3"], "{next}");
+    assert_eq!(examined(&next), 1, "{next}");
+    assert!(next["resume_below_ms"].is_null(), "{next}");
+
+    // The all-channels route bounds every channel the same way.
+    let body = ok(
+        &d.state,
+        &format!(
+            "/api/v1/search?q={}&tz=UTC",
+            url_encode("message after:2026-08-10 before:2026-08-18")
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(hit_texts(&body), ["message old 3"], "{body}");
+    let scope = body["scopes"]
+        .as_array()
+        .expect("scopes")
+        .iter()
+        .find(|scope| scope["channel"]["id"] == READ_CHANNEL)
+        .expect("the read channel's scope");
+    assert_eq!(scope["examined"], 1, "{scope}");
+}
+
 #[tokio::test]
 async fn a_slack_search_finds_replies_in_their_threads_and_withholds_a_thread_in_doubt() {
     let (state, fake, clock, _dir) = slack_deployment("cache-search-slack").await;

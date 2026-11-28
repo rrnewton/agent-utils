@@ -541,17 +541,19 @@ pub(crate) struct SearchRow {
     pub(crate) in_thread: bool,
 }
 
-/// The newest rows of `chan` created before `below_ms` in the scopes `scope_sql` selects (a
-/// condition on `s.scope_key`), newest first: `budget` of them, and then every other row sharing
-/// the last one's millisecond, so a batch always ends on a whole millisecond and a continuation
-/// below it skips nothing. Also whether older rows remain.
+/// The newest rows of `chan` created in `[from_ms, below_ms)` (`window`) in the scopes
+/// `scope_sql` selects (a condition on `s.scope_key`), newest first: `budget` of them, and then
+/// every other row sharing the last one's millisecond, so a batch always ends on a whole
+/// millisecond and a continuation below it skips nothing. Also whether older rows remain in the
+/// window. `#2425`: the lower bound is in the SQL, so a row older than the window is never read.
 pub(crate) fn search_rows(
     connection: &Connection,
     chan: &ChanKey,
     scope_sql: &str,
-    below_ms: i64,
+    window: (i64, i64),
     budget: usize,
 ) -> rusqlite::Result<(Vec<SearchRow>, bool)> {
+    let (from_ms, below_ms) = window;
     let Some(chan_id) = chan_id(connection, chan)? else {
         return Ok((Vec::new(), false));
     };
@@ -559,13 +561,13 @@ pub(crate) fn search_rows(
         let mut statement = connection.prepare(&format!(
             "SELECT {MESSAGE_COLUMNS}, m.search_text, m.thread_id IS NOT NULL AND m.is_root = 0
              FROM message m
-             WHERE m.chan = ?1 AND {condition}
+             WHERE m.chan = ?1 AND {condition} AND m.created_ms >= ?4
                AND EXISTS (SELECT 1 FROM message_scope s
                            WHERE s.row_id = m.row_id AND s.chan = ?1 AND ({scope_sql}))
              ORDER BY m.created_ms DESC, m.numeric_id DESC, m.message_id DESC LIMIT ?3"
         ))?;
         let rows = statement
-            .query_map(params![chan_id, upper_ms, limit], |row| {
+            .query_map(params![chan_id, upper_ms, limit, from_ms], |row| {
                 Ok(SearchRow {
                     message: cached(&chan.channel_id, row)?,
                     search_text: row.get(10)?,
@@ -590,22 +592,24 @@ pub(crate) fn search_rows(
 
 /// [`search_rows`] driven by the full-text index (`#604 server-side-search`): only the rows whose
 /// folded `search_text` holds every one of `patterns` (`LIKE`, which the trigram index answers
-/// without positions), newest first, `budget` of them and the rest of the last one's millisecond;
-/// and whether older such rows remain. Every row a query whose required terms are these patterns
-/// could match is among them, so a continuation below the last skips nothing.
+/// without positions), created in `[from_ms, below_ms)` (`window`, `#2425`), newest first,
+/// `budget` of them and the rest of the last one's millisecond; and whether older such rows
+/// remain. Every row a query whose required terms are these patterns could match is among
+/// them, so a continuation below the last skips nothing.
 pub(crate) fn search_candidates(
     connection: &Connection,
     chan: &ChanKey,
     scope_sql: &str,
-    below_ms: i64,
+    window: (i64, i64),
     patterns: &[String],
     budget: usize,
 ) -> rusqlite::Result<(Vec<SearchRow>, bool)> {
+    let (from_ms, below_ms) = window;
     let Some(chan_id) = chan_id(connection, chan)? else {
         return Ok((Vec::new(), false));
     };
     let likes = (0..patterns.len())
-        .map(|n| format!("search_text LIKE ?{}", n + 4))
+        .map(|n| format!("search_text LIKE ?{}", n + 5))
         .collect::<Vec<_>>()
         .join(" AND ");
     let select = |condition: &str, limit: i64, upper_ms: i64| -> rusqlite::Result<Vec<SearchRow>> {
@@ -613,13 +617,17 @@ pub(crate) fn search_candidates(
             "SELECT {MESSAGE_COLUMNS}, m.search_text, m.thread_id IS NOT NULL AND m.is_root = 0
              FROM (SELECT rowid AS r FROM message_fts WHERE {likes}) AS f
              CROSS JOIN message AS m ON m.row_id = f.r
-             WHERE m.chan = ?1 AND {condition}
+             WHERE m.chan = ?1 AND {condition} AND m.created_ms >= ?4
                AND EXISTS (SELECT 1 FROM message_scope s
                            WHERE s.row_id = m.row_id AND s.chan = ?1 AND ({scope_sql}))
              ORDER BY m.created_ms DESC, m.numeric_id DESC, m.message_id DESC LIMIT ?3"
         ))?;
-        let mut values: Vec<rusqlite::types::Value> =
-            vec![chan_id.into(), upper_ms.into(), limit.into()];
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            chan_id.into(),
+            upper_ms.into(),
+            limit.into(),
+            from_ms.into(),
+        ];
         values.extend(
             patterns
                 .iter()

@@ -70,6 +70,22 @@ impl Zone {
             .ok()
             .map(|start| start.timestamp().as_millisecond())
     }
+
+    /// The calendar day (year, month, day) an instant falls on in this zone: the reader's today,
+    /// against which a search's relative days (`after:7d`) are read (`#2425`). `None` for an
+    /// instant outside what the zone database can place.
+    #[must_use]
+    pub fn date_at_ms(&self, instant_ms: i64) -> Option<(i32, u32, u32)> {
+        let date = jiff::Timestamp::from_millisecond(instant_ms)
+            .ok()?
+            .to_zoned(self.tz.clone())
+            .date();
+        Some((
+            i32::from(date.year()),
+            u32::try_from(date.month()).ok()?,
+            u32::try_from(date.day()).ok()?,
+        ))
+    }
 }
 
 /// Resolve an IANA zone name such as `America/New_York` or `UTC`.

@@ -2597,6 +2597,7 @@ impl Sink {
         let request = SearchRequest {
             query: ask.query,
             view,
+            from_ms: ask.from_ms,
             below_ms: ask.below_ms,
             limit: ask.limit,
             budget: ask.budget,

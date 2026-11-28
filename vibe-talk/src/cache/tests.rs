@@ -3341,6 +3341,7 @@ fn a_cache_search_matches_with_the_shared_language_and_says_how_far_back_it_look
         let request = SearchRequest {
             query: &query,
             view,
+            from_ms: i64::MIN,
             below_ms: i64::MAX,
             limit,
             budget,
@@ -3367,7 +3368,10 @@ fn a_cache_search_matches_with_the_shared_language_and_says_how_far_back_it_look
         (T0 + STEP, head.settled_top())
     );
     assert!(!horizon.at_age_limit);
-    assert_eq!(whole.searched_back_to_ms(i64::MAX), Some(T0 + STEP));
+    assert_eq!(
+        whole.searched_back_to_ms(i64::MIN, i64::MAX),
+        Some(T0 + STEP)
+    );
 
     // All brings the replies the cache holds; Main does not; in:thread picks them out.
     assert_eq!(
@@ -3387,7 +3391,10 @@ fn a_cache_search_matches_with_the_shared_language_and_says_how_far_back_it_look
     let budgeted = search("cafe OR andoff", SearchView::Main, 10, 3);
     assert_eq!(hit_ids(&budgeted.hits), ids(&["m5"]));
     assert_eq!(budgeted.resume_below_ms, Some(T0 + 4 * STEP));
-    assert_eq!(budgeted.searched_back_to_ms(i64::MAX), Some(T0 + 4 * STEP));
+    assert_eq!(
+        budgeted.searched_back_to_ms(i64::MIN, i64::MAX),
+        Some(T0 + 4 * STEP)
+    );
     let limited = search("cafe OR andoff", SearchView::Main, 1, 100);
     assert_eq!(
         (limited.examined, limited.resume_below_ms),
@@ -3400,14 +3407,14 @@ fn a_cache_search_matches_with_the_shared_language_and_says_how_far_back_it_look
     ] {
         assert!(zero.hits.is_empty());
         assert_eq!(zero.resume_below_ms, Some(i64::MAX));
-        assert_eq!(zero.searched_back_to_ms(i64::MAX), None);
+        assert_eq!(zero.searched_back_to_ms(i64::MIN, i64::MAX), None);
     }
-    assert_eq!(whole.searched_back_to_ms(T0 + STEP), None);
+    assert_eq!(whole.searched_back_to_ms(i64::MIN, T0 + STEP), None);
 
     // No search vouches for nothing.
     let empty = search("  ", SearchView::Main, 10, 100);
     assert!(empty.hits.is_empty());
-    assert_eq!(empty.searched_back_to_ms(i64::MAX), None);
+    assert_eq!(empty.searched_back_to_ms(i64::MIN, i64::MAX), None);
 }
 
 #[test]
@@ -3440,6 +3447,7 @@ fn a_search_finds_a_reply_observed_before_a_channel_drop_and_flags_it_stale() {
     let request = SearchRequest {
         query: &query,
         view: SearchView::All,
+        from_ms: i64::MIN,
         below_ms: i64::MAX,
         limit: 10,
         budget: 100,
@@ -3517,6 +3525,7 @@ fn a_cache_search_takes_rare_terms_from_the_index_once_every_text_is_folded() {
         let request = SearchRequest {
             query: &query,
             view: SearchView::Main,
+            from_ms: i64::MIN,
             below_ms: i64::MAX,
             limit: 50,
             budget: 1_000,
@@ -3550,7 +3559,7 @@ fn a_cache_search_takes_rare_terms_from_the_index_once_every_text_is_folded() {
     assert_eq!(hit_ids(&rare.hits), ids(&["m201", "m11"]));
     assert_eq!((rare.examined, rare.resume_below_ms), (2, None));
     assert_eq!(
-        rare.searched_back_to_ms(i64::MAX),
+        rare.searched_back_to_ms(i64::MIN, i64::MAX),
         Some(T0 + STEP),
         "every row vouched for"
     );
@@ -3597,6 +3606,93 @@ fn a_cache_search_takes_rare_terms_from_the_index_once_every_text_is_folded() {
 }
 
 #[test]
+fn a_dated_cache_search_never_reads_a_row_outside_its_window_on_either_path() {
+    // `#2425 vibe-talk-search-date-filter`: the query's dates bound the rows in SQL, so a row
+    // outside `[from_ms, below_ms)` is neither read nor tested nor counted in `examined`, on the
+    // index path and on the scan alike, and a search that reaches the window's floor says so.
+    use super::search::{SearchRequest, SearchView};
+    let fx = Fixture::new("cache-search-window");
+    let first = T0 + 400 * STEP;
+    fx.clock.set(first);
+    let mut rows: Vec<Message> = (1..=300).map(m).collect();
+    rows[10].content = "the zebracrossing, long ago".to_owned();
+    rows[200].content = "zebracrossing again, lately".to_owned();
+    fx.list(rows, first, Some(newest_proof(ListStart::At(T0 + STEP))));
+    fx.cache.maintain(Maintenance::RebuildSearchText);
+    assert!(fx.cache.quiesce_blocking(Duration::from_secs(30)));
+    assert!(fx.cache.search_text_current());
+    let day = |d: crate::search_query::Day| d.start_ms_at_offset(0);
+    let at = |i: i64| T0 + i * STEP;
+    let search = |query: &str, from_ms: i64, below_ms: i64, budget: usize| {
+        let query = crate::search_query::parse(query);
+        let request = SearchRequest {
+            query: &query,
+            view: SearchView::Main,
+            from_ms,
+            below_ms,
+            limit: 500,
+            budget,
+            day_start_ms: &day,
+            pinned_ids: &std::collections::HashSet::new(),
+            manual_labels: &std::collections::HashMap::new(),
+        };
+        fx.cache
+            .search(&fx.chan, &request)
+            .served()
+            .expect("served")
+    };
+    let hit_ids = |hits: &[CachedMessage]| -> Vec<String> {
+        hits.iter().map(|h| h.message.id.0.clone()).collect()
+    };
+
+    // The index path: the old zebra row is never a candidate, so it is never tested.
+    let rare = search("zebracrossing", at(100), i64::MAX, 1_000);
+    assert!(rare.indexed);
+    assert_eq!(hit_ids(&rare.hits), ids(&["m201"]));
+    assert_eq!((rare.examined, rare.resume_below_ms), (1, None));
+    assert_eq!(
+        rare.searched_back_to_ms(at(100), i64::MAX),
+        Some(at(100)),
+        "it vouches for its window, never below it"
+    );
+
+    // The scan: only the window's rows are read, newest first, and it stops at the floor.
+    let recent = search("body", at(291), i64::MAX, 1_000);
+    assert!(!recent.indexed);
+    assert_eq!(recent.examined, 10, "m291..m300 and nothing older");
+    assert_eq!(recent.hits.len(), 10);
+    assert_eq!(
+        recent.resume_below_ms, None,
+        "the window's floor is the end"
+    );
+    let closed = search("body", at(100), at(110), 1_000);
+    assert_eq!(closed.examined, 10, "m100..m109");
+    assert_eq!(
+        hit_ids(&closed.hits).first().map(String::as_str),
+        Some("m109")
+    );
+    assert_eq!(
+        hit_ids(&closed.hits).last().map(String::as_str),
+        Some("m100")
+    );
+
+    // The budget is spent inside the window: a small one stops there, and the next search,
+    // below where it stopped, goes on inside the same window.
+    let budgeted = search("body", at(100), i64::MAX, 50);
+    assert_eq!(budgeted.examined, 50);
+    let resume = budgeted.resume_below_ms.expect("more inside the window");
+    assert_eq!(resume, at(251));
+    let rest = search("body", at(100), resume, 1_000);
+    assert_eq!(rest.examined, 151, "m100..m250: the window, never past it");
+    assert_eq!(rest.resume_below_ms, None);
+
+    // An empty window reads nothing at all.
+    let empty = search("body", at(110), at(100), 1_000);
+    assert!(empty.hits.is_empty());
+    assert_eq!((empty.examined, empty.resume_below_ms), (0, None));
+}
+
+#[test]
 fn a_cache_search_for_label_pinned_reads_the_pin_set_alone() {
     // `#1853`: `label:pinned` matches the caller's pin set, never a hashtag:
     // m3's text says #pinned (reserved, no label) and m2 is pinned with no
@@ -3616,6 +3712,7 @@ fn a_cache_search_for_label_pinned_reads_the_pin_set_alone() {
         let request = SearchRequest {
             query: &query,
             view: SearchView::Main,
+            from_ms: i64::MIN,
             below_ms: i64::MAX,
             limit: 50,
             budget: 1_000,
@@ -3663,6 +3760,7 @@ fn a_cache_search_horizon_stops_at_the_age_limit() {
         let request = SearchRequest {
             query: &query,
             view: SearchView::Main,
+            from_ms: i64::MIN,
             below_ms: i64::MAX,
             limit: 100,
             budget: 100,
@@ -3708,6 +3806,7 @@ fn a_cache_search_stops_only_on_a_whole_millisecond() {
         let request = SearchRequest {
             query: &query,
             view: SearchView::Main,
+            from_ms: i64::MIN,
             below_ms,
             limit,
             budget,

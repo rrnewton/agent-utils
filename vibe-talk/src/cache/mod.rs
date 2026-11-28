@@ -2462,7 +2462,7 @@ impl MessageCache {
                     &snapshot,
                     chan,
                     request.view.scope_sql(),
-                    request.below_ms,
+                    (request.from_ms, request.below_ms),
                     &patterns,
                     request.budget,
                 )?
@@ -2471,7 +2471,7 @@ impl MessageCache {
                     &snapshot,
                     chan,
                     request.view.scope_sql(),
-                    request.below_ms,
+                    (request.from_ms, request.below_ms),
                     request.budget,
                 )?
             };
@@ -2486,7 +2486,7 @@ impl MessageCache {
                     &snapshot,
                     chan,
                     request.view.scope_sql(),
-                    outcome.resume_below_ms.unwrap_or(i64::MIN),
+                    outcome.resume_below_ms.unwrap_or(request.from_ms),
                     request.below_ms,
                 )?;
             }
@@ -2544,8 +2544,13 @@ impl MessageCache {
         let scope_key = view.horizon_scope().key();
         self.read_scope(chan, &scope_key, |connection| {
             let snapshot = connection.unchecked_transaction()?;
-            let (rows, _more) =
-                reader::search_rows(&snapshot, chan, view.scope_sql(), i64::MAX, budget)?;
+            let (rows, _more) = reader::search_rows(
+                &snapshot,
+                chan,
+                view.scope_sql(),
+                (i64::MIN, i64::MAX),
+                budget,
+            )?;
             snapshot.finish()?;
             // `#2279`: the menu-added labels merged in as serving merges them, so a message
             // carrying `#kvm` both typed and added counts once.
