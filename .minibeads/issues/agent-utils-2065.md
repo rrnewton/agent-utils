@@ -8,7 +8,7 @@ labels:
 - agentctl
 - testing
 created_at: 2026-11-21T12:45:00-05:00
-updated_at: 2026-11-28T07:42:00-05:00
+updated_at: 2026-11-28T11:06:00-05:00
 ---
 
 # Description
@@ -136,6 +136,12 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
   - Every other wrkslots step ran with it (namespaced shards 2-14, host shards 0-2, lifecycle namespace 0-5 and host 0-2). Each failure was rerun without the stand-in: all fail the same way without it (local temp-dir artifacts), and the few that differed between the two runner invocations pass both ways when run identically, 2 rounds each. No test relied on a git child outliving its call.
   - Earlier prototypes, dropped: a subreaper that waits for every descendant (shards 2.4-2.75x slower: each call waits out the helper) and the namespace stand-in in Python (45 ms per call).
   - The stand-in's own test (`test_git_stand_in.py`) runs it for real: a detached grandchild is gone when the call returns, arguments and signal deaths pass through, and git's own SIGTERM handling decides the exit.
+- **Cross-gate /dev/shm collision, fixed (2026-11-28, 6c0f7500).** The namespacing above made every namespaced shard's pytest the same small pid inside its namespace (20 in a gate). Two fixtures named their /dev/shm directory by pid: `test_remove_write_rust.py` `_own_fs` (also used by `test_remove_lock_scope_rust.py`) and `test_census_foreign_fds.py`. /dev/shm is host-wide, so the same test in two concurrent gates shared one directory, and one run's cleanup deleted the other's fixture. Two gates failed `test_remove_ignored_file_discards_in_both_editions` that way in the same minutes. Both sites now use `tempfile.mkdtemp(dir="/dev/shm")`. Control: two namespaced runs of the case at once, 3 trials: main 6 of 6 failed, the fix 6 of 6 passed.
+  - Sweep done for tests AND product: pid-keyed or otherwise non-unique host-wide paths (/dev/shm, /run/user, /tmp and the private-root parent /tmp/aut-<uid>, lock files, sockets, user systemd units) that a namespaced shard could share with another gate. Only the wrkslots steps run namespaced. Found safe: private_tmp.py roots (owner record with pid_namespace), the stand-in's mkdtemp, the lifecycle exclusion roots and guards, abstract sockets that embed a private path, pid-named files inside private dirs, and systemd-unit names (the user manager is unreachable from the namespace).
+  - What remains:
+    - #2471 socket-selftest-cross-namespace-sweep (filed): the socket-probe self-test's stale sweep judges each creator pid in its own PID namespace, under the host /tmp.
+    - To audit, listed in #2471: the product readers of the real gate admission directory (`_gate_admission_dir`).
+  - Found while stopping an invalid gate: #2472 gate-abort-leaves-dagrun-scope (filed). A gate stopped by SIGTERM left its dagrun scope and steps running.
 - **Related.**
   - Two `test_worktrees_image` busy-holder tests hit the 600 s per-test timeout inside `scan_mount_holders` on another gate. #2372's test fix (906b54fc) gives them a fixture proc root, and its production change (#2372 50a174b4, pending) parses each distinct mount table once.
   - Outside #2065, noted for #2382's audit annex: `cross.herdr-run.differential`, `rust.merge-queue.test` and `vibe-talk.check.documents-browser` were red in the discovery gate.
