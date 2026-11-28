@@ -1223,6 +1223,20 @@
     width: calc(50% - 1.2rem);
   }
 
+  /* `#2445 search-clear-two-columns-found-hold`. Those chips float over the left list only, so the right
+     column's box, and its pane while a reply is open in it, keep no room for them. They kept the left
+     column's (`--scroll-tools-clearance`, the rule they share with the channel's box): the left list's
+     Newest pill coming up, as a found message was held there when a search cleared, grew the right
+     column's foot under a reader standing at it, and a reply arriving in its thread was not followed. */
+  #screen-main[data-columns="two"] #side-composer {
+    padding-bottom: calc(max(1rem, env(safe-area-inset-bottom)) + var(--read-steer-clearance, 0px));
+  }
+
+  #screen-main[data-columns="two"] #side-pane:has(> #side-reply:not([hidden])),
+  #screen-main[data-columns="two"] #side-list:has(> #side-reply:not([hidden])) {
+    padding-bottom: calc(max(1rem, env(safe-area-inset-bottom)) + var(--read-steer-clearance, 0px) + 2.4rem);
+  }
+
   /* The transient status speaks over the left column, where its chips are, not across the divider. */
   :root[data-screen="main"] #frame-body[data-columns="two"] #status-line {
     inset-inline: 0 50%;

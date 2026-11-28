@@ -33,8 +33,9 @@ At each size, in two columns with a mouse:
 
   THREAD. The short thread, opened by its card's replies button, opens at its foot with no room past it and
   no jump (LANDING) -> a small turn of the wheel takes the reader a little way into the room, and the jump
-  stays down (JUMP) -> a reply arriving then is followed as at the foot: the reader at or past the new
-  foot, the reply on screen, nothing offered as new (FOLLOW) -> PgDn goes on to the end of the room, the
+  stays down (JUMP) -> a reply arriving then moves nothing: the row being read keeps its top at every frame,
+  the reply shows below it, offered by the jump where any of it is below the fold (FOLLOW; `#2445`, owner
+  rule 370, replacing the old "followed as at the foot") -> End, then PgDn goes on to the end of the room, the
   last reply's top at the middle (PAGING) -> a short reply arriving there moves nothing for 1.5 s sampled
   at every frame and is drawn on screen in the room (STILL), and PgDn again brings its top to the middle:
   the room was fitted to it (FIT) -> End lands on the foot and closes the room (END) -> a reply arriving
@@ -59,7 +60,7 @@ INCONCLUSIVE and fails the walk, rather than passing a check that measured nothi
 THE NEGATIVE CONTROLS run the walk at 1920x1080 (where the thread has room past its foot) against copies of
 the page with one part of it taken out, and each must fail at the check that part answers for: the
 stylesheet drawing no room (WHEEL); the room not counted as the foot (JUMP or FOLLOW); a follower in the
-room taken back to the foot (STILL); no rest asked of the wheel before it opens the room (DETENT); the last
+room taken back to the foot (FOLLOW or STILL); no rest asked of the wheel before it opens the room (DETENT); the last
 card's change of size neither fitted to at the press nor held as its size is reported (HIGHLIGHT); and the
 search not among what the room was opened over (SEARCH). That is what proves the walk can see each of them.
 
@@ -111,6 +112,8 @@ ROOM_WORDS = f"{SUMMARY} {SUMMARY}"
 # open over the search would still have somewhere to go.
 EXTRA_THREADS = 14
 SEARCH_HITS = 10
+# `#2445`: how far the row being read may move, at any frame, as a reply arrives with the reader in the room.
+FOLLOW_PX = 0.5
 SEARCH_WORD = "kestrel"
 # How far from the middle of the column the last card's top may stop: sub-pixel layout and rounding.
 MIDDLE_PX = 2.0
@@ -308,12 +311,12 @@ CONTROLS: tuple[Control, ...] = (
     ("a follower in the room taken to the foot", FOOT_ROOMS,
      (("      if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;\n", ""),
       (LIVE_STREAM, "      if (ownSend(message, selfPosted)) {\n", "      if (true) {\n"),
-      (READ_CORE, "    !followsOwnSend;\n", "    !followsOwnSend && false;\n")), ("STILL",)),
+      (READ_CORE, "    !followsOwnSend;\n", "    !followsOwnSend && false;\n")), ("FOLLOW", "STILL")),
     # `#2230`: the follow of an arrival at the foot put back, as the page before owner 370 had it (`#1209`'s
     # follow-at-rest): the reply arriving at the thread's foot moves the row being read (ARRIVE).
     ("an arrival followed at the foot", LIVE_STREAM,
      (("      if (ownSend(message, selfPosted)) {\n", "      if (true) {\n"),
-      (READ_CORE, "    !followsOwnSend;\n", "    !followsOwnSend && false;\n")), ("ARRIVE",)),
+      (READ_CORE, "    !followsOwnSend;\n", "    !followsOwnSend && false;\n")), ("FOLLOW", "ARRIVE")),
     ("no rest asked of the wheel", FOOT_ROOMS,
      (("const OVERSCROLL_REST_MS = 150;\n", "const OVERSCROLL_REST_MS = 0;\n"),), ("DETENT",)),
     ("the last card's change of size neither fitted to nor held", "src/app/main.js",
@@ -437,7 +440,7 @@ def control_probe(reader: Reader, rest_ms: float, tags: tuple[str, ...]) -> None
     failure tags. Each probe uses the same wheel, key, and frame assertions.
     An unknown control fails here rather than silently receiving less coverage.
     """
-    if tags in (("JUMP", "FOLLOW"), ("STILL",), ("ARRIVE",)):
+    if tags in (("JUMP", "FOLLOW"), ("FOLLOW", "STILL"), ("FOLLOW", "ARRIVE")):
         thread_walk(reader)
     elif tags == ("DETENT",):
         back_up(reader, "side-cards", "DETENT")
@@ -782,19 +785,34 @@ def thread_walk(reader: Reader) -> None:
                  f"a small turn of the wheel did not take the reader a little way into the room: {room}")
     reader.check(not room.jump, f"JUMP: the jump came up in the room past the foot: {room}")
 
-    # A reply arriving then is followed as at the foot.
+    # A reply arriving then lands in the room below the row being read, which keeps its top at every frame
+    # (`#2445`, liaison 1152, owner rule 370 / `#2230`; this replaces `#338`'s "followed as at the foot", which
+    # the page met only when the left column's chips left a frame later and shrank this column's foot under
+    # the reader, `#2444`): the reply shows below it, and the jump offers it where any of it is below the fold.
+    before = reader.first("side-log")
+    reader.watch("side-log")
     first = api.add("A short reply, arriving.", ROOM)
     api.push("message", {"message": first}, str(first["id"]))
     reader.wait_for(f"() => !!document.querySelector(\"#side-log > li[data-id='{first['id']}']\")",
                     "the live reply never reached the thread on the right")
-    reader.quiet(900)
+    # At every frame the row being read is the first on screen and within 0.5 px of where it was (the
+    # liaison's bar for this case, tighter than the walk's usual pixel).
+    for sample in reader.watch_settled("a reply arriving with the reader a little way into the room"):
+        assert isinstance(sample, list) and len(sample) == 3
+        row, offset, _gap = sample
+        assert isinstance(row, str) and isinstance(offset, (int, float))
+        reader.check(row == before[0] and abs(float(offset) - before[1]) <= FOLLOW_PX,
+                     f"FOLLOW: a reply arriving with the reader a little way into the room moved the row being read: "
+                     f"row {before[0]} at {before[1]:.1f}px became row {row} at {float(offset):.1f}px")
     room = measure(reader, "side-log")
-    reader.check(room.top >= room.foot - 1 and not room.jump and not room.arrivals and room.last_id == first["id"]
-                 and room.last_bottom <= room.height,
-                 f"FOLLOW: a reply arriving with the reader in the room was not followed as at the foot: {room}")
-    reader.notes.append("a reply arriving with the reader a little way into the room was followed, the jump down")
+    shown = room.last_id == first["id"] and room.last_bottom <= room.height
+    reader.check(room.last_id == first["id"] and (shown or room.jump or room.arrivals),
+                 f"FOLLOW: the reply that arrived in the room is not shown below the row being read, nor offered: {room}")
+    reader.notes.append("a reply arriving with the reader a little way into the room moved nothing and showed below "
+                        "the row being read" + ("" if shown else ", offered by the jump"))
 
-    # PgDn to the end of the room.
+    # End to the foot, then PgDn to the end of the room.
+    key(reader, "End")
     key(reader, "PageDown")
     room = measure(reader, "side-log")
     reader.check(room.top > room.foot + 20, f"PAGING: PgDn at the foot of the thread did not go on past it: {room}")
