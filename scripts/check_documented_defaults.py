@@ -1449,6 +1449,42 @@ PINS: tuple[Pin, ...] = (
             ),
         ),
     ),
+    Pin(
+        "agent-teams-rate-runaway-factor",
+        "how many times its hourly limit a sender reaches before the receiver paces it (#2420)",
+        code=(
+            Site(
+                "rs/agent-teams/src/ledger.rs",
+                r"(?m)^pub const RATE_RUNAWAY_FACTOR: u64 = (?P<value>[\d_]+);$",
+                "the Rust pacing factor",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agent-teams/src/embedded_userguide.md",
+                r"runaway,\s+at\s+(?P<value>[A-Za-z\d,]+)\s+times\s+the\s+limit",
+                "the pacing factor the agent-teams guide states",
+            ),
+        ),
+    ),
+    Pin(
+        "agent-teams-saved-body-preview-lines",
+        "how many first lines of a saved body the coordinator is shown inline (#2420)",
+        code=(
+            Site(
+                "rs/agent-teams/src/ledger.rs",
+                r"(?m)^const PREVIEW_MAX_LINES: usize = (?P<value>[\d_]+);$",
+                "the Rust preview bound",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agent-teams/src/embedded_userguide.md",
+                r"the\s+body's\s+first\s+(?P<value>[A-Za-z\d,]+)\s+lines",
+                "the preview the agent-teams guide states",
+            ),
+        ),
+    ),
 )
 
 
