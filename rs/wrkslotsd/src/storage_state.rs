@@ -364,6 +364,19 @@ pub(crate) fn dead_mount_point(
         .max_by_key(|point| point.components().count())
 }
 
+/// Control-directory entries that hold slot storage rather than being slots
+/// (Python's `_REPRESENTATION_DIRECTORIES`): the disk images, the box's
+/// per-slot private state, the default local salvage bundles, and the
+/// removal proof mirrors (#2449). In the nested layout they sit beside the
+/// slot directories.
+const REPRESENTATION_DIRECTORIES: [&str; 5] = [
+    "slot-images",
+    "slot-state",
+    "box-state",
+    "wrkslots-salvage",
+    "proof-mirrors",
+];
+
 /// Bound on one dead-mount probe. A live mount answers at once; a
 /// hung FUSE server can hold a plain stat in the kernel
 /// indefinitely, which no lifecycle command may wait on (#1802).
@@ -1392,10 +1405,7 @@ pub(crate) fn parse_storage(root: Option<&Path>) -> Result<Value> {
             if path == cfg.control.join("wrkslots") {
                 continue;
             }
-            if root_path == cfg.control
-                && ["slot-images", "slot-state", "box-state", "wrkslots-salvage"]
-                    .contains(&name.as_str())
-            {
+            if root_path == cfg.control && REPRESENTATION_DIRECTORIES.contains(&name.as_str()) {
                 continue;
             }
             if slot_type == "agent" && path == slot_root(&cfg, "validate") {

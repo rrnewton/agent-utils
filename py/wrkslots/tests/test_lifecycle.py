@@ -35903,6 +35903,50 @@ def test_clean_caches_report_does_not_retire_proof_mirrors(tmp_path: Path) -> No
     assert not mirror.exists()
 
 
+def test_proof_mirror_directory_is_storage_not_a_slot(tmp_path: Path) -> None:
+    """#2449: the proof mirrors a removal makes are storage, not a slot.
+
+    In the nested layout <control>/proof-mirrors sits beside the slot
+    directories. status and doctor must not report it as a directory without
+    a row, unpushed must not refuse on it, and no slot may take its name.
+    """
+
+    project = _finished_dead_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    assert config.control == config.worktrees  # the nested layout
+    removed = remove(project)
+    assert removed.returncode == 0, removed.stderr
+    mirrors = config.control / "proof-mirrors"
+    assert mirrors.is_dir() and any(mirrors.iterdir()), removed.stdout + removed.stderr
+    set_liveness(project, "alive")
+    made = create(project, slot="slot02", agent="codex-2", branch="codex/two")
+    assert made.returncode == 0, made.stderr
+    assert "proof-mirrors" not in made.stdout + made.stderr
+
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    payload = json.loads(status.stdout)
+    assert payload["registry_storage_inconsistencies"] == [], payload
+    assert payload["registry_storage_state"] != "inconsistent", payload
+
+    report = command(project, "doctor", "--all-machines", "--format", "json")
+    assert report.returncode == 0, report.stderr
+    findings = json.loads(report.stdout)["findings"]
+    assert not [
+        item for item in findings if item["kind"] == "directory-without-row"
+    ], findings
+
+    unpushed = command(project, "unpushed", "--format", "json")
+    assert unpushed.returncode == 0, unpushed.stderr
+    assert "proof-mirrors" not in unpushed.stdout + unpushed.stderr
+    assert [row["slot"] for row in json.loads(unpushed.stdout)["slots"]] == ["slot02"]
+
+    taken = create(project, slot="proof-mirrors", agent="codex-3", branch="codex/three")
+    assert taken.returncode != 0
+    assert "reserved for wrkslots storage" in taken.stderr, taken.stderr
+    assert mirrors.is_dir() and any(mirrors.iterdir())
+
+
 def test_clean_caches_dry_run_reports_without_deleting(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(
         tmp_path, cache_globs=("target",)

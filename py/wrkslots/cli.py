@@ -77,6 +77,8 @@ _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT = 256 * 1024
 #: Directory under a salvage archive root (by default the control directory)
 #: that holds local salvage bundles and their receipts.
 _LOCAL_SALVAGE_DIRECTORY = "wrkslots-salvage"
+#: Control-directory entry holding the host-wide proof mirrors (#1692).
+_PROOF_MIRROR_DIRECTORY = "proof-mirrors"
 #: Under that directory, one verified complete-history bundle per commit,
 #: shared by every receipt that names it (#1153).  A machine name begins with
 #: a letter or digit, so this name never meets a machine's directory.
@@ -5888,13 +5890,15 @@ def _stale_mount_note(line: str) -> str | None:
 
 
 #: Control-directory entries that hold slot storage rather than being slots:
-#: the disk images, the box's per-slot private state, and the default local
-#: salvage bundles. In the nested layout they sit beside the slot directories.
+#: the disk images, the box's per-slot private state, the default local
+#: salvage bundles, and the removal proof mirrors (#2449). In the nested
+#: layout they sit beside the slot directories.
 _REPRESENTATION_DIRECTORIES = (
     slotimage.IMAGES_DIRECTORY,
     "slot-state",
     "box-state",
     _LOCAL_SALVAGE_DIRECTORY,
+    _PROOF_MIRROR_DIRECTORY,
 )
 
 
@@ -19076,7 +19080,7 @@ def _proof_mirror_retirement_candidates(
     run can name exactly what an apply run would retire (#1791).
     """
 
-    root = config.control / "proof-mirrors"
+    root = config.control / _PROOF_MIRROR_DIRECTORY
     if not root.is_dir():
         return []
     moment = time.time() if now is None else now
@@ -19106,7 +19110,7 @@ def _retire_proof_mirrors(config: Config, *, now: float | None = None) -> list[s
     and when the live set cannot be read every mirror is kept.
     """
 
-    root = config.control / "proof-mirrors"
+    root = config.control / _PROOF_MIRROR_DIRECTORY
     dropped: list[str] = []
     for name in _proof_mirror_retirement_candidates(config, now=now):
         entry = root / name
@@ -19126,7 +19130,7 @@ def _retire_proof_mirrors(config: Config, *, now: float | None = None) -> list[s
 def _proof_mirror_doctor_findings(config: Config) -> list[dict[str, object]]:
     """Report the proof-mirror collection's size, read-only (#1692)."""
 
-    root = config.control / "proof-mirrors"
+    root = config.control / _PROOF_MIRROR_DIRECTORY
     if not root.is_dir():
         return []
     entries = [entry for entry in root.iterdir() if entry.is_dir()]
@@ -61000,7 +61004,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 or not entry.is_dir()
                 or entry.is_symlink()
                 or entry.name.startswith("EVENTS.")
-                or entry.name == "proof-mirrors"
+                or entry.name == _PROOF_MIRROR_DIRECTORY
                 or _is_validate_storage_entry(config, entry)
                 or _is_eden_backing_entry(config, entry)
                 or _is_representation_directory(config, entry)
@@ -71801,7 +71805,8 @@ def _cmd_remove(
     if mirror_root is None:
         try:
             mirror_root = (
-                _load_config(args.project_root, args.machine).control / "proof-mirrors"
+                _load_config(args.project_root, args.machine).control
+                / _PROOF_MIRROR_DIRECTORY
             )
         except Exception:
             mirror_root = None

@@ -269,3 +269,28 @@ def test_parse_storage_clean_registry(tmp_path: Path) -> None:
     result = _rust(root)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"machines": ["node-a"], "findings": []}
+
+
+def test_parse_storage_storage_entries_are_not_slots_matches_python(
+    tmp_path: Path,
+) -> None:
+    # #2449: in the nested layout the control directory's storage entries,
+    # the removal proof mirrors among them, sit beside the slot directories.
+    # Neither edition may report one as a directory without a row.
+    root = _root(tmp_path)
+    _fixture(root)
+    control = root / "worktrees"
+    (control / "proof-mirrors" / DIGEST).mkdir(parents=True)
+    (control / "proof-mirrors" / DIGEST / "record.json").write_text("{}")
+    for name in ("slot-state", "box-state", "wrkslots-salvage"):
+        (control / name).mkdir()
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    actual = json.loads(result.stdout)
+    assert actual == _expected(root)
+    storage = {"proof-mirrors", "slot-state", "box-state", "wrkslots-salvage"}
+    assert not [item for item in actual["findings"] if item["slot"] in storage]
+    orphans = sorted(
+        item["slot"] for item in actual["findings"] if item["kind"] == "directory-without-row"
+    )
+    assert orphans == ["orphan", "orphan-v"]
