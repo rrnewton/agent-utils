@@ -8,6 +8,12 @@
 //! original's, so neither the change nor its rollback can fail on a property systemd-run cannot
 //! express. A unit file gets a drop-in that replaces `ExecStart=` (and sets `AGENTCTL_HOME`),
 //! followed by a daemon reload and a restart.
+//!
+//! With `no_reload` (#2441) nothing runs a user-manager daemon-reload. systemd applies a changed
+//! drop-in to a loaded unit only after a reload (systemd.unit(5)), and an active service is
+//! always loaded, so a unit-file service whose drop-in must change, or for which systemd already
+//! reports `NeedDaemonReload=yes`, is refused before anything is written. Transient units are
+//! replayed as always: that path never reloads.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -79,11 +85,16 @@ pub struct RefreshOptions {
     pub refreshes_dir: PathBuf,
     /// Where drop-ins for unit-file services are written: `DIR/UNIT.d/zz-agentctl-services.conf`.
     pub drop_in_dir: PathBuf,
+    /// Where unit-file services' links go (#2441): `DIR/UNIT` points at the snapshot.
+    pub links_dir: PathBuf,
     /// Set by a signal handler: finish the service in hand, then stop.
     pub interrupted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Fresh pin check run immediately before any action on each service
     /// (#2120); `None` for a plain `services refresh`, which has no pins.
     pub pin_check: Option<PinCheck>,
+    /// Never run `systemctl --user daemon-reload`, not even in a rollback (#2441): a
+    /// unit-file service whose move needs one is refused unchanged.
+    pub no_reload: bool,
 }
 
 /// How long a restarted service must stay up and healthy before it counts as refreshed.
@@ -103,13 +114,28 @@ enum Method {
         expected: Definition,
         original: Definition,
     },
-    /// Write a drop-in, reload, restart.
+    /// Point the unit's services link at the snapshot and restart; write the link-form
+    /// drop-in and reload first only when the drop-in must change or systemd reports
+    /// `NeedDaemonReload=yes` (#2441).
     DropIn {
         path: PathBuf,
         content: String,
         previous: Option<Vec<u8>>,
         expected_exec: Vec<String>,
+        link: LinkSwap,
+        /// The unit already runs through its link (link form).
+        linked: bool,
     },
+}
+
+/// The services link a unit-file service runs through (#2441): `ROOT/links/UNIT`.
+#[derive(Clone, Debug)]
+struct LinkSwap {
+    path: PathBuf,
+    /// The snapshot directory it points at after the move.
+    target: PathBuf,
+    /// What it pointed at before; `None` when there was no link.
+    previous: Option<PathBuf>,
 }
 
 /// The intended change for one service.
@@ -332,24 +358,50 @@ pub fn plan(
     service: &Service,
     snapshot: &Snapshot,
     drop_in_dir: &Path,
+    links_dir: &Path,
     force: bool,
 ) -> Result<Option<Plan>, String> {
     let new_binary = snapshot.agentctl();
-    let new_binary_text = new_binary
+    let transient = service.state.transient;
+    // A unit file runs the snapshot through its services link (#2441); a transient unit names
+    // the snapshot directly.
+    let link_path = links_dir.join(&service.unit);
+    let run_binary = if transient {
+        new_binary.clone()
+    } else {
+        link_path.join(super::snapshot::AGENTCTL)
+    };
+    let new_binary_text = run_binary
         .to_str()
         .ok_or("the snapshot path is not UTF-8")?
         .to_owned();
     let mut environment = Vec::new();
+    let mut home_current = true;
     if service.kind == Kind::Bridge {
-        let home = snapshot.home().to_string_lossy().into_owned();
+        let home_path = if transient {
+            snapshot.home()
+        } else {
+            link_path.join(super::snapshot::HOME)
+        };
+        let home = home_path.to_string_lossy().into_owned();
         let old = service
             .env(crate::plugins::AGENTCTL_HOME_ENV)
             .map(str::to_owned);
         if old.as_deref() != Some(home.as_str()) {
-            environment.push((crate::plugins::AGENTCTL_HOME_ENV.to_owned(), old, home));
+            environment.push((
+                crate::plugins::AGENTCTL_HOME_ENV.to_owned(),
+                old.clone(),
+                home,
+            ));
         }
+        // Current means it runs the snapshot's home, as written or through its link.
+        home_current = if transient {
+            environment.is_empty()
+        } else {
+            old.is_some_and(|old| same_file(Path::new(&old), &snapshot.home()))
+        };
     }
-    let current = same_file(&service.binary, &new_binary) && environment.is_empty();
+    let current = same_file(&service.binary, &new_binary) && home_current;
     if current && !force {
         return Ok(None);
     }
@@ -373,13 +425,12 @@ pub fn plan(
             }
         }
     }
-    let unit_binary = if service.state.transient {
+    let unit_binary = if transient {
         new_binary_text.clone()
     } else {
         new_binary_text.replace('%', "%%")
     };
     let new_exec = rewrite_exec(service, &unit_binary)?;
-    let transient = service.state.transient;
     let method = if transient {
         if service.parsed.files.len() > 1 {
             return Err(format!(
@@ -436,26 +487,42 @@ pub fn plan(
             .join(format!("{}.d", service.unit))
             .join(DROP_IN);
         let previous = fs::read(&path).ok();
+        // Link form (#2441): the text names the link, never a commit, so it is the same for
+        // every snapshot and a later move needs no daemon-reload.
         let mut content = format!(
-            "# Written by `agentctl services refresh` for snapshot {}.\n\
-             # Remove this file, then run `systemctl --user daemon-reload` and\n\
-             # `systemctl --user restart {}`, to run the unit's own command again.\n\
+            "# Written by `agentctl services refresh` in link form: the command runs the\n\
+             # snapshot that {} points at. A refresh repoints that link and\n\
+             # restarts the unit, with no daemon-reload. Remove this file, then run\n\
+             # `systemctl --user daemon-reload` and `systemctl --user restart {}`,\n\
+             # to run the unit's own command again.\n\
              [Service]\nExecStart=\nExecStart={}\n",
-            snapshot.commit,
+            link_path.display(),
             service.unit,
             new_exec.render()
         );
-        for (name, _, value) in &environment {
+        if service.kind == Kind::Bridge {
+            let home = link_path.join(super::snapshot::HOME);
             content.push_str(&format!(
                 "Environment={}\n",
-                quote_word(&format!("{name}={}", value.replace('%', "%%")))
+                quote_word(&format!(
+                    "{}={}",
+                    crate::plugins::AGENTCTL_HOME_ENV,
+                    home.to_string_lossy().replace('%', "%%")
+                ))
             ));
         }
+        let linked = normalize(&service.binary) == normalize(&run_binary);
         Method::DropIn {
             path,
             content,
             previous,
             expected_exec: new_exec.argv.clone(),
+            link: LinkSwap {
+                previous: fs::read_link(&link_path).ok(),
+                path: link_path,
+                target: snapshot.path.clone(),
+            },
+            linked,
         }
     };
     Ok(Some(Plan {
@@ -484,6 +551,78 @@ pub const CHECK_PREFIX: &str = "agentctl-services-check-";
 fn check_unit_name(unit: &str) -> String {
     let stem = unit.strip_suffix(".service").unwrap_or(unit);
     format!("{CHECK_PREFIX}{}-{stem}.service", std::process::id())
+}
+
+/// The prefix of every refusal reason for a move that needs a daemon-reload (#2441).
+pub const NEEDS_RELOAD: &str = "needs-daemon-reload";
+
+/// The form the service is in before its move, for the report (#2441): `transient`, `link`
+/// (a unit file that runs through its services link), or `drop-in` (any other unit file; its
+/// move writes the link-form drop-in, which takes one daemon-reload).
+fn form(plan: &Plan) -> &'static str {
+    match plan.method {
+        Method::Transient { .. } => "transient",
+        Method::DropIn { linked: true, .. } => "link",
+        Method::DropIn { .. } => "drop-in",
+    }
+}
+
+/// Whether a unit-file move writes its drop-in: only when it reloads and the bytes differ.
+fn writes_drop_in(plan: &Plan, reload: bool) -> bool {
+    match &plan.method {
+        Method::DropIn {
+            content, previous, ..
+        } => reload && previous.as_deref() != Some(content.as_bytes()),
+        Method::Transient { .. } => false,
+    }
+}
+
+/// Why moving the service of `plan` needs a daemon-reload, or `None` when it can move without
+/// one (#2441). A transient replay never needs one. A drop-in move needs one when the drop-in
+/// it would write differs from the file on disk (writing it sets `NeedDaemonReload=yes`, and a
+/// restart before a reload runs the old command), or when systemd already reports
+/// `NeedDaemonReload=yes` (what is on disk is not what is loaded).
+fn reload_needed(plan: &Plan, need_daemon_reload: bool) -> Option<String> {
+    let Method::DropIn {
+        path,
+        content,
+        previous,
+        ..
+    } = &plan.method
+    else {
+        return None;
+    };
+    if previous.as_deref() != Some(content.as_bytes()) {
+        return Some(format!(
+            "{NEEDS_RELOAD}: its drop-in {} must {} (the move to link form, or a changed \
+             command), and systemd applies a changed drop-in to a loaded unit only after a \
+             daemon-reload; nothing was written (refresh it once without --no-reload when a \
+             reload is safe; later moves need none)",
+            path.display(),
+            if previous.is_some() {
+                "change"
+            } else {
+                "be written"
+            }
+        ));
+    }
+    if need_daemon_reload {
+        return Some(format!(
+            "{NEEDS_RELOAD}: systemd reports NeedDaemonReload=yes for it, so its files on disk \
+             are not what systemd loaded and a restart would not run them; nothing was changed"
+        ));
+    }
+    None
+}
+
+/// `NeedDaemonReload` for one unit, read now (#2441).
+fn need_daemon_reload(host: &dyn Host, unit: &str) -> Result<bool, String> {
+    let states = host.show(&[unit.to_owned()])?;
+    states
+        .iter()
+        .find(|state| state.id == unit)
+        .map(|state| state.need_daemon_reload)
+        .ok_or_else(|| format!("systemctl show did not report {unit}"))
 }
 
 fn unix_seconds(time: SystemTime) -> f64 {
@@ -1169,7 +1308,13 @@ pub fn refresh(
             rows.push(entry);
             continue;
         }
-        let plan = match plan(service, snapshot, &options.drop_in_dir, options.force) {
+        let plan = match plan(
+            service,
+            snapshot,
+            &options.drop_in_dir,
+            &options.links_dir,
+            options.force,
+        ) {
             Ok(Some(plan)) => plan,
             Ok(None) => {
                 entry["action"] = json!("current");
@@ -1192,11 +1337,44 @@ pub fn refresh(
             .map(|(name, old, new)| json!({"name": name, "old": old, "new": new}))
             .collect::<Vec<_>>());
         entry["new_exec_start"] = json!(plan.new_exec.argv);
+        entry["form"] = json!(form(&plan));
+        if let Method::DropIn { link, .. } = &plan.method {
+            entry["link"] = json!({
+                "path": link.path,
+                "old_target": link.previous,
+                "new_target": link.target,
+            });
+        }
+        // #2441: a unit-file move reloads only when its drop-in must change or systemd already
+        // reports NeedDaemonReload=yes, read now. With --no-reload such a move is refused
+        // before anything is written.
+        let needs_reload = match &plan.method {
+            Method::Transient { .. } => None,
+            Method::DropIn { .. } => match need_daemon_reload(host, &service.unit) {
+                Ok(need) => reload_needed(&plan, need),
+                Err(error) => Some(format!(
+                    "{NEEDS_RELOAD} unknown: cannot read NeedDaemonReload: {error}"
+                )),
+            },
+        };
+        if options.no_reload {
+            if let Some(reason) = needs_reload {
+                entry["action"] = json!("refused");
+                entry["reason"] = json!(reason);
+                let dry = if options.dry_run { " (dry run)" } else { "" };
+                text.push_str(&format!("{label}: refused{dry}: {reason}\n"));
+                exit_code = exit_code.max(1);
+                rows.push(entry);
+                continue;
+            }
+        }
+        let reload = needs_reload.is_some();
+        entry["reload"] = json!(if reload { "daemon-reload" } else { "none" });
         if options.dry_run {
             entry["action"] = json!("would-refresh");
-            entry["commands"] = json!(plan_commands(&plan));
+            entry["commands"] = json!(plan_commands(&plan, reload));
             text.push_str(&format!("{label}: {old} -> {new} (dry run)\n"));
-            for command in plan_commands(&plan) {
+            for command in plan_commands(&plan, reload) {
                 text.push_str(&format!("    {command}\n"));
             }
             rows.push(entry);
@@ -1212,7 +1390,7 @@ pub fn refresh(
             }
             let directory = run.as_ref().expect("created above");
             entry["rollback"] = json!(directory.path().join("ROLLBACK.sh"));
-            match apply_inactive(host, &plan, directory) {
+            match apply_inactive(host, &plan, directory, reload) {
                 Ok(detail) => {
                     entry["action"] = json!("updated-inactive");
                     entry["health"] = json!(detail);
@@ -1258,7 +1436,7 @@ pub fn refresh(
         }
         let directory = run.as_ref().expect("created above");
         entry["rollback"] = json!(directory.path().join("ROLLBACK.sh"));
-        match apply(host, &plan, options, directory) {
+        match apply(host, &plan, options, directory, reload) {
             Ok(detail) => {
                 entry["action"] = json!("refreshed");
                 entry["health"] = json!(detail);
@@ -1364,7 +1542,7 @@ fn wait_for_idle_headless(host: &dyn Host, service: &Service, wait: Duration) ->
 }
 
 /// The shell commands a plan runs, for a dry run.
-fn plan_commands(plan: &Plan) -> Vec<String> {
+fn plan_commands(plan: &Plan, reload: bool) -> Vec<String> {
     let unit = &plan.service.unit;
     match &plan.method {
         Method::Transient { forward, check, .. } => vec![
@@ -1377,19 +1555,59 @@ fn plan_commands(plan: &Plan) -> Vec<String> {
             format!("systemctl --user reset-failed {}", shell_quote(unit)),
             format!("systemd-run --user {}", shell_line(forward)),
         ],
-        Method::DropIn { path, content, .. } => vec![
+        Method::DropIn {
+            path,
+            content,
+            link,
+            ..
+        } => {
+            let mut commands = Vec::new();
+            if writes_drop_in(plan, reload) {
+                commands.push(format!(
+                    "write {} with ExecStart={}",
+                    path.display(),
+                    content
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("ExecStart="))
+                        .find(|value| !value.is_empty())
+                        .unwrap_or("")
+                ));
+            } else {
+                commands.push(format!(
+                    "keep {} (already the link-form drop-in{})",
+                    path.display(),
+                    if reload {
+                        ""
+                    } else {
+                        " and loaded: no write, no reload"
+                    }
+                ));
+            }
+            commands.push(link_command(&link.path, Some(&link.target)));
+            if reload {
+                commands.push("systemctl --user daemon-reload".to_owned());
+            }
+            commands.push(format!("systemctl --user restart {}", shell_quote(unit)));
+            commands
+        }
+    }
+}
+
+/// The shell command that points `link` at `target` atomically (a new link renamed over the
+/// old one), or removes it when `target` is `None`.
+fn link_command(link: &Path, target: Option<&Path>) -> String {
+    let link_text = link.to_string_lossy();
+    match target {
+        Some(target) => {
+            let temporary = format!("{link_text}.rollback-new");
             format!(
-                "write {} with ExecStart={}",
-                path.display(),
-                content
-                    .lines()
-                    .filter_map(|line| line.strip_prefix("ExecStart="))
-                    .find(|value| !value.is_empty())
-                    .unwrap_or("")
-            ),
-            "systemctl --user daemon-reload".to_owned(),
-            format!("systemctl --user restart {}", shell_quote(unit)),
-        ],
+                "ln -sfn {} {temporary} && mv -Tf {temporary} {}",
+                shell_quote(&target.to_string_lossy()),
+                shell_quote(&link_text),
+                temporary = shell_quote(&temporary)
+            )
+        }
+        None => format!("rm -f {}", shell_quote(&link_text)),
     }
 }
 
@@ -1401,7 +1619,13 @@ struct Failure {
     changed: bool,
 }
 
-fn rollback_block(plan: &Plan, directory: &RunDirectory) -> Result<String, String> {
+/// The rollback commands for one service. `restart` is false for an inactive oneshot.
+fn rollback_block(
+    plan: &Plan,
+    directory: &RunDirectory,
+    reload: bool,
+    restart: bool,
+) -> Result<String, String> {
     let unit = &plan.service.unit;
     let mut block = format!("\n# {unit}: back to {}\n", plan.service.binary.display());
     match &plan.method {
@@ -1412,38 +1636,62 @@ fn rollback_block(plan: &Plan, directory: &RunDirectory) -> Result<String, Strin
                 unit = shell_quote(unit)
             ));
         }
-        Method::DropIn { path, previous, .. } => {
-            match previous {
-                Some(bytes) => {
-                    let saved = format!("{unit}.previous-drop-in.conf");
-                    directory.write(&saved, bytes)?;
-                    block.push_str(&format!(
-                        "cp {} {}\n",
-                        shell_quote(&directory.path().join(saved).to_string_lossy()),
-                        shell_quote(&path.to_string_lossy())
-                    ));
-                }
-                None => {
-                    block.push_str(&format!("rm -f {}\n", shell_quote(&path.to_string_lossy())))
+        Method::DropIn {
+            path,
+            previous,
+            link,
+            ..
+        } => {
+            if writes_drop_in(plan, reload) {
+                match previous {
+                    Some(bytes) => {
+                        let saved = format!("{unit}.previous-drop-in.conf");
+                        directory.write(&saved, bytes)?;
+                        block.push_str(&format!(
+                            "cp {} {}\n",
+                            shell_quote(&directory.path().join(saved).to_string_lossy()),
+                            shell_quote(&path.to_string_lossy())
+                        ));
+                    }
+                    None => {
+                        block.push_str(&format!("rm -f {}\n", shell_quote(&path.to_string_lossy())))
+                    }
                 }
             }
-            block.push_str(&format!(
-                "systemctl --user daemon-reload\nsystemctl --user restart {}\n",
-                shell_quote(unit)
-            ));
+            // #2441: the link goes back to what it pointed at (saved beside UNIT.before).
+            let previous_link = link.previous.as_ref().map_or_else(
+                || "none".to_owned(),
+                |target| target.to_string_lossy().into_owned(),
+            );
+            directory.write(
+                &format!("{unit}.previous-link"),
+                format!("{previous_link}\n").as_bytes(),
+            )?;
+            block.push_str(&link_command(&link.path, link.previous.as_deref()));
+            block.push('\n');
+            if reload {
+                block.push_str("systemctl --user daemon-reload\n");
+            } else {
+                block.push_str("# no daemon-reload: the drop-in was not changed\n");
+            }
+            if restart {
+                block.push_str(&format!("systemctl --user restart {}\n", shell_quote(unit)));
+            }
         }
     }
     Ok(block)
 }
 
 /// Move an inactive restore oneshot onto the snapshot without starting
-/// it: back up, write the drop-in, reload, and read the definition back.
-/// A transient oneshot has no definition to update while stopped, so it
-/// is refused unchanged.
+/// it: back up, point its services link at the snapshot (writing the
+/// link-form drop-in and reloading first only when `reload`), and read
+/// the definition back. A transient oneshot has no definition to update
+/// while stopped, so it is refused unchanged.
 fn apply_inactive(
     host: &dyn Host,
     plan: &Plan,
     directory: &RunDirectory,
+    reload: bool,
 ) -> Result<String, String> {
     let service = &plan.service;
     match host.cat(&service.unit) {
@@ -1460,6 +1708,8 @@ fn apply_inactive(
         content,
         previous,
         expected_exec,
+        link,
+        ..
     } = &plan.method
     else {
         return Err(
@@ -1467,68 +1717,157 @@ fn apply_inactive(
                 .to_owned(),
         );
     };
+    let write = writes_drop_in(plan, reload);
+    if !reload {
+        recheck_reload_free(host, &service.unit, path, content)?;
+    }
     directory.write(&format!("{}.before", service.unit), service.text.as_bytes())?;
-    let rollback = match previous {
-        Some(bytes) => {
-            let saved = format!("{}.previous-drop-in.conf", service.unit);
-            directory.write(&saved, bytes)?;
-            format!(
-                "\n# {}: back to {}\ncp {} {}\nsystemctl --user daemon-reload\n",
-                service.unit,
-                service.binary.display(),
-                shell_quote(&directory.path().join(saved).to_string_lossy()),
-                shell_quote(&path.to_string_lossy())
-            )
+    directory.append(
+        "ROLLBACK.sh",
+        &rollback_block(plan, directory, reload, false)?,
+    )?;
+    let changed = (|| -> Result<(), String> {
+        if write {
+            write_drop_in(path, content)?;
         }
-        None => format!(
-            "\n# {}: back to {}\nrm -f {}\nsystemctl --user daemon-reload\n",
-            service.unit,
-            service.binary.display(),
-            shell_quote(&path.to_string_lossy())
-        ),
-    };
-    directory.append("ROLLBACK.sh", &rollback)?;
+        swap_link(&link.path, Some(&link.target))?;
+        if reload {
+            host.daemon_reload()?;
+        }
+        let what = if reload {
+            "after the reload the"
+        } else {
+            "the loaded"
+        };
+        loaded_exec_is(host, &service.unit, expected_exec, what)
+    })();
+    if let Err(error) = changed {
+        let restored = restore_files(path, previous.as_deref(), link, write).and_then(|()| {
+            if reload {
+                host.daemon_reload()
+            } else {
+                Ok(())
+            }
+        });
+        return Err(match restored {
+            Ok(()) => error,
+            Err(restore_error) => {
+                format!("{error}; restoring the old drop-in and link failed: {restore_error}")
+            }
+        });
+    }
+    Ok(if reload {
+        "binary updated for its next run; the unit was not started".to_owned()
+    } else {
+        "binary updated for its next run by repointing its link, no daemon-reload; the unit was not started".to_owned()
+    })
+}
+
+/// Before a reload-free move changes anything (#2441): the drop-in the plan names must still be on
+/// disk and systemd must still report `NeedDaemonReload=no`, read now.
+fn recheck_reload_free(
+    host: &dyn Host,
+    unit: &str,
+    path: &Path,
+    content: &str,
+) -> Result<(), String> {
+    if fs::read(path).ok().as_deref() != Some(content.as_bytes()) {
+        return Err(format!(
+            "{NEEDS_RELOAD}: its drop-in {} changed since planning; nothing was changed",
+            path.display()
+        ));
+    }
+    if need_daemon_reload(host, unit)? {
+        return Err(format!(
+            "{NEEDS_RELOAD}: systemd reports NeedDaemonReload=yes for it since planning; \
+             nothing was changed"
+        ));
+    }
+    Ok(())
+}
+
+fn write_drop_in(path: &Path, content: &str) -> Result<(), String> {
     let parent = path.parent().ok_or("drop-in path has no directory")?;
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o755)
         .create(parent)
         .map_err(|error| format!("{}: {error}", parent.display()))?;
-    write_atomically(path, content.as_bytes())?;
-    let verified = host.daemon_reload().and_then(|()| {
-        let text = host.cat(&service.unit)?;
-        let parsed = UnitText::parse(&text);
-        let commands = parsed.effective("Service", "ExecStart");
-        let exec = commands
-            .last()
-            .map(|value| ExecCommand::parse(value))
-            .transpose()?;
-        if commands.len() == 1 && exec.as_ref().map(|exec| &exec.argv) == Some(expected_exec) {
-            Ok(())
-        } else {
-            Err(format!(
-                "after the reload the unit's ExecStart is not the planned one (is another drop-in sorted after {DROP_IN}?)"
-            ))
-        }
-    });
-    if let Err(error) = verified {
-        let restored = match previous {
-            Some(bytes) => write_atomically(path, bytes),
+    write_atomically(path, content.as_bytes())
+}
+
+/// Point the services link `link` at `target` atomically: a new link renamed over the old one
+/// (#2441). `None` removes the link.
+fn swap_link(link: &Path, target: Option<&Path>) -> Result<(), String> {
+    let Some(target) = target else {
+        return match fs::remove_file(link) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("{}: {error}", link.display())),
+        };
+    };
+    let parent = link.parent().ok_or("services link path has no directory")?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    let name = link
+        .file_name()
+        .ok_or("services link path has no name")?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{name}.new.{}", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    std::os::unix::fs::symlink(target, &temporary)
+        .map_err(|error| format!("{}: {error}", temporary.display()))?;
+    fs::rename(&temporary, link).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("{}: {error}", link.display())
+    })
+}
+
+/// Put back the drop-in (only when `wrote`) and the services link as they were.
+fn restore_files(
+    path: &Path,
+    previous: Option<&[u8]>,
+    link: &LinkSwap,
+    wrote: bool,
+) -> Result<(), String> {
+    if wrote {
+        match previous {
+            Some(bytes) => write_atomically(path, bytes)?,
             None => match fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(remove) if remove.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(remove) => Err(format!("{}: {remove}", path.display())),
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("{}: {error}", path.display())),
             },
         }
-        .and_then(|()| host.daemon_reload());
-        return Err(match restored {
-            Ok(()) => error,
-            Err(restore_error) => {
-                format!("{error}; restoring the old drop-in failed: {restore_error}")
-            }
-        });
     }
-    Ok("binary updated for its next run; the unit was not started".to_owned())
+    swap_link(&link.path, link.previous.as_deref())
+}
+
+/// Check that the unit's `ExecStart` as `systemctl cat` shows it is exactly `expected`; `what`
+/// starts the error ("after the reload the", "the loaded").
+fn loaded_exec_is(
+    host: &dyn Host,
+    unit: &str,
+    expected: &[String],
+    what: &str,
+) -> Result<(), String> {
+    let text = host.cat(unit)?;
+    let parsed = UnitText::parse(&text);
+    let commands = parsed.effective("Service", "ExecStart");
+    let exec = commands
+        .last()
+        .map(|value| ExecCommand::parse(value))
+        .transpose()?;
+    if commands.len() == 1 && exec.as_ref().map(|exec| exec.argv.as_slice()) == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what} unit's ExecStart is not the planned one (is another drop-in sorted after {DROP_IN}?)"
+        ))
+    }
 }
 
 /// Change one service, check it, and roll it back on failure.
@@ -1537,6 +1876,7 @@ fn apply(
     plan: &Plan,
     options: &RefreshOptions,
     directory: &RunDirectory,
+    reload: bool,
 ) -> Result<String, Failure> {
     let early = |error: String| Failure {
         error,
@@ -1557,7 +1897,10 @@ fn apply(
     // Back up and write the rollback commands just before the first change.
     let record = || -> Result<(), String> {
         directory.write(&format!("{}.before", service.unit), service.text.as_bytes())?;
-        directory.append("ROLLBACK.sh", &rollback_block(plan, directory)?)
+        directory.append(
+            "ROLLBACK.sh",
+            &rollback_block(plan, directory, reload, true)?,
+        )
     };
     let timeout = health_timeout(service, options);
     let new_environment = check_environment(service, &plan.environment);
@@ -1629,58 +1972,48 @@ fn apply(
             content,
             previous,
             expected_exec,
+            link,
+            ..
         } => {
-            let write = || -> Result<(), String> {
-                let parent = path.parent().ok_or("drop-in path has no directory")?;
-                fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o755)
-                    .create(parent)
-                    .map_err(|error| format!("{}: {error}", parent.display()))?;
-                write_atomically(path, content.as_bytes())
-            };
-            record().map_err(early)?;
-            write().map_err(|error| Failure {
-                rollback: restore_drop_in(
-                    host,
-                    service,
-                    path,
-                    previous.as_deref(),
-                    &old_environment,
-                    timeout,
-                ),
-                error,
-                changed: true,
-            })?;
+            let write = writes_drop_in(plan, reload);
             let restore = || {
                 restore_drop_in(
                     host,
                     service,
                     path,
                     previous.as_deref(),
+                    link,
+                    write,
+                    reload,
                     &old_environment,
                     timeout,
                 )
             };
+            if !reload {
+                // #2441: checked at planning; checked again now, before the first change.
+                recheck_reload_free(host, &service.unit, path, content).map_err(early)?;
+            }
+            record().map_err(early)?;
+            let change = || -> Result<(), String> {
+                if write {
+                    write_drop_in(path, content)?;
+                }
+                swap_link(&link.path, Some(&link.target))
+            };
+            change().map_err(|error| Failure {
+                rollback: restore(),
+                error,
+                changed: true,
+            })?;
             let began = host.now();
-            let outcome = host
-                .daemon_reload()
-                .and_then(|()| {
-                    let text = host.cat(&service.unit)?;
-                    let parsed = UnitText::parse(&text);
-                    let commands = parsed.effective("Service", "ExecStart");
-                    let exec = commands
-                        .last()
-                        .map(|value| ExecCommand::parse(value))
-                        .transpose()?;
-                    if commands.len() == 1 && exec.as_ref().map(|exec| &exec.argv) == Some(expected_exec) {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "after the reload the unit's ExecStart is not the planned one (is another drop-in sorted after {DROP_IN}?)"
-                        ))
-                    }
+            let configured = if reload {
+                host.daemon_reload().and_then(|()| {
+                    loaded_exec_is(host, &service.unit, expected_exec, "after the reload the")
                 })
+            } else {
+                loaded_exec_is(host, &service.unit, expected_exec, "the loaded")
+            };
+            let outcome = configured
                 .and_then(|()| host.restart(&service.unit))
                 .and_then(|()| {
                     health_after_stop(
@@ -1691,6 +2024,17 @@ fn apply(
                         began,
                         timeout,
                     )
+                })
+                .and_then(|detail| {
+                    // #2441: a reload-free move must leave nothing pending for the next reload.
+                    if !reload && need_daemon_reload(host, &service.unit)? {
+                        return Err(
+                            "systemd reports NeedDaemonReload=yes after the restart: its files \
+                             changed on disk during the refresh"
+                                .to_owned(),
+                        );
+                    }
+                    Ok(detail)
                 });
             outcome.map_err(|error| Failure {
                 rollback: restore(),
@@ -1890,24 +2234,25 @@ fn restore_transient(
         .map_err(|error| format!("restored to the old definition and binary, but {error}"))
 }
 
+/// Put the old drop-in (only when one was written) and the services link back, reload only
+/// when the move reloaded, restart, and check the old service (#2441).
+#[allow(clippy::too_many_arguments)]
 fn restore_drop_in(
     host: &dyn Host,
     service: &Service,
     path: &Path,
     previous: Option<&[u8]>,
+    link: &LinkSwap,
+    wrote: bool,
+    reload: bool,
     environment: &[(String, String)],
     timeout: Duration,
 ) -> Result<String, String> {
-    match previous {
-        Some(bytes) => write_atomically(path, bytes)?,
-        None => match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("{}: {error}", path.display())),
-        },
-    }
+    restore_files(path, previous, link, wrote)?;
     let began = host.now();
-    host.daemon_reload()?;
+    if reload {
+        host.daemon_reload()?;
+    }
     host.restart(&service.unit)?;
     health_after_stop(host, service, &service.binary, environment, began, timeout)
         .map_err(|error| format!("restored to the old definition and binary, but {error}"))

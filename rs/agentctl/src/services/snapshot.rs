@@ -100,6 +100,16 @@ pub fn snapshots_dir(root: &Path) -> PathBuf {
     root.join("snapshots")
 }
 
+/// Where per-unit services links live (#2441): `ROOT/links/UNIT` is a symbolic link to the
+/// snapshot directory a link-form unit runs, so moving the unit only repoints the link.
+#[must_use]
+pub fn links_dir(root: &Path) -> PathBuf {
+    root.join(LINKS)
+}
+
+/// The directory name of [`links_dir`] under the services root.
+pub const LINKS: &str = "links";
+
 /// Every complete snapshot under `root`, oldest build first.
 #[must_use]
 pub fn list(root: &Path) -> Vec<Snapshot> {

@@ -961,7 +961,7 @@ enum ServicesCommand {
     /// restart it on the snapshot's binary with every argument and environment variable kept,
     /// check its health, and roll it back automatically when the check fails. Prints old -> new
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl services refresh --dry-run\n  agentctl --registry ~/project/.agentctl services refresh\n  agentctl --registry ~/project/.agentctl services refresh --only chat-bridge --snapshot 1a2b3c4d\n\nOnly the agentctl binary changes, and for a bridge AGENTCTL_HOME, pointed at the snapshot's plugin\nhome so its Slack plugin matches. The outbound helper is part of the bridge's configuration\n(bridge.json) and is left alone; `services list` says when it differs from the snapshot's.\n\nA transient unit (made by systemd-run) is stopped and made again by systemd-run from its own\ndefinition, line for line. First, the same properties start a check unit whose shell only sleeps,\ngiven the planned command as arguments; it must read back as planned, so neither the change nor\nthe rollback can trip on a property systemd-run cannot express. A transient unit with drop-ins is\nrefused. A unit file gets the drop-in DROP_IN_DIR/UNIT.d/zz-agentctl-services.conf, then a daemon\nreload and a restart.\n\nEach service must pass the same health check before it is touched, or it is left alone. After the\nchange, for 30 seconds or more within --health-timeout counted from the new process's start\n(stopping the old process can take its full stop timeout; that time is added to the window and\nsaid in the report; a watcher or watch daemon gets at least its pass budget (or its interval)\nplus 90 s), the unit must stay active with the same main process running the new binary, then a\nbridge's `chat health` (run with the new binary) must not say DOWN, must see that process, which must\nrun with the snapshot's AGENTCTL_HOME, and its event stream must have delivered something since\nthe restart; a watcher or watch daemon must complete a pass\n(agent-watch.json or health.json checked_at after the restart) or show a daemon\nstarted after the restart with its heartbeat advancing at least twice\n(pass-progress.json in its state directory, written at daemon start;\nphase starting until its first pass begins, then pass); the report's\nhealth detail names the proof applied (health proof completed-pass,\npass-progress or daemon-start-progress); a headless wrapper must answer status on its\ncontrol socket from that process. A headless agent in a turn is waited for (--headless-wait), then\nskipped. Watchers go first, bridges next, headless wrappers last; the first failure stops the run.\n\nBefore changing a unit, ROOT/refreshes/STAMP-COMMIT12/ gets UNIT.before (its `systemctl cat`) and\nthe unit's commands in ROLLBACK.sh; report.json follows. Units that are not active are skipped.\nAn interrupt, hangup or termination signal does not stop a service halfway: the one in hand is\nfinished or rolled back, and the rest are not attempted. A SIGKILL can still leave a service\nstopped: run refresh in a terminal or a pane, not under a tool's timeout.\nExit status: 0 every selected service runs the snapshot and passed; 1 a service was refused or\nfailed and was rolled back (later services untouched); 4 a rollback failed too: run ROLLBACK.sh."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl services refresh --dry-run\n  agentctl --registry ~/project/.agentctl services refresh\n  agentctl --registry ~/project/.agentctl services refresh --only chat-bridge --snapshot 1a2b3c4d\n\nOnly the agentctl binary changes, and for a bridge AGENTCTL_HOME, pointed at the snapshot's plugin\nhome so its Slack plugin matches. The outbound helper is part of the bridge's configuration\n(bridge.json) and is left alone; `services list` says when it differs from the snapshot's.\n\nA transient unit (made by systemd-run) is stopped and made again by systemd-run from its own\ndefinition, line for line. First, the same properties start a check unit whose shell only sleeps,\ngiven the planned command as arguments; it must read back as planned, so neither the change nor\nthe rollback can trip on a property systemd-run cannot express. A transient unit with drop-ins is\nrefused. A unit file runs through its services link ROOT/links/UNIT (a symbolic link to the\nsnapshot): the drop-in DROP_IN_DIR/UNIT.d/zz-agentctl-services.conf names the link, never a commit,\nso a move repoints the link and restarts the unit. It reloads (systemctl --user daemon-reload)\nonly when the drop-in must change (the first move to this link form, or a changed command) or\nsystemd reports NeedDaemonReload=yes for the unit: systemd applies a changed drop-in to a loaded\nunit only after a reload. --no-reload never reloads, not even to roll back: such a unit is refused\nunchanged (reason needs-daemon-reload: ...), and transient units move as always. The report shows\nper unit form (transient, link, drop-in) and reload (none, daemon-reload). Before an unavoidable\nreload, `services transients --save` and, after it, `--check` show whether a live transient unit\nwas lost.\n\nEach service must pass the same health check before it is touched, or it is left alone. After the\nchange, for 30 seconds or more within --health-timeout counted from the new process's start\n(stopping the old process can take its full stop timeout; that time is added to the window and\nsaid in the report; a watcher or watch daemon gets at least its pass budget (or its interval)\nplus 90 s), the unit must stay active with the same main process running the new binary, then a\nbridge's `chat health` (run with the new binary) must not say DOWN, must see that process, which must\nrun with the snapshot's AGENTCTL_HOME, and its event stream must have delivered something since\nthe restart; a watcher or watch daemon must complete a pass\n(agent-watch.json or health.json checked_at after the restart) or show a daemon\nstarted after the restart with its heartbeat advancing at least twice\n(pass-progress.json in its state directory, written at daemon start;\nphase starting until its first pass begins, then pass); the report's\nhealth detail names the proof applied (health proof completed-pass,\npass-progress or daemon-start-progress); a headless wrapper must answer status on its\ncontrol socket from that process. A headless agent in a turn is waited for (--headless-wait), then\nskipped. Watchers go first, bridges next, headless wrappers last; the first failure stops the run.\n\nBefore changing a unit, ROOT/refreshes/STAMP-COMMIT12/ gets UNIT.before (its `systemctl cat`) and\nthe unit's commands in ROLLBACK.sh; report.json follows. Units that are not active are skipped.\nAn interrupt, hangup or termination signal does not stop a service halfway: the one in hand is\nfinished or rolled back, and the rest are not attempted. A SIGKILL can still leave a service\nstopped: run refresh in a terminal or a pane, not under a tool's timeout.\nExit status: 0 every selected service runs the snapshot and passed; 1 a service was refused or\nfailed and was rolled back (later services untouched); 4 a rollback failed too: run ROLLBACK.sh."
     )]
     Refresh(ServicesRefresh),
     /// Delete snapshots nothing needs: keep every snapshot a live unit runs, a refresh rollback record names, a turnover pin protects, and the newest few; list the rest. Changes nothing without --apply
@@ -979,6 +979,11 @@ enum ServicesCommand {
         after_help = "Example: agentctl services turnover --notify 'agentctl services turnover-notify'\n\nThe scheduled turnover entry sets AGENTCTL_AGENT=turnover-timer and SuccessExitStatus for exits 0 and 74; exits 1, 4 and 75 are failures, and turnover sends a run-failed phase through this wrapper so the coordinator is alerted. Exit status is the send's."
     )]
     TurnoverNotify(ServicesTurnoverNotify),
+    /// Read-only: list every live transient unit (scopes and services made through the systemd API) with its cgroup and accounting, save that list, or check a saved list after a daemon-reload: each unit whose cgroup still runs must still be active by name in systemd, in the same cgroup, with its CPU accounting still readable
+    #[command(
+        after_help = "Examples:\n  agentctl services transients\n  agentctl services transients --save ~/reload-window/before.json\n  agentctl services transients --check ~/reload-window/before.json\n\nFor a user-manager daemon-reload that cannot be avoided (the one-time move of a unit file to link form by services refresh), save the list just before the reload and check it just after. The record has, per transient unit: systemd's ActiveState/SubState, ControlGroup and MainPID, and from the cgroup under --cgroup-root: populated (cgroup.events), processes (cgroup.procs), cpu usage_usec (cpu.stat) and memory.current. The check reads both again. A unit whose cgroup still has processes is LOST when systemd no longer lists it by name, reports it inactive or failed, names another cgroup, or its cpu.stat stops reading or goes backwards: a meter that finds the unit by name would go blind. A unit whose cgroup has no processes now ENDED (its work finished or it was stopped); units started since are listed. Nothing is changed; --save refuses an existing file. --json prints schema agentctl-services-transients/v1 (list, save) or agentctl-services-transients-check/v1 (check). Exit status: 0 listed, saved, or no recorded unit lost; 1 a recorded unit was lost."
+    )]
+    Transients(ServicesTransients),
     /// Print the services guide
     Userguide,
 }
@@ -1020,6 +1025,22 @@ struct ServicesBuild {
 }
 
 #[derive(Args)]
+struct ServicesTransients {
+    /// Write the list to FILE (which must not exist) for a later --check
+    #[arg(long, value_name = "FILE", conflicts_with = "check")]
+    save: Option<PathBuf>,
+    /// Compare FILE, written by --save, with what systemd and the kernel say now
+    #[arg(long, value_name = "FILE")]
+    check: Option<PathBuf>,
+    /// The cgroup v2 mount the ControlGroup paths are under
+    #[arg(long, value_name = "DIR", default_value = "/sys/fs/cgroup")]
+    cgroup_root: PathBuf,
+    /// Print JSON instead of text
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct ServicesRefresh {
     /// Refresh only this unit (with or without .service); repeat for several (default: every service of the registry)
     #[arg(long, value_name = "UNIT")]
@@ -1045,6 +1066,9 @@ struct ServicesRefresh {
     /// Where drop-ins for unit-file services go (default: $XDG_CONFIG_HOME/systemd/user, else ~/.config/systemd/user)
     #[arg(long, value_name = "DIR")]
     drop_in_dir: Option<PathBuf>,
+    /// Never run `systemctl --user daemon-reload`, not even in a rollback: a unit-file service whose move needs one (its drop-in would change, or systemd reports NeedDaemonReload=yes) is refused unchanged
+    #[arg(long)]
+    no_reload: bool,
     /// Print the report as JSON (schema agentctl-services-refresh/v1) instead of text
     #[arg(long)]
     json: bool,
@@ -1107,6 +1131,9 @@ struct ServicesTurnover {
     /// Where drop-ins for unit-file services go (default: $XDG_CONFIG_HOME/systemd/user, else ~/.config/systemd/user)
     #[arg(long, value_name = "DIR")]
     drop_in_dir: Option<PathBuf>,
+    /// Never run `systemctl --user daemon-reload`, not even in a rollback: a unit-file service whose move needs one (its drop-in would change, or systemd reports NeedDaemonReload=yes) is refused unchanged
+    #[arg(long)]
+    no_reload: bool,
     /// Print the report as JSON (schema agentctl-services-turnover/v1) instead of text
     #[arg(long)]
     json: bool,
@@ -4084,6 +4111,33 @@ fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
             print!("{}", crate::SERVICES_USER_GUIDE);
             Ok(0)
         }
+        ServicesCommand::Transients(transients) => {
+            use crate::services::transients as tr;
+            if let Some(path) = &transients.check {
+                let saved = tr::load(&absolute(path)?).map_err(failed)?;
+                let report = tr::check(&host, &transients.cgroup_root, &saved).map_err(failed)?;
+                if transients.json {
+                    write_json(&report.document).map_err(Failure::Output)?;
+                } else {
+                    write_text(&report.text).map_err(Failure::Output)?;
+                }
+                return Ok(report.exit_code);
+            }
+            let units = tr::collect(&host, &transients.cgroup_root).map_err(failed)?;
+            let document = tr::record(&units, tr::now_seconds(&host));
+            let mut text = tr::listing(&units);
+            if let Some(path) = &transients.save {
+                let path = absolute(path)?;
+                tr::save(&path, &document).map_err(failed)?;
+                text.push_str(&format!("saved to {}\n", path.display()));
+            }
+            if transients.json {
+                write_json(&document).map_err(Failure::Output)?;
+            } else {
+                write_text(&text).map_err(Failure::Output)?;
+            }
+            Ok(0)
+        }
         ServicesCommand::List(list) => {
             let (document, text) =
                 crate::services::list(&host, &CliOptionTables, &registry, &root).map_err(failed)?;
@@ -4169,9 +4223,11 @@ fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
                 continue_after_rollback: false,
                 headless_wait: Duration::from_secs(refresh.headless_wait),
                 refreshes_dir: root.join("refreshes"),
+                links_dir: crate::services::snapshot::links_dir(&root),
                 drop_in_dir,
                 interrupted: None,
                 pin_check: None,
+                no_reload: refresh.no_reload,
             };
             // From here an interrupt, a hangup or a termination request no longer kills the
             // command between stopping a service and starting or restoring it: the service in
@@ -4307,6 +4363,7 @@ fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
                 notify,
                 global_binary,
                 interrupted: None,
+                no_reload: turnover.no_reload,
             };
             if !options.report_only && !options.dry_run {
                 let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -54,10 +54,13 @@ fn is_live(service: &Service) -> bool {
     matches!(service.state.active_state.as_str(), "active" | "reloading")
 }
 
-/// The snapshot a service runs, by its binary or its plugin home.
+/// The snapshot a service runs, by its binary or its plugin home, through its services link
+/// for a link-form unit (#2441).
 fn snapshot_index(service: &Service, snapshots: &[Snapshot]) -> Option<usize> {
-    let binary = discover::normalize(&service.binary);
-    let home = service.plugin_home().map(|home| discover::normalize(&home));
+    let binary = discover::normalize(&service.run_binary());
+    let home = service
+        .run_plugin_home()
+        .map(|home| discover::normalize(&home));
     snapshots.iter().position(|snapshot| {
         discover::normalize(&snapshot.agentctl()) == binary
             || home.as_deref() == Some(discover::normalize(&snapshot.home()).as_path())
@@ -196,6 +199,21 @@ pub fn prune(
                 ),
                 Ok(None) => {}
                 Err(error) => problems.push(error),
+            }
+        }
+    }
+    // #2441: every services link protects the snapshot it points at, live unit or not (an
+    // inactive restore oneshot runs through its link at the next boot).
+    if let Ok(entries) = fs::read_dir(snapshot::links_dir(root)) {
+        for entry in entries.flatten() {
+            let link = entry.path();
+            let Ok(target) = fs::canonicalize(&link) else {
+                continue;
+            };
+            if let Some(index) = snapshots.iter().position(|snapshot| {
+                fs::canonicalize(&snapshot.path).is_ok_and(|path| path == target)
+            }) {
+                keep(index, format!("services link {}", link.display()));
             }
         }
     }

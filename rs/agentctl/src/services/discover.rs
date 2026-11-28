@@ -118,6 +118,46 @@ impl Service {
             .map(|(_, value)| value.as_str())
     }
 
+    /// The services root of a link-form unit (#2441), whose binary is
+    /// `ROOT/links/UNIT/bin/agentctl`; `None` for any other unit.
+    #[must_use]
+    pub fn link_root(&self) -> Option<PathBuf> {
+        let suffix = Path::new(super::snapshot::LINKS)
+            .join(&self.unit)
+            .join(super::snapshot::AGENTCTL);
+        let binary = normalize(&self.binary);
+        if !binary.ends_with(&suffix) {
+            return None;
+        }
+        let mut root = binary.as_path();
+        for _ in suffix.components() {
+            root = root.parent()?;
+        }
+        Some(root.to_path_buf())
+    }
+
+    /// The binary the unit runs: through its services link for a link-form unit (#2441), so
+    /// the snapshot it points at is named; otherwise the binary as written.
+    #[must_use]
+    pub fn run_binary(&self) -> PathBuf {
+        match self.link_root() {
+            Some(_) => std::fs::canonicalize(&self.binary).unwrap_or_else(|_| self.binary.clone()),
+            None => self.binary.clone(),
+        }
+    }
+
+    /// The plugin home the bridge runs, through a services link when it names one (#2441).
+    #[must_use]
+    pub fn run_plugin_home(&self) -> Option<PathBuf> {
+        let home = self.plugin_home()?;
+        Some(match self.link_root() {
+            Some(root) if normalize(&home).starts_with(super::snapshot::links_dir(&root)) => {
+                std::fs::canonicalize(&home).unwrap_or(home)
+            }
+            _ => home,
+        })
+    }
+
     /// The bridge's plugin home: `AGENTCTL_HOME`, else `$HOME/.agentctl`.
     #[must_use]
     pub fn plugin_home(&self) -> Option<PathBuf> {

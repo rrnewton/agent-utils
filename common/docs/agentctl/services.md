@@ -182,12 +182,55 @@ program named without a path, and a bridge whose `AGENTCTL_HOME` could come
 from elsewhere (`EnvironmentFile=`, `UnsetEnvironment=`, `PassEnvironment=`, or
 an assignment in its script).
 
-**A unit file** gets the drop-in `DROP_IN_DIR/UNIT.d/zz-agentctl-services.conf`
-(`--drop-in-dir`, default `$XDG_CONFIG_HOME/systemd/user`), which resets
-`ExecStart=` and sets the new command (and `AGENTCTL_HOME`). After `systemctl
---user daemon-reload`, the unit's effective `ExecStart=` must be the planned
-one (another drop-in sorted later would win), then it is restarted. The unit
-file itself is never edited.
+**A unit file** runs through its services link: `ROOT/links/UNIT` is a
+symbolic link to the snapshot directory, and the drop-in
+`DROP_IN_DIR/UNIT.d/zz-agentctl-services.conf` (`--drop-in-dir`, default
+`$XDG_CONFIG_HOME/systemd/user`) resets `ExecStart=` to the same command with
+`ROOT/links/UNIT/bin/agentctl` as its binary (and, for a bridge, sets
+`AGENTCTL_HOME=ROOT/links/UNIT/home`). This is the link form. The drop-in names
+the link, never a commit, so its text is the same for every snapshot. A move
+then repoints the link atomically (a new link renamed over the old one) and
+restarts the unit. The unit file itself is never edited.
+
+systemd applies a changed drop-in to a loaded unit only after a user-manager
+daemon-reload (systemd.unit(5)), and an active service is always loaded. So a
+move reloads only when the drop-in must change (the first move of a unit to
+link form, or a changed command in the unit file), or when systemd already
+reports `NeedDaemonReload=yes` for the unit; then the drop-in is written, the
+link repointed, `systemctl --user daemon-reload` run, and the unit's effective
+`ExecStart=` must be the planned one (another drop-in sorted later would win)
+before the restart. Every other move of a link-form unit runs no reload: the
+loaded `ExecStart=` must already be the planned one, and after the restart
+systemd must still report `NeedDaemonReload=no`. The report says per unit
+`form` (`transient`, `link`, or `drop-in` for a unit file not in link form yet)
+and `reload` (`none` or `daemon-reload`), and for a unit file `link` (its path
+and its old and new targets).
+
+**`--no-reload`** never runs `systemctl --user daemon-reload`, not even in a
+rollback. A unit file whose move would need one is refused before anything is
+written (no drop-in write, no timestamp change, no stop or restart), with a
+reason that starts `needs-daemon-reload:`, when its drop-in must change or
+systemd already reports `NeedDaemonReload=yes` for it. Both are checked when
+the unit is planned and again just before its first change. Transient units
+are moved as always: their replay never reloads. A refused unit counts as a
+refusal (exit 1); the other units are still tried. `services turnover
+--no-reload` passes the flag through, names each refused unit in its notes
+and goes on with the rest.
+
+**Moving a unit file to link form** takes one reload per unit, once. Run it in
+a window where a reload is safe on that host, with `services transients`
+around it (below):
+
+1. Every agentctl that runs `services prune` on the host must read links
+   (a build with this change); an older prune does not see a link as in use.
+2. `agentctl services transients --save FILE` just before.
+3. `agentctl --registry REG services refresh --only UNIT` (without
+   `--no-reload`): writes the link-form drop-in, reloads once, restarts.
+4. `agentctl services transients --check FILE` just after: exit 0 means no
+   live transient unit was lost by the reload.
+
+After that, every move of the unit is reload-free, with or without
+`--no-reload`.
 
 **Health.** Each service must pass the same check before anything changes
 (without the "since the restart" conditions); a service that does not is left
@@ -230,9 +273,13 @@ seconds), so the restart never cuts a turn short, and skipped if it stays busy.
 
 **Rollback.** When the change or the check fails, the service is put back at
 once: a transient unit is stopped and made again from its original definition
-(which must read back as the backup); a drop-in is removed, or its previous
-contents restored, followed by a reload and a restart. The old service is then
-health-checked the same way.
+(which must read back as the backup); for a unit file the services link points
+back at its old target (or is removed when there was none), a drop-in the move
+wrote is removed or its previous contents restored, a reload runs only when
+the move reloaded, and the unit is restarted. The old service is then
+health-checked the same way. `ROLLBACK.sh` holds the same commands (no
+`daemon-reload` line for a reload-free move), and the link's old target is
+also saved beside `UNIT.before` as `UNIT.previous-link`.
 
 **A rollback pairs a binary with its state.** Rolling back restores the old
 binary, not the state the old binary last saw. Configuration files
@@ -283,6 +330,9 @@ needs. Discovery is host-wide, like turnover. A snapshot is kept when:
   (`REGISTRY/turnover.pin`, `REGISTRY/turnover-pins/<unit>.pin`, or
   `ROOT/global.pin` for the global binary), because turnover will
   never move that unit off its build;
+- a services link `ROOT/links/UNIT` points at it, whether its unit is
+  live or not (an inactive restore oneshot runs through its link at the
+  next boot), and a link-form unit's snapshot is found through its link;
 - it is among the newest `--keep` snapshots by commit time (default 3).
 
 Everything else is deleted. The default is a dry run: it lists each
@@ -293,6 +343,40 @@ is 1. `--json` prints the whole plan (schema
 `agentctl-services-prune/v1`). Prune is its own subcommand, not a step
 at the end of build or refresh, so it can be audited and run in an
 emergency without building anything or restarting a service.
+
+## services transients
+
+```sh
+agentctl services transients
+agentctl services transients --save ~/reload-window/before.json
+agentctl services transients --check ~/reload-window/before.json
+```
+
+Read-only. A user-manager daemon-reload has been seen to make systemd report
+a live transient scope as dead, which blinds a meter that finds the unit by
+its name. `transients` records, for every loaded transient unit (scopes and
+services made through the systemd API): systemd's `ActiveState`/`SubState`,
+`ControlGroup` and `MainPID`, and from the cgroup (under `--cgroup-root`,
+default `/sys/fs/cgroup`) `populated` (`cgroup.events`), the processes in
+`cgroup.procs`, `usage_usec` (`cpu.stat`) and `memory.current`: the two views a
+stop-by-name meter depends on.
+
+`--save FILE` writes the record (it refuses an existing file); `--check FILE`
+reads both views again and judges each recorded unit:
+
+- **kept**: its cgroup still has processes, systemd still reports it active by
+  name in the same cgroup, and its CPU accounting still reads, not lower;
+- **LOST**: its cgroup still has processes, but systemd no longer lists it,
+  reports it inactive or failed, names another cgroup, or its `cpu.stat`
+  stops reading or goes backwards;
+- **ended**: its cgroup has no processes now (its work finished or it was
+  stopped).
+
+Units started since the record are listed. A consumer's own meters are its
+own: add their names to the runbook beside the unit names this prints.
+`--json` prints schema `agentctl-services-transients/v1` (list, save) or
+`agentctl-services-transients-check/v1` (check). Exit status: 0 listed,
+saved, or no recorded unit lost; 1 a recorded unit was lost.
 
 ## services turnover
 

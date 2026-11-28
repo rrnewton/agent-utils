@@ -71,6 +71,8 @@ pub struct TurnoverOptions {
     pub global_binary: Option<PathBuf>,
     /// Signal flag passed through to each refresh.
     pub interrupted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Never run a daemon-reload (#2441), passed through to each refresh.
+    pub no_reload: bool,
 }
 
 /// The designed notify identity for timer-driven turnover runs (#1220):
@@ -1124,9 +1126,11 @@ pub fn turnover(
                     continue_after_rollback: true,
                     headless_wait: options.headless_wait,
                     refreshes_dir: options.root.join("refreshes"),
+                    links_dir: super::snapshot::links_dir(&options.root),
                     drop_in_dir: options.drop_in_dir.clone(),
                     interrupted: options.interrupted.clone(),
                     pin_check: Some(pin_check),
+                    no_reload: options.no_reload,
                 };
                 let report =
                     super::refresh(host, tables, registry, &options.root, &refresh_options)?;
@@ -1135,12 +1139,6 @@ pub fn turnover(
                 // A unit whose rollback completed stays on its old binary
                 // and is reported at the end; the remaining units still
                 // move (#1890). Anything harder stops the run.
-                let actions: Vec<&str> = report.document["services"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|entry| entry["action"].as_str())
-                    .collect();
                 for entry in report.document["services"].as_array().into_iter().flatten() {
                     if entry["action"] == "rolled-back" {
                         if let Some(unit) = entry["unit"].as_str() {
@@ -1148,17 +1146,43 @@ pub fn turnover(
                         }
                     }
                 }
-                let only_rollbacks = actions.contains(&"rolled-back")
-                    && actions.iter().all(|action| {
-                        matches!(
-                            *action,
-                            "rolled-back"
-                                | "refreshed"
-                                | "current"
-                                | "skipped"
-                                | "updated-inactive"
-                                | "would-refresh"
-                        )
+                // #2441: under --no-reload a unit whose move needs a daemon-reload is refused
+                // unchanged; like a completed rollback, that leaves it on its old build and the
+                // remaining units still move.
+                let reload_refused = |entry: &Value| {
+                    entry["action"] == "refused"
+                        && entry["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.starts_with(super::refresh::NEEDS_RELOAD))
+                };
+                let entries: Vec<&Value> = report.document["services"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                for entry in entries.iter().filter(|entry| reload_refused(entry)) {
+                    notes.push(format!(
+                        "{} not moved: {}",
+                        entry["unit"].as_str().unwrap_or("?"),
+                        entry["reason"].as_str().unwrap_or("")
+                    ));
+                }
+                let only_rollbacks = entries
+                    .iter()
+                    .any(|entry| entry["action"] == "rolled-back" || reload_refused(entry))
+                    && entries.iter().all(|entry| {
+                        reload_refused(entry)
+                            || entry["action"].as_str().is_some_and(|action| {
+                                matches!(
+                                    action,
+                                    "rolled-back"
+                                        | "refreshed"
+                                        | "current"
+                                        | "skipped"
+                                        | "updated-inactive"
+                                        | "would-refresh"
+                                )
+                            })
                     });
                 let hard_failure = report.exit_code != 0 && !only_rollbacks;
                 if hard_failure {

@@ -113,6 +113,23 @@ struct Fake {
     children: RefCell<BTreeMap<u32, Vec<u32>>>,
     /// `process_children` cannot determine children at all (#2227).
     children_unknown: Cell<bool>,
+    /// What `transient_units` reports (#2441).
+    transient_fields: RefCell<Vec<BTreeMap<String, String>>>,
+}
+
+/// `path` with any symbolic link among its directories replaced by its target, leaving the
+/// rest of the path as written.
+fn resolve_links(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        resolved.push(component);
+        if fs::symlink_metadata(&resolved).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            if let Ok(target) = fs::read_link(&resolved) {
+                resolved = target;
+            }
+        }
+    }
+    resolved
 }
 
 const UNIT_KEYS: [&str; 6] = [
@@ -155,6 +172,7 @@ impl Fake {
             pin_to_write: RefCell::new(None),
             children: RefCell::default(),
             children_unknown: Cell::new(false),
+            transient_fields: RefCell::default(),
         }
     }
 
@@ -162,14 +180,16 @@ impl Fake {
         self.calls.borrow().clone()
     }
 
-    /// The program a command really runs: argv[0], or the command of `sh -c "exec X ..."`.
+    /// The program a command really runs: argv[0], or the command of `sh -c "exec X ..."`,
+    /// with a symbolic link on its way resolved, as the kernel names `/proc/PID/exe` (#2441:
+    /// a link-form unit runs through its services link).
     fn program(argv: &[String]) -> PathBuf {
         if argv[0].ends_with("/sh") && argv.len() > 2 {
             let words = shell_words(&argv[2]).unwrap();
             let command = words.iter().find(|word| word.text != "exec").unwrap();
-            return PathBuf::from(&command.text);
+            return resolve_links(Path::new(&command.text));
         }
-        PathBuf::from(&argv[0])
+        resolve_links(Path::new(&argv[0]))
     }
 
     fn start(&self, name: &str) {
@@ -310,6 +330,10 @@ impl Host for Fake {
             .map(|name| match known.get(name) {
                 Some(unit) => {
                     let parsed = UnitText::parse(&unit.loaded);
+                    // #2441: a unit file whose text or drop-ins on disk differ from what was
+                    // loaded at the last reload needs one, as systemd reports it.
+                    let need_daemon_reload =
+                        !unit.transient && self.loaded_text(name, unit) != unit.loaded;
                     UnitState {
                         id: name.clone(),
                         load_state: "loaded".into(),
@@ -319,6 +343,7 @@ impl Host for Fake {
                         drop_in_paths: Vec::new(),
                         transient: unit.transient,
                         exec_start: parsed.effective("Service", "ExecStart").join(" "),
+                        need_daemon_reload,
                     }
                 }
                 None => UnitState {
@@ -388,6 +413,10 @@ impl Host for Fake {
             Fake::start(self, unit);
         }
         Ok(())
+    }
+
+    fn transient_units(&self) -> Result<Vec<BTreeMap<String, String>>, String> {
+        Ok(self.transient_fields.borrow().clone())
     }
 
     fn daemon_reload(&self) -> Result<(), String> {
@@ -492,12 +521,28 @@ impl Host for Fake {
     }
 
     fn binary_commit(&self, binary: &Path) -> Option<String> {
-        self.commits.borrow().get(binary).cloned().or_else(|| {
-            // Snapshot binaries report their snapshot's commit.
-            binary
-                .to_string_lossy()
-                .contains("/snapshots/")
-                .then(|| NEW.to_owned())
+        if let Some(commit) = self.commits.borrow().get(binary) {
+            return Some(commit.clone());
+        }
+        // A link-form unit's binary runs through its services link (#2441).
+        let binary = if binary.to_string_lossy().contains("/links/") {
+            resolve_links(binary)
+        } else {
+            binary.to_path_buf()
+        };
+        self.commits.borrow().get(&binary).cloned().or_else(|| {
+            // Snapshot binaries report their snapshot's commit, named by its (possibly staged,
+            // dot-prefixed) directory; NEW unless it is one of the other test commits (#2441).
+            let text = binary.to_string_lossy().into_owned();
+            let (_, rest) = text.split_once("/snapshots/")?;
+            let name = rest.split('/').next().unwrap_or("");
+            Some(
+                [THIRD, FOURTH]
+                    .into_iter()
+                    .find(|commit| name.contains(&commit[..12]))
+                    .unwrap_or(NEW)
+                    .to_owned(),
+            )
         })
     }
 
@@ -719,6 +764,11 @@ fn temporary(label: &str) -> Temporary {
 
 /// Fake release outputs and a snapshot built from them.
 fn make_snapshot(host: &dyn Host, root: &Path, work: &Path) -> Snapshot {
+    make_snapshot_at(host, root, work, NEW)
+}
+
+/// A snapshot of `commit` from fake release outputs under `work`.
+fn make_snapshot_at(host: &dyn Host, root: &Path, work: &Path, commit: &str) -> Snapshot {
     let release = work.join("release");
     fs::create_dir_all(&release).unwrap();
     for name in [
@@ -732,8 +782,15 @@ fn make_snapshot(host: &dyn Host, root: &Path, work: &Path) -> Snapshot {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../chat-subscription-slack/manifest.json"),
     )
     .unwrap();
-    snapshot::install_snapshot(host, root, NEW, &release, &manifest, &json!({"test": true}))
-        .expect("snapshot")
+    snapshot::install_snapshot(
+        host,
+        root,
+        commit,
+        &release,
+        &manifest,
+        &json!({"test": true}),
+    )
+    .expect("snapshot")
 }
 
 fn transient_args(unit: &str, description: &str, props: &[&str], argv: &[&str]) -> Vec<String> {
@@ -831,9 +888,11 @@ fn options(world: &World) -> RefreshOptions {
         continue_after_rollback: false,
         headless_wait: Duration::from_secs(30),
         refreshes_dir: world.root.join("refreshes"),
+        links_dir: snapshot::links_dir(&world.root),
         drop_in_dir: world.fake.drop_in_dir.clone(),
         interrupted: None,
         pin_check: None,
+        no_reload: false,
     }
 }
 
@@ -1744,7 +1803,14 @@ fn a_unit_file_service_gets_a_drop_in_and_loses_it_on_rollback() {
         .join(DROP_IN);
     let content = fs::read_to_string(&drop_in).unwrap();
     assert!(content.contains("ExecStart=\n"), "{content}");
-    assert!(content.contains(&world.snapshot.agentctl().to_string_lossy().into_owned()));
+    // #2441: the drop-in names the unit's services link, which points at the snapshot.
+    let link = snapshot::links_dir(&world.root).join("headless.service");
+    assert!(
+        content.contains(&link.join("bin/agentctl").to_string_lossy().into_owned()),
+        "{content}"
+    );
+    assert!(!content.contains(NEW), "{content}");
+    assert_eq!(fs::read_link(&link).unwrap(), world.snapshot.path);
     let pid = world.fake.pid("headless.service").unwrap();
     assert_eq!(world.fake.process_exe(pid), Some(world.snapshot.agentctl()));
     let calls = world.fake.calls();
@@ -2003,8 +2069,14 @@ fn a_transient_unit_with_a_drop_in_is_refused() {
         .unwrap();
     watcher.text.push_str("\n# /home/u/.config/systemd/user.control/watch.service.d/50-CPUQuota.conf\n[Service]\nCPUQuota=50%\n");
     watcher.parsed = UnitText::parse(&watcher.text);
-    let error =
-        super::refresh::plan(watcher, &world.snapshot, &world.fake.drop_in_dir, false).unwrap_err();
+    let error = super::refresh::plan(
+        watcher,
+        &world.snapshot,
+        &world.fake.drop_in_dir,
+        &snapshot::links_dir(&world.root),
+        false,
+    )
+    .unwrap_err();
     assert!(error.contains("drop-ins"), "{error}");
 }
 
@@ -2095,6 +2167,7 @@ fn turnover_options(world: &World, checkout: PathBuf) -> TurnoverOptions {
         notify: None,
         global_binary: None,
         interrupted: None,
+        no_reload: false,
     }
 }
 
@@ -2789,6 +2862,7 @@ fn turnover_expands_percent_h_in_execstart_and_honours_the_pin_it_finds() {
         notify: None,
         global_binary: None,
         interrupted: None,
+        no_reload: false,
     };
     let report = turnover(&fake, &Tables, &options).unwrap();
     let rows = report.document["services"].as_array().unwrap();
@@ -3133,6 +3207,796 @@ fn prune_apply_never_deletes_a_referenced_snapshot() {
     assert!(
         !world.directories["newest"].exists(),
         "with --keep 0 the merely-newest snapshot is deleted: {}",
+        report.text
+    );
+}
+
+// ---- #2441: reload-safe refresh (--no-reload) ----
+
+/// Add the unit-file headless wrapper the drop-in tests use, running the old binary.
+fn add_headless_unit_file(world: &World) {
+    let registry = world.registry.to_string_lossy().into_owned();
+    world.fake.add_unit_file(
+        "headless.service",
+        &format!(
+            "[Unit]\nDescription=headless wrapper\n\n[Service]\nEnvironment=PATH=/usr/bin:/bin\nExecStart=/state/bin/agentctl-old --registry {registry} run-headless --approval-timeout 600 lead\nRestart=on-failure\n"
+        ),
+    );
+}
+
+fn headless_drop_in(world: &World) -> PathBuf {
+    world
+        .fake
+        .drop_in_dir
+        .join("headless.service.d")
+        .join(DROP_IN)
+}
+
+fn reload_calls(world: &World) -> usize {
+    world
+        .fake
+        .calls()
+        .iter()
+        .filter(|call| *call == "daemon-reload")
+        .count()
+}
+
+fn row_for<'a>(report: &'a super::refresh::RefreshReport, unit: &str) -> &'a Value {
+    report.document["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["unit"] == unit)
+        .unwrap_or_else(|| panic!("no row for {unit}: {}", report.text))
+}
+
+#[test]
+fn no_reload_refuses_a_unit_file_whose_drop_in_would_be_written() {
+    let world = world();
+    add_headless_unit_file(&world);
+    let before = world.fake.service_text("headless.service");
+    let pid = world.fake.pid("headless.service");
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["headless.service".into()];
+    only.no_reload = true;
+    let calls_before = world.fake.calls().len();
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    let row = row_for(&report, "headless.service");
+    assert_eq!(row["action"], "refused", "{}", report.text);
+    assert_eq!(row["form"], "drop-in");
+    let reason = row["reason"].as_str().unwrap();
+    assert!(reason.starts_with("needs-daemon-reload: "), "{reason}");
+    assert!(reason.contains("be written"), "{reason}");
+    // Nothing was written, reloaded, stopped or restarted, and no rollback record was made.
+    assert!(!headless_drop_in(&world).exists());
+    let calls = world.fake.calls()[calls_before..].to_vec();
+    assert!(
+        calls
+            .iter()
+            .all(|call| call != "daemon-reload" && !call.ends_with("headless.service")),
+        "{calls:?}"
+    );
+    assert_eq!(world.fake.service_text("headless.service"), before);
+    assert_eq!(world.fake.pid("headless.service"), pid);
+    assert!(report.document["run_directory"].is_null());
+    assert!(
+        report.text.contains("refused: needs-daemon-reload"),
+        "{}",
+        report.text
+    );
+}
+
+#[test]
+fn no_reload_leaves_an_existing_drop_in_and_its_timestamp_alone() {
+    let world = world();
+    add_headless_unit_file(&world);
+    // An earlier refresh's drop-in for another binary, loaded.
+    let drop_in = headless_drop_in(&world);
+    fs::create_dir_all(drop_in.parent().unwrap()).unwrap();
+    let legacy = "# Written by `agentctl services refresh` for snapshot 3333.\n[Service]\nExecStart=\nExecStart=/state/bin/agentctl-old --registry REG run-headless --approval-timeout 600 lead\n"
+        .replace("REG", &world.registry.to_string_lossy());
+    fs::write(&drop_in, &legacy).unwrap();
+    let old_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fs::File::options()
+        .write(true)
+        .open(&drop_in)
+        .unwrap()
+        .set_modified(old_time)
+        .unwrap();
+    world.fake.daemon_reload().unwrap();
+    world.fake.restart("headless.service").unwrap();
+    let reloads = reload_calls(&world);
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["headless.service".into()];
+    only.no_reload = true;
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    let reason = row_for(&report, "headless.service")["reason"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        reason.starts_with("needs-daemon-reload: ") && reason.contains("must change"),
+        "{reason}"
+    );
+    assert_eq!(fs::read_to_string(&drop_in).unwrap(), legacy);
+    assert_eq!(
+        fs::metadata(&drop_in).unwrap().modified().unwrap(),
+        old_time
+    );
+    assert_eq!(reload_calls(&world), reloads);
+}
+
+#[test]
+fn no_reload_refuses_a_unit_whose_files_are_not_what_systemd_loaded() {
+    let world = world();
+    add_headless_unit_file(&world);
+    // The planned drop-in, as a normal refresh writes it.
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["headless.service".into()];
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let drop_in = headless_drop_in(&world);
+    let planned = fs::read_to_string(&drop_in).unwrap();
+    // Back to the old binary, then the planned drop-in put on disk with no reload: systemd
+    // still runs the old definition and reports NeedDaemonReload=yes.
+    fs::remove_file(&drop_in).unwrap();
+    world.fake.daemon_reload().unwrap();
+    world.fake.restart("headless.service").unwrap();
+    fs::write(&drop_in, &planned).unwrap();
+    let state = &world.fake.show(&["headless.service".to_owned()]).unwrap()[0];
+    assert!(state.need_daemon_reload);
+    let reloads = reload_calls(&world);
+    let pid = world.fake.pid("headless.service");
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    only.no_reload = true;
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    let reason = row_for(&report, "headless.service")["reason"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(reason.contains("NeedDaemonReload=yes"), "{reason}");
+    assert_eq!(reload_calls(&world), reloads);
+    assert_eq!(world.fake.pid("headless.service"), pid);
+    assert_eq!(fs::read_to_string(&drop_in).unwrap(), planned);
+}
+
+#[test]
+fn no_reload_still_moves_a_transient_unit_by_replay() {
+    let world = world();
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["watch.service".into()];
+    only.no_reload = true;
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let row = row_for(&report, "watch.service");
+    assert_eq!(row["action"], "refreshed", "{}", report.text);
+    assert_eq!(row["form"], "transient");
+    assert_eq!(row["reload"], "none");
+    let calls = world.fake.calls();
+    assert!(calls.iter().any(|call| call == "stop watch.service"));
+    assert!(calls
+        .iter()
+        .any(|call| call.starts_with("systemd-run --unit=watch.service")));
+    assert_eq!(reload_calls(&world), 0, "{calls:?}");
+}
+
+#[test]
+fn no_reload_dry_run_shows_form_reload_and_refusals() {
+    let world = world();
+    add_headless_unit_file(&world);
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut dry = options(&world);
+    dry.dry_run = true;
+    let report = refresh(&world.fake, &services, &dry).unwrap();
+    let headless = row_for(&report, "headless.service");
+    assert_eq!(headless["action"], "would-refresh");
+    assert_eq!(headless["form"], "drop-in");
+    assert_eq!(headless["reload"], "daemon-reload");
+    assert_eq!(row_for(&report, "watch.service")["reload"], "none");
+    dry.no_reload = true;
+    let calls_before = world.fake.calls().len();
+    let report = refresh(&world.fake, &services, &dry).unwrap();
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    let headless = row_for(&report, "headless.service");
+    assert_eq!(headless["action"], "refused");
+    assert!(headless["reason"]
+        .as_str()
+        .unwrap()
+        .starts_with("needs-daemon-reload: "));
+    assert!(
+        report
+            .text
+            .contains("headless.service (run-headless): refused (dry run): needs-daemon-reload"),
+        "{}",
+        report.text
+    );
+    assert_eq!(row_for(&report, "watch.service")["action"], "would-refresh");
+    // A dry run only reads.
+    assert!(world.fake.calls()[calls_before..]
+        .iter()
+        .all(|call| !call.starts_with("systemd-run") && call != "daemon-reload"));
+}
+
+#[test]
+fn no_reload_force_restarts_a_loaded_drop_in_without_writing_or_reloading() {
+    let world = world();
+    add_headless_unit_file(&world);
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["headless.service".into()];
+    assert_eq!(refresh(&world.fake, &services, &only).unwrap().exit_code, 0);
+    let drop_in = headless_drop_in(&world);
+    let modified = fs::metadata(&drop_in).unwrap().modified().unwrap();
+    let reloads = reload_calls(&world);
+    let pid = world.fake.pid("headless.service");
+    // Already on the snapshot, drop-in loaded: --force restarts it, reload-free.
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    only.no_reload = true;
+    only.force = true;
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let row = row_for(&report, "headless.service");
+    assert_eq!(row["action"], "refreshed", "{}", report.text);
+    assert_eq!(row["reload"], "none");
+    assert_eq!(reload_calls(&world), reloads);
+    assert_ne!(world.fake.pid("headless.service"), pid);
+    assert_eq!(
+        fs::metadata(&drop_in).unwrap().modified().unwrap(),
+        modified
+    );
+    let rollback = fs::read_to_string(
+        PathBuf::from(report.document["run_directory"].as_str().unwrap()).join("ROLLBACK.sh"),
+    )
+    .unwrap();
+    assert!(
+        !rollback.contains("systemctl --user daemon-reload"),
+        "{rollback}"
+    );
+}
+
+#[test]
+fn no_reload_rollback_never_reloads() {
+    let world = world();
+    add_headless_unit_file(&world);
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["headless.service".into()];
+    assert_eq!(refresh(&world.fake, &services, &only).unwrap().exit_code, 0);
+    let reloads = reload_calls(&world);
+    // The forced reload-free restart fails its check: the rollback is a restart, no reload.
+    *world.fake.crashing.borrow_mut() = Some(world.snapshot.agentctl());
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    only.no_reload = true;
+    only.force = true;
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_ne!(report.exit_code, 0, "{}", report.text);
+    let action = row_for(&report, "headless.service")["action"].clone();
+    assert!(
+        action == "rolled-back" || action == "rollback-failed",
+        "{}",
+        report.text
+    );
+    assert_eq!(reload_calls(&world), reloads, "{:?}", world.fake.calls());
+}
+
+// ---- #2441 part 2: link-form drop-ins ----
+
+const THIRD: &str = "3333333333333333333333333333333333333333";
+const FOURTH: &str = "4444444444444444444444444444444444444444";
+
+/// Another snapshot in the world, whose agentctl reports `commit`.
+fn next_snapshot(world: &World, commit: &str) -> Snapshot {
+    let work = world._temporary.0.join(format!("work-{}", &commit[..4]));
+    let next = make_snapshot_at(&world.fake, &world.root, &work, commit);
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(next.agentctl(), commit.to_owned());
+    next
+}
+
+fn headless_link(world: &World) -> PathBuf {
+    snapshot::links_dir(&world.root).join("headless.service")
+}
+
+/// Refresh only `unit` onto `snapshot`.
+fn refresh_unit(
+    world: &World,
+    unit: &str,
+    snapshot: &Snapshot,
+    no_reload: bool,
+) -> super::refresh::RefreshReport {
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(world);
+    only.only = vec![unit.to_owned()];
+    only.snapshot = snapshot.clone();
+    only.no_reload = no_reload;
+    refresh(&world.fake, &services, &only).unwrap()
+}
+
+#[test]
+fn a_link_form_unit_moves_by_repointing_its_link_with_no_reload() {
+    let world = world();
+    add_headless_unit_file(&world);
+    // The first move writes the link-form drop-in: the one reload.
+    let report = refresh_unit(&world, "headless.service", &world.snapshot, false);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let row = row_for(&report, "headless.service");
+    assert_eq!(row["form"], "drop-in");
+    assert_eq!(row["reload"], "daemon-reload");
+    assert_eq!(reload_calls(&world), 1);
+    let drop_in = headless_drop_in(&world);
+    let text = fs::read_to_string(&drop_in).unwrap();
+    let modified = fs::metadata(&drop_in).unwrap().modified().unwrap();
+    let link = headless_link(&world);
+    assert_eq!(fs::read_link(&link).unwrap(), world.snapshot.path);
+    // Later moves, with and without --no-reload: the link moves, nothing else changes.
+    let mut previous = world.snapshot.path.clone();
+    for (commit, no_reload) in [(THIRD, true), (FOURTH, false)] {
+        let next = next_snapshot(&world, commit);
+        let report = refresh_unit(&world, "headless.service", &next, no_reload);
+        assert_eq!(report.exit_code, 0, "{}", report.text);
+        let row = row_for(&report, "headless.service");
+        assert_eq!(row["action"], "refreshed", "{}", report.text);
+        assert_eq!(row["form"], "link");
+        assert_eq!(row["reload"], "none");
+        assert_eq!(row["link"]["old_target"], json!(previous));
+        assert_eq!(row["link"]["new_target"], json!(next.path));
+        assert_eq!(reload_calls(&world), 1, "{:?}", world.fake.calls());
+        assert_eq!(fs::read_to_string(&drop_in).unwrap(), text);
+        assert_eq!(
+            fs::metadata(&drop_in).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), next.path);
+        let pid = world.fake.pid("headless.service").unwrap();
+        assert_eq!(world.fake.process_exe(pid), Some(next.agentctl()));
+        let directory = PathBuf::from(report.document["run_directory"].as_str().unwrap());
+        let rollback = fs::read_to_string(directory.join("ROLLBACK.sh")).unwrap();
+        assert!(rollback.contains("ln -sfn"), "{rollback}");
+        assert!(
+            rollback.contains(&previous.to_string_lossy().into_owned()),
+            "{rollback}"
+        );
+        assert!(
+            !rollback.contains("systemctl --user daemon-reload"),
+            "{rollback}"
+        );
+        assert!(rollback.contains("systemctl --user restart headless.service"));
+        assert_eq!(
+            fs::read_to_string(directory.join("headless.service.previous-link")).unwrap(),
+            format!("{}\n", previous.display())
+        );
+        previous = next.path.clone();
+    }
+}
+
+#[test]
+fn a_failed_link_form_move_points_the_link_back_with_no_reload() {
+    let world = world();
+    add_headless_unit_file(&world);
+    assert_eq!(
+        refresh_unit(&world, "headless.service", &world.snapshot, false).exit_code,
+        0
+    );
+    let next = next_snapshot(&world, THIRD);
+    *world.fake.crashing.borrow_mut() = Some(next.agentctl());
+    let report = refresh_unit(&world, "headless.service", &next, true);
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    assert_eq!(
+        row_for(&report, "headless.service")["action"],
+        "rolled-back",
+        "{}",
+        report.text
+    );
+    assert_eq!(
+        fs::read_link(headless_link(&world)).unwrap(),
+        world.snapshot.path
+    );
+    let pid = world.fake.pid("headless.service").unwrap();
+    assert_eq!(world.fake.process_exe(pid), Some(world.snapshot.agentctl()));
+    assert_eq!(reload_calls(&world), 1, "{:?}", world.fake.calls());
+}
+
+#[test]
+fn moving_a_legacy_drop_in_to_link_form_takes_exactly_one_reload() {
+    let world = world();
+    add_headless_unit_file(&world);
+    // A drop-in written by an older refresh, naming a binary directly, loaded.
+    let drop_in = headless_drop_in(&world);
+    fs::create_dir_all(drop_in.parent().unwrap()).unwrap();
+    let legacy = "# Written by `agentctl services refresh` for snapshot 1111.\n[Service]\nExecStart=\nExecStart=/state/bin/agentctl-old --registry REG run-headless --approval-timeout 600 lead\n"
+        .replace("REG", &world.registry.to_string_lossy());
+    fs::write(&drop_in, legacy).unwrap();
+    world.fake.daemon_reload().unwrap();
+    world.fake.restart("headless.service").unwrap();
+    let reloads = reload_calls(&world);
+    let report = refresh_unit(&world, "headless.service", &world.snapshot, false);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(row_for(&report, "headless.service")["form"], "drop-in");
+    assert_eq!(reload_calls(&world), reloads + 1);
+    let text = fs::read_to_string(&drop_in).unwrap();
+    assert!(text.contains("in link form"), "{text}");
+    let directory = PathBuf::from(report.document["run_directory"].as_str().unwrap());
+    let rollback = fs::read_to_string(directory.join("ROLLBACK.sh")).unwrap();
+    // Its rollback puts the legacy drop-in back, removes the new link and reloads.
+    assert!(rollback.contains("previous-drop-in.conf"), "{rollback}");
+    assert!(
+        rollback.contains(&format!("rm -f {}", headless_link(&world).display())),
+        "{rollback}"
+    );
+    assert!(
+        rollback.contains("systemctl --user daemon-reload"),
+        "{rollback}"
+    );
+    let next = next_snapshot(&world, THIRD);
+    let report = refresh_unit(&world, "headless.service", &next, false);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(reload_calls(&world), reloads + 1);
+}
+
+#[test]
+fn a_unit_file_bridge_keeps_one_drop_in_text_across_snapshots() {
+    let world = world();
+    let registry = world.registry.to_string_lossy().into_owned();
+    world.fake.add_unit_file(
+        "filebridge.service",
+        &format!(
+            "[Unit]\nDescription=file bridge\n\n[Service]\nEnvironment=AGENTCTL_HOME=/state/home-old PATH=/usr/bin:/bin\nExecStart=/state/bin/agentctl-old --registry {registry} chat run --bridge-state /state/filebridge\n"
+        ),
+    );
+    let report = refresh_unit(&world, "filebridge.service", &world.snapshot, false);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let link = snapshot::links_dir(&world.root).join("filebridge.service");
+    let drop_in = world
+        .fake
+        .drop_in_dir
+        .join("filebridge.service.d")
+        .join(DROP_IN);
+    let text = fs::read_to_string(&drop_in).unwrap();
+    assert!(
+        text.contains(&format!("AGENTCTL_HOME={}", link.join("home").display())),
+        "{text}"
+    );
+    let next = next_snapshot(&world, THIRD);
+    let report = refresh_unit(&world, "filebridge.service", &next, true);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let row = row_for(&report, "filebridge.service");
+    assert_eq!(row["form"], "link");
+    assert_eq!(row["reload"], "none");
+    assert_eq!(fs::read_to_string(&drop_in).unwrap(), text);
+    assert_eq!(reload_calls(&world), 1);
+    // services list sees it on the newest snapshot, through the link.
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let bridge = services
+        .iter()
+        .find(|service| service.unit == "filebridge.service")
+        .unwrap();
+    assert_eq!(bridge.link_root(), Some(world.root.clone()));
+    assert_eq!(
+        fs::canonicalize(bridge.run_binary()).unwrap(),
+        fs::canonicalize(next.agentctl()).unwrap()
+    );
+    assert_eq!(
+        fs::canonicalize(bridge.run_plugin_home().unwrap()).unwrap(),
+        fs::canonicalize(next.home()).unwrap()
+    );
+}
+
+#[test]
+fn an_inactive_link_form_restore_unit_moves_its_link_only() {
+    let world = world();
+    let registry = world.registry.to_string_lossy().into_owned();
+    world.fake.add_unit_file(
+        "restore.service",
+        &format!(
+            "[Unit]\nDescription=boot restore\n\n[Service]\nType=oneshot\nExecStart=/state/bin/agentctl-old --registry {registry} restore\n"
+        ),
+    );
+    world.fake.stop("restore.service").unwrap();
+    let report = refresh_unit(&world, "restore.service", &world.snapshot, false);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(
+        row_for(&report, "restore.service")["action"],
+        "updated-inactive"
+    );
+    assert_eq!(reload_calls(&world), 1);
+    let next = next_snapshot(&world, THIRD);
+    let report = refresh_unit(&world, "restore.service", &next, true);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let row = row_for(&report, "restore.service");
+    assert_eq!(row["action"], "updated-inactive", "{}", report.text);
+    assert_eq!(row["reload"], "none");
+    assert_eq!(reload_calls(&world), 1);
+    let link = snapshot::links_dir(&world.root).join("restore.service");
+    assert_eq!(fs::read_link(link).unwrap(), next.path);
+    assert!(world.fake.pid("restore.service").is_none());
+}
+
+#[test]
+fn prune_keeps_every_snapshot_a_services_link_points_at() {
+    let world = prune_world();
+    let links = snapshot::links_dir(&world.root);
+    fs::create_dir_all(&links).unwrap();
+    std::os::unix::fs::symlink(&world.directories["stale"], links.join("idle.service")).unwrap();
+    let report = prune(&world.fake, &Tables, &prune_options(&world, true)).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert!(world.directories["stale"].exists(), "{}", report.text);
+    assert!(report.text.contains("services link"), "{}", report.text);
+}
+
+// ---- #2441: services transients (pre/post reload check) ----
+
+/// A transient unit as `systemctl show` reports it.
+fn transient_fields(unit: &str, active: &str, cgroup: &str) -> BTreeMap<String, String> {
+    [
+        ("Id", unit),
+        ("Transient", "yes"),
+        ("LoadState", "loaded"),
+        ("ActiveState", active),
+        (
+            "SubState",
+            if active == "active" {
+                "running"
+            } else {
+                "dead"
+            },
+        ),
+        ("ControlGroup", cgroup),
+        ("MainPID", "0"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect()
+}
+
+/// A fake cgroup directory with its accounting files.
+fn write_cgroup(root: &Path, cgroup: &str, populated: bool, usage: Option<u64>) {
+    let directory = root.join(cgroup.trim_start_matches('/'));
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("cgroup.events"),
+        format!("populated {}\nfrozen 0\n", u8::from(populated)),
+    )
+    .unwrap();
+    fs::write(
+        directory.join("cgroup.procs"),
+        if populated { "4242\n4243\n" } else { "" },
+    )
+    .unwrap();
+    match usage {
+        Some(usage) => fs::write(
+            directory.join("cpu.stat"),
+            format!("usage_usec {usage}\nuser_usec 1\nsystem_usec 1\n"),
+        )
+        .unwrap(),
+        None => {
+            let _ = fs::remove_file(directory.join("cpu.stat"));
+        }
+    }
+    fs::write(directory.join("memory.current"), "1048576\n").unwrap();
+}
+
+const SCOPE_A: &str = "/user.slice/app.slice/run-meter-a.scope";
+const SCOPE_B: &str = "/user.slice/app.slice/run-meter-b.scope";
+const SCOPE_C: &str = "/user.slice/app.slice/run-meter-c.scope";
+const SCOPE_D: &str = "/user.slice/app.slice/run-meter-d.scope";
+
+#[test]
+fn transients_record_lists_only_transient_units_with_their_cgroups() {
+    let temporary = temporary("transients-list");
+    let cgroups = temporary.0.join("cgroup");
+    let fake = Fake::new(temporary.0.join("drop-ins"));
+    write_cgroup(&cgroups, SCOPE_A, true, Some(1_000));
+    let mut unit_file = transient_fields("bridge.service", "active", "/user.slice/bridge.service");
+    unit_file.insert("Transient".into(), "no".into());
+    *fake.transient_fields.borrow_mut() = vec![
+        transient_fields("run-meter-a.scope", "active", SCOPE_A),
+        unit_file,
+    ];
+    let units = super::transients::collect(&fake, &cgroups).unwrap();
+    assert_eq!(units.len(), 1, "{units:?}");
+    assert_eq!(units[0].unit, "run-meter-a.scope");
+    assert_eq!(units[0].populated, Some(true));
+    assert_eq!(units[0].processes, Some(2));
+    assert_eq!(units[0].cpu_usage_usec, Some(1_000));
+    assert_eq!(units[0].memory_current, Some(1_048_576));
+    // Saved, it reads back the same; a second save to the same file is refused.
+    let path = temporary.0.join("before.json");
+    let document = super::transients::record(&units, 1.0);
+    super::transients::save(&path, &document).unwrap();
+    assert_eq!(super::transients::load(&path).unwrap(), units);
+    assert!(super::transients::save(&path, &document).is_err());
+    // A plain listing changed nothing: no systemctl call that acts.
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+#[test]
+fn transients_check_names_a_live_scope_systemd_calls_dead() {
+    let temporary = temporary("transients-check");
+    let cgroups = temporary.0.join("cgroup");
+    let fake = Fake::new(temporary.0.join("drop-ins"));
+    for scope in [SCOPE_A, SCOPE_B, SCOPE_C, SCOPE_D] {
+        write_cgroup(&cgroups, scope, true, Some(1_000));
+    }
+    *fake.transient_fields.borrow_mut() = vec![
+        transient_fields("run-meter-a.scope", "active", SCOPE_A),
+        transient_fields("run-meter-b.scope", "active", SCOPE_B),
+        transient_fields("run-meter-c.scope", "active", SCOPE_C),
+        transient_fields("run-meter-d.scope", "active", SCOPE_D),
+    ];
+    let saved = super::transients::collect(&fake, &cgroups).unwrap();
+    // After a reload: A still metered; B's processes live on but systemd calls it dead (the
+    // failure the check exists for); C finished; D lost its CPU accounting.
+    write_cgroup(&cgroups, SCOPE_A, true, Some(5_000));
+    write_cgroup(&cgroups, SCOPE_C, false, Some(1_200));
+    write_cgroup(&cgroups, SCOPE_D, true, None);
+    *fake.transient_fields.borrow_mut() = vec![
+        transient_fields("run-meter-a.scope", "active", SCOPE_A),
+        transient_fields("run-meter-b.scope", "inactive", SCOPE_B),
+        transient_fields("run-meter-d.scope", "active", SCOPE_D),
+        transient_fields(
+            "run-new.scope",
+            "active",
+            "/user.slice/app.slice/run-new.scope",
+        ),
+    ];
+    let report = super::transients::check(&fake, &cgroups, &saved).unwrap();
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    let verdict = |unit: &str| {
+        report.document["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["unit"] == unit)
+            .map(|row| row["verdict"].as_str().unwrap().to_owned())
+            .unwrap()
+    };
+    assert_eq!(verdict("run-meter-a.scope"), "kept", "{}", report.text);
+    assert_eq!(verdict("run-meter-b.scope"), "lost", "{}", report.text);
+    assert_eq!(verdict("run-meter-c.scope"), "ended", "{}", report.text);
+    assert_eq!(verdict("run-meter-d.scope"), "lost", "{}", report.text);
+    assert_eq!(report.document["lost"], 2);
+    assert_eq!(report.document["new_units"], json!(["run-new.scope"]));
+    assert!(
+        report
+            .text
+            .contains("run-meter-b.scope: LOST (/user.slice/app.slice/run-meter-b.scope): its cgroup still has processes, but systemd reports it inactive/dead"),
+        "{}",
+        report.text
+    );
+    assert!(report.text.contains("LOST: 2 of 4"), "{}", report.text);
+    // A unit systemd no longer lists at all, cgroup alive, is lost too; all kept is exit 0.
+    *fake.transient_fields.borrow_mut() =
+        vec![transient_fields("run-meter-a.scope", "active", SCOPE_A)];
+    let only_a: Vec<_> = saved
+        .iter()
+        .filter(|unit| unit.unit == "run-meter-a.scope")
+        .cloned()
+        .collect();
+    let report = super::transients::check(&fake, &cgroups, &only_a).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let only_b: Vec<_> = saved
+        .iter()
+        .filter(|unit| unit.unit == "run-meter-b.scope")
+        .cloned()
+        .collect();
+    let report = super::transients::check(&fake, &cgroups, &only_b).unwrap();
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    assert!(
+        report.text.contains("no longer lists the unit by name"),
+        "{}",
+        report.text
+    );
+}
+
+/// The candidate snapshot of `new` fabricated in place, so turnover's build step reuses it
+/// (as the other applying turnover tests do), with its binary reporting `new`.
+fn fabricate_candidate(world: &World, new: &str) -> PathBuf {
+    let release = world._temporary.0.join("release-candidate");
+    fs::create_dir_all(&release).unwrap();
+    for name in [
+        "agentctl",
+        "agentctl-slack-outbound",
+        "agentctl-slack-plugin",
+    ] {
+        fs::write(release.join(name), format!("#!/bin/sh\necho {name}\n")).unwrap();
+    }
+    let destination = world.root.join("snapshots").join(&new[..12]);
+    fs::create_dir_all(destination.join("bin")).unwrap();
+    fs::create_dir_all(destination.join("home/plugins/slack")).unwrap();
+    for (from, to) in [
+        ("agentctl", snapshot::AGENTCTL),
+        ("agentctl-slack-outbound", snapshot::OUTBOUND),
+        ("agentctl-slack-plugin", snapshot::PLUGIN),
+    ] {
+        fs::copy(release.join(from), destination.join(to)).unwrap();
+    }
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../chat-subscription-slack/manifest.json"),
+        destination.join(snapshot::MANIFEST),
+    )
+    .unwrap();
+    let files: serde_json::Map<String, Value> = [
+        snapshot::AGENTCTL,
+        snapshot::OUTBOUND,
+        snapshot::PLUGIN,
+        snapshot::MANIFEST,
+    ]
+    .into_iter()
+    .map(|relative| {
+        (
+            relative.to_owned(),
+            json!({"sha256": world.fake.file_sha256(&destination.join(relative)), "bytes": 1}),
+        )
+    })
+    .collect();
+    fs::write(
+        destination.join("snapshot.json"),
+        json!({
+            "schema": snapshot::SNAPSHOT_SCHEMA,
+            "commit": new,
+            "built_at": 1_800_000_000_u64,
+            "source": {"test": true},
+            "files": files,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(destination.join(snapshot::AGENTCTL), new.to_owned());
+    destination
+}
+
+#[test]
+fn turnover_no_reload_moves_the_rest_and_names_a_unit_that_needs_a_reload() {
+    let world = world();
+    add_headless_unit_file(&world);
+    let (checkout, old, new) = turnover_checkout(&world._temporary.0);
+    fabricate_candidate(&world, &new);
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(PathBuf::from("/state/bin/agentctl-old"), old.clone());
+    let mut options = turnover_options(&world, checkout);
+    options.report_only = false;
+    options.no_reload = true;
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    // The unit file is refused unchanged; the transient units still move.
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    assert_eq!(reload_calls(&world), 0, "{:?}", world.fake.calls());
+    assert!(!headless_drop_in(&world).exists());
+    assert!(
+        report
+            .text
+            .contains("headless.service not moved: needs-daemon-reload"),
+        "{}",
+        report.text
+    );
+    let refreshed: Vec<String> = report.document["refreshes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|document| document["services"].as_array().cloned().unwrap_or_default())
+        .filter(|row| row["action"] == "refreshed")
+        .map(|row| row["unit"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        refreshed.contains(&"watch.service".to_owned())
+            && refreshed.contains(&"bridge.service".to_owned()),
+        "{refreshed:?}\n{}",
         report.text
     );
 }

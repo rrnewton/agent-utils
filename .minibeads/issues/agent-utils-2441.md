@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-services-refresh-reload-safe: services refresh --no-reload never runs a user-manager daemon-reload, refuses a unit-file move that needs one, and a link-form drop-in makes later moves reload-free'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: cl-svcreload
@@ -9,7 +9,8 @@ labels:
 - services
 - hot-machine
 created_at: 2026-11-27T23:55:00-05:00
-updated_at: 2026-11-27T23:55:00-05:00
+updated_at: 2026-11-28T00:31:00-05:00
+closed_at: 2026-11-28T00:31:00-05:00
 ---
 
 # Description
@@ -31,7 +32,7 @@ Part 1, `services refresh --no-reload` (also passed through by `services turnove
   2. `systemctl --user show -p NeedDaemonReload UNIT` already says `yes`, so what is on disk is not what is loaded, and a restart would not run what the plan checked.
 - A refused unit gets no write and no file timestamp change. It counts as a refusal (exit 1) and the next units are still tried.
 - Otherwise the unit is restarted by its exact name and health-checked as today. After the restart, `NeedDaemonReload` must still say `no`, or the unit is rolled back by the same reload-free path.
-- `--dry-run` shows, per unit, `reload: none` or `would-refuse: needs-daemon-reload (reason)`.
+- `--dry-run` shows the same refusals (action `refused`, text `refused (dry run): needs-daemon-reload: ...`, as for other plan refusals) and, per unit, `form` and `reload`.
 
 Part 2, link-form drop-ins, which make Part 1 useful for unit-file services:
 
@@ -47,6 +48,10 @@ Report and rollback record:
 
 Part 2 is a simpler form of the stable launcher in #2221. If it lands here, #2221 narrows to whatever the link form leaves out.
 
+With Part 2, a move without `--no-reload` also reloads only when the drop-in must change or `NeedDaemonReload=yes`; the rest of its moves of a link-form unit are reload-free too.
+
+Part 3, a read-only pre/post check for the one migration reload (asked for by the consumer team's lead): `agentctl services transients` lists every loaded transient scope and service with systemd's `ActiveState`/`SubState`, `ControlGroup` and `MainPID`, and from its cgroup `populated`, the processes in `cgroup.procs`, `cpu.stat` `usage_usec` and `memory.current`. `--save FILE` records the list (refusing an existing file); `--check FILE` reads both views again: a recorded unit whose cgroup still has processes is LOST when systemd no longer lists it, reports it inactive or failed, names another cgroup, or its CPU accounting stops reading or goes backwards; one whose cgroup is empty ENDED. Exit 1 when a unit was lost.
+
 # Acceptance Criteria
 
 - Test (fake systemctl): with `--no-reload`, a unit-file service whose drop-in would change is refused before any write. The drop-in file and its timestamp are unchanged, and the fake never sees `daemon-reload`, `restart` or `stop` for it.
@@ -56,8 +61,16 @@ Part 2 is a simpler form of the stable launcher in #2221. If it lands here, #222
 - Test: a refresh without `--no-reload` migrates a legacy drop-in to link form with exactly one reload.
 - Test: prune keeps a snapshot a link points at.
 - Test: the dry run and the JSON report show `form`, `reload` and the `needs-daemon-reload` refusals.
+- Test: `services transients` keeps only transient units, and a check after a simulated reload names a scope whose cgroup still runs but which systemd calls dead (LOST), one without CPU accounting (LOST), one that ended, and new units.
+- Test through the real CLI with a fake `--systemctl` script: `services refresh --no-reload` refuses a unit-file move with only read calls reaching systemctl and nothing written; `services transients --save` then `--check` exits 1 on a lost scope.
 - Docs: `services refresh --help` and the services section of the agentctl user guide describe `--no-reload`, the refusal conditions, the link form and the one-time migration.
 
 # Notes
 
 Requested by the lead coordinator on 2026-11-27 for a consumer team whose standing rule since 2026-11-23 forbids user-manager reloads while their transient units run. Evidence for the reload requirement was read on systemd 262: systemd.unit(5) and the warning text in systemctl. No test touches a live user manager; all tests use the fake host or a fake `--systemctl`.
+
+Conditions from the consumer team's lead for its migration (operational, after landing): (1) its pinned agentctl moves to a build with this change before any of its units is moved to link form, because an older `services prune` does not see a link as in use; (2) the one migration reload runs in a quiet window it names, with `services transients --save` just before and `--check` just after, its own meter names listed beside the unit names.
+
+## Resolution
+
+Implemented as designed in three parts: `--no-reload` on `services refresh` and `services turnover`, link-form drop-ins (`ROOT/links/UNIT`), and `services transients --save/--check`. The report rows carry `form`, `reload` and `link`; `ROLLBACK.sh` has no reload line for a reload-free move and saves `UNIT.previous-link`. `services prune` and `services list` resolve links. The guide's services section has the migration runbook.

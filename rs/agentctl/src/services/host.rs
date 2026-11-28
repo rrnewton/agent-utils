@@ -31,6 +31,9 @@ pub struct UnitState {
     pub transient: bool,
     /// The raw `ExecStart` property, used only to decide which units to read in full.
     pub exec_start: String,
+    /// `NeedDaemonReload=yes`: the unit's files on disk are not what systemd loaded, so a
+    /// restart would not run what is on disk (#2441).
+    pub need_daemon_reload: bool,
 }
 
 /// The machine, as seen by `agentctl services`.
@@ -51,6 +54,11 @@ pub trait Host {
     fn start(&self, unit: &str) -> Result<(), String>;
     /// `systemctl --user daemon-reload`.
     fn daemon_reload(&self) -> Result<(), String>;
+    /// Every loaded service and scope, as `systemctl --user show` fields
+    /// ([`super::transients::PROPERTIES`]), for `services transients` (#2441). Read-only.
+    fn transient_units(&self) -> Result<Vec<BTreeMap<String, String>>, String> {
+        Err("this host cannot list transient units".to_owned())
+    }
     /// `systemd-run --user ARGS...`.
     fn systemd_run(&self, args: &[String]) -> Result<(), String>;
     /// The commit an agentctl binary reports on `--version`; `None` when it names none or does
@@ -101,7 +109,7 @@ pub struct SystemHost {
 
 /// The `systemctl show` properties [`UnitState`] needs.
 const SHOW_PROPERTIES: &str =
-    "Id,LoadState,ActiveState,MainPID,FragmentPath,DropInPaths,Transient,ExecStart";
+    "Id,LoadState,ActiveState,MainPID,FragmentPath,DropInPaths,Transient,ExecStart,NeedDaemonReload";
 
 /// The most units passed to one `systemctl show`.
 const SHOW_BATCH: usize = 64;
@@ -165,6 +173,7 @@ pub fn parse_show(text: &str) -> Vec<UnitState> {
                 .collect(),
             transient: field("Transient") == "yes",
             exec_start: field("ExecStart"),
+            need_daemon_reload: field("NeedDaemonReload") == "yes",
         });
         fields.clear();
     };
@@ -188,7 +197,55 @@ pub fn parse_show(text: &str) -> Vec<UnitState> {
     states
 }
 
+/// Parse `systemctl show` output for several units into one field map per unit (#2441).
+#[must_use]
+pub fn parse_show_fields(text: &str) -> Vec<BTreeMap<String, String>> {
+    let mut units = Vec::new();
+    let mut fields: BTreeMap<String, String> = BTreeMap::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if !fields.is_empty() {
+                units.push(std::mem::take(&mut fields));
+            }
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            fields.insert(key.to_owned(), value.to_owned());
+        }
+    }
+    if !fields.is_empty() {
+        units.push(fields);
+    }
+    units
+}
+
 impl Host for SystemHost {
+    fn transient_units(&self) -> Result<Vec<BTreeMap<String, String>>, String> {
+        let listed = self.systemctl(&[
+            "list-units",
+            "--all",
+            "--type=service,scope",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+        ])?;
+        let mut names: Vec<String> = listed
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|name| name.ends_with(".service") || name.ends_with(".scope"))
+            .map(str::to_owned)
+            .collect();
+        names.sort();
+        names.dedup();
+        let mut units = Vec::new();
+        for batch in names.chunks(SHOW_BATCH) {
+            let mut args = vec!["show", "--property", super::transients::PROPERTIES];
+            args.extend(batch.iter().map(String::as_str));
+            units.extend(parse_show_fields(&self.systemctl(&args)?));
+        }
+        Ok(units)
+    }
+
     fn service_units(&self) -> Result<Vec<String>, String> {
         let mut units = Vec::new();
         let loaded = self.systemctl(&[
@@ -497,7 +554,7 @@ mod tests {
 
     #[test]
     fn parse_show_splits_units_and_reads_fields() {
-        let text = "Id=a.service\nLoadState=loaded\nActiveState=active\nMainPID=42\nFragmentPath=/run/a.service\nDropInPaths=/x/a.d/1.conf /x/a.d/2.conf\nTransient=yes\nExecStart={ path=/bin/sh ; argv[]=/bin/sh -c exec agentctl }\n\nId=b.service\nLoadState=not-found\nActiveState=inactive\nMainPID=0\nFragmentPath=\nDropInPaths=\nTransient=no\nExecStart=\n";
+        let text = "Id=a.service\nLoadState=loaded\nActiveState=active\nMainPID=42\nFragmentPath=/run/a.service\nDropInPaths=/x/a.d/1.conf /x/a.d/2.conf\nTransient=yes\nExecStart={ path=/bin/sh ; argv[]=/bin/sh -c exec agentctl }\nNeedDaemonReload=yes\n\nId=b.service\nLoadState=not-found\nActiveState=inactive\nMainPID=0\nFragmentPath=\nDropInPaths=\nTransient=no\nExecStart=\n";
         let states = parse_show(text);
         assert_eq!(states.len(), 2);
         assert_eq!(states[0].main_pid, Some(42));
@@ -505,6 +562,20 @@ mod tests {
         assert_eq!(states[0].drop_in_paths.len(), 2);
         assert_eq!(states[1].main_pid, None);
         assert_eq!(states[1].fragment_path, None);
+        // #2441: the reload flag is read per unit; a missing field reads as no.
+        assert!(states[0].need_daemon_reload);
+        assert!(!states[1].need_daemon_reload);
+    }
+
+    #[test]
+    fn parse_show_fields_keeps_one_map_per_unit() {
+        let text = "Id=a.scope\nTransient=yes\nControlGroup=/u/a.scope\n\nId=b.service\nTransient=no\nControlGroup=\n";
+        let units = parse_show_fields(text);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0]["Id"], "a.scope");
+        assert_eq!(units[0]["ControlGroup"], "/u/a.scope");
+        assert_eq!(units[1]["Transient"], "no");
+        assert_eq!(units[1]["ControlGroup"], "");
     }
 
     /// A minimal stat record for `pid` whose parent is `parent`.

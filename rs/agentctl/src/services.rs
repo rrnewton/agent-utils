@@ -23,6 +23,7 @@ pub mod host;
 pub mod prune;
 pub mod refresh;
 pub mod snapshot;
+pub mod transients;
 pub mod turnover;
 pub mod unit;
 
@@ -112,9 +113,14 @@ fn describe(host: &dyn Host, service: &Service, newest: Option<&Snapshot>) -> Va
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     // The kernel marks an executable replaced on disk since the process started.
-    let running_matches = running_text
-        .as_deref()
-        .map(|text| discover::normalize(Path::new(text)) == discover::normalize(&service.binary));
+    // A link-form unit (#2441) runs the snapshot its services link points at.
+    let linked = service.link_root().is_some();
+    let run_binary = service.run_binary();
+    let running_matches = running_text.as_deref().map(|text| {
+        let exe = discover::normalize(Path::new(text));
+        exe == discover::normalize(&service.binary)
+            || (linked && exe == discover::normalize(&run_binary))
+    });
     let plugin_home = service.plugin_home();
     let plugin = plugin_home
         .as_ref()
@@ -125,11 +131,18 @@ fn describe(host: &dyn Host, service: &Service, newest: Option<&Snapshot>) -> Va
         .flatten();
     let outbound_sha = outbound.as_ref().and_then(|path| host.file_sha256(path));
     let newest_view = newest.map(|snapshot| {
-        let on_snapshot = discover::normalize(&service.binary)
-            == discover::normalize(&snapshot.agentctl())
-            && (service.kind != Kind::Bridge
-                || plugin_home.as_deref().map(discover::normalize)
-                    == Some(discover::normalize(&snapshot.home())));
+        let on_snapshot = if linked {
+            refresh::same_file(&run_binary, &snapshot.agentctl())
+                && (service.kind != Kind::Bridge
+                    || service
+                        .run_plugin_home()
+                        .is_some_and(|home| refresh::same_file(&home, &snapshot.home())))
+        } else {
+            discover::normalize(&service.binary) == discover::normalize(&snapshot.agentctl())
+                && (service.kind != Kind::Bridge
+                    || plugin_home.as_deref().map(discover::normalize)
+                        == Some(discover::normalize(&snapshot.home())))
+        };
         json!({
             "commit": snapshot.commit,
             "path": snapshot.path,
