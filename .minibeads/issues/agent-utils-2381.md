@@ -10,7 +10,7 @@ labels:
 - tests
 - gate
 created_at: 2026-11-27T08:52:21-05:00
-updated_at: 2026-11-28T10:32:00-05:00
+updated_at: 2026-11-28T13:21:00-05:00
 closed_at: 2026-11-28T10:32:00-05:00
 ---
 
@@ -77,3 +77,5 @@ Fixed in 5949efb4 (test file only, `rs/agentctl/tests/console_pty.rs`; `console.
   - Fix: 576 of 576 cases passed (each original case 144 of 144, the negative control 144 of 144, the regression check 144 of 144), with no refusals.
   - The new tests with the launcher's wait removed: the regression check failed 3 of 3, by name, in about 4 s.
 - Negative control against a real harness: `agentctl console` started directly on a pty from that session's shell refused with that session's claude pid, exit 2.
+- Follow-up check (2026-11-28, `cl-flaketriage`, from the 48-hour triage). Before the fix, `console_delivers_typed_lines_as_plain_turns` was the `rust.agentctl.test` red in 4 of 9 red gates in the 48 hours before it (heads d8b73e16, aa943857, 87d285fa, 54b0854a; read from those lanes' console gate logs). After 5949efb4: 14 gates carried the fix by 18:11 UTC, and none had `rust.agentctl.test` red. In the 4 of them whose agentctl step log was kept, the case passed every time (gates on 7582169c, 9c268096, 4eca6aa1, 97fb290d).
+
