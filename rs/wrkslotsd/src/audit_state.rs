@@ -42,7 +42,7 @@ use crate::handoff_write::publication;
 use crate::hold_write::{active_document, current_hold, holds_from_events, validate_global};
 use crate::journal_state::{journal_forward_compatible, JOURNAL_EXTENSION_KEYS};
 use crate::remove_write::{
-    assert_slot_unused_snapshot, capture_process_snapshot, liveness_answer, ProcessSnapshot,
+    assert_slot_unused_snapshot, capture_audit_snapshot, liveness_answer, ProcessSnapshot,
 };
 use crate::status_state::process_state;
 
@@ -6455,7 +6455,7 @@ fn audit_record(
         // a row can use it (single attempt, fail-closed like Python);
         // rows judged in parallel wait for the one capture.
         match process_census
-            .get_or_init(|| capture_process_snapshot(std::process::id() as i64, census_targets))
+            .get_or_init(|| capture_audit_snapshot(std::process::id() as i64, census_targets))
         {
             Err(error) => {
                 reasons.push(format!("process/path census failed: {error}"));

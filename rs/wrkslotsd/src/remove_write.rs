@@ -725,6 +725,52 @@ fn reanchor_liveness(record: &Value) -> Option<Liveness> {
     })
 }
 
+/// The census process's own descendants among `names`, one listing round
+/// (#2464): a process whose parent chain, read from `proc_root`, reaches
+/// `own`. For the audit these are its own commands (a row's git calls and
+/// whatever they run under), never running agents: a pooled audit captured
+/// its one shared census while a sibling row's git child worked in that
+/// row's slot, and counted it as one. A child never starts before its
+/// parent, so a parent pid that was reused by a later process breaks the
+/// chain instead of adopting strangers.
+fn own_descendants(proc_root: &Path, names: &[String], own: i64) -> BTreeSet<i64> {
+    let mut children: HashMap<i64, Vec<(i64, u64)>> = HashMap::new();
+    let mut own_start: Option<u64> = None;
+    for name in names {
+        let Ok(pid) = name.parse::<i64>() else {
+            continue;
+        };
+        let Some((parent, start)) = process_parent_and_start(&proc_root.join(name)) else {
+            continue;
+        };
+        if pid == own {
+            own_start = Some(start);
+        }
+        children.entry(parent).or_default().push((pid, start));
+    }
+    let mut result = BTreeSet::new();
+    let mut pending = vec![(own, own_start.unwrap_or(0))];
+    while let Some((parent, parent_start)) = pending.pop() {
+        for &(child, start) in children.get(&parent).map(Vec::as_slice).unwrap_or(&[]) {
+            if start >= parent_start && child != own && result.insert(child) {
+                pending.push((child, start));
+            }
+        }
+    }
+    result
+}
+
+/// The parent pid and start time (clock ticks) from one process's stat.
+fn process_parent_and_start(base: &Path) -> Option<(i64, u64)> {
+    let raw = std::fs::read(base.join("stat")).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let closing = text.rfind(") ")?;
+    let fields: Vec<&str> = text[closing + 2..].split_whitespace().collect();
+    let parent = fields.get(1)?.parse().ok()?;
+    let start = fields.get(19)?.parse().ok()?;
+    Some((parent, start))
+}
+
 fn own_ancestry() -> BTreeSet<i64> {
     let mut result = BTreeSet::new();
     let mut current = std::process::id() as i64;
@@ -1249,7 +1295,69 @@ pub(crate) fn capture_process_snapshot_at(
     coordinator_pid: i64,
     targets: &[PathBuf],
 ) -> Result<ProcessSnapshot> {
+    capture_snapshot(proc_root, coordinator_pid, targets, false)
+}
+
+/// The audit's census: as `capture_process_snapshot`, and it also skips the
+/// audit's own descendants (#2464). The audit captures one shared census
+/// for every row; with `--jobs N` a sibling row's git command can be
+/// working in its slot at that moment, and it is the audit's own child, not
+/// a running agent.
+pub(crate) fn capture_audit_snapshot(
+    coordinator_pid: i64,
+    targets: &[PathBuf],
+) -> Result<ProcessSnapshot> {
+    capture_audit_snapshot_at(Path::new("/proc"), coordinator_pid, targets)
+}
+
+pub(crate) fn capture_audit_snapshot_at(
+    proc_root: &Path,
+    coordinator_pid: i64,
+    targets: &[PathBuf],
+) -> Result<ProcessSnapshot> {
+    capture_snapshot(proc_root, coordinator_pid, targets, true)
+}
+
+/// Test seam (#2464): `WRKSLOTS_TEST_CENSUS_OWN_CHILD_CWD` names a directory
+/// in which a child of the census's own process works while the snapshot is
+/// taken, as a pooled audit's sibling git command does. The child ends when
+/// the snapshot does, on every return path.
+struct OwnChildSeam(Option<std::process::Child>);
+
+impl OwnChildSeam {
+    fn start() -> Self {
+        Self(
+            std::env::var_os("WRKSLOTS_TEST_CENSUS_OWN_CHILD_CWD").and_then(|dir| {
+                std::process::Command::new("sleep")
+                    .arg("3600")
+                    .current_dir(dir)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .ok()
+            }),
+        )
+    }
+}
+
+impl Drop for OwnChildSeam {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn capture_snapshot(
+    proc_root: &Path,
+    coordinator_pid: i64,
+    targets: &[PathBuf],
+    skip_own_descendants: bool,
+) -> Result<ProcessSnapshot> {
     use std::os::unix::fs::MetadataExt as _;
+    let _own_child_seam = OwnChildSeam::start();
     let ignored = own_ancestry();
     // A target that cannot be inspected is judged (and refused) by
     // assert_slot_unused_snapshot; here it can settle nothing.
@@ -1291,11 +1399,16 @@ pub(crate) fn capture_process_snapshot_at(
         }
         reads.unsettling.clear();
         reads.added = 0;
+        let descendants = if skip_own_descendants {
+            own_descendants(proc_root, &names, std::process::id() as i64)
+        } else {
+            BTreeSet::new()
+        };
         for name in names {
             let Ok(pid) = name.parse::<i64>() else {
                 continue;
             };
-            if ignored.contains(&pid) || pid == coordinator_pid {
+            if ignored.contains(&pid) || descendants.contains(&pid) || pid == coordinator_pid {
                 continue;
             }
             let base = proc_root.join(pid.to_string());
@@ -5721,7 +5834,10 @@ pub(crate) fn remove_slot(
 
 #[cfg(test)]
 mod link_tests {
-    use super::{assert_slot_unused_snapshot, capture_process_snapshot_at, link_points_into};
+    use super::{
+        assert_slot_unused_snapshot, capture_audit_snapshot_at, capture_process_snapshot_at,
+        link_points_into,
+    };
 
     #[test]
     fn link_points_into_cases() {
@@ -5785,6 +5901,90 @@ mod link_tests {
         assert!(error.contains("working directory"));
         child.kill().unwrap();
         child.wait().unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn audit_snapshot_skips_the_callers_own_children_and_still_counts_a_stranger() {
+        // #2464: a pooled audit's one shared census can be captured while a
+        // sibling row's git command works in its slot. The audit's census
+        // skips its own descendants; a process that is not one still counts.
+        use std::io::BufRead as _;
+        let base =
+            std::env::temp_dir().join(format!("wrkslots-own-children-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let slot = base.join("slot");
+        std::fs::create_dir_all(&slot).unwrap();
+        let slot = slot.canonicalize().unwrap();
+        // The caller's child, and a grandchild through a live intermediate shell.
+        let mut child = std::process::Command::new("sleep")
+            .arg("3600")
+            .current_dir(&slot)
+            .spawn()
+            .unwrap();
+        let mut shell = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 3600 & echo $!; wait")
+            .current_dir(&slot)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(shell.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: i64 = line.trim().parse().unwrap();
+        // A stranger: the shell that starts it exits at once, so the sleep is
+        // re-parented to an ancestor of this process, never under it.
+        let started = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("setsid sleep 3600 </dev/null >/dev/null 2>&1 & echo $!")
+            .current_dir(&slot)
+            .output()
+            .unwrap();
+        let stranger: i64 = String::from_utf8_lossy(&started.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        let proc_root = base.join("proc");
+        std::fs::create_dir_all(&proc_root).unwrap();
+        for pid in [
+            i64::from(child.id()),
+            i64::from(shell.id()),
+            grandchild,
+            stranger,
+        ] {
+            std::os::unix::fs::symlink(format!("/proc/{pid}"), proc_root.join(pid.to_string()))
+                .unwrap();
+        }
+        let own = std::process::id() as i64;
+        let audit =
+            capture_audit_snapshot_at(&proc_root, own, std::slice::from_ref(&slot)).unwrap();
+        let error = assert_slot_unused_snapshot(&audit, &slot).unwrap_err();
+        assert!(
+            error.contains(&format!("live process {stranger} uses slot")),
+            "{error}"
+        );
+        // The ordinary census still counts the caller's own child: remove
+        // and its tests rely on that, and nothing of remove's own is in
+        // flight during its census.
+        let ordinary =
+            capture_process_snapshot_at(&proc_root, own, std::slice::from_ref(&slot)).unwrap();
+        assert!(assert_slot_unused_snapshot(&ordinary, &slot).is_err());
+        // Without the stranger, the audit's census finds the slot unused.
+        std::fs::remove_file(proc_root.join(stranger.to_string())).unwrap();
+        let audit =
+            capture_audit_snapshot_at(&proc_root, own, std::slice::from_ref(&slot)).unwrap();
+        assert!(assert_slot_unused_snapshot(&audit, &slot).is_ok());
+        for pid in [grandchild, stranger] {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        shell.kill().unwrap();
+        shell.wait().unwrap();
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

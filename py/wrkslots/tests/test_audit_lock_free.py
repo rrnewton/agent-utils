@@ -799,7 +799,6 @@ def _comparable_rust_audit(root: Path, tmp_path: Path, jobs: int) -> tuple[dict[
 
 
 @pytest.mark.git_stand_in  # a host git wrapper's detached helper outlives the git calls (#2065)
-@pytest.mark.load_quarantine(issue="#2464", expires="2026-12-05")  # census-counts-own-descendants: the pooled audit's one shared census can count a sibling row's in-flight git child as a running agent
 def test_other_edition_pools_rows_with_the_same_report(tmp_path: Path) -> None:
     """#1200 rust-status-consistency: Rust audit --jobs 4 reports exactly what --jobs 1 does."""
     root = _verdict_mix_fixture(tmp_path / "case")
@@ -812,3 +811,50 @@ def test_other_edition_pools_rows_with_the_same_report(tmp_path: Path) -> None:
     }
     assert {"BLOCKED", "HELD"} <= set(verdicts.values()), verdicts
     print(f"rust audit: --jobs 1 {serial_seconds:.2f}s, --jobs 4 {pooled_seconds:.2f}s")
+
+
+@pytest.mark.real_process_evidence
+@pytest.mark.git_stand_in  # a host git wrapper's detached helper outlives the git calls (#2065)
+def test_other_edition_audit_never_counts_its_own_child_as_an_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2464 census-counts-own-descendants: the audit's census skips the audit's own children.
+
+    A pooled audit captured its one shared census while a sibling row's git
+    command worked in that row's slot, and counted that child as a running
+    agent. The census seam (WRKSLOTS_TEST_CENSUS_OWN_CHILD_CWD) starts such a
+    child in plain-0 during every capture, deterministically. With it, both
+    --jobs 1 and --jobs 4 report exactly what the audit reports without it,
+    while a stranger working in plain-1 is still a live process in both.
+    """
+
+    root = _verdict_mix_fixture(tmp_path / "case")
+    stranger = subprocess.Popen(
+        ["sleep", "3600"], cwd=root / "worktrees" / "plain-1" / "repo",
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        runs = tmp_path / "runs"
+        (runs / "plain").mkdir(parents=True)
+        baseline, _ = _comparable_rust_audit(root, runs / "plain", 1)
+        monkeypatch.setenv(
+            "WRKSLOTS_TEST_CENSUS_OWN_CHILD_CWD", str(root / "worktrees" / "plain-0" / "repo")
+        )
+        seamed = {}
+        for jobs in (1, 4):
+            (runs / f"seamed-{jobs}").mkdir()
+            seamed[jobs], _ = _comparable_rust_audit(root, runs / f"seamed-{jobs}", jobs)
+    finally:
+        stranger.kill()
+        stranger.wait(timeout=60)
+    rows = {
+        str(row["slot"]): row for row in cast(list[dict[str, object]], baseline["slots"])
+    }
+    stranger_reasons = [str(reason) for reason in cast(list[object], rows["plain-1"]["reasons"])]
+    assert rows["plain-1"]["verdict"] == "BLOCKED", rows["plain-1"]
+    assert any(f"live process {stranger.pid} " in reason for reason in stranger_reasons), (
+        stranger_reasons
+    )
+    assert rows["plain-0"]["verdict"] != "BLOCKED", rows["plain-0"]
+    assert seamed[1] == baseline
+    assert seamed[4] == baseline

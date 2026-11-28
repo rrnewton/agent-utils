@@ -1358,6 +1358,31 @@ def test_remove_forced_churn_refuses_like_python(
             assert f"live process {pid} uses slot" in detail, (edition, detail)
 
 
+def test_remove_still_counts_its_own_child_in_the_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2464: only the audit's census skips the caller's own children; remove's does not.
+
+    The census seam (WRKSLOTS_TEST_CENSUS_OWN_CHILD_CWD) starts a child of the
+    remove's own process in the slot during every capture. The remove refuses
+    for that live process and keeps the slot; the twin fixture without the
+    seam is removed, so the seam is the only difference.
+    """
+
+    with _own_fs(tmp_path) as base:
+        plain = _fixture(base / "plain")
+        result = _rust_remove(plain)
+        assert result.returncode == 0, result.stderr
+        assert not (plain / "worktrees" / "slot-a").exists()
+        seamed = _fixture(base / "seamed")
+        slot = seamed / "worktrees" / "slot-a"
+        monkeypatch.setenv("WRKSLOTS_TEST_CENSUS_OWN_CHILD_CWD", str(slot / "repo"))
+        result = _rust_remove(seamed)
+        assert result.returncode != 0, "removed a slot its own child was working in"
+        assert re.search(r"live process \d+ uses slot", result.stderr), result.stderr
+        assert (slot / "repo" / "file.txt").exists()
+
+
 # #1174 rust-remove-census-root-maps: a process whose ONLY use of the slot is
 # its root directory (a chroot, in an unprivileged user namespace), or a file
 # mapped from it whose descriptor it closed and which it then deleted.  Each

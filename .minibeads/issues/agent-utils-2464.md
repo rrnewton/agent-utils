@@ -34,16 +34,25 @@ The Python census also skips only its invoking ancestry (`ignore_invoking_ancest
 
 # Design
 
-- Skip the census process's descendants as well as its ancestry. Build the parent map from the same listing (the parent pid is already read from each process's stat), and skip any process whose parent chain reaches the census's own pid. Compare start times along the chain, so a reused pid is never taken for a child.
-- The caller's own children are never holders or agents: a remove's or an audit's own git commands, and the wrappers they run under (the tests' git stand-in included).
-- Same rule in both editions.
-- A deterministic differential on a fixture proc root (the `capture_process_snapshot_at` seam). A slot process that is the caller's child is ignored, one that is a grandchild through an intermediate process is ignored, and an unrelated process in the slot still counts. Both editions return the same verdicts.
+- The AUDIT's census skips the audit's own descendants as well as its ancestry: `capture_audit_snapshot` / `capture_audit_snapshot_at` in `rs/wrkslotsd/src/remove_write.rs`, which the audit's one shared census now uses.
+  - Each listing round builds a parent map from the same listing (parent pid and start time from each process's stat), and skips any process whose parent chain reaches the audit's own pid.
+  - A child never starts before its parent, so a reused pid on the chain breaks it instead of adopting strangers.
+- Remove's census is unchanged: `capture_process_snapshot` still counts the caller's own children, for two reasons.
+  - Remove has nothing of its own in flight during its census: its git commands finish before the census runs. The orphaned helpers of #2418 are no longer its descendants, so this rule would not cover them anyway.
+  - Remove's census tests use the test process's own children as the holders in a slot (`shared_snapshot_detects_live_use_and_allows_unused` and the fake-proc-root census tests). Those must still count.
+- The Python edition needs no change. Its audit captures the shared census BEFORE judging any row (the `census_needed` pre-pass, then `_capture_process_path_census`), so no row's git child can be in flight at capture. The Rust audit captures lazily, inside the parallel row judging; that is where the race was.
+- Tests:
+  - Unit (Rust, fixture proc root): the audit snapshot ignores the caller's child and its grandchild through a live shell, and still names an unrelated process (a re-parented `setsid` sleep). The ordinary (remove) snapshot still counts the caller's own child. Without the unrelated process, the audit snapshot finds the slot unused.
+  - End to end, through the Rust CLI: a test seam, `WRKSLOTS_TEST_CENSUS_OWN_CHILD_CWD`, keeps a child of the census's own process working in a named directory while each snapshot is taken.
+    - Audit (`test_other_edition_audit_never_counts_its_own_child_as_an_agent`): with the seam in `plain-0`, `audit --jobs 1` and `--jobs 4` both report exactly what the audit reports without it, and an unrelated process in `plain-1` is still a live process in all three.
+    - Remove (`test_remove_still_counts_its_own_child_in_the_slot`): with the seam in the slot, remove refuses for that live process and keeps the slot; its twin fixture without the seam is removed.
 - No new persisted wrkslots field.
 
 # Acceptance Criteria
 
-- The census skips the caller's descendants (start-time checked) as well as its ancestry, in both editions.
-- The differential above passes in both editions.
+- The audit's census skips the audit's own descendants (start-time checked) as well as its ancestry; remove's census still counts the caller's own children.
+- The unit test covers both: the audit ignores its own child and grandchild and counts an unrelated process, and the remove snapshot still counts a test-child holder.
+- The end-to-end seam tests pass: `audit --jobs 1` and `--jobs 4` ignore the audit's own child, and remove still refuses for its own child in the slot.
 - `test_other_edition_pools_rows_with_the_same_report` comes out of quarantine and passes in its namespaced shard in a gate.
 - No wall-clock budget added (owner rule 346); no new persisted field.
 
