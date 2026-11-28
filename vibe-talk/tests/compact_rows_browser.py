@@ -48,6 +48,7 @@ import json
 import mimetypes
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -332,6 +333,15 @@ class Walk:
         except Exception:  # noqa: BLE001 - the check below says what did not happen
             self.check(bool(self.page.evaluate(condition, arg)), why)
 
+    def posted(self, entry: str, why: str) -> None:
+        """The fake server logged `entry` (`#2443 compact-rows-swipe-post-race`). The page draws what
+        an act did before its request reaches the server, so the request is waited for as a
+        condition, under the hang backstop, never read in the same instant as the draw."""
+        deadline = time.monotonic() + browser_waits.HANG_BACKSTOP_MS / 1000
+        while entry not in self.api.posts and time.monotonic() < deadline:
+            self.page.wait_for_timeout(25)
+        self.check(entry in self.api.posts, why)
+
     def settled(self) -> None:
         # Two frames and nothing more (`#1118 browser-fixed-frame-settle`): a paint frame after
         # an exact wait, before header geometry, or to land a scroll. Never the only wait
@@ -544,7 +554,7 @@ def compact_walk(walk: Walk, wide: bool) -> None:
         page.keyboard.press("e")
         walk.wait_for("() => document.querySelector('#discord-log > li[data-id=\"503\"]')"
                       ".getAttribute('data-archived') === 'false'", "e did not unarchive the collapsed 503")
-        walk.check("restore 503" in walk.api.posts, f"e sent no Unarchive for 503: {walk.api.posts}")
+        walk.posted("restore 503", f"e sent no Unarchive for 503: {walk.api.posts}")
         walk.notes.append("e on the selected collapsed row unarchives it")
     walk.notes.append(f"a long message opened by a tap shows Reply and Done, an archived one opened by {how} Reply"
                       f" and Unarchive, together on a line, and {how} again takes them away")
@@ -563,7 +573,7 @@ def compact_walk(walk: Walk, wide: bool) -> None:
         cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
         walk.wait_for("() => document.querySelector('#discord-log > li[data-id=\"507\"]')"
                       ".getAttribute('data-archived') === 'true'", "a swipe did not archive the collapsed 507")
-        walk.check("dismiss 507" in walk.api.posts, f"the swipe sent no Done for 507: {walk.api.posts}")
+        walk.posted("dismiss 507", f"the swipe sent no Done for 507: {walk.api.posts}")
         walk.settled()
         walk.collapsed_row("507", "archived by a swipe")
         walk.shot("5-swiped-archived")
