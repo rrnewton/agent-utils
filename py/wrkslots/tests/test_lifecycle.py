@@ -21011,7 +21011,6 @@ def test_validate_batch_census_deadline_starts_after_seal_preflight(
 
 
 @pytest.mark.parametrize("expiry_point", ("shared", "fresh"))
-@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: asserts an 8 s wall-clock rollback reserve (measured 10.18 s under load); needs an ordering/outcome or CPU-based check
 def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -21027,6 +21026,7 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
         slot: stat.S_IMODE(path.stat().st_mode) for slot, path in slot_paths.items()
     }
     monotonic_now = 100.0
+    census_calls = {"shared": 0, "fresh": 0}
 
     def monotonic() -> float:
         return monotonic_now
@@ -21038,6 +21038,7 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
         include_owner_cgroups: bool = True,
     ) -> wrkslots._ProcessPathCensus:
         nonlocal monotonic_now
+        census_calls["shared"] += 1
         assert budget is not None
         assert include_owner_cgroups is False
         # Eight sealed slots: 120 s for the first plus 60 s for each other,
@@ -21052,6 +21053,7 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
         _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
     ) -> wrkslots._ProcessPathCensus:
         nonlocal monotonic_now
+        census_calls["fresh"] += 1
         monotonic_now = budget.deadline + 1.0
         budget.remaining_seconds()
         raise AssertionError("unreachable")
@@ -21076,9 +21078,7 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
     for slot in slots:
         arguments.extend(("--slot", f"{slot}=1"))
     arguments.extend(("--format", "json"))
-    started = time.perf_counter()
     assert wrkslots.main(arguments) == 1
-    rollback_seconds = time.perf_counter() - started
 
     report = json.loads(capsys.readouterr().out)
     assert report["removed"] == []
@@ -21091,10 +21091,14 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
         "(bound 540.0 s, elapsed 541.0 s)" in row["reason"]
         for row in report["retained"]
     )
-    # Rollback after an expired census deadline has its own fixed reserve; it
-    # does not scale with the measured census bound.
-    rollback_reserve = 8.0
-    assert rollback_seconds < rollback_reserve
+    # Order, not elapsed time (#2065, owner rule 346): the census ran once
+    # (and the fresh census once when it is the one that expires), the
+    # deadline passed, and the rollback below then restored every seal with
+    # no further census and no budget left to spend. It does not depend on
+    # the expired census bound. A wall-clock reserve here measured 10.18 s
+    # against its 8 s under load.
+    assert census_calls == {"shared": 1, "fresh": int(expiry_point == "fresh")}
+    assert monotonic_now > 100.0 + 540.0
     assert all(path.is_dir() for path in slot_paths.values())
     assert {
         slot: stat.S_IMODE(path.stat().st_mode) for slot, path in slot_paths.items()
