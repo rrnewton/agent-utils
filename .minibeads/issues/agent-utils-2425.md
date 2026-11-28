@@ -1,6 +1,7 @@
 ---
 title: 'vibe-talk-search-date-filter: the search bar reminds the after:/before: syntax, with last-K-days and since-DATE from a calendar icon, applied server-side so old results are never fetched'
-status: open
+status: closed
+assignee: cl-searchdate
 priority: 1
 issue_type: feature
 labels:
@@ -8,7 +9,8 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-27T19:46:00-05:00
-updated_at: 2026-11-27T19:46:00-05:00
+updated_at: 2026-11-28T10:52:00-05:00
+closed_at: 2026-11-28T10:52:00-05:00
 ---
 
 # Description
@@ -50,3 +52,23 @@ Owner request 2026-11-27 7:09 PM ET (fourth of four that evening); owner-UI fast
 Settled by the liaison (2026-11-28, the owner may veto): typed relative days `after:7d`, `today`, `yesterday` (days only); the calendar writes an absolute day at click time (Last 7 writes `after:<the day a week back>`), with chips 7 / 30 / 90 and a number box; a date alone is a search; the hint stays while the bar is open and names the standing date; Since, Before and Between (either end optional) in the first cut; the window applied in SQL on the server; the scope placeholder (#2251) untouched.
 
 Implementation (cl-searchdate, branch cl-searchdate/2425): (1) language and server: relative days resolve against the reader's today wherever a parse knows it (the server in the request's `tz`, the page in its own zone), so the tree holds ordinary days; the server folds the top-level `after:` / `before:` (a negated one bounding the other side, nothing under OR) into a window bound in SQL on both reader paths, so a row outside it is never read nor counted in `examined`; (2) page: the calendar button and Dates panel write the tokens into the field (replacing only the plain top-level ones they own) and run them as typing does; the hint line floats where the bucket chips float, takes no room, and shows only while the bar is open with nothing typed (gate fixes after the first owner gate: its head room re-inherited through the whole document on open and shifted rows under the thread-view park; the widened park was withdrawn), and the calendar names the dates standing. Tests: the shared corpus (both twins), cache and route tests (the route test fails on main: the older rows are read and counted), page suites, and `tests/search_date_filter_browser.py` (DAG step 195; fails on main).
+
+## Resolution
+
+Landed as 9bf112c0, four commits on c80ba7d1:
+- eb774327: language and server window.
+- 4e2865cd: page.
+- bbbaa976: gate fixes.
+- 9bf112c0: the walk asserts that the floating hint never covers a row's text.
+
+Owner gate 1795867317656119677-79160a2f passed on 9f90a935. Deployed 2026-11-28 7:31 AM ET, and the post-deploy guards passed 6 of 6.
+
+The follow-up "outside your dates" landed as 5c378303. Under a date window that lies wholly above the oldest loaded row, the step back no longer offers "Search before <floor>": it reads "Before <floor>: outside your dates" and is disabled. It was gated as 333a7328 (gate 1795869993979983716-b15be669). Its two reds were waived (liaison 1174): column-overscroll-1920-browser, a flake #2445 removed, and screenshots-phones (#2175). It was replayed over #2445 (022cf893) with a combined-tree check: 22 walks and all page JS green on the replayed tree. Deployed 2026-11-28 10:21 AM ET; its post-deploy guards (search_date_filter with the disabled stage, search_typing_stays, search_unmatched, search_clear_stays) passed 4 of 4.
+
+- The hint changed from the first settled choice (liaison 1167, v2). It floats where the bucket chips float, takes no room, and shows only while the bar is open with nothing typed. The calendar button names the standing dates ("Dates: since Nov 20, 2026", plus "moving with today" for a typed relative day). The walk asserts that the hint never meets a row's text in any shot. The first owner gate failed because the hint's head room restyled the whole document, moved the reader under the #2200 park, and pushed the emptied-list sentence past the foot on a 360x420 screen.
+- Two behaviour changes the liaison accepted:
+  - The calendar is the first toggle on the bar, which keeps the owner-set Whose/Links/Pinned/glass adjacencies; Tab from the field reaches it first.
+  - The #2200 park stays main's: the widened park was withdrawn.
+- Not done here:
+  - On a phone, the found-form count makes the bar three rows, and the floating chips cover its foot. This geometry predates this issue (#2200).
+  - The design review's disputed items, R9 bar pitch and R10 8 px edge, are bar-wide changes for their own issue.
