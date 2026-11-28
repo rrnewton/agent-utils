@@ -2371,11 +2371,9 @@ fn relay_deliver(
         out.receipt_text = Some(render_receipt(envelope, &receipt));
         out
     };
+    // Warnings shown under the delivered message's team tag (#2420).
+    let mut warnings: Vec<String> = Vec::new();
     if !tag_matches(text, envelope) {
-        // The signed bypass applies only when the tag line is absent
-        // (the fence-only piece of a split post): a present-but-wrong tag
-        // means the visible header disagrees with the envelope, which is
-        // filed as unparseable, never silently delivered.
         let tag_absent = !text
             .lines()
             .next()
@@ -2386,6 +2384,19 @@ fn relay_deliver(
             log_event(
                 state,
                 &json!({"event": "relay-in", "outcome": "tag-missing-signed", "route": route, "peer_sender": peer_sender, "id": id}),
+            );
+        } else if signed_verified {
+            // A present but different tag line, on an envelope whose signature verified, is
+            // delivered with a warning (#2420 R2): the tag is advisory, the signature is the
+            // authority, and holding the message lost it.
+            log_event(
+                state,
+                &json!({"event": "relay-in", "outcome": "tag-mismatch-signed-delivered", "route": route, "peer_sender": peer_sender, "id": id}),
+            );
+            warnings.push(
+                "the post's visible tag line disagrees with its envelope; the envelope, signed \
+                 and verified, is what is delivered"
+                    .to_string(),
             );
         } else {
             // Legacy admission has no signature to trust, so a missing tag
@@ -2407,10 +2418,11 @@ fn relay_deliver(
     // delivered as received with a warning under its team tag and counted (#2420, owner
     // decision 2026-11-27: never hold or drop a message on a fragile check). The ledger still
     // keys it by its ID and signed hash, so a copy of a delivered message stays `known`.
-    let mut body_warning: Option<String> = None;
+    let mut body_mismatch = false;
     if let Err(reason) = check_envelope(envelope) {
         if reason == "body-hash-mismatch" {
-            body_warning = Some(body_hash_warning(envelope.get("relay").is_some()));
+            body_mismatch = true;
+            warnings.push(body_hash_warning(envelope.get("relay").is_some()));
         } else {
             record_stranger(
                 state,
@@ -2441,14 +2453,16 @@ fn relay_deliver(
         peer_host: "",
         via_chat_relay: true,
     };
-    let answer = match &body_warning {
-        Some(warning) => {
-            let answer = crate::ledger::accept_with_body_warning(
-                &ctx,
-                envelope,
-                deliverer.as_ref(),
-                warning,
-            )?;
+    let answer = if warnings.is_empty() {
+        accept(&ctx, envelope, deliverer.as_ref())?
+    } else {
+        let answer = crate::ledger::accept_with_body_warning(
+            &ctx,
+            envelope,
+            deliverer.as_ref(),
+            &warnings.join("; "),
+        )?;
+        if body_mismatch {
             note_body_hash_warning(
                 state,
                 declaration,
@@ -2458,9 +2472,8 @@ fn relay_deliver(
                 id,
                 &answer,
             )?;
-            answer
         }
-        None => accept(&ctx, envelope, deliverer.as_ref())?,
+        answer
     };
     let state_name = answer
         .state

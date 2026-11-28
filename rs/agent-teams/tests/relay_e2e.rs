@@ -2319,14 +2319,15 @@ fn long_mirror_post_is_never_split_and_dismiss_clears_unparseable() {
         "no alarm for the fence-only piece: {:?}",
         agent_teams::relay::alarms(&world.state)
     );
-    // A present-but-wrong tag on a signed envelope is NOT bypassed: the
-    // visible header would disagree with what was delivered.
+    // A present-but-wrong tag on a signed, verified envelope is delivered
+    // with a warning since #2420 R2 (the tag is advisory); this message was
+    // already delivered, so the copy is a known duplicate, never quarantined.
     let wrong_tag = format!(
         "[from someone-else via agent-teams]\n{}",
         &posts[0][fence_at..]
     );
     let outcome = world.relay_in(BOT1, &wrong_tag);
-    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
     assert_eq!(
         world
             .hook_inbox_texts("tools")
@@ -2334,18 +2335,9 @@ fn long_mirror_post_is_never_split_and_dismiss_clears_unparseable() {
             .filter(|t| t.contains(&"x".repeat(100)))
             .count(),
         1,
-        "message not delivered again (an alarm notice is fine)"
+        "message not delivered again"
     );
-    // Remove that quarantine entry so the counts below stay simple.
-    let wrong_id = agent_teams::relay::quarantined_posts(&world.state)
-        .last()
-        .expect("quarantined")
-        .get("id")
-        .and_then(|v| v.as_str())
-        .expect("id")
-        .to_string();
-    let (code, out, err) = world.run(&["relay", "quarantine", "dismiss", &wrong_id]);
-    assert_eq!(code, 0, "dismiss wrong-tag: {out} {err}");
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
 
     // An unparseable post from the CONFIRMED bot is not a stranger: it is
     // quarantined under its own alarm kind and dismissed by ID.
@@ -3462,4 +3454,34 @@ fn an_entry_the_pump_cannot_resolve_is_reported_never_skipped_silently() {
             .is_some_and(|reason| reason.contains("ghost")),
         "{entry}"
     );
+}
+
+#[test]
+fn a_signed_post_whose_visible_tag_disagrees_is_delivered_with_a_warning() {
+    // #2420 R2: a signed, verified envelope whose visible tag line disagrees with it was
+    // quarantined as unparseable and never delivered, although the tag is only advisory and
+    // the signature is the authority. It is now delivered, with a warning under its tag.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let public = world.ensure_signing_key("sim");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-a", &public, "test").expect("trust");
+    let (id, post) = world.send_sim_to_tools("Tag rewritten by a provider.", "r2-tag");
+    assert!(post.contains("\"sig2\""), "signed: {post}");
+    let (tag, rest) = post.split_once('\n').expect("tag line");
+    let rewritten = format!(
+        "{}\n{rest}",
+        tag.replace("to: tools@host-a", "to: tools@host-b")
+    );
+    let outcome = world.relay_in(BOT1, &rewritten);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert!(
+        delivered[0]
+            .contains("[relay warning: the post's visible tag line disagrees with its envelope"),
+        "{}",
+        delivered[0]
+    );
+    assert!(world.ledger_has("tools", &id));
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
 }

@@ -419,7 +419,9 @@ is a known duplicate, not a second delivery. A post that a #2160 build
 held for this reason (with `awaiting_twin_until` or `twin`) is replayed
 the same way at the next `relay-in`, `pump` or `relay alarms`. A
 signed envelope whose tag line was lost (the fence-only piece of a
-split) is still delivered: the signature, not the tag, is the authority. The envelope is authoritative — a provider may rewrite
+split) is still delivered: the signature, not the tag, is the authority.
+One whose tag line is present but disagrees with the envelope is
+delivered too, with a `[relay warning: ...]` line saying so (#2420). The envelope is authoritative — a provider may rewrite
 visible text, so the receiver re-derives the tag from the envelope and
 checks the body hash.
 Receipts go back in the post's thread (one line plus a fenced
