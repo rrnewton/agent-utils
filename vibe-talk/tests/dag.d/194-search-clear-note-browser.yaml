@@ -1,0 +1,22 @@
+steps:
+  # `#2442` R5 (ui-rules R5, liaison 1156): the place-keeper's substitute sentence ("Filtered out — the
+  # nearest is here.") floats over no row, and the clear that shows the selection again takes it away.
+  # Real Chromium at 1280x800, 1920x1080 with two columns, and 412x915 by touch (keyboard closed and
+  # open), Discuss open on three: a selected message hidden by a search, then the search cleared (Escape,
+  # the X, the magnifier, the field emptied); the sentence's own timer is let go so a hot host sees
+  # the same walk as a quiet one.
+  - group: check
+    job: search-clear-note-browser
+    desc: the substitute sentence a search says for a hidden selection floats over no row's text, and no frame after a clear (Escape, the X, the magnifier, the field emptied) shows it, in current Chromium at 1280x800, 1920x1080 two columns and 412x915 by touch (#2442 R5)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/search_clear_note_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 600
+    cpu_timeout: 240
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 100
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

@@ -4380,6 +4380,31 @@ test("`#243 filter-keeps-selection`: Links on and off keeps the selected message
   assert.equal(selectedId(page), "21", "the selection did not stay with the message Links hid");
 });
 
+test("`#2442` R5: the substitute sentence is announced, not floated over the rows it is about, and goes with the change that shows the selected message again", async () => {
+  // Liaison 1156: "announce, don't float; and it shouldn't survive the clear at all". The sentence is
+  // true only while the selection is hidden; tests/search_clear_note_browser.py walks the search's clears.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, placeChannel());
+  await showLinks(page);
+  await page.el("links-filter").click();
+  await page.settle();
+  // Message 20 has no link: chosen by a tap, then hidden by Links.
+  parkAt(page, "20", 140);
+  await tapRow(page, "20");
+  await page.el("links-filter").click();
+  await page.settle();
+  const line = page.el("status-line");
+  assert.equal(statusText(page), "Filtered out — the nearest is here.");
+  assert.equal(line.hidden, false, "the sentence was not said");
+  assert.equal(line.hasAttribute("data-idle"), true, "the sentence floats as the pill, over the rows it is about");
+  // Links off: message 20 is back, and the sentence saying it is hidden goes with it.
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.equal(placeRow(page, "20").hasClass("search-hidden"), false, "Links off did not show message 20 again");
+  assert.equal(line.hidden, true, "the sentence outlived the change that showed the selected message again");
+});
+
 test("`#243 filter-keeps-selection`: PRs, Commits and Actions keep the selected link where it is, and a pull request hidden by PRs comes back where it was", async () => {
   const page = newPage();
   await signIn(page);

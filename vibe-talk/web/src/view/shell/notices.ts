@@ -40,6 +40,15 @@ const IDLE_STATUS_WORDS: ReadonlySet<string> = new Set(["Ready.", "ready",
 /** How long the connection banner stays before it takes itself away, in ms. */
 const BANNER_DISMISS_MS = 8000;
 
+/**
+ * How a status line is said (`setStatus`). `float: false` (`#2442` R5, liaison 1156): a sentence about
+ * where the list put the reader is announced, not floated over the rows it is about, as the idle words
+ * are (`#1859`, `#2350`, `#2365`, `#2375`).
+ */
+export interface StatusOptions {
+  readonly float?: boolean;
+}
+
 /** What the notices ask of the page. */
 export interface ShellNoticesDependencies {
   readonly clock: ClockPort;
@@ -57,8 +66,11 @@ export interface ShellNoticesDependencies {
 
 /** The notices' commands. */
 export interface ShellNotices {
-  /** Say `text` on the status line, until it takes itself away. */
-  setStatus(text: unknown): void;
+  /**
+   * Say `text` on the status line, until it takes itself away. `float: false` (`#2442` R5): announced in
+   * the polite live region and floated over nothing, as an idle confirmation is (`IDLE_STATUS_WORDS`).
+   */
+  setStatus(text: unknown, options?: StatusOptions): void;
   /**
    * Whether the status line is up and saying `text` still: nothing said over it, and not yet taken away. What
    * an act said at once checks before saying more once the network answers (`#892 voice-page-optimistic-done`).
@@ -95,7 +107,7 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
   let connectionDetail = "";
   let bannerTimer: TimerHandle | null = null;
 
-  function setStatus(text: unknown): void {
+  function setStatus(text: unknown, options?: StatusOptions): void {
     // `#1726 vibe-talk-empty-red-banner`: a notice with no words is a shell, not a
     // message. Nothing to say takes the line away instead of showing it empty.
     if (deps.redact(text).trim() === "") {
@@ -109,10 +121,11 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
     // text changes announces nothing at all; the order here is what makes it speak.
     el("status-line").hidden = false;
     el("status").textContent = deps.redact(text);
-    const idle = IDLE_STATUS_WORDS.has(deps.redact(text).trim());
+    const idle = IDLE_STATUS_WORDS.has(deps.redact(text).trim()) || options?.float === false;
     // `#1859 vibe-talk-ready-toast-covers-text`: an idle confirmation is announced
     // but not floated — the stylesheet waits it out, so after a load it never
     // stands over the message text under the pill. Action words float as before.
+    // `#2442` R5: so is a line its sayer asks not to float (`StatusOptions`).
     if (idle) el("status-line").setAttribute("data-idle", "");
     else el("status-line").removeAttribute("data-idle");
     statusTimer = deps.clock.setTimeout(dismissStatus, idle ? STATUS_IDLE_DISMISS_MS : STATUS_DISMISS_MS);

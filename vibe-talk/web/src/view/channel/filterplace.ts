@@ -117,7 +117,8 @@ export interface FilterPlaceDependencies {
   userMovedSince?(mark: unknown): boolean;
   renderJumpNewest(): void;
   guardQuietly<A extends unknown[]>(fn: (...args: A) => unknown): (...args: A) => unknown;
-  setStatus(text: string): void;
+  /** `float: false` (`#2442` R5): announced in the polite live region, floated over no row. */
+  setStatus(text: string, options?: { readonly float?: boolean }): void;
   sidePane(): FilterPane;
   channelPane(): FilterPane;
   markOf(pane: FilterPane): FilterMark | null;
@@ -186,6 +187,13 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
   const FILTER_WALK_STATUS = "Loading earlier messages…";
 
   /**
+   * `#2442` R5 (liaison 1156): the substitute sentence last said (`filterHiddenSentence`), with the
+   * selected message it is about and the column it was said in, while it may still stand on the status
+   * line. It is true only while that message is hidden (`dropStaleSubstitute`).
+   */
+  let substituteSaid: { text: string; selected: string; column: unknown } | null = null;
+
+  /**
    * End the walk back for a filter change, where it is: another change, a jump, a view or channel, or the
    * reader's own act has taken over. Its line on the status strip goes with it, unless something has
    * said something else there since.
@@ -194,6 +202,26 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     if (!filterChanges.endWalk()) return;
     deps.inColumn(deps.mainColumn(), deps.renderOlderControl);
     if (!deps.el("status-line").hidden && deps.el("status").textContent === FILTER_WALK_STATUS) deps.dismissStatus();
+  }
+
+  /**
+   * `#2442` R5 (liaison 1156: "announce, don't float; and it shouldn't survive the clear at all"): the
+   * substitute sentence says the selected message is hidden and the nearest one stands in its place. A
+   * change that shows that message again (the search cleared by Escape, the X, the magnifier or the
+   * field emptied; a filter turned off) makes it false, and it goes, as `endFilterWalk` takes its own
+   * line away; anything said on the line since stands.
+   */
+  function dropStaleSubstitute(): void {
+    const said = substituteSaid;
+    if (said === null) return;
+    if (deps.el("status-line").hidden || deps.el("status").textContent !== said.text) {
+      substituteSaid = null;
+      return;
+    }
+    const gone = said.column === deps.sideColumn() && !deps.sideShowing();
+    if (!gone && !deps.inColumn(said.column, () => anchorRow({ row: null, ids: [said.selected] } as unknown as FilterAnchor) !== null)) return;
+    substituteSaid = null;
+    deps.dismissStatus();
   }
 
   /** Which list a filter's place is in: the view on screen, and whether the Pinned list stands in for it. */
@@ -569,6 +597,9 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
           if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied, false, room);
         });
       }
+      // `#2442` R5: whatever the anchors were, a change that showed the selected message again ends the
+      // sentence saying it is hidden.
+      dropStaleSubstitute();
     };
     // At once, on the rows on screen; and for a change that reads, again on the rows the read drew.
     place();
@@ -666,7 +697,15 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
       offset: placed.getBoundingClientRect().top - deps.listPlaceTop(area), mark: mark ? mark.id : null,
     };
     deps.renderJumpNewest();
-    if (substitute && anchor.selected !== null) deps.setStatus(filterHiddenSentence(anchor, walked));
+    // `#2442` R5: said while the selection is hidden, announced in the polite live region and floated
+    // over no row (the pill stood over the very rows it was about); ended by the change showing it again.
+    if (substitute && anchor.selected !== null) {
+      const text = filterHiddenSentence(anchor, walked);
+      substituteSaid = { text, selected: anchor.selected, column: deps.activeColumn() };
+      deps.setStatus(text, { float: false });
+    } else {
+      dropStaleSubstitute();
+    }
   }
 
   /**
