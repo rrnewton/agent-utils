@@ -178,11 +178,46 @@ pub fn resolve_registry(
 /// how a send finds the project registry from the queue's own location
 /// (its repository or state directory) instead of the caller's working
 /// directory (#1472 mq-notice-registry-from-cwd).
+///
+/// The walk stops before the home directory, agentctl's own rule (#1169,
+/// `find_registry_from`): `~/.agentctl` is agentctl's plugin home, never a
+/// project registry, so a queue anywhere under home must not silently address
+/// it. With no home to stop at, only `anchor` itself is checked rather than
+/// walking to the filesystem root (#2383 found the gap: a temp root under home
+/// let fixtures reach a real `~/.agentctl`).
 pub fn registry_above(anchor: &std::path::Path) -> Option<PathBuf> {
-    anchor
-        .ancestors()
-        .map(|ancestor| ancestor.join(".agentctl"))
-        .find(|candidate| candidate.is_dir())
+    registry_above_until(
+        anchor,
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .as_deref(),
+    )
+}
+
+/// [`registry_above`] with an explicit home, so tests need not change `HOME`.
+/// Paths are compared canonically, so a trailing slash or a symlink in the
+/// home still stops the walk.
+pub fn registry_above_until(
+    anchor: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    let canonical =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let stop = home.map(canonical);
+    for (depth, directory) in anchor.ancestors().enumerate() {
+        match &stop {
+            Some(home) if canonical(directory) == *home => break,
+            Some(_) => {}
+            None if depth > 0 => break,
+            None => {}
+        }
+        let candidate = directory.join(".agentctl");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// The configured agentctl-compatible sender.
@@ -878,11 +913,45 @@ mod unit {
         // A registry beside the anchor itself wins over a higher one.
         std::fs::create_dir_all(deep.join(".agentctl")).unwrap();
         assert_eq!(registry_above(&deep), Some(deep.join(".agentctl")));
-        // No registry anywhere above: none.
+        // No registry anywhere above (up to the home stop): none.
         let bare = root.join("elsewhere/queue");
         std::fs::create_dir_all(&bare).unwrap();
-        assert_eq!(registry_above(&root.join("elsewhere")), None);
+        assert_eq!(
+            registry_above_until(&root.join("elsewhere"), Some(&root)),
+            None
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registry_above_stops_before_the_home_directory() {
+        // #1169's rule, as agentctl's own discovery: `~/.agentctl` is the
+        // plugin home, never a project registry, and nothing above home counts.
+        let base =
+            std::env::temp_dir().join(format!("merge-queue-registry-home-{}", std::process::id()));
+        let home = base.join("home/user");
+        let queue = home.join("work/project/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::create_dir_all(home.join(".agentctl")).unwrap();
+        std::fs::create_dir_all(base.join(".agentctl")).unwrap();
+        assert_eq!(registry_above_until(&queue, Some(&home)), None);
+        // A trailing slash in the home still stops the walk.
+        let slashed = PathBuf::from(format!("{}/", home.display()));
+        assert_eq!(registry_above_until(&queue, Some(&slashed)), None);
+        // A project registry below home is still found.
+        std::fs::create_dir_all(home.join("work/.agentctl")).unwrap();
+        assert_eq!(
+            registry_above_until(&queue, Some(&home)),
+            Some(home.join("work/.agentctl"))
+        );
+        // With no home to stop at, only the anchor itself is checked.
+        assert_eq!(registry_above_until(&queue, None), None);
+        std::fs::create_dir_all(queue.join(".agentctl")).unwrap();
+        assert_eq!(
+            registry_above_until(&queue, None),
+            Some(queue.join(".agentctl"))
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
