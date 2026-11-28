@@ -280,7 +280,13 @@ mod tests {
         );
         let first_error = missing["slot"]["error"].as_str().expect("first error");
         assert!(first_error.contains("[Errno 2]"), "{first_error}");
-        assert!(!first_error.contains("107"), "{first_error}");
+        // The message embeds the fixture path, whose temp root can hold any
+        // digits (a gate's root is named by a pid such as 1075891), so look
+        // for the statvfs error itself, not a bare "107".
+        assert!(
+            !first_error.contains("[Errno 107]") && !first_error.contains("Transport endpoint"),
+            "{first_error}"
+        );
 
         std::fs::remove_dir_all(&root).expect("cleanup");
         let _ = PathBuf::new();
