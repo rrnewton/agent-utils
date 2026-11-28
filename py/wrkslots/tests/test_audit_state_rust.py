@@ -35,17 +35,11 @@ pytestmark = pytest.mark.usefixtures("pinned_process_evidence")
 AU_ROOT = Path(__file__).resolve().parents[3]
 
 
-#: Why two audit differentials whose fixtures run git in the slot run only on the host (#2065).
-#: A host git wrapper can leave a detached helper after every git call, which runs git with
-#: the checkout as its working directory. Both editions count a live process using the slot
-#: as a running agent; in a PID namespace the census is fast enough to see the helper, so the
-#: editions disagree on which one saw it. They come back when wrkslots waits for its own
-#: commands' descendants before a census (#2418).
-_HOST_GIT_HELPER_AGENT = (
-    "a host git wrapper's detached helper outlives the audit's own git calls with its working "
-    "directory in the slot, and the fast census in a PID namespace counts it as a running agent "
-    "(#2065)"
-)
+# Two audit differentials whose fixtures run git in the slot are marked git_stand_in: a host
+# git wrapper can leave a detached helper after every git call, with the checkout as its
+# working directory, and both editions count a live process using the slot as a running
+# agent. The session's git stand-in (#2065) ends every call's processes with the call; the
+# product fix is for wrkslots to wait for its own commands' descendants (#2418).
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -604,7 +598,7 @@ def test_audit_planning_work_exhaustion_matches_python(
     )
 
 
-@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_AGENT)
+@pytest.mark.git_stand_in
 def test_audit_planning_fair_share_matches_python(tmp_path: Path) -> None:
     root = _cache_fixture(tmp_path)
     config = root / ".wrkslots.yml"
@@ -804,7 +798,7 @@ def test_audit_census_resume_state_matches_python(tmp_path: Path) -> None:
     assert _rows(python_third)[0]["cache_status"] == "complete"
 
 
-@pytest.mark.ordinary_environment(reason=_HOST_GIT_HELPER_AGENT)
+@pytest.mark.git_stand_in
 def test_audit_census_finalize_reserve_matches_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     config = root / ".wrkslots.yml"

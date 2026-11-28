@@ -75,19 +75,19 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
     - `test_absent_slot_closure.py` (7) and `test_validate_teardown_closure.py` (4): they skip outside the initial identity user namespace, so they would have been lost silently.
   - Per test:
     - `test_audit_state_rust.py` (15): validation-run handles are judged against host PIDs and user-systemd units.
-    - `test_audit_state_rust.py` (2 more): `test_audit_planning_fair_share_matches_python` and `test_audit_census_finalize_reserve_matches_python`. A host git wrapper's detached helper outlives the audit's own git calls with its working directory in the slot, and the fast census in a PID namespace counts it as a running agent. See the rebased-gate note below.
+    - `test_audit_state_rust.py` (2 more, back in the namespaced shards since the git stand-in note below): `test_audit_planning_fair_share_matches_python` and `test_audit_census_finalize_reserve_matches_python`. A host git wrapper's detached helper outlives the audit's own git calls with its working directory in the slot, and the fast census in a PID namespace counts it as a running agent. See the rebased-gate note below.
     - `test_census_threads.py` (7) and `test_census_late_fork.py` (2): the real census commands are trusted only in the initial identity user namespace.
     - `test_sandbox_root_spec.py` (5): the real uid and passwd home.
     - `test_cli.py` (4): root-owned git and real scope masks.
-    - `test_remove_write_rust.py` (9): a host git wrapper's detached helper outlives wrkslotsd's own git calls with its working directory in the slot, and the fast census in a PID namespace names it as a holder. See the final-gate note below.
+    - `test_remove_write_rust.py` (9, back in the namespaced shards since the git stand-in note below): a host git wrapper's detached helper outlives wrkslotsd's own git calls with its working directory in the slot, and the fast census in a PID namespace names it as a holder. See the final-gate note below.
     - `test_classify_journals_rust.py` (3), `test_recover_abort_own.py` (1) and `test_eden_restart.py` (1): host-visible PIDs.
     - `test_slice_fallbacks.py` (2): root-owned sudo and host scopes.
     - `test_seal_recover_scoped_census.py` (2) and `test_recover_late_census_rollback.py` (1): the real census.
     - `test_release_frozen_rust.py` (1): a root-owned sticky /tmp parent.
-  - In all, 283 cases run on the host (81, 96 and 106 per host shard). The 9 `test_remove_write_rust.py` cases are also `load_quarantine`, so they run there only on opt-in.
+  - In all, 283 cases ran on the host (81, 96 and 106 per host shard), the 9 `test_remove_write_rust.py` cases only on opt-in (`load_quarantine`). With the git stand-in, all 11 helper cases leave the host shards and run in the namespaced ones: 281 cases now run on the host (95, 88 and 98 per host shard; the 9 remove cases had run there only on opt-in).
 - **`load_quarantine` additions.** Each has a #2065 pointer and stays runnable with `WRKSLOTS_INCLUDE_QUARANTINED=1` or `-m load_quarantine`.
   - Host cases that need a live census inside the remove budget:
-    - `test_remove_write_rust.py`: 9 cases;
+    - `test_remove_write_rust.py`: 9 cases (un-quarantined with the git stand-in; see its note);
     - `test_seal_recover_scoped_census.py`: 2 cases;
     - `test_recover_late_census_rollback.py::test_early_census_refusal_with_fenced_holder_retains_journal_and_retry_removes`;
     - `test_slice_fallbacks.py::test_teardown_without_a_slice_falls_back_to_the_census`;
@@ -114,7 +114,17 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
   - Both editions count a live process using the slot as a running agent, so the faster Rust census seeing one is the #2418 cause, not an edition bug.
   - The two tests are `ordinary_environment` with that reason. Their 15 sibling audit differentials already pass on the host shards.
 - **Test fix, not a mark.** `test_eden_restart.py::test_hung_daemon_times_out_and_the_other_slot_still_restarts` patched both eden timeouts to 0.5 s, so the healthy slot's start was refused inside a gate's host shard. Both timeouts are now 10 s: the hung fake sleeps 30 s and still times out by name. Alone 5 of 5 at load1 215-261.
-- **Coverage.** Removal-path coverage for the quarantined set now rests on #2392's new tests and on this on-demand set. The 9 `test_remove_write_rust.py` Rust/Python remove differentials come back to the namespaced shards when #2418 lands.
+- **Coverage.** Removal-path coverage for the quarantined set now rests on #2392's new tests and on this on-demand set. The 9 `test_remove_write_rust.py` Rust/Python remove differentials are back in the namespaced shards with the git stand-in (next note); #2418 stays the product fix.
+- **Git stand-in, option B' (2026-11-28, coordinator's approval).** The wrkslots tests put a git stand-in first on PATH for the session (`py/wrkslots/tests/git_stand_in.c` and `git_stand_in.py`, wired in the conftest).
+  - The stand-in runs the real git in its own unprivileged user and PID namespace under a small init. When git exits, the kernel kills whatever git left behind (the host wrapper's helper) before the call returns. No privilege beyond unprivileged user namespaces; plain git where they are refused, counted in the session summary.
+  - It is compiled once per session into a private directory under `TMPDIR` (a gate's private run root), or the checkout's ignored `.pytest_cache` when `TMPDIR` is unset or the host temp dir. The directory is removed at session end.
+  - Off (no C compiler, or namespaces refused by a probe call at session start): the stand-in stays off PATH, the summary says why, and cases marked `git_stand_in` are quarantined for that session, so their helper reds cannot come back.
+  - Marks: the 11 `ordinary_environment` helper marks (remove x9, audit x2) and the remove x9 `load_quarantine` are gone; those 11 and the three later helper victims (`test_remove_lock_scope_rust::test_remove_waits_for_a_live_finish_journal_then_proceeds`, `test_validate_nested_git_policy::test_audit_and_validation_removal_agree_on_one_tree`, `test_audit_lock_free::test_other_edition_pools_rows_with_the_same_report`) are marked `git_stand_in`.
+  - Measured (namespaced shards, alternating, under a disk floor), direct git -> stand-in: shard 0 195 s / 646 CPU-s -> 204 s / 538; shard 1 302 s / 413 -> 328 s / 275; shard 15 183 s / 322 -> 210 s / 196 (load1 118-145). Per git call 19.4 ms -> 21.0 ms median. Orphaned helpers seen 40/45 and 254/265 -> 0. 4,489, 6,285 and 5,013 calls, none fell back. CPU falls because the helpers no longer run.
+  - The 14 marked cases in the namespace, 3 rounds alternating: without the stand-in 3, 6 and 4 of 14 failed (helper reds); with it 14 of 14 each round, no fallback.
+  - Every other wrkslots step ran with it (namespaced shards 2-14, host shards 0-2, lifecycle namespace 0-5 and host 0-2). Each failure was rerun without the stand-in: all fail the same way without it (local temp-dir artifacts), and the few that differed between the two runner invocations pass both ways when run identically, 2 rounds each. No test relied on a git child outliving its call.
+  - Earlier prototypes, dropped: a subreaper that waits for every descendant (shards 2.4-2.75x slower: each call waits out the helper) and the namespace stand-in in Python (45 ms per call).
+  - The stand-in's own test (`test_git_stand_in.py`) runs it for real: a detached grandchild is gone when the call returns, arguments and signal deaths pass through, and git's own SIGTERM handling decides the exit.
 - **Related.**
   - Two `test_worktrees_image` busy-holder tests hit the 600 s per-test timeout inside `scan_mount_holders` on another gate. #2372's test fix (906b54fc) gives them a fixture proc root, and its production change (#2372 50a174b4, pending) parses each distinct mount table once.
   - Outside #2065, noted for #2382's audit annex: `cross.herdr-run.differential`, `rust.merge-queue.test` and `vibe-talk.check.documents-browser` were red in the discovery gate.

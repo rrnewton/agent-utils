@@ -76,7 +76,8 @@ Host opt-out trial (2026-11-27, one paired trial, load1 about 220). The wrapper 
 - It is NOT set in this harness's gate environment, because it would hide the race that this issue fixes.
 
 Test side, 2026-11-28 (#2065 option B, coordinator's decision). Marking namespaced tests one at a time did not converge: each gate showed new victims of this cause in remove, audit and validate tests, in both editions.
-- So the wrkslots tests get a git stand-in first on PATH. It makes itself a child subreaper, runs the real git, and returns only after every process that call started has exited. The census in a test then never sees a git call's leftovers.
+- So the wrkslots tests get a git stand-in first on PATH (#2065 option B'). It runs the real git in its own unprivileged user and PID namespace under a small init. When git exits, the kernel kills whatever that call left behind before the call returns, so the census in a test never sees a git call's leftovers. A first prototype that waited for every leftover as a child subreaper made the shards 2.4-2.75x slower; this one costs about 1.6 ms per git call.
+- This issue's own tests must put their fake `git` ahead of the stand-in on PATH (a test's own PATH entry wins), so they exercise the product behaviour.
 - That masks the race in TESTS only. The product subreaper-wait designed here (P1) stays the real fix, for production removes on a host whose git leaves helpers.
 - It waits behind #2392 and the hold on removal changes, and needs its cold review.
 

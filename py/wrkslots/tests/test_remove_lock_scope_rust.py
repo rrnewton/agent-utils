@@ -78,6 +78,7 @@ def _write_live_finish_journal(root: Path, pid: int) -> Path:
     return journal
 
 
+@pytest.mark.git_stand_in  # a host git wrapper's detached helper outlives the git calls (#2065)
 def test_remove_waits_for_a_live_finish_journal_then_proceeds(tmp_path: Path) -> None:
     """#1755 (Rust): remove waits out a live finish journal."""
 

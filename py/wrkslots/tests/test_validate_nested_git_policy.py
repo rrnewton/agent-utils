@@ -146,6 +146,7 @@ def _remove_validate_complete(project: Path) -> tuple[int, str, str]:
     return removed.returncode, removed.stdout, removed.stderr
 
 
+@pytest.mark.git_stand_in  # a host git wrapper's detached helper outlives the git calls (#2065)
 @pytest.mark.parametrize(("kind", "condition"), _REACHES_OUTSIDE, ids=[item[0] for item in _REACHES_OUTSIDE])
 def test_audit_and_validation_removal_agree_on_one_tree(
     tmp_path: Path,

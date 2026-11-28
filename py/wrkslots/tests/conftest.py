@@ -26,6 +26,13 @@ import pytest  # noqa: E402
 
 from gitconfig_guard import GlobalGitConfigGuard  # noqa: E402
 
+# A git stand-in first on PATH for the whole session, so no process a git call
+# leaves behind outlives the call (#2065; see git_stand_in.py). Started before
+# collection so every subprocess inherits it.
+from wrkslots.tests.git_stand_in import GitStandIn  # noqa: E402
+
+_git_stand_in = GitStandIn.start()
+
 # After each test, unmount any slot image it left mounted in its tmp_path
 # (#1064 test-temp-and-mount-leaks).
 from wrkslots.tests.image_teardown import pytest_runtest_teardown  # noqa: E402,F401
@@ -155,6 +162,10 @@ def pytest_collection_modifyitems(
     for item in items:
         if item.get_closest_marker("load_quarantine") is not None:
             quarantined.append(item)
+        elif not _git_stand_in.on and item.get_closest_marker("git_stand_in") is not None:
+            # Without the stand-in a host git wrapper's detached helper can
+            # outlive the case's own git calls in its slot (#2065).
+            quarantined.append(item)
         else:
             kept.append(item)
     if quarantined:
@@ -178,6 +189,10 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
+    # Read the stand-in's call log before its directory goes; the terminal
+    # summary is written after this hook.
+    session.config._git_stand_in_summary = _git_stand_in.summary()  # type: ignore[attr-defined]
+    _git_stand_in.cleanup()
     if _gitconfig_guard is None:
         return
     try:
@@ -193,6 +208,10 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    stand_in = getattr(terminalreporter.config, "_git_stand_in_summary", "")
+    if stand_in:
+        terminalreporter.write_sep("=", "git stand-in (#2065)")
+        terminalreporter.write_line(f"  {stand_in}")
     guard_result = getattr(terminalreporter.config, "_gitconfig_guard_result", None)
     if guard_result is not None:
         status, message = guard_result

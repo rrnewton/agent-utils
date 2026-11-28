@@ -477,6 +477,7 @@
         "py/wrkslots/tests/test_finisher.py",
         "py/wrkslots/tests/test_freeze_rust.py",
         "py/wrkslots/tests/test_frozen_parser_closure.py",
+        "py/wrkslots/tests/test_git_stand_in.py",
         "py/wrkslots/tests/test_git_storage_state_rust.py",
         "py/wrkslots/tests/test_gitconfig_guard.py",
         "py/wrkslots/tests/test_global_state_rust.py",
