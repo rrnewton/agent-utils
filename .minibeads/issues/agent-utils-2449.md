@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-proof-mirrors-storage-dir: in the nested layout the proof-mirror directory is not a storage entry, so status and doctor report agent:proof-mirrors as directory-without-row and unpushed refuses on it (both editions)'
-status: in_progress
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-proofmirrors
@@ -8,7 +8,8 @@ labels:
 - wrkslots
 - census
 created_at: 2026-11-28T05:35:00-05:00
-updated_at: 2026-11-28T06:45:00-05:00
+updated_at: 2026-11-28T07:45:00-05:00
+closed_at: 2026-11-28T07:45:00-05:00
 ---
 
 # Description
@@ -53,3 +54,17 @@ Residual, unchanged: in an affected project, an unregistered real slot directory
 - The Rust audit enumeration has no storage-name filter.
 
 The Rust coverage is a differential test that runs the real `wrkslotsd` binary against the Python oracle, the module's established pattern, rather than a Rust `#[test]`.
+
+## Resolution
+
+Landed as e51595a6 (fix) and bed697e3 (review follow-ups) on main, on top of 9bf112c0. The gate was path-selected on the gated head 6bdb9f21 and passed: 76 steps, none failed or incomplete. Main had changed `py/wrkslots/tests/test_lifecycle.py` since the gated base: one load-quarantine marker line, far from this change. So the replay landed with `--allow-overlap` after a combined-tree check on the replayed tree d94d7156 (a first check on b3f2bc7c went stale when main moved again). That check ran static checks, the issue parse, the two Rust differential files, the proof-batching tests and the focused lifecycle selection.
+
+- Python: `_PROOF_MIRROR_DIRECTORY` is in `_REPRESENTATION_DIRECTORIES`. Status, doctor, unpushed, audit and clean-caches no longer treat `<control>/proof-mirrors` as a slot directory. A slot of that name is refused as reserved for wrkslots storage.
+- Rust: the status census list (`REPRESENTATION_DIRECTORIES` in `storage_state.rs`) includes `proof-mirrors`. That covers Rust status, doctor and unpushed.
+- Tests:
+  - `test_proof_mirror_directory_is_storage_not_a_slot`: a real removal in the nested layout, then status, doctor, unpushed and the reserved name.
+  - `test_parse_storage_storage_entries_are_not_slots_matches_python`: Rust against Python.
+  - Both fail on the base commit.
+- One review read by the consumer's review seat: OK with conditions, both met in the follow-up commit.
+
+Not done here (follow-ups): retirement limited to mirror-digest names; Rust create reserved names and the Rust audit storage filter.
