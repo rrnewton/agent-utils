@@ -473,10 +473,13 @@ def test_a_host_temp_root_past_its_bound_stops_the_command_with_a_named_refusal(
     monkeypatch.setattr(wrapper.private_tmp, "HOST_TEMP_LIMIT_BYTES", 1_000_000)
     monkeypatch.setattr(wrapper.private_tmp, "HOST_TEMP_POLL_SECONDS", 0.05)
     report = tmp_path / "report"
+    # The child reports its root BEFORE it passes the bound (#2493): the wrapper may stop it on
+    # the first poll that sees the big file, so a report written after it might never exist.
     child_code = (
         "import os, time; root = os.environ['TMPDIR']; "
+        f"report = open({str(report)!r}, 'w'); report.write(root); report.close(); "
         "open(os.path.join(root, 'big'), 'wb').write(os.urandom(4_000_000)); "
-        f"open({str(report)!r}, 'w').write(root); time.sleep({HANG_BACKSTOP_S})"
+        f"time.sleep({HANG_BACKSTOP_S})"
     )
     code = wrapper.main(["--host-temp", sys.executable, "-c", child_code])
     assert code == wrapper.private_tmp.OVER_LIMIT_EXIT == 73
