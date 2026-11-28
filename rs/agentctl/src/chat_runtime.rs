@@ -6512,6 +6512,9 @@ pub struct BridgeState {
     latency_headless: bool,
     /// Prompt and tool-call times the transcript reader keeps, for the think/tool split (#897).
     turn_marks: Option<crate::chat_transcript::SharedTurnMarks>,
+    /// A reply sent this long or longer after it was captured carries a late tag (#2420 D3);
+    /// `None` never tags. Replaces holding stale replies back at start (#781).
+    late_reply_after: Option<Duration>,
     #[cfg(test)]
     admission_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
@@ -6658,6 +6661,7 @@ impl BridgeState {
             latency_registry: None,
             latency_headless: false,
             turn_marks: None,
+            late_reply_after: Some(held_replies::DEFAULT_HOLD_REPLIES_OLDER_THAN),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -6777,6 +6781,7 @@ impl BridgeState {
             latency_registry: None,
             latency_headless: false,
             turn_marks: None,
+            late_reply_after: Some(held_replies::DEFAULT_HOLD_REPLIES_OLDER_THAN),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -6907,6 +6912,14 @@ impl BridgeState {
         marks: crate::chat_transcript::SharedTurnMarks,
     ) -> Self {
         self.turn_marks = Some(marks);
+        self
+    }
+
+    /// Tag a reply sent at least `after` past its capture as late (#2420 D3: a stale reply is
+    /// sent with a late tag, never held); `None` never tags.
+    #[must_use]
+    pub fn with_late_reply_after(mut self, after: Option<Duration>) -> Self {
+        self.late_reply_after = after;
         self
     }
 
@@ -15127,6 +15140,21 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             Some(SlackFormat::Converted) => linked_body,
             _ => crate::chat_links::strip_link_titles(&linked_body),
         };
+        // A reply sent long after it was written carries a late tag of its own paragraph, never
+        // held back (#2420 D3, owner decision: warning at most, never delay).
+        let now = unix_millis();
+        let linked_body = match self.late_reply_after {
+            Some(after)
+                if u128::from(now.saturating_sub(reply.captured_at_millis))
+                    >= after.as_millis() =>
+            {
+                format!(
+                    "[late reply: written {}, sent only now]\n\n{linked_body}",
+                    format_age(now, reply.captured_at_millis)
+                )
+            }
+            _ => linked_body,
+        };
         let body_text = outbound_text(&self.config.agent_label, &linked_body);
         let mut fallback = reply.send_fallback_request_id.is_some();
         let mut active_request_id = reply
@@ -22959,6 +22987,43 @@ pub(crate) mod tests {
     /// #781 chat-no-stale-replies-on-restart: a reply left unsent across a restart and older
     /// than the bound is held at start, listed and not sent, until the coordinator sends it; a
     /// fresh one is not held; a dropped one is never sent.
+    /// #2420 D3 (owner decision: warning at most, never delay): a reply sent at least the bound
+    /// after its capture goes out with a late tag of its own paragraph, never held; a fresh
+    /// reply is untagged.
+    #[test]
+    fn a_reply_sent_long_after_its_capture_carries_a_late_tag_and_is_never_held() {
+        let (state, key, root) = state_with_reply("late-tag", "an old answer");
+        let mut transport = FakeReplyTransport::default();
+        let fresh = state.publish_one(&key, &mut transport).expect("sent");
+        assert!(fresh.is_some());
+        assert!(
+            !transport.submissions[0].2.contains("[late reply:"),
+            "a fresh reply is untagged: {}",
+            transport.submissions[0].2
+        );
+        fs::remove_dir_all(root).ok();
+
+        let (state, key, root) = state_with_reply("late-tag-old", "an old answer");
+        let state = state.with_late_reply_after(Some(Duration::ZERO));
+        let mut transport = FakeReplyTransport::default();
+        assert!(state
+            .publish_one(&key, &mut transport)
+            .expect("sent")
+            .is_some());
+        let posted = &transport.submissions[0].2;
+        assert!(posted.contains("[late reply: written "), "{posted}");
+        assert!(
+            posted.contains("sent only now]\n\nan old answer"),
+            "{posted}"
+        );
+        assert_eq!(
+            state.read_reply(&key, 1).expect("stored").body,
+            "an old answer",
+            "the stored reply keeps the agent's own text"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn a_stale_reply_is_held_at_start_until_the_coordinator_sends_or_drops_it() {
         let bound = DEFAULT_HOLD_REPLIES_OLDER_THAN;

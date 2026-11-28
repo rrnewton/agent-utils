@@ -3582,18 +3582,17 @@ command writes nothing and never contacts the chat provider. Exit status: 0 OK,
 a bridge is up but typing into a dead pane, `chat repoint` fixes it without a
 restart.
 
-A restarted bridge does not post replies that are no longer what the
-coordinator would say. When `chat run` starts, it holds back each reply it has
-not sent that was captured `--hold-replies-older-than` ago or longer (default
-15m; `0` holds only the next case, `off` holds nothing), or whose thread has
-moved on because a later request in the same thread already has a reply sent.
-It lists them in `held-replies.json` in the state directory, logs each as
-`HELD STALE REPLY`, and tells the coordinator once, as a reply reminder is
-typed, with the commands that send or drop each. `chat held` lists them, oldest
+A reply is never held back for its age (#2420, owner decision: warning at
+most, never delay). A reply sent `--hold-replies-older-than` or longer after it
+was captured (default 15m; `0` or `off` never tags) goes out with a paragraph
+of its own above it, `[late reply: written 4h ago, sent only now]`, as after a
+restart; the stored reply keeps the agent's own text. Replies that an older
+build held in `held-replies.json` are released when `chat run` starts, so
+they go out tagged too. `chat held` still lists any held reply, oldest
 first, as `KEY/ORDINAL` with when each was captured, why it is held and its
 first 300 characters (`--json`: schema `agentctl-chat-held/v1`, whole texts);
 `chat held --send KEY/ORDINAL` takes the hold off so the service sends the
-reply as it is, and `chat held --drop KEY/ORDINAL` marks it never to be sent,
+reply, and `chat held --drop KEY/ORDINAL` marks it never to be sent,
 so the request's later replies go out. To change a held reply, drop it and send
 the new text with `chat reply`. Either wakes a running service. A reply that
 comes after a held one in the same request waits behind it, in order; replies

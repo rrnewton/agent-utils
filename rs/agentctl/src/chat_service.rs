@@ -2163,25 +2163,37 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
             .with_reply_source(source)
             .with_turn_marks(marks)
     };
-    // Replies this start finds unsent and stale are held back before any pass can send them
-    // (#781 chat-no-stale-replies-on-restart).
-    if let Some(older_than) = settings.hold_replies_older_than {
-        match state.hold_stale_replies(chat_runtime::unix_millis(), older_than) {
-            Ok(held) => {
-                for entry in held {
-                    service_log(format_args!(
-                        "agentctl: held reply {} of request {} at start ({}); the coordinator is \
-                         told, and `chat held` sends or drops it",
+    // A stale reply is sent with a late tag, never held back (#2420 D3, owner decision:
+    // warning at most, never delay; it replaces #781's hold at start). Replies an older build
+    // held are released now, and go out tagged too.
+    let state = state.with_late_reply_after(
+        settings
+            .hold_replies_older_than
+            .filter(|after| !after.is_zero()),
+    );
+    match state.held_replies() {
+        Ok(held) => {
+            for entry in held {
+                match state.release_held_reply(&entry.key, entry.ordinal) {
+                    Ok(_) => service_log(format_args!(
+                        "agentctl: released reply {} of request {} that an older build held ({}); \
+                         it is sent with a late tag",
                         entry.ordinal,
                         entry.key.get(..12).unwrap_or(&entry.key),
                         entry.reason.describe()
-                    ));
+                    )),
+                    Err(error) => service_log(format_args!(
+                        "agentctl: held reply {} of request {} could not be released at start: \
+                         {error}",
+                        entry.ordinal,
+                        entry.key.get(..12).unwrap_or(&entry.key)
+                    )),
                 }
             }
-            Err(error) => service_log(format_args!(
-                "agentctl: stale replies could not be held at start, so they may be sent: {error}"
-            )),
         }
+        Err(error) => service_log(format_args!(
+            "agentctl: the held replies could not be read at start: {error}"
+        )),
     }
     let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
