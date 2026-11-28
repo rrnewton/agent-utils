@@ -1715,8 +1715,16 @@ impl SlackDriver {
             if rescan.ledger.carried(&key) || rescan.ledger.rescued(&key) {
                 continue;
             }
-            let Ok(inbound) = self.admit(&message, true) else {
-                continue;
+            // The pass admitted it with the same rules before queueing it, so a refusal here
+            // means something changed in between. It is never skipped silently (#2430 S2): the
+            // refusal is logged once and, for an allowed sender, counted durably, like a
+            // stream refusal, so agentctl can raise its alarm.
+            let inbound = match self.admit(&message, true) {
+                Ok(inbound) => inbound,
+                Err(reason) => {
+                    self.refuse_queued_rescue(rescan, &message, &key, reason);
+                    continue;
+                }
             };
             let base = self
                 .last_cursor
@@ -1750,6 +1758,43 @@ impl SlackDriver {
                 .map(Some);
         }
         Ok(None)
+    }
+
+    /// Log and count a queued rescued message that admission refuses when it is offered
+    /// (#2430 S2): once per key in the log, and durably for an allowed sender.
+    fn refuse_queued_rescue(
+        &self,
+        rescan: &mut Rescan,
+        message: &SlackMessage,
+        key: &str,
+        reason: &str,
+    ) {
+        if rescan.noted.len() >= MAX_NOTED || !rescan.noted.insert(format!("offer:{key}")) {
+            return;
+        }
+        let author = message.user_id.as_deref().unwrap_or("none");
+        self.diagnostics.log(&format!(
+            "rescan: {key} was queued but refused when offered ({reason}; user {author}); not offered"
+        ));
+        if message
+            .user_id
+            .as_deref()
+            .is_some_and(|user| self.senders.contains(user))
+        {
+            let refusal = crate::refusals::Refusal {
+                at_millis: crate::refusals::now_millis(),
+                sequence: 0,
+                channel_id: message.channel_id.clone(),
+                message_ts: message.message_ts.clone(),
+                user_id: author.to_owned(),
+                reason: format!("rescued, then refused when offered: {reason}"),
+            };
+            if let Err(error) = self.refusals.record(&refusal) {
+                self.diagnostics.log(&format!(
+                    "rescan: the allowed-sender refusal of {key} could not be saved: {error}"
+                ));
+            }
+        }
     }
 
     fn created_floor_millis(&self) -> u64 {
