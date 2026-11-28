@@ -964,7 +964,7 @@ pub struct StepStream {
     tracker: Mutex<TestTracker>,
     /// The last START already announced from an UNTERMINATED tail, so it is journaled once.
     tail_announced: Mutex<Option<String>>,
-    /// The test opened by the latest libtest START line and not yet ended (#2484). libtest
+    /// The test opened by the latest libtest START line, whose end is unseen (#2484). libtest
     /// prints START lines only when it runs tests one at a time, so a libtest line naming another
     /// test means this one has finished, even when its verdict was never recognized.
     serial_open: Mutex<Option<String>>,

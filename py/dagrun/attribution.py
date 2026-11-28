@@ -295,7 +295,7 @@ LIBTEST_MODES = (" - should panic", " - compile fail", " - compile")
 
 
 def recognize_libtest(line: str) -> TestEvent | None:
-    """Recognize a Rust libtest boundary: ``test NAME ... VERDICT`` (end) or ``test NAME ... ``.
+    """Recognize a libtest boundary: ``test NAME ... VERDICT`` (end) or ``test NAME ... `` (start).
 
     Captured mode prints the whole line at once, so it is an end. A serial run prints the
     ``test NAME ... `` prefix before the test starts and the verdict when it ends; without output
@@ -636,7 +636,7 @@ class StepStream:
         self._partial = ""
         self._tracker = TestTracker()
         self._tail_announced: str | None = None
-        # The test opened by the latest libtest start line and not yet ended (#2484). libtest
+        # The test opened by the latest libtest start line, whose end is unseen (#2484). libtest
         # prints start lines only when it runs tests one at a time, so a libtest line naming
         # another test means this one has finished, even when its verdict was never recognized.
         self._serial_open: str | None = None
