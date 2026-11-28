@@ -1,6 +1,6 @@
 ---
 title: 'search-view-unstable-while-searching: rows jump on screen as the query changes and as search results arrive'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: cl-searchux
@@ -10,7 +10,8 @@ labels:
 - owner-ui
 - scroll
 created_at: 2026-11-27T21:45:00-05:00
-updated_at: 2026-11-28T03:20:00-05:00
+updated_at: 2026-11-28T04:20:00-05:00
+closed_at: 2026-11-28T04:20:00-05:00
 ---
 
 # Description
@@ -39,3 +40,9 @@ Existing work this builds on: `#2346` (landed) holds the row a search's first ke
 - Over 200 rows the entry does not land on the newest hits (`#1734`): the fast pass keeps the reader's place (`#2257`), now held through the settled pass. Whether a long list should land as a short one does is a separate question for the liaison.
 - Owner UI, fast-track (owner 7:09 PM ET 2026-11-27). Filed at the coordinator's request (issue file only); the same owner message's first half is `#2423`.
 - Related: `#2346`, `#2354`, `#2422` search hits vanish after a redraw, `#2425` date filter, `#2426` loading program, `#2230` the reading row stays put.
+
+## Resolution
+
+[opus 5.5] Landed in 3d014bf8 (2026-11-28 3:4x AM ET, coordinator's LAND NOW after the liaison's OK; owner gate pass on the gated head fa3433f8), with the test-only follow-up 8b9ae34e (owner gate pass on 94fb3851) that names every clamp-bound phone frame its 1.0 px allowance covers (liaison 1147, 1148); live since 3:50 AM ET in 3aebaeae with `#2423` (watch clean).
+
+Typing a search never moves the row being read: over 200 rows the typing's fast pass holds its stand-in row with the room the list lacks and tells the settled pass which row the reader reads (no more following the foot the clamp left them at), and the chips' row shrinking under a reader near the foot holds the row the eye is on, as `#2367` does for the read strip. Evidence (`search_typing_stays_browser.py`, fixture server answering the search with older hits placed as cards, per-frame trace of the row being read through the keys, the settled pass, the marks and the server's answer): the `#2423` head moved it in 18 of 44 walks (up to 167 px), this change in none (worst 0.41 px; 0.66 px on clamp-bound phone frames, allowed 1.0 px there and named). The first owner gate (on b7d0237a) caught `mention_jump_browser.py` intermittently not drawing an older page (3 of 21 runs and the gate, 0 of 11 without it); the change behind it, a +1 px foot room in the scroll owner's hold, was dropped. The design review's blank band at a short list's foot (the hold's room, given back on the next scroll) was accepted as R12 over R10 (liaison 1128); its pre-existing finds went into `#2442`.

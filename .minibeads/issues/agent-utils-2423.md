@@ -1,6 +1,6 @@
 ---
 title: 'search-escape-clear-moves-found-message: pressing Escape to clear the search moves the found, highlighted message on screen'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: cl-searchux
@@ -10,7 +10,8 @@ labels:
 - owner-ui
 - scroll
 created_at: 2026-11-27T21:45:00-05:00
-updated_at: 2026-11-28T01:35:00-05:00
+updated_at: 2026-11-28T04:20:00-05:00
+closed_at: 2026-11-28T04:20:00-05:00
 ---
 
 # Description
@@ -42,3 +43,9 @@ Hypothesis from reading the code (a local repro will confirm or correct it): cle
 - Found on the way, left to `#2424`: over 200 rows the typing's fast pass (`#1913`) hides rows before the place-keeper measures and notes the typed-at screen again at every key, so the entry's landing (`#1734`) never fires and the typing's hold sits on whichever row the fast pass kept; the landed and typed-closed walks over 260 rows join `search_clear_stays_browser.py` with `#2424`.
 - Owner UI, fast-track (owner 7:09 PM ET 2026-11-27). Filed at the coordinator's request (issue file only); the same owner message's second half is `#2424`.
 - Related: `#2346` the search-landed reader follows the foot (entry side), `#2354` scroll causes, `#2230` the reading row stays put, `#2422` search hits vanish after a redraw, `#2426` loading program.
+
+## Resolution
+
+[opus 5.5] Landed in a0d58201 (2026-11-28 2:2x AM ET, coordinator's LAND NOW after the liaison's OK; owner gate pass on the gated head bb503027, replayed over `#2427` dbecb0bb); live since 3:50 AM ET in 3aebaeae (watch clean). Clearing a search (Escape, the X, the magnifier, the field emptied) keeps the message the reader found where it stands, by its top, when they landed on a result (the `#1734` entry landing or their own scroll in the results) or highlighted one; a search typed and closed with nothing found keeps today's behaviour; with one column on screen (two columns: `#2445`).
+
+Evidence (fixture server, `search_clear_stays_browser.py`, per-frame trace of the found message's top from the frame before the clear until 60 still frames after): main moved it in 54 of 74 walks (30 px to 19,820 px), the fix in none (worst 0.48 px), desk 1280x800 and phone 412x915, light and dark, keyboard open and closed, Discuss open, 120 and 260 rows; the typed-closed walk keeps the row read before the search on both. The first owner gate (on 9219e82f) caught `column_overscroll_browser.py` FOLLOW (3 of 3 on that head, 0 of 3 on main and on `#2427` alone): the found row held in the left list of two columns left the right column's thread short of following a reply; scoped to one column (liaison 1133, 1140), and the walk gained that two-column case. Advisory design review: no violation introduced; four pre-existing finds filed as `#2442`.
