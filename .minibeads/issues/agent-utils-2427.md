@@ -9,7 +9,7 @@ labels:
 - owner-ui
 - performance
 created_at: 2026-11-27T19:50:00-05:00
-updated_at: 2026-11-27T19:50:00-05:00
+updated_at: 2026-11-27T21:10:00-05:00
 ---
 
 # Description
@@ -66,6 +66,16 @@ This is owner-UI fast-track work (owner rule 370, owner request 381 on lag).
 # Notes
 
 Filed by `cl-flaketriage` at the coordinator's request (2026-11-27). Owner P0, fast track.
+
+Owner redirect (2026-11-27, 7:39 PM ET): "the old version of Windowing was completely broken when I turned it on so I turned it back off. we're looking for the new smart/incremental loading to become DEFAULT not maintaining multiple strategies. Also even on desktop I think 5000 messages is too large a target to load. The loading should be incremental and small."
+- So windowed mode does NOT go on by default. The loading program (#2426) retires it.
+- This issue became interim relief through a held-size parameter, with windowing off. The Design's windowing steps 2 and 3 are superseded by this note.
+- The parameter was dead. The data reach-back (5000 desk, 300 phone) was never enforced: `reachBackExcess` has no caller. Nothing trimmed the page's in-memory rows during a session; only the saved device copy is cut, to 120 rows. The owner's 107,000 px page was session growth.
+- The relief is therefore the residency layer of #2426 (its interface reviewed by the program's owner):
+  - a newest window per Main and All view, 150 rows on a phone and 200 on a desk;
+  - overridable by a new device key `vibe-talk.voice.resident-rows`. Not `data-reach-back`: the windowing switch saved that field's prefilled 5000.
+  - Rows are given up only at the oldest edge, only while the reader stands at the newest with no search open, never a pinned row, and only down to a page boundary the page holds a cursor for, so the walk back has no hole.
+- Measured on 2026-11-27, windowing off, single runs at load1 about 140-200. At the owner's scale (650 rows) against 150-200 rows, every freeze grows about linearly with held rows: the load draw, an arrival's redraw, a selection change, a keystroke's handler.
 
 Related:
 - #1846: windowed rendering.
