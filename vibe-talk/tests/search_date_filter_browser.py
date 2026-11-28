@@ -251,6 +251,37 @@ BOXES_JS = """() => {
 }"""
 
 
+# The floating hint's box against every rendered line of text in the list's rows (and the lines
+# between them): each text node's client rects, as the browser lays them out. Empty when the hint is
+# not drawn, or overlaps no text; otherwise the rows (by id or kind) and the overlapping words.
+HINT_OVER_TEXT_JS = """() => {
+    const hint = document.getElementById('search-date-hint');
+    if (!hint || !hint.getClientRects().length) return [];
+    const h = hint.getBoundingClientRect();
+    if (h.width === 0 || h.height === 0) return [];
+    const over = [];
+    for (const row of document.querySelectorAll('#discord-log > li')) {
+        if (!row.getClientRects().length) continue;
+        const r = row.getBoundingClientRect();
+        if (r.bottom <= h.top || r.top >= h.bottom) continue;
+        const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            if (!node.textContent.trim()) continue;
+            const range = document.createRange();
+            range.selectNodeContents(node);
+            for (const box of range.getClientRects()) {
+                if (box.width > 0 && box.height > 0 && box.left < h.right && box.right > h.left
+                    && box.top < h.bottom && box.bottom > h.top) {
+                    over.push({row: row.getAttribute('data-id') || row.className, text: node.textContent.trim().slice(0, 40)});
+                    break;
+                }
+            }
+        }
+    }
+    return over;
+}"""
+
+
 class Walk:
     def __init__(self, page: Page, label: str, shots: Path | None, api: DatesApi, touch: bool) -> None:
         self.page, self.label, self.shots, self.api, self.touch = page, label, shots, api, touch
@@ -259,6 +290,10 @@ class Walk:
         check(condition, f"{self.label}: {why}")
 
     def shot(self, name: str) -> None:
+        # The liaison's condition (#2425 v2): in every state this walk photographs, the floating hint
+        # is a label under the bar, never a note over rows: it intersects no row's text.
+        over = self.page.evaluate(HINT_OVER_TEXT_JS)
+        self.check(over == [], f"{name}: the floating hint stands over a row's text: {over}")
         if self.shots is not None:
             self.page.screenshot(path=str(self.shots / f"{self.label}-{name}.png"))
 
