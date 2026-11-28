@@ -685,12 +685,12 @@ def test_unmount_busy_names_the_holding_pid_and_unit(
     ] * worktreesimage.UMOUNT_ATTEMPTS
 
 
-@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: times out in the real host /proc holder scan, as #2372's two did; a fixture proc root is #2434
 def test_unmount_busy_clears_on_a_bounded_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_proc_root: list[Path]
 ) -> None:
     # #1733: a holder that exits during the backoff lets the retry
-    # succeed without any holder diagnostic.
+    # succeed without any holder diagnostic. Its re-checks scan the
+    # fixture process tree, never the host's /proc (#2434, as #2372).
     target = tmp_path / "slots" / "s1"
     target.mkdir(parents=True)
 
