@@ -1,14 +1,16 @@
 ---
 title: 'wrkslots-unmount-retry-test-real-proc-scan: test_unmount_busy_clears_on_a_bounded_retry scans every host process''s mountinfo and hit the 600 s per-test timeout'
-status: open
+status: closed
 priority: 1
 issue_type: bug
+assignee: cl-flaketriage
 labels:
 - wrkslots
 - tests
 - flaky-test
 created_at: 2026-11-27T20:37:20-05:00
-updated_at: 2026-11-27T20:37:20-05:00
+updated_at: 2026-11-28T08:39:00-05:00
+closed_at: 2026-11-28T08:39:00-05:00
 ---
 
 # Description
@@ -36,3 +38,15 @@ Test-only (no production change):
 # Notes
 
 Filed by `cl-transferlock` at the coordinator's request (2026-11-27), number reserved by the coordinator. Related: `#2372` (same cause, two other tests, fixture from `906b54fc`), `#2065` (the shard wildcard that labels it known-red), `#2396` (the gate that showed it).
+
+## Resolution
+
+Fixed in bfbe58ad (test only), landed with 615961c6. Gated as 3e2e2e76: gate 1795870439918991988-1bbc670c. Its one red, `python-lifecycle.host.shard-2`, was another case's own 22 s wall-clock census budget (`test_batch_census_two_selected_trees_cannot_mask_socket_holder`, untouched here; a dated quarantine of it under #2065 is in review) and was waived (liaison 1177).
+
+- `test_unmount_busy_clears_on_a_bounded_retry` takes the `fake_proc_root` fixture from 906b54fc: one process holding nothing, and a guard that fails the test if the holder scan read any other root or never ran. Its assertions are unchanged, and it is out of the #2065 quarantine.
+- Audit of the other holder-scan callers:
+  - in `test_worktrees_image.py` the three busy-holder tests already pass fixture proc trees;
+  - `test_unmount_bind_takes_deleted_peer_views_and_leaves_live_binds` never scans, because its fake umount succeeds at once;
+  - no other test file reaches `unmount_bind`, `scan_mount_holders` or `describe_mount_holders` (`test_eden.py`'s umount lines are a fake runner's call list, and the lifecycle image cases take no busy-unmount path).
+- Ten consecutive runs of the file in its namespaced shard environment (`with-private-tmp --host-temp` plus the user/PID namespace) at load1 178-229: 10 of 10, each 137 passed and 3 skipped, in 13-17 s.
+
