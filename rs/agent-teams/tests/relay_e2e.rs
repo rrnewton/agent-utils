@@ -2228,13 +2228,7 @@ fn refused_message_is_not_mirrored() {
     world.write_relay_route(true, &post.to_string_lossy());
     world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
     world.ensure_signing_key("sim");
-    // The receiver admits one message an hour from each sender.
     let decl_path = world.state.join("teams.d/tools/declaration.json");
-    let mut decl: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&decl_path).expect("decl"))
-            .expect("decl json");
-    decl["limits"]["per_sender_per_hour"] = serde_json::json!(1);
-    std::fs::write(&decl_path, serde_json::to_string(&decl).expect("decl")).expect("decl write");
     let (code, out, err) = world.run(&[
         "send",
         "tools@host-a",
@@ -2248,6 +2242,14 @@ fn refused_message_is_not_mirrored() {
     ]);
     assert_eq!(code, 75, "{out} {err}");
     assert_eq!(world.channel_posts().len(), 1, "first message mirrored");
+    // The receiver now takes only requests from sim: the next info is refused by sender
+    // policy (a rate over the limit is delivered with a warning since #2420 R6, so the
+    // refusal this test needs comes from the sender rule).
+    let mut decl: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&decl_path).expect("decl"))
+            .expect("decl json");
+    decl["accepts_from"] = serde_json::json!([{"sender": "sim", "kinds": ["request"]}]);
+    std::fs::write(&decl_path, serde_json::to_string(&decl).expect("decl")).expect("decl write");
     let (code, out, err) = world.run(&[
         "send",
         "tools@host-a",

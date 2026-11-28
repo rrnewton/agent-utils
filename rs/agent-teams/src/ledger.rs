@@ -130,6 +130,39 @@ pub const REPLAY_UNPROVEN_WARNING: &str =
 /// The proof shown for such a message, in place of the route's proof.
 const REPLAY_UNPROVEN_PROOF: &str = "sender UNVERIFIED (a replay cannot be ruled out)";
 
+/// A sender at this many times its hourly rate limit is paced, not delivered at once (#2420 R6).
+pub const RATE_RUNAWAY_FACTOR: u64 = 10;
+
+/// Raise the alarm for a paced runaway sender: one notice per sender per UTC day
+/// (`notices/rate-paced-<sender>-<YYYY-MM-DD>.json`; agentctl watch-agents tells the coordinator
+/// once), and a team-log event for every paced message.
+fn note_rate_paced(state: &Path, team: &str, sender: &str, id: &str, detail: &str, now_ms: i64) {
+    let notice = json!({
+        "event": "rate-paced-notice", "team": team, "id": id, "sender": sender,
+        "reason": detail, "at": format_rfc3339_ms(now_ms),
+    });
+    crate::sender::log_event(state, &notice);
+    let day = format_rfc3339_ms(now_ms)
+        .get(..10)
+        .unwrap_or("day")
+        .to_string();
+    let name = format!(
+        "rate-paced-{}-{day}",
+        crate::envelope::sender_namespace(sender)
+    );
+    let notices = state.join("teams.d").join(team).join("notices");
+    if !notices.join(format!("{name}.json")).exists()
+        && !state
+            .join("teams.d")
+            .join(team)
+            .join("notices-told")
+            .join(format!("{name}.json"))
+            .exists()
+    {
+        write_notice(&notices, &name, &notice);
+    }
+}
+
 /// The first-line warning of a message delivered after its `not_after` (#2420 R4).
 pub fn late_warning(not_after: &str, not_after_ms: i64, now_ms: i64) -> String {
     format!(
@@ -562,10 +595,14 @@ fn accept_checked(
             &json!({"event": "accept", "outcome": "over-max-ttl-delivered", "team": team, "id": id, "max_ttl_seconds": ctx.declaration.max_ttl_seconds}),
         );
     }
-    // Rate limit: arrivals from one sender in the trailing hour, counted
-    // on durable recorded_at (refusals count too, so a flood cannot wash
-    // its own record away; the window slides).
+    // Rate: arrivals from one sender in the trailing hour, counted on durable recorded_at
+    // (the window slides). Over per_sender_per_hour was a terminal `refused` (#2420 R6, the
+    // liaison's ruling): the message is delivered with a warning instead. Only a runaway, at
+    // RATE_RUNAWAY_FACTOR times the limit, is paced: answered `deferred` with nothing recorded,
+    // so its sender keeps it and retries once the window slides, and one alarm per sender per
+    // day tells the coordinator.
     if ctx.declaration.per_sender_per_hour > 0 {
+        let limit = ctx.declaration.per_sender_per_hour;
         let window_start = now_ms - 3_600_000;
         let recent = list_entries(ctx.state, team)
             .iter()
@@ -577,16 +614,31 @@ fn accept_checked(
                         .and_then(parse_rfc3339_ms)
                         .is_some_and(|at| at >= window_start)
             })
-            .count();
-        if recent as u64 >= ctx.declaration.per_sender_per_hour {
-            return refuse(
-                "refused",
-                format!(
-                    "rate limit: {recent} arrivals from {sender} in the last hour (limit {})",
-                    ctx.declaration.per_sender_per_hour
-                ),
-                lock,
+            .count() as u64;
+        let pace_at = limit.saturating_mul(RATE_RUNAWAY_FACTOR);
+        if recent >= pace_at {
+            let detail = format!(
+                "paced: {recent} arrivals from {sender} in the last hour (paced from {pace_at}, \
+                 {RATE_RUNAWAY_FACTOR} times its limit {limit}); nothing recorded, the sender keeps \
+                 it and retries"
             );
+            note_rate_paced(ctx.state, team, &sender, &id, &detail, now_ms);
+            unlock(lock);
+            return Ok(AcceptAnswer {
+                outcome: "undeliverable".to_string(),
+                state: Some("deferred".to_string()),
+                detail,
+                findings: Vec::new(),
+            });
+        }
+        if recent >= limit {
+            crate::sender::log_event(
+                ctx.state,
+                &json!({"event": "accept", "outcome": "over-rate-delivered", "team": team, "id": id, "sender": sender, "recent": recent, "limit": limit}),
+            );
+            warnings.under.push(format!(
+                "sender over its rate: {recent} in the last hour, limit {limit}"
+            ));
         }
     }
     // Topic rule: an older message than the newest taken for delivery on its

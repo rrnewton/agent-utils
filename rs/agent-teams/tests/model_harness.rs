@@ -1479,7 +1479,10 @@ fn reconcile_covers_drain_gaps_a_to_d() {
 /// `recorded_at`s; the third arrival in an hour is refused, and the
 /// refusal names the limit.
 #[test]
-fn per_sender_rate_limit_refuses_beyond_the_hour() {
+fn per_sender_rate_limit_warns_beyond_the_hour_and_paces_a_runaway() {
+    // #2420 R6: over per_sender_per_hour was a terminal `refused`, and the message was lost.
+    // It is delivered with a warning; only a runaway (10 times the limit) is paced: answered
+    // `deferred` with nothing recorded, so the sender keeps and retries it, with one alarm.
     let state = temp_state("rate-limit");
     let team_dir = state.join("teams.d/tools");
     std::fs::create_dir_all(&team_dir).expect("team dir");
@@ -1539,8 +1542,42 @@ fn per_sender_rate_limit_refuses_beyond_the_hour() {
         Some("accepted")
     );
     let third = send("tm-sim-7777777777777777", 3);
-    assert_eq!(third.state.as_deref(), Some("refused"), "{third:?}");
-    assert!(third.detail.contains("rate limit"), "{third:?}");
+    assert_eq!(third.state.as_deref(), Some("accepted"), "{third:?}");
+    {
+        let pastes = fake.pastes.lock().expect("pastes");
+        let warned = &pastes.last().expect("third delivered").1;
+        assert_eq!(
+            warned.lines().nth(1),
+            Some("[relay warning: sender over its rate: 2 in the last hour, limit 2]"),
+            "{warned}"
+        );
+    }
+    for seq in 4..=20 {
+        let answer = send(&format!("tm-sim-77777777777777{seq:02}"), seq);
+        assert_eq!(
+            answer.state.as_deref(),
+            Some("accepted"),
+            "{seq}: {answer:?}"
+        );
+    }
+    // 20 recorded in the hour = 10 times the limit: the next is paced, nothing recorded.
+    let paced = send("tm-sim-7777777777777799", 99);
+    assert_eq!(paced.outcome, "undeliverable", "{paced:?}");
+    assert_eq!(paced.state.as_deref(), Some("deferred"), "{paced:?}");
+    assert!(
+        paced.detail.starts_with("paced: 20 arrivals from sim"),
+        "{paced:?}"
+    );
+    assert!(read_entry(&state, "tools", "tm-sim-7777777777777799").is_none());
+    let again = send("tm-sim-7777777777777798", 98);
+    assert_eq!(again.state.as_deref(), Some("deferred"));
+    let notices: Vec<_> = std::fs::read_dir(state.join("teams.d/tools/notices"))
+        .expect("notices")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(notices.len(), 1, "one alarm: {notices:?}");
+    assert!(notices[0].starts_with("rate-paced-sim-"), "{notices:?}");
     let _ = std::fs::remove_dir_all(&state);
 }
 

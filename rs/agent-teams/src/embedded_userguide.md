@@ -146,6 +146,14 @@ explicit rule.
     at the destination's `max_ttl_seconds` when that declaration is
     readable locally. A receiver delivers an envelope beyond its
     `max_ttl_seconds` and logs it (older receivers refused it, #2420).
+  - A sender over the receiving team's `per_sender_per_hour` (default 30)
+    is delivered with `[relay warning: sender over its rate: N in the last
+    hour, limit L]`, never refused (#2420). Only a runaway, at 10 times the
+    limit, is paced: the receiver answers `deferred` and records nothing,
+    so the sender keeps the message and its pump retries it once the hour
+    slides. One notice per sender per day
+    (`teams.d/<team>/notices/rate-paced-<sender>-<date>.json`, event
+    `rate-paced-notice`) tells the coordinator.
   - A body over the receiving team's `max_bytes` (default 8192) is
     delivered with a `[relay warning: N bytes, over this team's max_bytes
     M]` line, never refused (#2420). A body over both `max_bytes` and
