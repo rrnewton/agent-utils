@@ -77,8 +77,6 @@ _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT = 256 * 1024
 #: Directory under a salvage archive root (by default the control directory)
 #: that holds local salvage bundles and their receipts.
 _LOCAL_SALVAGE_DIRECTORY = "wrkslots-salvage"
-#: Control-directory entry holding the host-wide proof mirrors (#1692).
-_PROOF_MIRROR_DIRECTORY = "proof-mirrors"
 #: Under that directory, one verified complete-history bundle per commit,
 #: shared by every receipt that names it (#1153).  A machine name begins with
 #: a letter or digit, so this name never meets a machine's directory.
@@ -87,6 +85,8 @@ _PROOF_MIRROR_DIRECTORY = "proof-mirrors"
 #: count every receipt that names a bundle here.
 _SHARED_SALVAGE_DIRECTORY = "_by-commit"
 _SHARED_SALVAGE_METADATA_SCHEMA = 1
+#: Control-directory entry holding the host-wide proof mirrors (#1692).
+_PROOF_MIRROR_DIRECTORY = "proof-mirrors"
 #: Most gitignored bytes one removal archives with --archive-ignored (#1302).
 #: Above this, archiving refuses and names the total, so an evidence
 #: directory stays a deliberate, visible decision rather than a silent

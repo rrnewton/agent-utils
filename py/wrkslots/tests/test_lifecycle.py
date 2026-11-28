@@ -35942,9 +35942,11 @@ def test_proof_mirror_directory_is_storage_not_a_slot(tmp_path: Path) -> None:
     assert [row["slot"] for row in json.loads(unpushed.stdout)["slots"]] == ["slot02"]
 
     taken = create(project, slot="proof-mirrors", agent="codex-3", branch="codex/three")
-    assert taken.returncode != 0
+    assert taken.returncode == 3, taken.stderr
     assert "reserved for wrkslots storage" in taken.stderr, taken.stderr
     assert mirrors.is_dir() and any(mirrors.iterdir())
+    rows = active_slots(project)
+    assert [row["slot"] for row in rows if isinstance(row, dict)] == ["slot02"], rows
 
 
 def test_clean_caches_dry_run_reports_without_deleting(tmp_path: Path) -> None:
