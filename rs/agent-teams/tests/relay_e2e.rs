@@ -2719,8 +2719,7 @@ fn a_damaged_relay_copy_with_no_delivered_copy_is_delivered_with_a_warning_to_it
     let delivered = world.hook_inbox_texts("tools");
     assert_eq!(delivered.len(), 1, "{delivered:?}");
     assert!(
-        delivered[0]
-            .contains("[relay warning: this body differs from the hash its sender declared"),
+        delivered[0].contains("[relay warning: body differs from the hash its sender declared"),
         "{}",
         delivered[0]
     );
@@ -2775,7 +2774,7 @@ fn a_damaged_signed_relay_copy_is_delivered_with_a_warning_and_its_intact_copy_i
     let delivered = world.hook_inbox_texts("tools");
     assert_eq!(delivered.len(), 1);
     assert!(
-        delivered[0].contains("[relay warning: this body differs from the hash its sender signed"),
+        delivered[0].contains("[relay warning: body differs from the hash its sender signed"),
         "{}",
         delivered[0]
     );
@@ -3495,7 +3494,7 @@ fn a_signed_post_whose_visible_tag_disagrees_is_delivered_with_a_warning() {
         "the proven sender leads: {lines:?}"
     );
     assert!(
-        lines[1].starts_with("[relay warning: the sender above is proven")
+        lines[1].starts_with("[relay warning: signed sender above;")
             && lines[1].contains("UNVERIFIED")
             && lines[1].contains("to: tools@host-b"),
         "the visible tag comes after, labelled unverified: {lines:?}"
@@ -3529,8 +3528,7 @@ fn an_unparseable_post_from_a_confirmed_sender_is_delivered_as_received_with_a_w
         "the proven sender leads: {lines:?}"
     );
     assert!(
-        lines[1]
-            .starts_with("[relay warning: the sender above is proven by its confirmed relay bot")
+        lines[1].starts_with("[relay warning: not a readable envelope (")
             && lines[1].contains("UNVERIFIED"),
         "{lines:?}"
     );

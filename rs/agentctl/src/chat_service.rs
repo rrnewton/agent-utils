@@ -17881,7 +17881,7 @@ esac
             .expect("posted from the transcript");
         assert!(
             stored.starts_with(
-                "[chat-bridge warning: the bridge missed this reply when it was printed"
+                "[chat-bridge warning: missed when printed, posted from the transcript "
             ),
             "{stored}"
         );

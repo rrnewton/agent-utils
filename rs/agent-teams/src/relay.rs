@@ -2410,15 +2410,14 @@ fn relay_deliver(
             // The proven sender leads the delivered text (the tag line above is the signed
             // envelope's); the post's own visible tag follows only here, labelled unverified and
             // without its brackets, so it can never read as the sender (lead-014's condition).
+            // One short plain line (lead-014): the visible tag is cut at 100 characters.
             let visible: String = post_tag_line(text)
                 .chars()
                 .filter(|c| !c.is_control() && *c != '[' && *c != ']')
-                .take(300)
                 .collect();
             warnings.push(format!(
-                "the sender above is proven by the envelope's verified signature; the post's own \
-                 visible tag line disagrees and is UNVERIFIED, not the sender: \"{}\"",
-                visible.trim()
+                "signed sender above; this post's own tag differs, UNVERIFIED: \"{}\"",
+                short_line(visible.trim(), 100)
             ));
         } else {
             // Legacy admission has no signature to trust, so a missing tag
@@ -2814,15 +2813,15 @@ fn deliver_unparseable_confirmed(
     let clean_reason: String = reason
         .chars()
         .filter(|c| !c.is_control() && *c != '[' && *c != ']')
-        .take(200)
         .collect();
+    // One short plain line (lead-014): the sender is the tag above, proven by its confirmed
+    // relay bot; the text below, any tag line in it included, is unverified.
     let rendered = format!(
         "[from {from} via agent-teams · to: {}@{this_host} · id: {key}]\n\
-         [relay warning: the sender above is proven by its confirmed relay bot; this post could \
-         not be read as an agent-teams envelope ({clean_reason}), as when a provider splits, \
-         truncates or rewrites it. Its text follows as received and is UNVERIFIED: any tag line \
-         in it is not the sender. It has no message ID to reply to]\n{body}",
-        declaration.team
+         [relay warning: not a readable envelope ({}); sender proven by its relay bot; text below \
+         UNVERIFIED, no ID to reply to]\n{body}",
+        declaration.team,
+        short_line(clean_reason.trim(), 60)
     );
     let notice_envelope = json!({
         "id": key,
@@ -3032,10 +3031,20 @@ fn record_unparseable_confirmed(
 /// the hash its sender signed (or, unsigned, declared) (#2420).
 fn body_hash_warning(signed: bool) -> String {
     format!(
-        "this body differs from the hash its sender {} (after undoing Slack link markup and \
-         bullets): a provider rewrite or tampering; it is delivered as received",
+        "body differs from the hash its sender {}; delivered as received",
         if signed { "signed" } else { "declared" }
     )
+}
+
+/// `text` cut to at most `max` characters, with an ellipsis when cut, so a warning stays one
+/// short line (#2420, lead-014).
+fn short_line(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 /// `relay/body-hash-warnings.json`: how many relay copies were delivered (or found already

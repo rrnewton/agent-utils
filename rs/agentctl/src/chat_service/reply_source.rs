@@ -115,8 +115,8 @@ fn post_missed_block(
     };
     let minutes = now.saturating_sub(miss.block_at_millis) / 60_000;
     let body = format!(
-        "[chat-bridge warning: the bridge missed this reply when it was printed and posted it \
-         from the coordinator's transcript {minutes} min later]\n{}",
+        "[chat-bridge warning: missed when printed, posted from the transcript {minutes} min \
+         later]\n{}",
         block.body
     );
     match state.submit_reply(&miss.key, &miss.reply_id, &body) {

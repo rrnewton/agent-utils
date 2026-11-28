@@ -5947,9 +5947,8 @@ pub(crate) trait TranscriptReplies: Send + fmt::Debug {
 pub(crate) const SCREEN_FALLBACK_AFTER: Duration = Duration::from_secs(60);
 /// The line put above a reply whose table was read only from the screen (#2420 C3): it is
 /// posted, never refused, with this warning that the table may be drawn mangled.
-pub(crate) const SCREEN_TABLE_WARNING: &str = "[chat-bridge warning: the bridge read this reply \
-only from the screen, which can draw its table mangled; the coordinator was asked to resend it if \
-it reads wrong]";
+pub(crate) const SCREEN_TABLE_WARNING: &str =
+    "[chat-bridge warning: table read from the screen, it may be garbled]";
 /// Most screen blocks remembered as held back before the memory starts over.
 const MAX_HELD_SCREEN_BLOCKS: usize = 4_096;
 /// Screen blocks held back, by `transcript_digest`: when a capture first read each, in Unix
