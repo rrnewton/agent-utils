@@ -6590,6 +6590,13 @@ const TUNING_BANDS = {
   DATA_REACH_PHONE: [50, 2000, "messages held as data on a phone"],
   DATA_REACH_DESKTOP: [500, 20000, "messages held as data on a desk"],
   DATA_BYTES_PER_MESSAGE: [256, 8192, "planning bytes per cached message"],
+  // `#2427 vibe-talk-windowed-default-on`. The newest window a channel view keeps resident: measured
+  // 2026-11-27, every freeze grows about linearly with held rows (the owner's page held about 650);
+  // under a page or two the reader runs out of history in a glance, far above the owner's scale it
+  // is no relief. The boundary ledger: enough walked and newest-read pages to cut at, bounded.
+  RESIDENT_ROWS_PHONE: [50, 400, "rows a channel view keeps resident on a phone"],
+  RESIDENT_ROWS_DESKTOP: [50, 500, "rows a channel view keeps resident on a desk"],
+  RESIDENCY_BOUNDARIES_KEPT: [8, 512, "page boundaries kept per view for residency cuts"],
   MIN_DATA_REACH_BACK: [0, 0, "the least kept reach-back (0 = device default)"],
   MAX_DATA_REACH_BACK: [1000, 100000, "the most kept reach-back"],
   DEFAULT_DATA_REACH_BACK: [0, 0, "kept reach-back meaning device default"],

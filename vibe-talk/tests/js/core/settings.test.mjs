@@ -166,6 +166,8 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     // `#2385 vibe-talk-thread-open-layout-first`: the pending-reply boxes' kill switch, on unless "0".
     ["threadReplyBoxes", "vibe-talk.voice.thread-reply-boxes", true, [[false, "0"], [true, "1"]], true],
     ["dataReachBack", "vibe-talk.voice.data-reach-back", 0, [[5000, "5000"], [0, "0"]], 0],
+    // `#2427 vibe-talk-windowed-default-on`: the rows each channel view keeps resident; 0 = default.
+    ["residentRows", "vibe-talk.voice.resident-rows", 0, [[200, "200"], [0, "0"]], 0],
   ];
   const refused = () => { throw new Error("SecurityError"); };
   const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });

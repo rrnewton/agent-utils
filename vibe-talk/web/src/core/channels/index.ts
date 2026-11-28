@@ -35,6 +35,8 @@ export { serverVersions } from "./versions.ts";
 export type { ServerVersions } from "./versions.ts";
 export { coverViewOf, projectionOf } from "./views.ts";
 export { restoreCanon, savedTimelineOf } from "./saved.ts";
+export { applyDiscard, planResidency } from "./residency.ts";
+export type { DiscardFacts, DiscardResult, DiscardedSpan, HeldRow, PageBoundary, PinReason, ResidencyBudgetShape, ResidencyInput, ResidencyPlan } from "./residency.ts";
 export { MESSAGE_CACHE_CHARS, MESSAGE_CACHE_KEY, MESSAGE_CACHE_ROWS, MESSAGE_CACHE_SCOPES, MESSAGE_CACHE_VERSION, createMessageCache, tokenFingerprint } from "./cache.ts";
 export type { CacheEntry, CacheShell, MessageCache, MessageCacheDependencies, MessageCacheEnvelope, SavedPage } from "./cache.ts";
 export type { SavedCover, SavedTimeline } from "./saved.ts";

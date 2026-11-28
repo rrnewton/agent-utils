@@ -525,6 +525,18 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (n: number) => String(clampDataReachBack(n)),
     refused: { value: DEFAULT_DATA_REACH_BACK },
   } satisfies DeviceSetting<number>,
+  /**
+   * `#2427 vibe-talk-windowed-default-on`. Rows each channel view keeps resident, its newest window;
+   * 0 = the per-device default (core/settings/residency.ts). A key of its own: the windowing switch
+   * saved `data-reach-back` from a field filled with the old 5000/300 defaults, so that key may hold
+   * a value nobody chose.
+   */
+  residentRows: {
+    key: "vibe-talk.voice.resident-rows",
+    read: (raw: string | null) => clampDataReachBack(raw === null ? DEFAULT_DATA_REACH_BACK : raw),
+    write: (n: number) => String(clampDataReachBack(n)),
+    refused: { value: DEFAULT_DATA_REACH_BACK },
+  } satisfies DeviceSetting<number>,
 });
 
 /** The device's settings, kept in its storage. */

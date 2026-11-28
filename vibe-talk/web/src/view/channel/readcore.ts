@@ -12,6 +12,7 @@
 import type { Message, ThreadSummary, TimelineResponse } from "../../contract/index.ts";
 import {
   answerUnplaced,
+  applyDiscard,
   DISCORD_PAGE_LIMIT,
   foldDeltaIn,
   foldLiveIn,
@@ -20,13 +21,14 @@ import {
   inViewOf,
   newerPageSpeaksFor,
   pageFoldIn,
+  planResidency,
   projectionOf,
   restoreCanon,
   sameMessage,
   threadOf,
   timeOf,
 } from "../../core/channels/index.ts";
-import type { ChannelCanon, ChannelStore, CopyOrder, PageFold, Removals, ReplyTally, SavedTimeline } from "../../core/channels/index.ts";
+import type { ChannelCanon, ChannelStore, CopyOrder, PageBoundary, PageFold, Removals, ReplyTally, ResidencyBudgetShape, SavedTimeline } from "../../core/channels/index.ts";
 /** The reader (core/sync `createTimelineReader`), as this view uses it. */
 export interface TimelineReaderLike {
   readTimeline(path: string, options?: { signal?: CancelSignal }): Promise<TimelineResponse>;
@@ -335,6 +337,12 @@ export interface TimelineViewDependencies {
    */
   heldComposerTop?(area: HTMLElement): number | null;
   keepComposer?(area: HTMLElement, beforeTop: number): boolean;
+  /**
+   * `#2427 vibe-talk-windowed-default-on`: how many rows a channel view keeps resident (its newest
+   * window), from the device settings (core/settings/residency.ts). Absent or null: everything held
+   * stays resident.
+   */
+  residency?(): ResidencyBudgetShape | null;
   screensView(): string;
   renderJumpNewest(): void;
 }
@@ -638,6 +646,7 @@ function foldTimelinePage(payload: TimelineResponse, older: boolean, view: strin
     },
     noteReplyGaps: (before) => noteReplyGaps(payload, view, older, false, before),
   });
+  notePageBoundary(payload, view, viewKey(view, thread));
 }
 
 /**
@@ -774,6 +783,125 @@ function drawProjection(): boolean {
   // the server itself is seen to have the message.
   renderOutgoingMessages();
   return true;
+}
+
+/**
+ * `#2427 vibe-talk-windowed-default-on`: the page boundaries each view's reads folded, by channel
+ * and view key: the oldest row of a page that said more exists, and the cursor that reads exactly
+ * what is older than it. Residency gives rows up only down to one of these, so the walk back
+ * starts where the kept rows begin (core/channels/residency.ts).
+ */
+const residencyBoundaries = new Map<string, PageBoundary[]>();
+const RESIDENCY_BOUNDARIES_KEPT = 64;
+let residencyApplying = false;
+
+function boundaryKey(key: string): string {
+  return `${channelStore.current().channel}\u0000${key}`;
+}
+
+/** Note the boundary a folded page of `view` (under view key `key`) gives, if it gives one. */
+function notePageBoundary(payload: TimelineResponse, view: string, key: string): void {
+  if (view !== "main" && view !== "flat") return;
+  const messages = payload.messages || [];
+  const oldest = messages[0] as Message | undefined;
+  if (payload.has_more !== true || !payload.next_before || !oldest) return;
+  const oldestMs = timeOf(oldest, "timestamp");
+  if (!Number.isFinite(oldestMs)) return;
+  const held = residencyBoundaries.get(boundaryKey(key)) || [];
+  const kept = held.filter((boundary) => boundary.oldestId !== String(oldest.id));
+  kept.push({ oldestId: String(oldest.id), oldestMs, nextBefore: String(payload.next_before) });
+  residencyBoundaries.set(boundaryKey(key), kept.slice(-RESIDENCY_BOUNDARIES_KEPT));
+}
+
+/** The ids the reader's text selection touches in the list: never given up while it stands. */
+function selectedRowIds(list: HTMLElement): string[] {
+  const chosen = document.getSelection();
+  if (!chosen || chosen.isCollapsed || chosen.rangeCount === 0) return [];
+  const ids: string[] = [];
+  for (const node of [chosen.anchorNode, chosen.focusNode]) {
+    const element = node instanceof Element ? node : node ? node.parentElement : null;
+    const row = element ? element.closest("#discord-log > li") : null;
+    if (row && list.contains(row)) ids.push(...idsOf(row));
+  }
+  return ids;
+}
+
+/**
+ * The rows residency never gives up, in the channel list: the row a jump landed on (the reader's
+ * latest explicit place), the reader's selection, the row a reply box is open on (its draft with
+ * it) and the row being read aloud, or asked to be. One set for every residency policy (`#2426`'s
+ * islands read it too).
+ */
+function residencyPins(): ReadonlySet<string> {
+  const list = el("discord-log");
+  const jumped = jumpAnchorRow ? jumpAnchorRow() : null;
+  const marked = [...list.querySelectorAll(
+    ":scope > li[data-replying], :scope > li[data-reading='true'], :scope > li[data-pending='true']")].flatMap(idsOf);
+  return new Set<string>([...(jumped ? idsOf(jumped) : []), ...selectedRowIds(list), ...marked]);
+}
+
+/**
+ * Keep the view's residency (core/channels/residency.ts): when the reader stood at the newest of
+ * Main or All (`wasAtNewest`, judged before the read or arrival drew: what lands then stands below
+ * them, `#2230`) with no search open and the view holds more than its newest window, give up the
+ * oldest run down to a page boundary, from the store and every view, and redraw the view from the
+ * store with the reader's place held. Called after a read lands and after an arrival is drawn.
+ */
+function applyResidency(wasAtNewest: boolean): void {
+  if (residencyApplying || !deps.residency || !providerFacts.threading()) return;
+  const view = selection().view;
+  if ((view !== "main" && view !== "flat") || screens.view() !== "discord" || columnWork.side()) return;
+  const budget = deps.residency();
+  if (!budget || timelineRows().messages.length <= budget.newestRows) return;
+  const canon = channelStore.current();
+  if (canon.channel !== String(selectedChannelId())) return;
+  const list = el("discord-log");
+  const atNewest = wasAtNewest;
+  const key = viewKey();
+  const pins = residencyPins();
+  const plan = planResidency({
+    held: timelineRows().messages.map((message) => ({ id: String(message.id), ms: timeOf(message, "timestamp") })),
+    pins,
+    anchor: atNewest ? null : "reader",
+    atNewest,
+    searchOpen: searchField.open(),
+    boundaries: residencyBoundaries.get(boundaryKey(key)) || [],
+    bytesOf: () => 0,
+  }, budget);
+  const span = plan.discard[0];
+  if (!span) return;
+  residencyApplying = true;
+  try {
+    const done = applyDiscard(canon, span, { viewKey: key, pins, stillToDo: (message, dismissed) => stillToDo(message, dismissed) });
+    if (!done.removed.length) return;
+    for (const raised of done.raised) {
+      const held = residencyBoundaries.get(boundaryKey(raised));
+      if (held) residencyBoundaries.set(boundaryKey(raised), held.filter((boundary) => boundary.oldestMs >= span.cutMs));
+    }
+    // The rows given up stand above the reader. They are taken out of the list as they are, nothing
+    // else redrawn (a redraw's landing work would clear the "N new" an arrival below the reader just
+    // counted), and the row the reader is on is put back where it stood by the scroll owner's one
+    // relative write. Not `preservingScroll`: a reader within rest slack of the foot counts as pinned
+    // there, and being put back on the foot would clear that count too.
+    const area = el("scroll-area");
+    const held = scrollAnchor(area);
+    const heldId = held ? held.getAttribute("data-context-id") || idsOf(held)[0] || null : null;
+    const heldTop = held ? held.getBoundingClientRect().top : 0;
+    timelineRows().messages = (projectView() || []) as Message[];
+    olderPages().moreAbove = true;
+    olderPages().cursor = span.nextBefore;
+    const kept = new Set(canon.messages.map((message) => String(message.id)));
+    for (const row of [...list.children]) {
+      const ids = idsOf(row);
+      if (ids.length > 0 && ids.every((id) => !kept.has(id))) row.remove();
+    }
+    renderOlderControl();
+    const again = heldId ? [...list.children].find((row) => (row.getAttribute("data-context-id") || idsOf(row)[0]) === heldId) : null;
+    if (again) deps.nudge(area, again.getBoundingClientRect().top - heldTop);
+    saveChannelScope();
+  } finally {
+    residencyApplying = false;
+  }
 }
 
 /**
@@ -1129,6 +1257,8 @@ async function loadTimeline(options?: TimelineReadOptions): Promise<void> {
       settleAfterRead(messages as readonly Message[], { area, ...at, ownAct });
       noteFreshRead(deltas[deltas.length - 1] as TimelineResponse);
       saveChannelScope();
+      // `#2427`: what the store keeps resident, once the read has landed and settled.
+      applyResidency(at.wasAtNewest);
       renderScrollTools();
     });
     requestVisibleSummaries();
@@ -1283,6 +1413,8 @@ async function loadTimeline(options?: TimelineReadOptions): Promise<void> {
         settleAfterRead(messages as readonly Message[], { area, ...at, ownAct });
         noteFreshRead(payload);
         saveChannelScope();
+        // `#2427`: what the store keeps resident, once the read has landed and settled.
+        applyResidency(at.wasAtNewest);
         renderScrollTools();
       });
       requestVisibleSummaries();
@@ -2275,6 +2407,8 @@ function appendChannelRow(arriving: Message, live = false, folded = false): void
   // at the desk). Put back from here instead, by the scroll owner's one composer write.
   const area = el("scroll-area");
   const composerTop = deps.heldComposerTop ? deps.heldComposerTop(area) : null;
+  // `#2427`: whether the reader stood at the newest before this row was drawn below them.
+  const wasAtNewest = screens.view() === "discord" && followsNewest(area);
   const append = () => {
     // A LIVE ARRIVAL CAN JOIN THE ROW ABOVE IT, and it has to be given the chance: the second half
     // of a split post usually arrives over the stream a fraction of a second after the first, so
@@ -2301,6 +2435,8 @@ function appendChannelRow(arriving: Message, live = false, folded = false): void
   if (composerTop !== null && deps.keepComposer) deps.keepComposer(area, composerTop);
   // A live arrival and an acknowledged send are both what a reload should show next.
   save();
+  // `#2427`: an arrival grows the view at its foot; what it keeps resident is decided once it stands.
+  if (providerFacts.threading() && !columnWork.side()) applyResidency(wasAtNewest);
 }
 
 /**

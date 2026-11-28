@@ -89,3 +89,5 @@ export {
   windowedConfig,
 } from "./windowed.ts";
 export type { WindowedConfig } from "./windowed.ts";
+export { RESIDENT_MAX_BYTES_DESKTOP, RESIDENT_MAX_BYTES_PHONE, RESIDENT_ROWS_DESKTOP, RESIDENT_ROWS_PHONE, residencyBudget } from "./residency.ts";
+export type { ResidencyBudget } from "./residency.ts";

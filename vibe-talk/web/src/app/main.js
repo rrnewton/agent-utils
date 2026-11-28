@@ -63,7 +63,7 @@ import {DISMISSED_SENDS_DAYS,
   sentReceiptRetires as receiptRetires,
   underDraft,
   unsentText,} from "../core/outbox/index.ts";
-import {DEFAULT_COLLAPSED_LINES, DEFAULT_DISCUSS_WIDTH, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampDiscussWidth, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createEnterSends, createInAppLinks, createKeptSwitch, createMarkReadFirstPercent, createMarkReadLongWords, createQuoteReadPercent, createSettingsSync} from "../core/settings/index.ts";
+import {DEFAULT_COLLAPSED_LINES, DEFAULT_DISCUSS_WIDTH, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampDiscussWidth, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createEnterSends, createInAppLinks, createKeptSwitch, createMarkReadFirstPercent, createMarkReadLongWords, createQuoteReadPercent, createSettingsSync, residencyBudget} from "../core/settings/index.ts";
 import {childByClass,
   createGeometry,
   createOncePerFrame,
@@ -7943,6 +7943,8 @@ const timelineView = createTimelineView({
   // `#2292`: the scroll owner's composer hold, for a read's landing.
   heldComposerTop: (area) => scrollKeeping.heldComposerTop(area),
   keepComposer: (area, top) => scrollKeeping.keepComposer(area, top),
+  // `#2427`: the rows each channel view keeps resident (core/settings/residency.ts).
+  residency: () => residencyBudget(deviceSettings(), document.documentElement.clientWidth < 900),
 });
 const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, rowsAsDrawn, applyTimelinePage: applyTimelinePagePass, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage: foldLiveMessagePass, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta: foldTimelineDeltaPass, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow: appendChannelRowPass, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition: channelReadPositionPass, settleAfterRead: settleAfterReadPass, landedReadPosition } = timelineView;
 // A read's page landing, a live arrival and a poll's delta, as the client debug mode's spans (`#2276`).

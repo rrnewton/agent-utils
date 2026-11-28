@@ -1,0 +1,22 @@
+steps:
+  # `#2427 vibe-talk-windowed-default-on`: a long session keeps only its newest window. A channel
+  # walked back to 300 rows, the reader at the newest, one arrival: at most the newest 100 (the
+  # device's resident rows) plus one walked page stay, the newest rows and the arrival among them;
+  # the reading row moves at most one whole pixel in every frame; the first step back after the cap
+  # asks for exactly the rows below the first kept row and leaves one unbroken run; with resident
+  # rows 20000 nothing goes. Counts, ids and geometry only, no wall-clock budget.
+  - group: check
+    job: residency-browser
+    desc: a long session keeps its newest window (resident rows), the reading row still under one whole pixel, and the step back after the cap has no hole; nothing goes at resident rows 20000; in current Chromium at 412x915 by touch and 1280x800 (#2427)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/residency_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 900
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 200
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824
