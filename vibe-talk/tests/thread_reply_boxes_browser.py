@@ -449,6 +449,11 @@ def late_count(case: Case, profile: str) -> str:
             return f"{case.tag}: switch off -> old behaviour (0 boxes, no thread read when the count landed)"
         until(page, f"() => document.querySelectorAll('#pending-replies .pending-reply').length === {NEW_REPLIES}",
               f"{case.tag}: the count landed and no {NEW_REPLIES} boxes stood")
+        # The read leaves with the boxes (the same frame), but reaches this fake's handler a moment later
+        # on a hot host: wait for it to arrive (a condition, not a clock), then judge what arrived.
+        deadline = time.monotonic() + WAIT_S
+        while not case.api.thread_reads() and time.monotonic() < deadline:
+            page.wait_for_timeout(25)
         reads = case.api.thread_reads()
         check(len(reads) == 1 and "reason=enter" in reads[0], f"{case.tag}: the count did not read the thread at once "
               f"(reason enter, not the poll): {reads}")
