@@ -8,7 +8,7 @@ labels:
 - gate
 - ledger
 created_at: 2026-11-27T15:25:00-05:00
-updated_at: 2026-11-27T15:25:00-05:00
+updated_at: 2026-11-28T14:49:00-05:00
 ---
 
 # Description
@@ -42,6 +42,13 @@ The landing tool's coverage check is being fixed where that tool lives. This iss
 # Notes
 
 Filed by `cl-flaketriage` at the coordinator's request (2026-11-27), after the #2372 test-fix landing (906b54fc).
+
+A case (2026-11-28): today land-main credits a step only from a rerun that passed as a WHOLE. A step that passed inside a partly red rerun stays uncovered.
+- c949532e's full gate (1795890126740230136-2a0515e3) failed 3 steps.
+- Its rerun (1795892878208731861-9e488471) passed `python.wrkslots.shard-1` but failed the two other steps, which were then waived (liaison 1199).
+- land-main refused anyway: "the gate failed 1 step(s) that no passing rerun after it ran (#2401): python.wrkslots.shard-1".
+- A second solo rerun of shard-1 alone (1795894632386173636-09671cfe, a whole pass) was needed before the landing.
+- With this issue's per-step green list in the row, the first rerun's shard-1 pass would have counted.
 
 Related:
 - #2355: unmeasured NO_RESULT steps; the same journal dependency for steps a rerun cleared.
