@@ -218,7 +218,8 @@ mod tests {
         assert!(dry.iter().all(|e| e.outcome == "would_retire"));
         assert!(root.join("inbox/msg-1.json").exists());
         let all = retire(&root, &[], true, "delivered by hand", false).unwrap();
-        assert!(all.iter().all(|e| e.outcome == "retired"));
+        // #2487: name every entry's outcome, so a red names its cause.
+        assert!(all.iter().all(|e| e.outcome == "retired"), "{all:#?}");
         assert!(pending_entries(&root).is_empty());
         let _ = fs::remove_dir_all(&root);
     }
