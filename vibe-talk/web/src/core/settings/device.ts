@@ -21,8 +21,6 @@ import {
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
   DEFAULT_DATA_REACH_BACK,
-  DEFAULT_RENDER_PREFETCH_PX,
-  DEFAULT_RENDER_ROW_CAP,
   clampCardMaxLines,
   clampDataReachBack,
   clampMarkReadFirstPercent,
@@ -35,8 +33,6 @@ import {
   clampMsgScale,
   clampReadKeepAliveMs,
   clampReadPrerollMs,
-  clampRenderPrefetchPx,
-  clampRenderRowCap,
   clampReadSpeed,
   clampReadSteerWidth,
   clampReadingWidth,
@@ -516,14 +512,6 @@ export const DEVICE_SETTINGS = Object.freeze({
     refused: { value: false },
   } satisfies DeviceSetting<boolean>,
   /**
-   * `#1846 vibe-talk-windowed-rendering`. Whether the channel/thread lists mount only the
-   * viewport plus a prefetch margin. OFF unless on; default off at S0 (see settings/windowed.ts).
-   * The Settings help for this switch states the browser find-in-page limitation (Q3).
-   */
-  windowedLists: offUnlessOn("vibe-talk.voice.windowed-lists", false),
-  /** `#1846` S1: explicit Off on phone (unset = On at phone widths, Off on desktop). */
-  windowedListsOff: offUnlessOn("vibe-talk.voice.windowed-lists-off", false),
-  /**
    * `#2385 vibe-talk-thread-open-layout-first`. Whether an open thread draws boxes for the replies
    * its root reports and the page has not brought, and reads the thread at once when a late count
    * says it is short. ON unless off: a rollback kill switch only, kept "0" by hand, never shown in
@@ -536,20 +524,6 @@ export const DEVICE_SETTINGS = Object.freeze({
     read: (raw: string | null) => clampDataReachBack(raw === null ? DEFAULT_DATA_REACH_BACK : raw),
     write: (n: number) => String(clampDataReachBack(n)),
     refused: { value: DEFAULT_DATA_REACH_BACK },
-  } satisfies DeviceSetting<number>,
-  /** `#1846`. Render prefetch margin in px; 0 = per-device default (1200 phone / 1600 desktop). */
-  renderPrefetchPx: {
-    key: "vibe-talk.voice.render-prefetch-px",
-    read: (raw: string | null) => clampRenderPrefetchPx(raw === null ? DEFAULT_RENDER_PREFETCH_PX : raw),
-    write: (n: number) => String(clampRenderPrefetchPx(n)),
-    refused: { value: DEFAULT_RENDER_PREFETCH_PX },
-  } satisfies DeviceSetting<number>,
-  /** `#1846`. Mounted-row cap per list; 0 = per-device default (60 phone / 80 desktop). */
-  renderRowCap: {
-    key: "vibe-talk.voice.render-row-cap",
-    read: (raw: string | null) => clampRenderRowCap(raw === null ? DEFAULT_RENDER_ROW_CAP : raw),
-    write: (n: number) => String(clampRenderRowCap(n)),
-    refused: { value: DEFAULT_RENDER_ROW_CAP },
   } satisfies DeviceSetting<number>,
 });
 

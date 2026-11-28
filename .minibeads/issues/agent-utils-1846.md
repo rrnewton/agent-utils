@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-windowed-rendering: render only the viewport plus a bounded prefetch margin'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -9,7 +9,8 @@ labels:
 - scroll
 - performance
 created_at: 2026-11-18T10:17:59-05:00
-updated_at: 2026-11-18T10:40:00-05:00
+updated_at: 2026-11-27T20:30:00-05:00
+closed_at: 2026-11-27T20:30:00-05:00
 ---
 
 # Description
@@ -42,3 +43,7 @@ updated_at: 2026-11-18T10:40:00-05:00
 [watermelon-full-preview] Steps 2-3 landed: step 2 as c59c6860 (height index, inert; silent resync), step 3 as 77417014 (channel-list windowing behind windowed-lists, default Off; budgets B2/B3/B4 proven on the 5000-row test page). Remaining: step 4 thread-list windowing, step 5 hydration pacer + jump/search/Read/selection pinning (incl. aria-setsize/posinset), step 6 Settings UI switch with the find-in-page help text + rollout S1 (phone On; S2 separate approval). Final shots: /tmp/mu-windowed-shots-final with BUILD.txt (77417014, page build 2e5dbb13); matrix: /tmp/mu-windowed-matrix.
 
 [watermelon-full-preview] Steps 4-6 landed by mu-windowed2: step 4 thread-list windowing (threadCards windows #thread-list behind windowed-lists; Off returns every card, no spacers), step 5 hydration pacer (createHydrationPacer, <=8ms slices, retain cancels out-of-window) + jump/focus/pinned groups held in the channel window (JumpAnchor.id()), step 6 aria-setsize/aria-posinset on mounted rows in both lists + Settings UI (windowed-lists switch with find-in-page help, data-reach-back and render-row-cap knobs) + S1 (On by default at phone widths unless explicitly Off via windowedListsOff; desktop Off). Dynamic proof: windowed_refresh_browser.py on the real page routes — 5000 messages mount 37 rows at 412x915 and 57 at 1280x800 (caps 60/80), one screenful mounts 0 new rows (budget 20), off-screen edit does zero DOM work. Shots: /tmp/mu-windowed2-shots (16 harness images, BUILD.txt). Remaining: S2 (default On everywhere) by separate approval after one phone cycle.
+
+## Resolution
+
+[opus 5.5, cl-loading] Superseded by #2426 vibe-talk-sparse-loading-program and closed by its slice R1 (owner 2026-11-27, 7:39 PM ET: "Well the old version of "Windowing" was completely broken when I turned it on so I turned it back off. we're looking for the new smart/incremental loading to become DEFAULT not maintaining multiple strategies"). The render window (step 3 channel windowing, step 4 thread-card windowing, the step 5 hydration pacer, which had no caller, and the step 6 Settings switch with its render knobs) is retired: every held row is mounted, and what bounds the list is how much is held (the residency layer, #2427 and #2426). Kept from this issue: step 1's incremental per-id cache updates, step 2's height index (the residency layer prices what it lets go of with it), and the data reach-back constants (`core/settings/windowed.ts`, now data only). A device that still holds the windowed-lists key is unaffected: nothing reads it.

@@ -13,7 +13,8 @@ never races the page's own per-frame anchor write):
   case 3, the item spans both edges: the seam (the fold line standing for it)
          lands within 0.5 px of the visible band's centre.
 
-Windowed on and off, at 412x915 by touch and 1280x800 on a desk. The
+At 412x915 by touch and 1280x800 on a desk (one loading strategy since `#2426`:
+the windowed variants are gone with the windowed renderer). The
 next-unread walk measures the two phases separately: while the shrink
 settles the selection has not yet moved, and only then does `e`'s
 after-Done move land on the next unread row as its own explicit move.
@@ -22,10 +23,9 @@ after-Done move land on the next unread row as its own explicit move.
 deterministic random archive/fold/expand/select/arrival sequences asserting
 the same invariant after each step, printing seed and step on failure. The
 gated run keeps a few fixed seeds; `--fuzz-steps 200` is the long opt-in.
-`--fuzz-skip NAME,...` leaves a run's fuzz half out, saying so by name: the gated
-run skips phone-412-windowed and desk-1280-windowed until #2239
-vibe-talk-windowed-coverage-shift-loses-reading-row (owner rule 346: fragile on
-the base too); their deterministic cases stay gated.
+`--fuzz-skip NAME,...` leaves a run's fuzz half out, saying so by name (the
+gated run skips none: the windowed runs #2239 kept out went with the windowed
+renderer, `#2426`).
 
 `--screenshots DIR` writes one before/after pair per case (phone and desk,
 light and dark): the acted item outlined, a guide line at the anchor, and a
@@ -552,7 +552,7 @@ def fuzz(page: Page, api: ShrinkApi, seed: int, steps: int, label: str) -> str:
 
 
 def run(chromium: object, args: argparse.Namespace, label: str, width: int, height: int,
-        touch: bool, scheme: str, windowed: bool, after_unread: bool) -> list[str]:
+        touch: bool, scheme: str, after_unread: bool) -> list[str]:
     api = ShrinkApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
     server.daemon_threads = True
@@ -566,8 +566,6 @@ def run(chromium: object, args: argparse.Namespace, label: str, width: int, heig
                 viewport={"width": width, "height": height}, color_scheme=scheme,
                 device_scale_factor=2.625 if touch else 1, is_mobile=touch, has_touch=touch)
             init = ""
-            if windowed:
-                init += "try { localStorage.setItem('vibe-talk.voice.windowed-lists', '1'); } catch (e) {}\n"
             if after_unread:
                 init += "try { localStorage.setItem('vibe-talk.voice.after-done', 'unread'); } catch (e) {}\n"
             if init:
@@ -577,10 +575,10 @@ def run(chromium: object, args: argparse.Namespace, label: str, width: int, heig
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             open_fold(page)
-            name = f"{label}-{'windowed' if windowed else 'full'}"
+            name = f"{label}-full"
             if args.fuzz_seeds and name in {one for one in args.fuzz_skip.split(",") if one}:
                 # Named, never silent: the gated run says which fuzz half it left out and why.
-                report.append(f"{name}: fuzz SKIPPED (--fuzz-skip; #2239 vibe-talk-windowed-coverage-shift-loses-reading-row)")
+                report.append(f"{name}: fuzz SKIPPED (--fuzz-skip)")
             elif args.fuzz_seeds:
                 for seed in [int(one) for one in args.fuzz_seeds.split(",") if one]:
                     report.append(f"{name}: {fuzz(page, api, seed, args.fuzz_steps, name)}")
@@ -615,9 +613,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--fuzz-steps", type=int, default=14,
                         help="fuzz steps per seed (default 14; use 200 for the long opt-in run)")
     parser.add_argument("--fuzz-skip", default="",
-                        help="comma-separated run names (e.g. phone-412-windowed) whose fuzz half is skipped "
-                             "and reported as skipped; default none. The gated run skips phone-412-windowed and "
-                             "desk-1280-windowed until #2239 vibe-talk-windowed-coverage-shift-loses-reading-row is fixed")
+                        help="comma-separated run names (e.g. phone-412-full) whose fuzz half is skipped "
+                             "and reported as skipped; default none")
     return parser.parse_args()
 
 
@@ -634,11 +631,10 @@ def main() -> int:
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, touch in (("phone-412", 412, 915, True), ("desk-1280", 1280, 800, False)):
-            for windowed in (False, True):
-                report += run(playwright.chromium, args, label, width, height, touch, "dark", windowed, False)
+            report += run(playwright.chromium, args, label, width, height, touch, "dark", False)
         if not args.fuzz_seeds:
             for label, width, height, touch in (("phone-412", 412, 915, True), ("desk-1280", 1280, 800, False)):
-                report += run(playwright.chromium, args, label, width, height, touch, "dark", False, True)
+                report += run(playwright.chromium, args, label, width, height, touch, "dark", True)
         if args.screenshots:
             report += shots(playwright.chromium, args)
     for line in report:

@@ -1,7 +1,7 @@
 steps:
   # `#2281 vibe-talk-client-perf-benchmarks`: load-invariant counts for the hot
   # triggers (composer key, search key, live arrival) on the big channel at
-  # phone size, windowed lists off. Pure counts only (class writes, childList
+  # phone size (one loading strategy, #2426). Pure counts only (class writes, childList
   # mutations, layout reads, Layout/RecalcStyle counts) under ceilings set from
   # the measured baseline; long-task count and CPU time are report-only and
   # never gate, so a hot host cannot red this step by being slow.

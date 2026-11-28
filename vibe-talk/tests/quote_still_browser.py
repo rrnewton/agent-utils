@@ -8,8 +8,8 @@ STILL on the screen. This violates our view stability principle I believe".
 
 This drives the real page (fixture API only, served on a kernel-picked loopback
 port): a thread of 35 rows with one long message in the middle, opened in the
-right column at 1280x800 (two columns) and in the one thread column at 412x915,
-with windowed lists on and off. The long message's words are selected as a
+right column at 1280x800 (two columns) and in the one thread column at 412x915
+(one loading strategy since `#2426`). The long message's words are selected as a
 reader selects them, its Reply pressed as Quote reply, and every animation
 frame from the press until 60 frames after the box has settled -- and again
 through Cancel -- records the quoted post's `getBoundingClientRect().top`.
@@ -18,7 +18,7 @@ The invariant, counted in frames and conditions, never wall time:
 
   * the quoted post's top changes by 0 px in every captured frame (at most
     half a pixel of rounding), with its top in the middle of the column and
-    low on the screen, windowed on and off, at both widths;
+    low on the screen, at both widths;
   * low on the screen the reply box is still visible inside the column's band
     (docked to its foot, over the rows), never by scrolling the post away;
   * no page error at any step.
@@ -146,7 +146,7 @@ def settled(page: Page) -> None:
 
 
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
-         phone: bool, windowed: bool, place: float) -> str:
+         phone: bool, place: float) -> str:
     api = StillApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True
@@ -164,10 +164,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
-            flag = "vibe-talk.voice.windowed-lists" if windowed else "vibe-talk.voice.windowed-lists-off"
-            page.add_init_script(
-                "try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); "
-                f"localStorage.setItem('{flag}', '1'); }} catch (e) {{}}")
+            page.add_init_script("try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); } catch (e) {}")
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
@@ -191,8 +188,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 wait_for(page, "() => document.querySelectorAll('#side-log > li[data-id]').length > 10",
                          f"{label}: the thread did not open on the right")
             settled(page)
-            # The quoted post at `place` of its column (scroll roughly first, so a
-            # windowed slice mounts it, then by its real rect).
+            # The quoted post at `place` of its column (scroll roughly first, then by its real rect).
             for _attempt in range(4):
                 found = page.evaluate("""([listId, scrollerId, targetId, frac]) => {
                   const scroller = document.getElementById(scrollerId);
@@ -276,7 +272,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 worst = max(worst, abs(float(frame["top"]) - baseline))  # type: ignore[arg-type]
             check(worst <= 0.5,
                   f"{label}: the quoted post moved {worst:.1f}px from {baseline:.1f} across "
-                  f"{len(frames)} frames (windowed={windowed}, place={place})")
+                  f"{len(frames)} frames (place={place})")
             open_frame = frames[opened_at] if opened_at < len(frames) else frames[-1]
             low = place >= 0.7
             if low:
@@ -285,7 +281,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                       and num(open_frame, "mountTop") >= num(open_frame, "bandTop") - 2,
                       f"{label}: low on screen the box is not visible in the column: {open_frame}")
             return (f"{label}: quoted post still at {baseline:.1f}px over {len(frames)} frames "
-                    f"(worst {worst:.1f}px, windowed={'on' if windowed else 'off'}"
+                    f"(worst {worst:.1f}px"
                     f"{', box docked at the foot' if open_frame['footDocked'] else ''})")
     finally:
         api.stopping.set()
@@ -317,11 +313,9 @@ def main() -> int:
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, phone in (("desk-1280", 1280, 800, False), ("phone-412", 412, 915, True)):
-            for windowed in (True, False):
-                for place, where in ((0.35, "mid"), (0.7, "low")):
-                    report.append(walk(playwright.chromium, args,
-                                       f"{label}-{where}-{'win' if windowed else 'full'}",
-                                       width, height, phone, windowed, place))
+            for place, where in ((0.35, "mid"), (0.7, "low")):
+                report.append(walk(playwright.chromium, args, f"{label}-{where}-full",
+                                   width, height, phone, place))
     for line in report:
         print(line)
     return 0

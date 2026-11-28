@@ -1166,9 +1166,8 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
    * no ordering, no day and no pin membership, so the census, arrange, seams and pinned
    * rebuild of `renderChannelRowsNow` have nothing to redo; what follows an archive is the
    * acted rows' own dress, their thread roots' unread chips, the cards that tally threads,
-   * and the read runs the acted rows stand in. A row that is not mounted (windowed lists,
-   * archived from the keyboard while just off-screen) is not mounted or measured here: its
-   * dress comes from the store when the window next mounts it.
+   * and the read runs the acted rows stand in. A row that is not mounted is not mounted or
+   * measured here: its dress comes from the store when a draw next mounts it.
    */
   function dressDoneRows(ids: readonly string[]): void {
     const acted = new Set(ids.map(String));

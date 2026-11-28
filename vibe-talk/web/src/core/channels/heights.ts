@@ -1,6 +1,6 @@
-// Height estimation for unmounted rows (`#1846 vibe-talk-windowed-rendering`, step 2; inert
-// until step 3 mounts a window). The scroller needs a total height and per-row offsets for
-// rows that are not mounted. Measured heights are kept per message id and width bucket (a
+// Height estimation for rows that are not mounted (`#1846`, step 2). Its render window is
+// retired (`#2426`: one loading strategy); the index stays for the residency layer, which prices
+// the stretches it lets go of and the gaps the page draws for them. Measured heights are kept per message id and width bucket (a
 // phone, a desk, and a Discuss-narrowed list are different buckets; a bucket's measures are
 // reused when the reader returns to that width). Unmeasured rows are estimated from the
 // median measured height of their row class at that bucket, refined by body length until

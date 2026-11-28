@@ -9,14 +9,14 @@ above the composer. Sticking to the bottom is only for newly arriving messages.
 
 Before the fix, at the end of the history the touched row's bottom was pinned
 instead (its top absorbed the whole change: -226px on a 412px phone, -104px at
-1280px, windowed on or off), because the scroll owner's pinned restore, the
+1280px, with the since-retired windowed lists on or off), because the scroll owner's pinned restore, the
 collapse act's foot branch, and the foot keepers all followed the foot for a
 change the reader caused. Mid-list the top already held.
 
 This samples the touched row's top on every animation frame from the act until
 the list settles and 30 more frames pass, and requires 0px of movement (1px of
 sub-pixel slack) at the end of the history and mid-list, on a 412x915 phone and
-at 1280x800, with windowed lists on and off. Two arrival walks guard the other
+at 1280x800 (one loading strategy since `#2426`). Two arrival walks guard the other
 half of the policy: an arrival with no act in flight, the reader at the foot,
 moves nothing (`#2230 vibe-talk-reading-row-stays-put`, owner 370, superseding
 the old "an arrival still sticks to the bottom"), and an arrival that lands
@@ -483,7 +483,7 @@ def forced_poll_at_foot(page: Page, api: AnchorApi, label: str) -> str:
     return f"forced poll at the foot, no threads: top {moved:.1f}px/{len(tops)}f, {shown}"
 
 
-def open_main(page: Page, touch: bool, windowed: bool, threads: bool = True) -> None:
+def open_main(page: Page, touch: bool, threads: bool = True) -> None:
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     try:
@@ -502,17 +502,13 @@ def open_main(page: Page, touch: bool, windowed: bool, threads: bool = True) -> 
         page.click("#column-toggle")
         until(page, "() => document.getElementById('side-column').getClientRects().length > 0",
               "the desk layout did not draw two columns")
-    if windowed:
-        until(page, "() => document.querySelectorAll('#discord-log > li[data-id]').length >= 20",
-              "windowed Main did not draw rows")
-    else:
-        until(page, f"() => document.querySelectorAll('#discord-log > li[data-id]').length >= {COUNT}",
-              "Main did not draw every message")
+    until(page, f"() => document.querySelectorAll('#discord-log > li[data-id]').length >= {COUNT}",
+          "Main did not draw every message")
     settled(page)
 
 
 def run(chromium: object, args: argparse.Namespace, label: str, width: int, height: int,
-        touch: bool, scheme: str, windowed: bool, shots_only: bool, forced: bool = False,
+        touch: bool, scheme: str, shots_only: bool, forced: bool = False,
         flat: bool = False) -> list[str]:
     api = FlatAnchorApi() if flat else AnchorApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler(api))
@@ -526,9 +522,6 @@ def run(chromium: object, args: argparse.Namespace, label: str, width: int, heig
                 profile, headless=True, executable_path=args.browser_executable,
                 viewport={"width": width, "height": height}, color_scheme=scheme,
                 device_scale_factor=2.625 if touch else 1, is_mobile=touch, has_touch=touch)
-            if windowed:
-                context.add_init_script(
-                    "try { localStorage.setItem('vibe-talk.voice.windowed-lists', '1'); } catch (e) {}")
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -536,8 +529,8 @@ def run(chromium: object, args: argparse.Namespace, label: str, width: int, heig
                 # Time flows as normal; the forced walks step it past a slow read's second.
                 page.clock.install()
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
-            open_main(page, touch, windowed, threads=not flat)
-            name = f"{label}-{'windowed' if windowed else 'full'}"
+            open_main(page, touch, threads=not flat)
+            name = f"{label}-full"
             if forced and flat:
                 report.append(f"{name}: {forced_poll_at_foot(page, api, name)}")
                 check(not errors, f"{name}: the page threw: {errors}")
@@ -585,16 +578,15 @@ def main() -> int:
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, touch in (("phone-412", 412, 915, True), ("desk-1280", 1280, 800, False)):
-            for windowed in (False, True):
-                report += run(playwright.chromium, args, label, width, height, touch, "dark", windowed, False)
-                report += run(playwright.chromium, args, f"{label}-forced", width, height, touch, "dark",
-                              windowed, False, forced=True)
-        report += run(playwright.chromium, args, "phone-412-forced-nothreads", 412, 915, True, "dark", False, False,
+            report += run(playwright.chromium, args, label, width, height, touch, "dark", False)
+            report += run(playwright.chromium, args, f"{label}-forced", width, height, touch, "dark",
+                          False, forced=True)
+        report += run(playwright.chromium, args, "phone-412-forced-nothreads", 412, 915, True, "dark", False,
                       forced=True, flat=True)
         if args.screenshots:
             for label, width, height, touch in (("phone-412", 412, 915, True), ("desk-1280", 1280, 800, False)):
                 for scheme in ("light", "dark"):
-                    report += run(playwright.chromium, args, f"{label}-{scheme}", width, height, touch, scheme, False, True)
+                    report += run(playwright.chromium, args, f"{label}-{scheme}", width, height, touch, scheme, True)
     for line in report:
         print(line)
     return 0

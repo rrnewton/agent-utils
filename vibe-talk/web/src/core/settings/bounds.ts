@@ -298,8 +298,8 @@ const DEFAULT_READ_KEEP_ALIVE_MS = 25000;
 
 /**
  * `#1846 vibe-talk-windowed-rendering`. How many messages the cache holds as DATA for local
- * search/filtering (the reach-back knob; the render window is separate). 0 means "the per-device
- * default" (windowed.ts), so an untouched device follows its form factor.
+ * search/filtering (the reach-back knob). 0 means "the per-device default" (windowed.ts), so an
+ * untouched device follows its form factor.
  */
 const MIN_DATA_REACH_BACK = 0;
 const MAX_DATA_REACH_BACK = 20000;
@@ -312,34 +312,6 @@ function clampDataReachBack(value: unknown): number {
   const n = Number(text);
   if (!Number.isFinite(n)) return DEFAULT_DATA_REACH_BACK;
   return Math.min(MAX_DATA_REACH_BACK, Math.max(MIN_DATA_REACH_BACK, Math.round(n)));
-}
-
-/** `#1846`. Prefetch margin beside the viewport, in px, for the render window. 0 = device default. */
-const MIN_RENDER_PREFETCH_PX = 0;
-const MAX_RENDER_PREFETCH_PX = 8000;
-const DEFAULT_RENDER_PREFETCH_PX = 0;
-
-/** A prefetch margin this page will apply: 0 (device default) for anything else. */
-function clampRenderPrefetchPx(value: unknown): number {
-  const text = typeof value === "string" ? value.trim() : value;
-  if (text === "" || text === null || text === undefined) return DEFAULT_RENDER_PREFETCH_PX;
-  const n = Number(text);
-  if (!Number.isFinite(n)) return DEFAULT_RENDER_PREFETCH_PX;
-  return Math.min(MAX_RENDER_PREFETCH_PX, Math.max(MIN_RENDER_PREFETCH_PX, Math.round(n)));
-}
-
-/** `#1846`. Hard cap on mounted rows in one list. 0 = device default (60 phone / 80 desktop). */
-const MIN_RENDER_ROW_CAP = 0;
-const MAX_RENDER_ROW_CAP = 500;
-const DEFAULT_RENDER_ROW_CAP = 0;
-
-/** A row cap this page will apply: 0 (device default) for anything else. */
-function clampRenderRowCap(value: unknown): number {
-  const text = typeof value === "string" ? value.trim() : value;
-  if (text === "" || text === null || text === undefined) return DEFAULT_RENDER_ROW_CAP;
-  const n = Number(text);
-  if (!Number.isFinite(n)) return DEFAULT_RENDER_ROW_CAP;
-  return Math.min(MAX_RENDER_ROW_CAP, Math.max(MIN_RENDER_ROW_CAP, Math.round(n)));
 }
 
 /** A keep-alive this page will apply: the default for anything that is not a number. */
@@ -394,19 +366,11 @@ export {
   MIN_READ_SPEED,
   MIN_TWO_COLUMN_SPLIT,
   DEFAULT_DATA_REACH_BACK,
-  DEFAULT_RENDER_PREFETCH_PX,
-  DEFAULT_RENDER_ROW_CAP,
   MAX_DATA_REACH_BACK,
-  MAX_RENDER_PREFETCH_PX,
-  MAX_RENDER_ROW_CAP,
   MIN_DATA_REACH_BACK,
-  MIN_RENDER_PREFETCH_PX,
-  MIN_RENDER_ROW_CAP,
   clampCardMaxLines,
   clampCollapsedLines,
   clampDataReachBack,
-  clampRenderPrefetchPx,
-  clampRenderRowCap,
   clampDiscussDockedHeight,
   clampDiscussTimelineHeight,
   clampDiscussWidth,

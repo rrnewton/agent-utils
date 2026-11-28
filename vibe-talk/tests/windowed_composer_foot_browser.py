@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""The composer's foot has one writer while the reader types, windowed lists on or off (`#2292`).
+"""The composer's foot has one writer while the reader types (`#2292`).
 
 `#2292 vibe-talk-windowed-composer-foot-fight`: with windowed lists on, typing at the foot while
 messages arrived moved the composer 46 px: the windowed renderer held a row (its anchor nudge, its
 foot lock), a read's landing restored a row (`settleAfterRead`), and the scroll owner kept the
 composer (`keepComposerInView`), three writers partly undoing each other. And a jump onto the
-middle of a windowed list waited a frame's deferred re-slice with no row in the band.
+middle of a windowed list waited a frame's deferred re-slice with no row in the band. The windowed
+renderer is retired (`#2426`, one loading strategy); the one-writer rule for the composer stays.
 
 This walk serves the checked-out page and the scroll-stability fake API (one channel taller than
 any window, a live stream the walk writes events into) from one loopback origin, and checks:
 
   * phone (412x915, touch, keyboard up: the visual viewport shrunk as by a keyboard) and desk
-    (1280x800, composer focused), each with windowed lists ON and OFF: the reader at the foot types
+    (1280x800, composer focused), with the retired windowed-lists key stored on (it must change
+    nothing: no window spacer stands): the reader at the foot types
     while four messages arrive, each followed by its read's landing; every scroll write in that
     time is the scroll owner's composer keep (renderer, landing and foot-keeper writes counted:
     zero), and the composer moves at most 1.0 px, between two frames or in all. The bar is the
     whole-pixel one (ui-rules R11): Chromium lands every scroll position on a whole CSS pixel and
     clamps it to a whole-pixel foot, while the composer's own top is fractional, so a keep can
     leave it up to (never) one pixel off; anything a second writer does moves it far more (46 px
-    with windowing on, 8.7 px per arrival at the desk, before `#2292`);
-  * phone, windowed ON: programmatic jumps into the list (a quarter, half, three quarters down)
-    have a mounted row in the band by the time the jump's scroll event has been answered, and in
-    the frame it paints.
+    with windowing on, 8.7 px per arrival at the desk, before `#2292`).
 
 Counts and geometry only; waits are on page conditions, with the hang backstop as their deadline.
 Pass --web-root DIR to run it against another copy of the page.
@@ -49,15 +48,14 @@ from scroll_stability_browser import FILLER, READS_JS, Reader, StabilityApi, han
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
 
-# More rows than the windowed renderer's cap, all in the first read, so the windowed list stands
-# as a window with spacers on both sides.
+# A tall list, all in the first read (more rows than the retired windowed renderer ever mounted).
 EXTRA_ROWS = 160
 KEYBOARD_PX = 336
 ARRIVALS = 4
 BACKSTOP_S = browser_waits.HANG_BACKSTOP_MS / 1000
 FLAG = "vibe-talk.voice.windowed-lists"
 # Writers that hold a ROW: none may write while the composer holds the view.
-ROW_WRITERS = ("renderWindowed", "settleAfterRead")
+ROW_WRITERS = ("settleAfterRead",)
 COMPOSER_WRITER = "keepComposerInView"
 
 # Every write of the list's scroll position while armed, as the innermost named function that made
@@ -82,24 +80,6 @@ ARM_JS = r"""() => {
 }"""
 DISARM_JS = r"""() => { const probe = window.__footProbe; probe.on = false;
   delete document.getElementById('scroll-area').scrollTop; return { writes: probe.writes, tops: probe.tops }; }"""
-
-# A jump into the list, with whether a mounted row stands in the band when the jump's scroll event
-# has been answered (a listener added after the page's own) and in the frame that paints it (a frame
-# callback that listener asks for, so it runs after any the page asked for in the same event).
-JUMP_JS = r"""(at) => new Promise((done) => {
-  const area = document.getElementById('scroll-area');
-  const covered = () => { const box = area.getBoundingClientRect(); const foot = box.top + area.clientHeight;
-    return [...document.querySelectorAll('#discord-log > li[data-id]')]
-      .some((row) => { const r = row.getBoundingClientRect(); return r.height > 0 && r.bottom > box.top + 1 && r.top < foot; }); };
-  const onScroll = () => {
-    area.removeEventListener('scroll', onScroll);
-    const atEvent = covered();
-    requestAnimationFrame(() => done({ atEvent, painted: covered(), spacers: document.querySelectorAll('[data-window-spacer]').length }));
-  };
-  area.addEventListener('scroll', onScroll, { passive: true });
-  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * at);
-})"""
-
 
 def writer_of(stack: str) -> str:
     """The writer a stack names: the composer keep, a row writer, or the stack itself."""
@@ -132,14 +112,14 @@ def arrive(reader: Reader, index: int) -> None:
     reader.settled()
 
 
-def typing_walk(reader: Reader, windowed: bool, keyboard: bool) -> str:
+def typing_walk(reader: Reader, keyboard: bool) -> str:
     """Typing at the foot through arrivals: one composer writer, the composer still."""
     page = reader.page
     page.evaluate("() => { const area = document.getElementById('scroll-area'); area.scrollTop = area.scrollHeight; }")
     reader.frames(2)
     reader.settled()
     spacers = page.evaluate("() => document.querySelectorAll('#discord-log > [data-window-spacer]').length")
-    reader.check((spacers > 0) == windowed, f"windowed lists {'on' if windowed else 'off'} but {spacers} spacers stand")
+    reader.check(spacers == 0, f"the retired windowed-lists key is stored on and {spacers} window spacers stand")
     if reader.touch:
         page.tap("#channel-compose-text")
     else:
@@ -166,7 +146,7 @@ def typing_walk(reader: Reader, windowed: bool, keyboard: bool) -> str:
     reader.check(len(tops) >= 8, f"only {len(tops)} frames sampled")
     step = max((abs(b - a) for a, b in zip(tops, tops[1:])), default=0.0)
     spread = max(tops) - min(tops)
-    print(f"{reader.label} {'windowed' if windowed else 'full'}: writers {writers}, step {step:.2f} px, spread {spread:.2f} px, "
+    print(f"{reader.label}: writers {writers}, step {step:.2f} px, spread {spread:.2f} px, "
           f"{len(tops)} frames", file=sys.stderr, flush=True)
     reader.check(writers.get(COMPOSER_WRITER, 0) >= 1,
                  f"no write was the composer keep's (writers {writers}): the stack names this check reads are gone")
@@ -177,26 +157,12 @@ def typing_walk(reader: Reader, windowed: bool, keyboard: bool) -> str:
     reader.check(spread < 1.0, f"the composer moved {spread:.2f} px in all")
     focused = page.evaluate("() => document.activeElement && document.activeElement.id")
     reader.check(focused == "channel-compose-text", f"the composer lost the focus to {focused!r}")
-    return (f"typing {'windowed' if windowed else 'full'}{' keyboard up' if keyboard else ''}: "
+    return (f"typing{' keyboard up' if keyboard else ''}: "
             f"{writers.get(COMPOSER_WRITER, 0)} composer keeps, 0 row writes, step {step:.2f} px, spread {spread:.2f} px "
             f"over {len(tops)} frames")
 
 
-def jump_walk(reader: Reader) -> str:
-    """Jumps onto the middle of a windowed list: a row in the band as each is answered and painted."""
-    found = []
-    for at in (0.5, 0.25, 0.75):
-        result = reader.page.evaluate(JUMP_JS, at)
-        reader.check(result["spacers"] > 0, "the list is not windowed")
-        reader.check(bool(result["atEvent"]), f"a jump {at:.2f} down had no row in the band when its scroll was answered")
-        reader.check(bool(result["painted"]), f"a jump {at:.2f} down painted a frame with no row in the band")
-        reader.settled()
-        found.append(f"{at:.2f}")
-    return "jumps " + ", ".join(found) + " down: a row in the band as answered and painted"
-
-
-def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, touch: bool,
-         windowed: bool) -> str:
+def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, touch: bool) -> str:
     stability.FLAT_PAGE = 2000
     api = StabilityApi()
     for index in range(EXTRA_ROWS):
@@ -213,7 +179,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             context = chromium.launch_persistent_context(profile, headless=True, executable_path=args.browser_executable,
                                                          **options)  # type: ignore[arg-type]
             browser_waits.hot_host_timeouts(context)
-            context.add_init_script(f"try {{ localStorage.setItem('{FLAG}', '{'1' if windowed else '0'}'); }} catch (e) {{}}")
+            # The retired key, as a device that once turned windowed lists on still holds it (`#2426`).
+            context.add_init_script(f"try {{ localStorage.setItem('{FLAG}', '1'); }} catch (e) {{}}")
             page: Page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -221,13 +188,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.add_init_script(READS_JS)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             open_main(reader)
-            notes = []
-            if windowed and touch:
-                notes.append(jump_walk(reader))
-            notes.append(typing_walk(reader, windowed, keyboard=touch))
+            notes = [typing_walk(reader, keyboard=touch)]
             reader.check(not errors, f"the page threw: {errors}")
             context.close()
-            return f"{label} {'windowed' if windowed else 'full'}: " + "; ".join(notes)
+            return f"{label}: " + "; ".join(notes)
     finally:
         api.stopping.set()
         api.timeline_gate.set()
@@ -256,8 +220,7 @@ def main() -> int:
     report = []
     with sync_playwright() as playwright:
         for label, width, height, touch in (("phone-412", 412, 915, True), ("desk-1280", 1280, 800, False)):
-            for windowed in (True, False):
-                report.append(walk(playwright.chromium, args, label, width, height, touch, windowed))
+            report.append(walk(playwright.chromium, args, label, width, height, touch))
     for line in report:
         print(line)
     return 0

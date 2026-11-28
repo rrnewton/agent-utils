@@ -2042,9 +2042,6 @@ const SETTINGS = await moduleForTests("src/core/settings/index.ts");
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
 function newPage(store = new Map(), script = SCRIPT, arrange = null) {
-  // `#1846` S1: the existing suite exercises the Off path (full rendering); windowed
-  // variants live in the windowing suites. Seed explicit Off unless a test chose otherwise.
-  if (!store.has("vibe-talk.voice.windowed-lists") && !store.has("vibe-talk.voice.windowed-lists-off")) store.set("vibe-talk.voice.windowed-lists-off", "1");
   // A page whose MODULES are broken on purpose (`brokenModule`): its prelude, and the legacy script.
   let prelude = PRELUDE_COMPILED;
   if (script && typeof script === "object") ({ prelude, script } = script);
@@ -6588,29 +6585,16 @@ const TUNING_BANDS = {
     "four, subpixel rounding can make the note and first pill touch and read as one element " +
     "even when their boxes do not overlap; past a couple of dozen, the spare room itself uses " +
     "enough of a 360px line that strips with plainly visible room are put back on their own row"],
-  // `#1846 vibe-talk-windowed-rendering`. The render window beside the viewport and its row
-  // caps (Q1/Q2 approved starting values): under a screenful of prefetch a fast flick lands on
-  // unmounted rows; caps far above these mount the list the issue exists to stop mounting.
-  CARD_EST_PX: [40, 200, "estimated thread-card height before first measure, px"],
-  RENDER_PREFETCH_PHONE_PX: [600, 4000, "phone prefetch beside the viewport, px per side"],
-  RENDER_PREFETCH_DESKTOP_PX: [800, 6000, "desktop prefetch beside the viewport, px per side"],
-  RENDER_CAP_PHONE: [20, 200, "mounted rows per list on a phone"],
-  RENDER_CAP_DESKTOP: [20, 300, "mounted rows per list on a desk"],
-  SCROLL_MOUNT_BUDGET: [5, 100, "rows one screenful of scrolling may mount (budget M)"],
+  // `#1846 vibe-talk-windowed-rendering`. The data reach-back (its render window is retired by
+  // `#2426`, one loading strategy).
   DATA_REACH_PHONE: [50, 2000, "messages held as data on a phone"],
   DATA_REACH_DESKTOP: [500, 20000, "messages held as data on a desk"],
   DATA_BYTES_PER_MESSAGE: [256, 8192, "planning bytes per cached message"],
   MIN_DATA_REACH_BACK: [0, 0, "the least kept reach-back (0 = device default)"],
   MAX_DATA_REACH_BACK: [1000, 100000, "the most kept reach-back"],
   DEFAULT_DATA_REACH_BACK: [0, 0, "kept reach-back meaning device default"],
-  MIN_RENDER_PREFETCH_PX: [0, 0, "the least kept prefetch (0 = device default)"],
-  MAX_RENDER_PREFETCH_PX: [1000, 20000, "the most kept prefetch, px"],
-  DEFAULT_RENDER_PREFETCH_PX: [0, 0, "kept prefetch meaning device default"],
   DEFAULT_ROW_PX: [40, 200, "row height before anything is measured, px"],
   SAMPLES_KEPT: [4, 200, "measured heights kept per row class for its median"],
-  MIN_RENDER_ROW_CAP: [0, 0, "the least kept row cap (0 = device default)"],
-  MAX_RENDER_ROW_CAP: [50, 2000, "the most kept row cap"],
-  DEFAULT_RENDER_ROW_CAP: [0, 0, "kept row cap meaning device default"],
   // `#2385 vibe-talk-thread-open-layout-first`: the boxes for an open thread's replies on their way.
   PENDING_REPLY_BOXES_MAX: [50, 50, "boxes at once: the bodies read brings the thread's newest page of 50"],
   PENDING_REPLY_PX_DEFAULT: [40, 200, "a box's height with no reply on screen to measure, px"],

@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-windowed-coverage-shift-loses-reading-row: in windowed mode the coverage shift can slide the slice off the row being read under estimated heights'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - scroll
 - windowed
 created_at: 2026-11-25T09:10:00-05:00
-updated_at: 2026-11-25T09:10:00-05:00
+updated_at: 2026-11-27T20:30:00-05:00
+closed_at: 2026-11-27T20:30:00-05:00
 ---
 
 # Description
@@ -41,3 +42,7 @@ Evidence (seeded fuzz, `tests/shrink_anchor_browser.py --fuzz-steps 14`):
 Out of gating meanwhile (owner rule 346: fragile on the base too): #2230 skips the failing windowed fuzz runs of the gated shrink-anchor step, each with a named `--fuzz-skip` line (the step's command lists them). The two skipped runs are phone-412 windowed and desk-1280 windowed. The non-windowed fuzz and every deterministic case, windowed included, stay gated.
 
 Not in the owner's path: the owner's live page clients report windowed=false in their freeze reports, so this opt-in mode is not what the owner reads with.
+
+## Resolution
+
+[opus 5.5, cl-loading] Closed as obsolete by #2426 R1 (one loading strategy, owner 2026-11-27: "the old version of "Windowing" was completely broken when I turned it on so I turned it back off. we're looking for the new smart/incremental loading to become DEFAULT not maintaining multiple strategies"). The windowed renderer this issue is about (`renderWindowed` and its coverage shift in `web/src/view/channel/readcore.ts`, `windowing.ts`, the thread-card window) is deleted, with the windowed-lists setting and its Settings switch. The shrink-anchor step's `--fuzz-skip` lines for the two windowed runs are gone with the runs; its non-windowed fuzz seeds 1-3 and every deterministic case stay gated. The design's rule (section 3.5 of the sparse loading design) holds: islands run on the full renderer, so no slice re-prices a slide over estimated heights.

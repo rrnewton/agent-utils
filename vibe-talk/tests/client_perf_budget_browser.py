@@ -19,8 +19,8 @@ set from the measured baseline after the freeze fix lands; until then
 the walk prints the baseline table and asserts only that every count
 is finite and the triggers did their work.
 
-Every wait is a condition wait. Runs at phone size, windowed lists off
-and on. Print the table with --report (the default prints it too).
+Every wait is a condition wait. Runs at phone size (one loading strategy
+since `#2426`). Print the table with --report (the default prints it too).
 """
 
 from __future__ import annotations
@@ -211,7 +211,7 @@ def main() -> int:
     parser.add_argument("--web-root", type=Path, default=fixture.WEB_ROOT)
     parser.add_argument("--report", action="store_true", help="print the baseline table (default)")
     parser.add_argument("--gate", action="store_true",
-                        help="gated subset (phone, windowed off, three triggers) with count ceilings")
+                        help="gated subset (phone, three triggers) with count ceilings")
     args = parser.parse_args()
     try:
         from playwright.sync_api import sync_playwright
@@ -222,9 +222,7 @@ def main() -> int:
     load1 = os.getloadavg()[0]
     all_rows: list[dict[str, object]] = []
     with sync_playwright() as playwright:
-        runs = (("phone-full", False),) if args.gate else (
-            ("phone-full", False), ("phone-windowed", True))
-        for label, windowed in runs:
+        for label in ("phone-full",):
             api = PerfApi()
             server, thread, url = typing_fast.serve(api, web_root)
             try:
@@ -236,10 +234,7 @@ def main() -> int:
                         device_scale_factor=2.625, is_mobile=True, has_touch=True)
                     browser_waits.hot_host_timeouts(context)
                     page = context.pages[0]
-                    init = "try { localStorage.setItem('vibe-talk.welcome.dismissed', '1');"
-                    if windowed:
-                        init += " localStorage.setItem('vibe-talk.voice.windowed-lists', '1');"
-                    page.add_init_script(init + " } catch (e) {}")
+                    page.add_init_script("try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); } catch (e) {}")
                     page.add_init_script(f"({COUNTERS_JS})()")
                     errors: list[str] = []
                     page.on("pageerror", lambda error: errors.append(str(error)))

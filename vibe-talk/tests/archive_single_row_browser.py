@@ -7,10 +7,8 @@ and desktop sizes, with event counts only (owner rule 346, never a wall-clock th
   one `e` archive and one `e` unarchive of the selected row dress at most 20 rows, write at
   most 100 row classes and read at most 50 layouts — where the whole-list dress before wrote
   ~1,634 classes and ~270 layouts over the same list;
-  the acted row shows archived and then back, and its state survives the write's answer;
-  with windowed lists on, the mounted rows stay within the row cap, archiving a selected row
-  that the window has since unmounted (just off-screen, from the keyboard) mounts nothing and
-  reads no whole-list layout, and the row shows its archived state when mounted again.
+  the acted row shows archived and then back, and its state survives the write's answer.
+  (The windowed-lists half went with the windowed renderer, `#2426`: one loading strategy.)
 
 Pass --screenshots DIR to keep a PNG of each stage.
 """
@@ -105,12 +103,9 @@ def press_e_and_check(page: Page, label: str, acted_id: str, archived: bool) -> 
     return cast(PressCounts, page.evaluate(SNAP_JS))
 
 
-def walk(page: Page, label: str, total: int, windowed: bool, shots: Path | None) -> None:
+def walk(page: Page, label: str, total: int, shots: Path | None) -> None:
     open_channel(page, total)
     page.evaluate(COUNTERS_JS)
-    mounted = page.evaluate("() => document.querySelectorAll('#discord-log > li').length")
-    if windowed:
-        check(mounted <= 90, f"{label}: windowed lists mounted {mounted} rows over the cap")
     # Select the newest row by clicking it, then archive and unarchive from the keyboard.
     acted = page.evaluate("""() => {
         const rows = [...document.querySelectorAll('#discord-log > li[data-id]')];
@@ -119,11 +114,8 @@ def walk(page: Page, label: str, total: int, windowed: bool, shots: Path | None)
         return row.getAttribute('data-id');
     }""")
     page.wait_for_timeout(300)
-    # With windowed lists on, the place-keeping scroll that follows a press re-slices the
-    # window once and every mounted row is dressed at its mount: the bound there is the
-    # window cap plus the acted run, not the single-row bound.
-    dressed_bound = 95 if windowed else MAX_DRESSED_ROWS
-    rect_bound = 700 if windowed else MAX_RECT_READS
+    dressed_bound = MAX_DRESSED_ROWS
+    rect_bound = MAX_RECT_READS
     counts = press_e_and_check(page, label, acted, True)
     check(counts["dressed"] <= dressed_bound,
           f"{label}: an archive dressed {counts['dressed']} rows (bound {dressed_bound}): {counts}")
@@ -136,33 +128,6 @@ def walk(page: Page, label: str, total: int, windowed: bool, shots: Path | None)
     counts = press_e_and_check(page, label, acted, False)
     check(counts["dressed"] <= dressed_bound and counts["rect"] <= rect_bound and counts["cls"] <= MAX_CLASS_WRITES,
           f"{label}: an unarchive exceeded the per-press bounds: {counts}")
-    if windowed:
-        # Archive again, then take the window away from the selected row (it stays the
-        # selection, unmounted just off-screen) and unarchive from the keyboard: nothing is
-        # mounted for the act and no whole-list layout is read.
-        press_e_and_check(page, label, acted, True)
-        page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
-        until(page, f"() => !document.querySelector('#discord-log > li[data-id=\"{acted}\"]')",
-              f"{label}: the acted row stayed mounted after the window moved away")
-        before = page.evaluate("() => document.querySelectorAll('#discord-log > li').length")
-        page.evaluate(RESET_JS)
-        page.keyboard.press("e")
-        page.wait_for_timeout(600)
-        mid = page.evaluate(SNAP_JS)
-        after = page.evaluate("() => document.querySelectorAll('#discord-log > li').length")
-        check(mid["rect"] <= MAX_RECT_READS,
-              f"{label}: archiving an unmounted row read {mid['rect']} layouts (bound {MAX_RECT_READS})")
-        check(after <= before + 5,
-              f"{label}: archiving an unmounted row mounted rows ({before} -> {after})")
-        # The keyboard act on an unmounted selection is a no-op (its row is not on the
-        # screen to act on), so the message stays archived in the store — and is dressed
-        # from the store, correctly, when the window mounts it again.
-        page.evaluate("""() => { const jump = document.getElementById('jump-newest');
-            if (jump && !jump.hidden) { jump.click(); return; }
-            const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }""")
-        until(page,
-              f"() => document.querySelector('#discord-log > li[data-id=\"{acted}\"]') !== null",
-              f"{label}: the acted row did not mount again after jumping back")
 
 
 def arguments() -> argparse.Namespace:
@@ -187,11 +152,11 @@ def main() -> int:
     total = 816
     runs = (
         ("phone", 412, 915, False, "dark"),
-        ("desk-windowed", 1280, 800, True, "dark"),
+        ("desk", 1280, 800, False, "dark"),
     )
     report: list[str] = []
     with sync_playwright() as playwright:
-        for label, width, height, windowed, scheme in runs:
+        for label, width, height, _touch, scheme in runs:
             api = typing_fast.BigApi()
             server, thread, url = typing_fast.serve(api, web_root)
             try:
@@ -203,17 +168,13 @@ def main() -> int:
                         device_scale_factor=2.625 if width < 600 else 1, is_mobile=width < 600, has_touch=width < 600)
                     browser_waits.hot_host_timeouts(context)
                     page = context.pages[0]
-                    if windowed:
-                        page.add_init_script(
-                            "try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); "
-                            "localStorage.setItem('vibe-talk.voice.windowed-lists', '1'); } catch (e) {}")
                     errors: list[str] = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(url, wait_until="load")
-                    walk(page, label, total, windowed, args.screenshots)
+                    walk(page, label, total, args.screenshots)
                     check(not errors, f"{label}: the page threw: {errors}")
                     context.close()
-                    report.append(f"{label} {width}x{height} windowed={windowed}: archive dresses acted rows only")
+                    report.append(f"{label} {width}x{height}: archive dresses acted rows only")
             finally:
                 server.shutdown()
                 server.server_close()

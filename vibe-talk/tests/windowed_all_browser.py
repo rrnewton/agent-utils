@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Windowed All view: chips, fold anchor, END, Newest, no bounce (`#1985`).
+"""All view: chips, fold anchor, END, Newest, no bounce (`#1985`), one strategy (`#2426`).
 
-Owner bug 262/263: with windowed lists ON, in All (and Main) the Thread
-chips stood bare for about a minute, `;` threw the reader far back, END and
-the Newest chip did not land at the bottom, and the list could bounce
-between two scroll positions at frame rate. This walk serves the checked-out
-page and a fake API from one loopback origin (the page's exact timeline
-requests; only the chat upstream is faked) with 24 threads x 10 messages,
-and checks, with windowed ON and OFF, at 412x915 and 1280x800:
+Owner bug 262/263 (found with the since-retired windowed lists ON): in All
+(and Main) the Thread chips stood bare for about a minute, `;` threw the
+reader far back, END and the Newest chip did not land at the bottom, and the
+list could bounce between two scroll positions at frame rate. This walk
+serves the checked-out page and a fake API from one loopback origin (the
+page's exact timeline requests; only the chat upstream is faked) with 24
+threads x 10 messages, and checks at 412x915 and 1280x800:
 
+  * ONE LOADING STRATEGY (`#2426 vibe-talk-sparse-loading-program`, owner
+    2026-11-27: "not maintaining multiple strategies"): with the retired
+    windowed-lists key still stored as on, every held row is mounted and no
+    window spacer exists, before and after the fold and END (fails on a page
+    that still windows);
   * a mounted root's Thread chip shows its slug and count on first render;
-  * `;` keeps the anchor row within a few px (windowed ON);
+  * `;` keeps the anchor row within a few px;
   * END and the Newest chip land on the newest row, at the foot;
   * after landing, scrollTop changes direction at most once while settling
     (the oscillation detector: direction changes per settle window, ~0).
@@ -272,7 +277,20 @@ class Walk:
             self.page.screenshot(path=str(self.shots / f"{self.label}-{name}.png"), full_page=False)
 
 
-def all_walk(walk: Walk, windowed: bool) -> None:
+def one_strategy(walk: Walk, when: str) -> None:
+    """Every held row mounted and no window spacer, with the retired key stored as on (`#2426`)."""
+    census = walk.page.evaluate("""() => ({
+      spacers: document.querySelectorAll('#discord-log > li[data-window-spacer]').length,
+      ids: new Set([...document.querySelectorAll('#discord-log > li[data-id]')]
+        .flatMap((li) => [li.getAttribute('data-id'), ...(li.getAttribute('data-ids') || '').split(' ')])
+        .filter(Boolean)).size,
+    })""")
+    walk.check(census["spacers"] == 0, f"{when}: {census['spacers']} window spacers stand: a second loading strategy is live")
+    walk.check(census["ids"] >= THREADS * (REPLIES + 1),
+               f"{when}: only {census['ids']} of {THREADS * (REPLIES + 1)} held messages are mounted")
+
+
+def all_walk(walk: Walk) -> None:
     page = walk.page
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
@@ -282,17 +300,10 @@ def all_walk(walk: Walk, windowed: bool) -> None:
         page.select_option("#thread-select", "flat")
     walk.wait_for("() => document.getElementById('discord-log').getAttribute('data-view') === 'flat'",
                   "All did not open")
-    walk.wait_for("() => document.querySelectorAll('#discord-log > li:not([data-window-spacer])').length > 0",
+    walk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
                   "All mounted no rows")
-    if windowed:
-        # The window stands a render after the first rows land: condition, not a count at an instant.
-        walk.wait_for("() => { const n = document.querySelectorAll('#discord-log > li:not([data-window-spacer])').length; "
-                      f"return n > 0 && n < {THREADS * (REPLIES + 1)}; }}",
-                      "windowed All never windowed its rows")
+    one_strategy(walk, "first render")
     mounted = int(page.evaluate(MOUNTED_JS))
-    if windowed:
-        walk.check(0 < mounted < THREADS * (REPLIES + 1),
-                   f"windowed All mounted all {mounted} rows")
     # (a) Thread chips: slug and count on the first render pass.
     chips = page.evaluate(CHIP_JS)
     walk.check(bool(chips) and all(f"({REPLIES})" in c["text"] or c["slug"] for c in chips),
@@ -332,27 +343,10 @@ def all_walk(walk: Walk, windowed: bool) -> None:
             stable = 0
         top = now
         page.wait_for_timeout(50)
-    if windowed:
-        walk.check(top is not None and abs(top - anchor["top"]) <= 8,
-                   f"';' moved the anchor from {anchor['top']} to {top}")
-        walk.notes.append(f"';' kept the anchor within {abs((top or 0) - anchor['top']):.1f}px")
-    if windowed:
-        # #2009: no settled empty viewport band after the fold - the point
-        # 3/4 down the band must be a message row, never the bottom spacer.
-        filled = page.evaluate("""() => {
-          const a = document.getElementById('scroll-area');
-          const list = document.getElementById('discord-log');
-          const band = a.getBoundingClientRect();
-          const rows = [...document.querySelectorAll('#discord-log > li:not([data-window-spacer])')];
-          const el = document.elementFromPoint(band.left + band.width / 2, band.top + a.clientHeight * 0.75);
-          const li = el ? el.closest('li') : null;
-          return { onRow: Boolean(li && li.getAttribute('data-id')),
-                   lastBottom: rows.length ? rows[rows.length - 1].getBoundingClientRect().bottom : 0,
-                   bandBottom: band.top + a.clientHeight };
-        }""")
-        walk.check(filled["onRow"] or filled["lastBottom"] >= filled["bandBottom"] - 1,
-                   f"after ';' the viewport band stands empty below the anchor: {filled}")
-        walk.notes.append("after ';' the viewport band is filled with rows")
+    walk.check(top is not None and abs(top - anchor["top"]) <= 8,
+               f"';' moved the anchor from {anchor['top']} to {top}")
+    walk.notes.append(f"';' kept the anchor within {abs((top or 0) - anchor['top']):.1f}px")
+    one_strategy(walk, "after ';'")
     walk.shot("2-fold-anchor")
     # (c) END lands at the bottom, and (bug 5) does not bounce afterwards.
     page.keyboard.press("End")
@@ -360,6 +354,7 @@ def all_walk(walk: Walk, windowed: bool) -> None:
     changes = int(page.evaluate(SETTLE_JS))
     walk.check(changes <= 1, f"after END the list bounced: {changes} scroll direction changes while settling")
     walk.notes.append(f"END at the foot; settle direction changes={changes}")
+    one_strategy(walk, "after END")
     walk.shot("3-end")
     # (d) The Newest chip from mid-history.
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight * 0.4; }")
@@ -400,7 +395,7 @@ def main() -> int:
     report: list[str] = []
     with sync_playwright() as playwright:
         for size, width, height, phone in (("412x915", 412, 915, True), ("1280x800", 1280, 800, False)):
-            for windowed in (True, False):
+            for _ in ("stored-on",):
                 api = FakeApi()
                 server, thread_, url = serve(api, web_root)
                 try:
@@ -416,13 +411,14 @@ def main() -> int:
                         page = context.pages[0]
                         errors: list[str] = []
                         page.on("pageerror", lambda error: errors.append(str(error)))
-                        flag = "vibe-talk.voice.windowed-lists" if windowed else "vibe-talk.voice.windowed-lists-off"
+                        # The retired windowed-lists key, stored as a device that once turned it on
+                        # still holds it: the page must not read it (`#2426`).
                         page.add_init_script(
                             "try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); "
-                            f"localStorage.setItem('{flag}', '1'); }} catch (e) {{}}")
+                            "localStorage.setItem('vibe-talk.voice.windowed-lists', '1'); } catch (e) {}")
                         page.goto(url, wait_until="load")
-                        walk = Walk(page, f"{size}-{'on' if windowed else 'off'}", args.screenshots)
-                        all_walk(walk, windowed)
+                        walk = Walk(page, f"{size}-stored-on", args.screenshots)
+                        all_walk(walk)
                         if errors:
                             raise AssertionError(f"{walk.label}: the page threw: {errors}")
                         context.close()

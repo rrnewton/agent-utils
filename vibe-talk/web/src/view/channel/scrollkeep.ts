@@ -278,8 +278,8 @@ export interface ScrollKeeping {
    * `#2292 vibe-talk-windowed-composer-foot-fight`: the held composer's top where it stands in
    * view in `area` now (`composerBefore`), else null; and putting it back at `beforeTop` with
    * this owner's one composer write (`keepComposerInView`, the keyboard's fitted foot kept).
-   * For a writer that runs outside this owner's holds (the windowed renderer's re-slice, a
-   * read's landing): while the composer holds the view it is the place kept, never a row,
+   * For a writer that runs outside this owner's holds (a read's landing): while the composer
+   * holds the view it is the place kept, never a row,
    * so such a writer stands its own row hold down and asks for this one instead.
    */
   heldComposerTop(area: HTMLElement): number | null;

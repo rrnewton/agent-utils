@@ -8129,7 +8129,7 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   own capture finds the reader at the foot sticks. Before this, at the end of the history the
   touched row's bottom was pinned and its top absorbed the whole change (-226px on a phone,
   -104px at desk width). `tests/top_anchor_browser.py` (DAG step `top-anchor-browser`) measures
-  the touched top on every frame for each act, at the end and mid-list, windowed on and off.
+  the touched top on every frame for each act, at the end and mid-list.
 - **A shrink holds what the reader is looking at** (`#2091 vibe-talk-shrink-anchor-policy`, owner
   requests 307 and 308): archiving (Done) in Fold read, and any collapse of a message to a fold
   line, is a shrink held by the same scroll owner under one numeric invariant — for every
@@ -8141,8 +8141,7 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   reader is idle at the bottom are the one exception. The shrink opens the `#2076` hold, and the
   next-unread move after a Done waits for the shrink to settle, then lands as its own explicit
   move. `tests/shrink_anchor_browser.py` (DAG step `shrink-anchor-browser`) measures the anchor
-  on every frame for the three cases, windowed on and off, and fuzzes random acts against the
-  same invariant.
+  on every frame for the three cases, and fuzzes random acts against the same invariant.
 - **A message the stream has drawn stays drawn** (`#310 stale-live-read-flicker`). A read asked before it
   arrived, landing after, never takes away a message that arrived meanwhile. Two live messages a moment
   apart used to have the first one's read redraw the list without the second for a dozen frames. Reads

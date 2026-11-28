@@ -63,7 +63,7 @@ import {DISMISSED_SENDS_DAYS,
   sentReceiptRetires as receiptRetires,
   underDraft,
   unsentText,} from "../core/outbox/index.ts";
-import {DEFAULT_COLLAPSED_LINES, DEFAULT_DISCUSS_WIDTH, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampDiscussWidth, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createEnterSends, createInAppLinks, createKeptSwitch, createMarkReadFirstPercent, createMarkReadLongWords, createQuoteReadPercent, createSettingsSync, windowedConfig} from "../core/settings/index.ts";
+import {DEFAULT_COLLAPSED_LINES, DEFAULT_DISCUSS_WIDTH, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampDiscussWidth, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createEnterSends, createInAppLinks, createKeptSwitch, createMarkReadFirstPercent, createMarkReadLongWords, createQuoteReadPercent, createSettingsSync} from "../core/settings/index.ts";
 import {childByClass,
   createGeometry,
   createOncePerFrame,
@@ -3002,7 +3002,8 @@ const anchorDebug = createAnchorDebug({
       return {
         view: screens.view(), screen: screens.screen(), channelView: selection().view || "",
         twoColumns: sideColumnUp(),
-        windowed: windowedConfig(deviceSettings(), document.documentElement.clientWidth < 900).windowed,
+        // `#2426`: one loading strategy, no render window; the field stays on the wire, always false.
+        windowed: false,
       };
     } catch (_error) {
       return { view: "", screen: "", channelView: "", twoColumns: false, windowed: false };
@@ -5048,7 +5049,6 @@ function createThreadList(deps) {
   };
   return createThreadListView({
     ...deps,
-    windowed: deps.windowed ?? (() => { const cfg = windowedConfig(deviceSettings(), document.documentElement.clientWidth < 900); return cfg.windowed ? { prefetchPx: cfg.prefetchPx, rowCap: cfg.rowCap } : null; }),
     readThreadPins: deps.readThreadPins ?? (async (channel) => {
       const response = await ports.http.fetch(
         `/api/v1/channels/${encodeURIComponent(channel)}/thread-pins`,
@@ -7932,9 +7932,7 @@ const timelineView = createTimelineView({
   captureScroll, restoreScroll, screensView: () => screens.view(), renderJumpNewest,
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   toPosition: (area, top) => scrollKeeping.toPosition(area, top),
-  windowed: () => { const cfg = windowedConfig(deviceSettings(), document.documentElement.clientWidth < 900); return cfg.windowed ? { prefetchPx: cfg.prefetchPx, rowCap: cfg.rowCap } : null; },
-  pinnedIds: () => { const id = jumpAnchor.id(); return id ? [id] : []; },
-  // `#2292`: the scroll owner's composer hold, for the windowed renderer and a read's landing.
+  // `#2292`: the scroll owner's composer hold, for a read's landing.
   heldComposerTop: (area) => scrollKeeping.heldComposerTop(area),
   keepComposer: (area, top) => scrollKeeping.keepComposer(area, top),
 });
@@ -9470,7 +9468,6 @@ const { closeSpeedPopover, leaveReadingMode, setReadingMode } = readingActsOwner
 // The reading preferences' switches: the read-aloud pace's popover, Your own messages, and the switches that shape
 // how messages are drawn and sent. One owner in web/src/view/settings/preferenceswitches.ts (`#624
 // voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's teardown.
-{ const cfg = windowedConfig(deviceSettings(), document.documentElement.clientWidth < 900); el("windowed-lists").checked = cfg.windowed; el("data-reach-back").value = String(cfg.dataReach); el("render-row-cap").value = String(cfg.rowCap); }
 application.track(mountPreferenceSwitches({
   lookup: (id) => el(id),
   toggleSpeedPopover: () => {
@@ -9491,15 +9488,6 @@ application.track(mountPreferenceSwitches({
   afterDoneChanged: messagePreferences.afterDone.changed,
   summariesChanged: messagePreferences.summaries.changed,
   enterSendsChanged: (on) => enterSends.apply(on),
-  windowedChanged: (on) => {
-    deviceSettings().keep(DEVICE_SETTINGS.windowedLists, on);
-    deviceSettings().keep(DEVICE_SETTINGS.windowedListsOff, !on);
-    const reach = parseInt(el("data-reach-back").value, 10);
-    if (Number.isFinite(reach)) deviceSettings().keep(DEVICE_SETTINGS.dataReachBack, reach);
-    const cap = parseInt(el("render-row-cap").value, 10);
-    if (Number.isFinite(cap)) deviceSettings().keep(DEVICE_SETTINGS.renderRowCap, cap);
-    renderChannelRows();
-  },
   markReadChanged: messagePreferences.markRead.changed,
   markReadQuoteGuardChanged: messagePreferences.markRead.quoteGuardChanged,
   markReadFoldGuardChanged: messagePreferences.markRead.foldGuardChanged,
@@ -10101,7 +10089,8 @@ const freezeWatch = createFreezeWatch({
         channelView: selection().view || "",
         twoColumns: sideColumnUp(),
         reading: freezeReadingWord(),
-        windowed: windowedConfig(deviceSettings(), document.documentElement.clientWidth < 900).windowed,
+        // `#2426`: one loading strategy, no render window; the field stays on the wire, always false.
+        windowed: false,
       };
     } catch (_error) {
       // Watching never breaks the page it watches: an unreadable state says so as "other".

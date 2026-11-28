@@ -99,8 +99,8 @@ class FlashApi(StripApi):
         self.live_arrived = 0
         self.handler_error: str | None = None
         self.traces: list[Json] = []
-        # A taller All than the strip check's, so the windowed walks mount only a
-        # window of it: three threads' replies and plain messages interleaved to 90.
+        # A taller All than the strip check's: three threads' replies and plain
+        # messages interleaved to 90.
         roots = {}
         for row in self.messages:
             record = thread_of(row)
@@ -290,8 +290,7 @@ def trace_summary(api: FlashApi) -> list[str]:
     return lines or ["(the scroll trace held no write to #scroll-area)"]
 
 
-def walk(page: Page, api: FlashApi, desk: Desk, label: str, during: bool,
-         windowed: bool = False) -> tuple[int, list[str], float]:
+def walk(page: Page, api: FlashApi, desk: Desk, label: str, during: bool) -> tuple[int, list[str], float]:
     """Park on the newest line of All, send, and count the flash's frames."""
     page.fill("#api-token", fixture.TOKEN)
     page.click("#save-token")
@@ -303,7 +302,7 @@ def walk(page: Page, api: FlashApi, desk: Desk, label: str, during: bool,
         pass  # no first-run Welcome on this path (a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
     desk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length >= "
-                  f"{20 if windowed else len(api.messages)}",
+                  f"{len(api.messages)}",
                   "the channel did not open")
     if page.evaluate("() => document.getElementById('thread-select').value") != "flat":
         page.select_option("#thread-select", "flat")
@@ -422,21 +421,14 @@ def main() -> int:
         ("desk-1280-dark", 1280, 800, "dark"),
         ("desk-1280-light", 1280, 800, "light"),
     ]
-    walks: list[tuple[str, int, int, str, bool, bool]] = []
+    walks: list[tuple[str, int, int, str, bool]] = []
     for label, width, height, scheme in profiles:
         for during in (False, True):
-            walks.append((label, width, height, scheme, during, False))
-    # The windowed-lists path too, at one phone and one desk profile: the setting may
-    # differ across the owner's devices, and its append bypasses the render window.
-    for label, width, height, scheme in profiles:
-        if label not in ("phone-412-dark", "desk-1280-dark"):
-            continue
-        for during in (False, True):
-            walks.append((label, width, height, scheme, during, True))
+            walks.append((label, width, height, scheme, during))
     results: list[tuple[str, int, list[str], float, str | None]] = []
     with sync_playwright() as playwright:
-        for label, width, height, scheme, during, windowed in walks:
-            name = f"{label}-{'late-read' if during else 'plain'}{'windowed' if windowed else ''}"
+        for label, width, height, scheme, during in walks:
+            name = f"{label}-{'late-read' if during else 'plain'}"
             if True:
                 api = FlashApi()
                 server = ThreadingHTTPServer(("127.0.0.1", 0), flash_handler(api))
@@ -453,15 +445,12 @@ def main() -> int:
                         page = context.pages[0]
                         context.add_init_script(
                             "try { localStorage.setItem('vibe-talk.voice.scroll-trace', '1'); } catch (e) {}")
-                        if windowed:
-                            context.add_init_script(
-                                "try { localStorage.setItem('vibe-talk.voice.windowed-lists', '1'); } catch (e) {}")
                         errors: list[str] = []
                         page.on("pageerror", lambda error: errors.append(str(error)))
                         desk = Desk(page, args.screenshots, name, width, height)
                         page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
                         try:
-                            bad, missing, moved = walk(page, api, desk, name, during, windowed)
+                            bad, missing, moved = walk(page, api, desk, name, during)
                             failure = api.handler_error or ("; ".join(errors) if errors else None)
                         except Exception as error:  # one walk's crash never ends the run
                             bad, missing, moved = 0, [], 0.0
@@ -475,7 +464,7 @@ def main() -> int:
                     server.server_close()
                     thread.join()
     # Every walk is reported first, so one run shows phone and desk, light and dark,
-    # plain and late-read, and windowed, before any of them is judged.
+    # plain and late-read, before any of them is judged.
     for name, bad, missing, moved, failure in results:
         print(f"RESULT {name}: flash frames {bad} (missing {missing}); anchor moved at most "
               f"{moved:.1f}px; failure {failure}")
