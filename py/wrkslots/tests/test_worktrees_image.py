@@ -685,6 +685,7 @@ def test_unmount_busy_names_the_holding_pid_and_unit(
     ] * worktreesimage.UMOUNT_ATTEMPTS
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: times out in the real host /proc holder scan, as #2372's two did; a fixture proc root is #2434
 def test_unmount_busy_clears_on_a_bounded_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
