@@ -53,3 +53,21 @@ Why the group needs `/tmp` (first gate of #2383, 2026-11-27, 14 red steps):
 # Notes
 
 Filed 2026-11-27 at the lead coordinator's request, as the end of #2383's scoped exception (liaison condition 4).
+
+## Proposal from #2383 (cl-tmpfix, 2026-11-27)
+
+[opus 5.5] The way to end the exception, in four steps, after #2383's three gates:
+
+1. A pytest helper and a Rust test helper find the trusted root for `tmp_path`.
+   - They ask wrkslots' own evaluator (`_trusted_validation_exclusion_root` and its Rust twin) for the first qualifying candidate among the configured production roots and `/tmp`.
+   - On the gating host, the configured production root already qualifies for paths under the home directory through its bind alias.
+   - A host with no qualifying root skips the test with a stated reason.
+   - The fixtures that name `/tmp` take the helper's answer, and so does `WRKSLOTS_TEST_EXCLUSION_ROOTS`.
+2. The namespace shards get a `tmp_path` whose ancestors can be read inside the namespace: the canonical, non-automounted path of the same root. wrkslots' fail-closed provenance check stays as it is.
+3. `test_sandbox_root_spec` derives its trusted roots from `tmp_path`.
+4. `--host-temp` is dropped from the 27 steps. `private_tmp.HOST_TEMP_STEPS` is removed. The contract test `test_only_the_listed_wrkslots_steps_run_in_the_host_temp_dir` then requires that no step uses `--host-temp`.
+
+Until this lands, liaison condition 2's daily sweep is `python3 <checkout>/scripts/private_tmp.py sweep`.
+- It exits 0, prints one line per swept root, and ends with a total line.
+- Run it from a checkout that contains #2383; an older checkout's `private_tmp.py` has no `sweep`.
+- The lead coordinator adds it to the daily tick (team-tick).
