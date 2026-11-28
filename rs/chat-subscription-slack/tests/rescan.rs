@@ -2298,3 +2298,58 @@ fn a_garbage_or_unknown_schema_watch_file_never_stops_the_subscription() {
         fs::remove_dir_all(&directory).unwrap();
     }
 }
+
+clock!(other_cursor_clock, OTHER_CURSOR_NOW);
+
+#[test]
+fn an_unacknowledged_rescue_under_an_unrelated_cursor_is_offered_again_not_dropped() {
+    // #2430 S1: a rescued message the bridge never acknowledged, when the next subscription
+    // resumes from a cursor that is neither the rescue's nor the one before it, was recorded
+    // delivered and never offered again: lost, with only a diagnostics line. It is now offered
+    // again from the new subscription's cursor; the bridge dedupes by message key.
+    let directory = scratch("other-cursor");
+    let fake = FakeTransport::new();
+    let first_ts = ts(T0 + 10_000);
+    fake.push_history(listed(&first_ts, None, OWNER, "first", &["F0DDDDDDDD1"]));
+    OTHER_CURSOR_NOW.store(T0 + 100_000, Ordering::SeqCst);
+    fake.push_script(heartbeats(4));
+    let resume = "slack1:seq:9";
+    let mut backend = backend(&fake, other_cursor_clock);
+    {
+        let (mut ledger, _) = chat_subscription_slack::rescan::Ledger::load(
+            directory.join(LEDGER_FILE),
+            u128::from(T0) * 1_000,
+        );
+        ledger.cursor = Some(resume.to_owned());
+        ledger.save().unwrap();
+    }
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(&directory, Some(resume), json!({})))
+            .unwrap();
+    let offered = next_batch_within(&mut subscription, 1).expect("first rescue");
+    assert!(offered
+        .cursor()
+        .as_str()
+        .ends_with(&format!(";rescued:{CHANNEL}/{first_ts}")));
+    // Never acknowledged; the bridge comes back from some other cursor.
+    subscription.close().unwrap();
+    let elsewhere = "slack1:seq:12";
+    fake.push_script(heartbeats(4));
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(&directory, Some(elsewhere), json!({})),
+    )
+    .unwrap();
+    let again = next_batch_within(&mut subscription, 2).expect("offered again, not dropped");
+    assert_eq!(
+        again.cursor().as_str(),
+        format!("{elsewhere};rescued:{CHANNEL}/{first_ts}"),
+        "built on the new subscription's cursor"
+    );
+    assert_eq!(again.events(), offered.events(), "the same message");
+    subscription.commit_durable(&again).unwrap();
+    subscription.close().unwrap();
+    let saved = ledger(&directory);
+    assert_eq!(saved["pending"], Value::Null);
+    assert!(!log(&directory).contains("recorded delivered and not offered again"));
+}

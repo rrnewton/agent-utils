@@ -936,6 +936,7 @@ fn open_rescan(
         }
     }
     let mut replay = None;
+    let mut reoffer = None;
     if let Some(pending) = ledger.pending.clone() {
         if resume == Some(pending.cursor.as_str()) {
             diagnostics.log(&format!(
@@ -951,13 +952,16 @@ fn open_rescan(
             ));
             replay = Some(pending);
         } else {
+            // Never recorded delivered unacknowledged (#2430 S1): that lost the message. It is
+            // offered again from this subscription's cursor; the bridge dedupes by message key,
+            // so a copy it did admit under another cursor is harmless.
             diagnostics.log(&format!(
                 "rescan: the unacknowledged rescued message {} belongs to another cursor than \
-                 this subscription's; it is recorded delivered and not offered again",
+                 this subscription's; it is offered again from this subscription's cursor",
                 pending.key
             ));
-            ledger.mark_rescued(&pending.key);
             ledger.pending = None;
+            reoffer = Some(pending);
         }
         if let Err(error) = ledger.save() {
             diagnostics.log(&format!("rescan: the ledger could not be saved: {error}"));
@@ -1088,6 +1092,7 @@ fn open_rescan(
         stopped: false,
         delivering: None,
         replay,
+        reoffer,
         noted: BTreeSet::new(),
         truncation_noted: false,
         relay_interval,
@@ -1136,6 +1141,9 @@ struct Rescan {
     delivering: Option<String>,
     // An unacknowledged rescued batch to offer again before anything else.
     replay: Option<PendingRescue>,
+    // An unacknowledged rescued message from another cursor's lineage, offered again from
+    // this subscription's cursor before the queue (#2430 S1).
+    reoffer: Option<PendingRescue>,
     // Allowed senders' messages a pass did not admit, logged once each.
     noted: BTreeSet<String>,
     truncation_noted: bool,
@@ -1669,6 +1677,37 @@ impl SlackDriver {
                     pending.cursor,
                     CommittableEvent::message_created(pending.message),
                 )
+                .map(Some);
+        }
+        if let Some(pending) = rescan.reoffer.take() {
+            let base = self
+                .last_cursor
+                .clone()
+                .unwrap_or_else(|| Cursor::Since(self.created_floor_millis()).encode());
+            let cursor = rescan::rescue_cursor(&base, &pending.key);
+            rescan.ledger.pending = Some(PendingRescue {
+                prior_cursor: self.last_cursor.clone(),
+                cursor: cursor.clone(),
+                key: pending.key.clone(),
+                message: pending.message.clone(),
+            });
+            if let Err(error) = rescan.ledger.save() {
+                rescan.ledger.pending = None;
+                self.diagnostics.log(&format!(
+                    "rescan: {} was not offered again because the ledger could not be saved \
+                     ({error}); it stays waiting",
+                    pending.key
+                ));
+                rescan.reoffer = Some(pending);
+                return Ok(None);
+            }
+            rescan.delivering = Some(pending.key.clone());
+            self.diagnostics.log(&format!(
+                "rescan: request {} again at {cursor}",
+                pending.message.message_id().as_str()
+            ));
+            return self
+                .batch(cursor, CommittableEvent::message_created(pending.message))
                 .map(Some);
         }
         while let Some(message) = rescan.queue.pop_front() {
