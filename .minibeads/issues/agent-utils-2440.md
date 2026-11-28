@@ -37,3 +37,10 @@ Step (c) of #2420 relay-never-lossy. The owner decided on 2026-11-27: no lossy t
 
 - Split from #2420 (audit rows D4, D5, D6) on 2026-11-27, numbered by coordb. Chat size limits are #2439.
 - Boundary mismatch keeps its halt (coordb, 2026-11-28: a different batch at the current cursor can mean corruption, not just a gap); D5 covers provider gaps only. Follow-up proposal: when the batch offered at the current cursor differs from the saved boundary only by messages the bridge already holds under the same keys with the same content (a provider re-render), admit it as a boundary replacement with one alarm; any key with different content keeps the halt.
+- 2026-11-28 (cl-bridgeretire), D4 close note:
+  - D4 landed on main in the chat-stack landing d3494a71..23077655.
+  - 4ad7631d: when the store is full and owner messages are held, the coordinator's pane gets ONE `[chat-bridge ALARM]` line at once, once per hold (queue ID `chat-capacity-hold-<held_since_millis>`), naming how to close finished requests (lead-014's ask).
+  - a4046cbf (option 3; lead-014 and coordb: yes): at the 2,048 limit, after answered requests and unanswered ones past 24 h, any other unanswered request closes oldest first through the closure outbox, so an owner message is never held while one could make room. A closed OWNER request still awaiting a reply opens the agent's notice with an alarm line naming its key.
+  - Tests: a_full_store_puts_one_alarm_line_in_the_agents_pane_at_once; a_closed_owner_request_awaiting_a_reply_gets_an_alarm_line_naming_its_key; the capacity admission test, rewritten so the next owner message is admitted at once and the oldest unanswered request is retired.
+  - The request cap stays 2,048, deliberately, with no request_hard_cap key. More reply routes would push RouteCache::patterns past the 96 KiB herdr output-subscription budget and break reply capture. A higher cap needs a reworked matcher, which is a separate design.
+  - D5/D6 landed as 23077655; cl-gapreconcile writes its close note.
