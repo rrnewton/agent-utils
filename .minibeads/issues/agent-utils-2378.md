@@ -8,7 +8,7 @@ labels:
 - validation
 - tests
 created_at: 2026-11-27T08:10:00-05:00
-updated_at: 2026-11-27T08:10:00-05:00
+updated_at: 2026-11-28T01:38:00-05:00
 ---
 
 # Description
@@ -57,3 +57,26 @@ Owner rule 346 forbids wall-clock budgets in gating checks: a gating check waits
 - Related: owner rule 346 (no real-time-sensitive gating checks); #1750 agentctl-tests-load-sensitive took the same approach in agentctl.
 - Found by cl-shardcap in the #2318 gate. Step log: `rust.merge-queue.test.log` in gate log directory `1795777600642083805-50cbd6b7`.
 - The exclusive rerun of both red steps on the same tree passed (ticket `1795784636031325182-279d838b`, 8:10 to 8:21 AM ET): this case passed, and `rust.merge-queue.test` had 0 failed of 686. load1 during the rerun was 107 to 154, lower than during the failure, so the pass shows only that the timeout is intermittent, not that the case is robust under load.
+- Quarantine under owner rule 346 (liaison, 2026-11-28, as a condition of the step waiver for the #2383 gate): until this issue is fixed, mark the case so that gates skip it, with the same form the #1765 and #2065 quarantines use:
+
+  ```rust
+  #[ignore = "#2378 merge-queue-donor-rebuild-wait-timeout (owner rule 346): a 60 s wall-clock wait for the stale root's rebuild fails about 3 runs in 5 above load1 270; run on demand with cargo test -- --ignored"]
+  ```
+
+  The first code change to merge-queue adds this line, or this issue's fix replaces it. Either way, the case comes back only when it meets the acceptance criteria above.
+- Seen again in the #2383 gate on f267fac3 (ticket `1795840912275062057-23be4040`, 2026-11-28): the same panic at `cli_donor.rs:163`. The case ran 64 s, 12:44 to 12:45 AM ET, with load1 at 377, then 298, then 243. The liaison waived the step for that landing instead of a rerun.
+- Reproduced alone: the failing case only, 5 runs per tree, with the gate's release flags, under a private temp root.
+
+  | Tree | Passed | Failures | load1 |
+  |---|---|---|---|
+  | #2383 tree | 2 of 5 | two timeouts at `:163`; one panic at `:174` (see the last bullet) | 310 to 333 |
+  | main's code (aace00b3) | 2 of 5 | three timeouts at `:163` | 271 to 333 |
+
+  About 3 runs in 5 fail once load1 is above 270, whether or not #2383 is present.
+- A second fault for the same change: the test's `KillOnDrop` covers only the donor daemon.
+  - On a panic, the `merge-queue run` child from `spawn_run` is dropped without a kill, so it keeps running.
+  - In one main-code run it recreated an empty fixture directory (`queue/.git/merge-queue`) under the run's temp root after the temp-root wrapper had removed it.
+  - Fix: wrap the `run` child in `KillOnDrop` too, and check that no process from the case is left after it.
+- A third failure shape: `item_status` panicked at `:174` on `Option::unwrap()` of `None`, 7 s in.
+  - The panic came while the test waited for change 1 to land: `list --all --json` returned no entry for change 1 at that moment.
+  - Either the helper should treat a missing entry as "not yet" and keep waiting, or `list` read the queue state while it was being rewritten. The second would be a product bug, so check which one it is first.
