@@ -1,0 +1,21 @@
+steps:
+  # `#2437 vibe-talk-reply-keyboard-hides-message-top`: the phone's keyboard coming up over a Reply keeps
+  # the answered message's header on screen. The long channel of the reply-open walk; Reply on a message
+  # with gathered replies and on one without, then the keyboard up. Geometry only: the header inside the
+  # list, the reply's field above the keys, the box never over the message (replies that cannot also fit
+  # give way, reported). 412x915 and 393x852 by touch, light and dark.
+  - group: check
+    job: reply-keyboard-head-browser
+    desc: the phone's keyboard coming up over a Reply keeps the answered message's header on screen, the field above the keys and the box off the message, over 100k px of rows, in current Chromium at 412x915 and 393x852 by touch, light and dark (#2437)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/reply_keyboard_head_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 600
+    cpu_timeout: 240
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 150
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1610612736

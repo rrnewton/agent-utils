@@ -144,7 +144,11 @@ export function createComposerBoxes(deps: ComposerBoxesDependencies): ComposerBo
     if (seen === null || seen.list <= 0 || now.list >= seen.list) return false;
     const box = boxBeingWritten(area);
     if (box === null || !boxWasInView(box, area, seen.list)) return false;
-    composerGrowth.keepBoxInView(box, area);
+    // `#2437`: a reply in the stream keeps the message it answers (`data-replying`) on screen.
+    const inStream = box === deps.leftEl("column-reply") || box === deps.leftEl("side-reply");
+    const answered = inStream && typeof area.querySelector === "function"
+      ? area.querySelector<HTMLElement>("li[data-replying]") : null;
+    composerGrowth.keepBoxInView(box, area, answered);
     return true;
   }
 

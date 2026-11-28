@@ -56,9 +56,10 @@ export interface ComposerGrow {
   /**
    * Bring the whole of `box` into the view of `area`, the list it is in, as `keepComposerInView` says:
    * the box whole, or its top where the list is shorter than it. `#340 composer-grow-box` made it any
-   * composer's, for a box growing under the reader's typing.
+   * composer's, for a box growing under the reader's typing. `head`, where given, is a row the move must
+   * not push above the list's top (`#2437`: the message a reply in the stream answers).
    */
-  keepBoxInView(box: HTMLElement, area: HTMLElement): void;
+  keepBoxInView(box: HTMLElement, area: HTMLElement, head?: HTMLElement | null): void;
 }
 
 /** Grow off; nothing measured yet. */
@@ -87,13 +88,23 @@ export function createComposerGrow(deps: ComposerGrowDependencies): ComposerGrow
    * the box whole, or its top where the list is shorter than it. `#340 composer-grow-box` made it any
    * composer's, for a box growing under the reader's typing.
    */
-  function keepBoxInView(box: HTMLElement, area: HTMLElement): void {
+  function keepBoxInView(box: HTMLElement, area: HTMLElement, head: HTMLElement | null = null): void {
     const rect = box.getBoundingClientRect();
-    const top = rect.top - area.getBoundingClientRect().top + area.scrollTop;
+    const areaTop = area.getBoundingClientRect().top;
+    const top = rect.top - areaTop + area.scrollTop;
     const bottom = top + rect.height;
     const view = area.clientHeight || 0;
     if (top >= area.scrollTop && bottom <= area.scrollTop + view) return;
-    deps.toPosition(area, rect.height <= view ? bottom - view : top);
+    let target = rect.height <= view ? bottom - view : top;
+    // `#2437 vibe-talk-reply-keyboard-hides-message-top`. The phone's keyboard shrinking the list moved it
+    // so the whole reply box stood above the keys, and with its replies gathered over it the message it
+    // answers went out over the top (its header at -14 px). Never past that message's top: the box comes
+    // up as far as that allows, its field first, and the reader sees what they answer.
+    if (head && head.getClientRects().length) {
+      const headTop = head.getBoundingClientRect().top - areaTop + area.scrollTop;
+      if (headTop >= area.scrollTop - 0.5) target = Math.min(target, headTop);
+    }
+    if (Math.abs(target - area.scrollTop) > 0.5) deps.toPosition(area, target);
   }
 
   const owner: ComposerGrow = {
