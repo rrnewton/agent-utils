@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from types import ModuleType
 
@@ -480,10 +481,99 @@ def _gate_scope_units() -> set[str]:
     return {line.split()[0] for line in done.stdout.splitlines() if line.split()}
 
 
+def _own_gate_scopes(admission: Path, gate_pids: Iterable[int]) -> set[str]:
+    """The scope names this test's own gates could have made (#2450).
+
+    Every gate on the host names its scope ``agent-utils-gate-<run id>``, and
+    its preflight's ``agent-utils-gate-preflight-<gate pid>``, so a real gate
+    that starts while the test runs adds one too: a leak check must never diff
+    the host's whole set. The test's run ids are in its private admission
+    directory: a history row for each finished gate, a queue or runs ticket for
+    any gate still waiting or running."""
+    ids: set[str] = set()
+    history = admission / "history.jsonl"
+    if history.exists():
+        for line in history.read_text(errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and row.get("id"):
+                ids.add(str(row["id"]))
+    for ticket in [*admission.glob("queue/*.json"), *admission.glob("runs/*.json")]:
+        try:
+            data = json.loads(ticket.read_text())
+        except (OSError, json.JSONDecodeError):
+            data = None
+        ids.add(str(data["id"]) if isinstance(data, dict) and data.get("id") else ticket.stem)
+    names = {f"agent-utils-gate-{run_id}.scope" for run_id in ids}
+    names |= {f"agent-utils-gate-preflight-{pid}.scope" for pid in gate_pids}
+    return names
+
+
+def _leaked_own_scopes(
+    admission: Path,
+    gate_pids: Iterable[int],
+    live: Callable[[], set[str]] = _gate_scope_units,
+    settle_s: float = 120.0,
+) -> list[str]:
+    """This test's own gate scopes that are still live. Scope teardown can lag
+    process exit, so wait (up to the generous ``settle_s``) for them to go."""
+    pids = list(gate_pids)
+    deadline = time.time() + settle_s
+    while True:
+        leaked = live() & _own_gate_scopes(admission, pids)
+        if not leaked or time.time() >= deadline:
+            return sorted(leaked)
+        time.sleep(0.25)
+
+
+def test_the_scope_leak_check_ignores_a_foreign_gate_scope(tmp_path: Path) -> None:
+    """#2450 negative control: a real gate elsewhere on the host that starts
+    mid-test adds an agent-utils-gate-* scope (and a preflight scope); neither
+    is this test's leak."""
+    admission = tmp_path / "admission"
+    (admission / "runs").mkdir(parents=True)
+    (admission / "history.jsonl").write_text(json.dumps({"id": "100-own"}) + "\n")
+    (admission / "runs" / "300-own.json").write_text(json.dumps({"id": "300-own"}))
+    foreign = {"agent-utils-gate-200-foreign.scope", "agent-utils-gate-preflight-999.scope"}
+    appears: list[set[str]] = [set(), foreign]
+    assert _leaked_own_scopes(admission, [4242], live=lambda: appears.pop(0), settle_s=0) == []
+    assert _leaked_own_scopes(admission, [4242], live=lambda: appears.pop(0), settle_s=0) == []
+
+
+def test_the_scope_leak_check_still_names_the_tests_own_scopes(tmp_path: Path) -> None:
+    """#2450 control: a scope named for one of the test's own run ids (finished,
+    waiting or running) or for one of its gates' preflights is still a leak,
+    next to a foreign scope that is not."""
+    admission = tmp_path / "admission"
+    (admission / "queue").mkdir(parents=True)
+    (admission / "runs").mkdir()
+    (admission / "history.jsonl").write_text(json.dumps({"id": "100-own"}) + "\nnot json\n")
+    (admission / "queue" / "300-waiting.json").write_text(json.dumps({"id": "300-waiting"}))
+    (admission / "runs" / "400-running.json").write_text("{torn")
+    live = {"agent-utils-gate-100-own.scope", "agent-utils-gate-300-waiting.scope",
+            "agent-utils-gate-400-running.scope", "agent-utils-gate-preflight-4242.scope",
+            "agent-utils-gate-200-foreign.scope"}
+    assert _leaked_own_scopes(admission, [4242], live=lambda: live, settle_s=0) == [
+        "agent-utils-gate-100-own.scope", "agent-utils-gate-300-waiting.scope",
+        "agent-utils-gate-400-running.scope", "agent-utils-gate-preflight-4242.scope"]
+
+
+def test_the_scope_leak_check_waits_for_a_lagging_teardown(tmp_path: Path) -> None:
+    """#2450: the check waits on the condition (the test's own scope gone), not
+    a wall-clock budget; a scope that goes after a few polls is no leak."""
+    admission = tmp_path / "admission"
+    admission.mkdir()
+    (admission / "history.jsonl").write_text(json.dumps({"id": "100-own"}) + "\n")
+    polls = [{"agent-utils-gate-100-own.scope"}] * 3 + [set()]
+    assert _leaked_own_scopes(admission, [], live=lambda: polls.pop(0)) == []
+    assert polls == []
+
+
 def test_a_rerun_ticket_jumps_ordinary_queued_gates(tmp_path: Path) -> None:
     """A --rerun ticket sorts ahead of every ordinary queued ticket and is
     granted as soon as the running gate finishes."""
-    scopes_before = _gate_scope_units()
     order = tmp_path / "order.txt"
 
     def note(tag: str) -> str:
@@ -513,15 +603,12 @@ def test_a_rerun_ticket_jumps_ordinary_queued_gates(tmp_path: Path) -> None:
         out, _ = proc.communicate(timeout=30)
         assert proc.returncode == 0, out
     assert order.read_text().split() == ["rerun", "ordinary"]
-    # No systemd scope this test created may survive it (they leaked on
-    # 2026-11-10/11 when the test timed out under load). Scope teardown
-    # can lag process exit, so poll briefly.
-    deadline = time.time() + 120
-    leaked = _gate_scope_units() - scopes_before
-    while leaked and time.time() < deadline:
-        time.sleep(0.25)
-        leaked = _gate_scope_units() - scopes_before
-    assert not leaked, f"test leaked gate scope(s): {sorted(leaked)}"
+    # No systemd scope this test's own gates made may survive it (they leaked
+    # on 2026-11-10/11 when the test timed out under load). Only this test's
+    # own scope names count: a real gate that starts on the host meanwhile is
+    # not a leak (#2450).
+    leaked = _leaked_own_scopes(tmp_path / "admission", [p.pid for p in (running, ordinary, rerun)])
+    assert not leaked, f"test leaked gate scope(s): {leaked}"
 
 
 def test_cpu_quota_comes_from_the_slots_file_with_a_default(tmp_path: Path) -> None:
