@@ -1,6 +1,6 @@
 ---
 title: 'search-clear-two-columns-found-hold: with two columns up, clearing a search keeps the found message in the channel list, and the right column still follows a reply in its thread'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: cl-searchux
@@ -10,7 +10,8 @@ labels:
 - owner-ui
 - scroll
 created_at: 2026-11-28T01:45:00-05:00
-updated_at: 2026-11-28T05:40:00-05:00
+updated_at: 2026-11-28T10:20:00-05:00
+closed_at: 2026-11-28T10:20:00-05:00
 ---
 
 # Description
@@ -38,3 +39,23 @@ The owner reads on a wide desktop (the installed page, two columns), so the owne
 
 - Filed at the coordinator's request (issue file only), from the `#2423` first owner gate's catch and its scope correction (liaison 1133, 1140).
 - Related: `#2423`, `#2424`, `#2442`, `#2444` (a separate intermittent 4 px FOLLOW miss in the same walk), `#2230`, `#2346`, `#2354`.
+
+## Resolution
+
+[opus 5.5] Landed in 90ff376b (step 1) and 022cf893 (step 2) on 2026-11-28 at 9:47 AM ET, on the coordinator's LAND NOW after the liaison's OK (1151, 1152, 1156). Gated head 7921b0a0 on 9bf112c0, after `#2426` R3 and `#2425` landed; the rebase left both commits identical (range-diff "=", same patch-ids). The owner gate there had four browser walks red at load1 300-350: fold-steps, reload-place, search-typing-stays and view-switch. The change touches none of them: three are phone walks, where it changes nothing, and one is a desk walk with one column. All four passed on the solo rerun (load1 about 127). The search-typing red's unreproduced 110 px move is `#2463` search-typing-foot-jump.
+
+With two columns up, clearing a search keeps the found message in the channel list, as `#2423` does with one column. The right column's box and reply pane no longer keep room for the left column's chips. A reply arriving with the reader in the right column's room past its foot moves nothing: the row being read keeps its top, and the reply shows below it (owner rule 370, replacing `#338`'s follow).
+
+Evidence (fixture server; desk 1920x1080 with two columns, light and dark, Discuss open):
+- `search_clear_stays_browser.py`: 51 walks, max 0.48 px per frame, including the two-column walks; the light and dark two-column pass, 12 walks, max 0.48 px.
+- `column_overscroll_browser.py` FOLLOW at desk-1920: main 9/10 fail (the timing-luck follow), step 1 10/10 pass; after the rebase 3/3 pass, every negative control failing as it must.
+- Before/after pairs, BUILD.txt and the advisory design review are in the lane's evidence. The right column's foot is 40 px lower with the room closed, still clear of the dock.
+
+Live in 022cf893: the coordinator's deploy and its watch both exited 0. Post-deploy checks on the page built from 022cf893 (fixture server only, never the live server), 2026-11-28 10:09-10:20 AM ET, all passed:
+- `search_clear_stays_browser.py`: 51 walks, max 0.48 px, two-column walks included (load1 198 -> 156).
+- `column_overscroll_browser.py --size desk-1920`, with its negative controls (load1 156 -> 161).
+- `search_typing_stays_browser.py` (load1 161 -> 159).
+- `fold_steps_browser.py` (load1 159 -> 156).
+- `two_column_browser.py` (load1 156 -> 155).
+
+`#2444`'s intermittent 4 px FOLLOW miss came from the same path. It is closed (12bceede) as fixed by step 1: 25 of 25 runs passed at desk-1920 on main 022cf893, 20 of them starting under load1 237.
