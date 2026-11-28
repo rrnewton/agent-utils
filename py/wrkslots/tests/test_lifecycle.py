@@ -670,6 +670,86 @@ def attributable_validation_exclusion_guards(
     }
 
 
+#: #2465 lifecycle-recovery-cases-outside-gates: the cases that move a fenced
+#: path into an ownerless-validation exclusion guard need their temp dir in the
+#: same filesystem view as the host temp dir, whose root-owned sticky directory
+#: (or a fixture root made under it) is the guard's parent. The gate's lifecycle
+#: and wrkslots steps provide it (scripts/with-private-tmp --host-temp, a private
+#: root under the host temp dir, #2383); a lane scratch root under the home
+#: directory does not, and the product refuses there by design.
+_EXCLUSION_VIEW_REMEDY = (
+    "run it under scripts/with-private-tmp --host-temp, as the gate's lifecycle "
+    "and wrkslots steps do (#2383)"
+)
+
+
+def require_host_temp_exclusion_view(
+    tmp_path: Path, environ: Mapping[str, str] = os.environ
+) -> None:
+    """Skip, by name, a case whose environment lacks the exclusion parent (#2465).
+
+    The check is the product's own view check (``_mount_alias_path``) from the
+    test temp dir to the host temp dir. Outside a gate a missing view SKIPS with
+    the requirement and the remedy named. Inside a gate (``GATE_ADMISSION_RUN_ID``
+    is set for every admitted run's children) it never skips: it FAILS, because
+    the gate is where this environment must exist.
+    """
+
+    host_temp = Path("/tmp")
+    try:
+        wrkslots._mount_alias_path(
+            tmp_path / "exclusion-view-probe",
+            host_temp,
+            wrkslots._self_mountinfo_records(),
+        )
+    except wrkslots.Refusal as exc:
+        problem = (
+            f"the test temp dir {tmp_path} is not in the filesystem view of {host_temp}, "
+            f"so ownerless validation cleanup has no trusted root-owned sticky parent "
+            f"there ({exc})"
+        )
+        if environ.get("GATE_ADMISSION_RUN_ID", "").strip():
+            pytest.fail(
+                f"#2465: inside a gate (GATE_ADMISSION_RUN_ID is set) this case must run, "
+                f"never skip: {problem}",
+                pytrace=False,
+            )
+        pytest.skip(f"#2465: {problem}; {_EXCLUSION_VIEW_REMEDY}")
+
+
+def test_exclusion_view_guard_fails_rather_than_skips_inside_a_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2465: inside a gate the guard FAILS where it would skip outside one.
+
+    The view check is forced to refuse. With the gate's run marker set the
+    guard must raise a failure; a skip there fails this test. Without the
+    marker it skips with the requirement and the remedy named. When the view
+    check passes the guard is silent, marker or not.
+    """
+
+    def refuse(*_args: object) -> Path:
+        raise wrkslots.Refusal("fixture: outside the view")
+
+    monkeypatch.setattr(wrkslots, "_mount_alias_path", refuse)
+    try:
+        require_host_temp_exclusion_view(tmp_path, {"GATE_ADMISSION_RUN_ID": "run-1"})
+    except pytest.skip.Exception as skipped:
+        pytest.fail(f"the guard skipped inside a gate: {skipped}")
+    except pytest.fail.Exception as failed:
+        assert "#2465" in str(failed) and "never skip" in str(failed), failed
+    else:
+        pytest.fail("the guard neither failed nor skipped inside a gate")
+    with pytest.raises(pytest.skip.Exception) as outside:
+        require_host_temp_exclusion_view(tmp_path, {})
+    assert "with-private-tmp --host-temp" in str(outside.value), outside.value
+    assert "fixture: outside the view" in str(outside.value), outside.value
+
+    monkeypatch.setattr(wrkslots, "_mount_alias_path", lambda path, *_rest: path)
+    require_host_temp_exclusion_view(tmp_path, {"GATE_ADMISSION_RUN_ID": "run-1"})
+    require_host_temp_exclusion_view(tmp_path, {})
+
+
 def install_validation_exclusion_fixture(
     project: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3461,6 +3541,9 @@ def test_result_recorded_frozen_removal_resumes_from_its_journal(
     capsys: pytest.CaptureFixture[str],
     boundary: str,
 ) -> None:
+    if boundary.startswith("after-ownerless-validate-"):
+        # Only the ownerless-validate boundaries reach the exclusion (#2465).
+        require_host_temp_exclusion_view(tmp_path)
     project, repository, _remote = make_project(tmp_path)
     checkout, record, frozen, target_sha = prepare_result_recorded_frozen_checkout(
         project, repository, monkeypatch=monkeypatch, name="resume"
@@ -4726,6 +4809,7 @@ def test_ownerless_validate_batch_removes_terminal_frozen_checkout(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    require_host_temp_exclusion_view(tmp_path)
     project, repository, _remote = make_project(tmp_path)
     checkout, record, target_sha = prepare_frozen_validation_checkout(
         project, repository, monkeypatch=monkeypatch
@@ -4792,6 +4876,7 @@ def test_frozen_validate_batch_closes_operation_owned_fds_before_censuses(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    require_host_temp_exclusion_view(tmp_path)
     project, repository, _remote = make_project(tmp_path)
     checkout, record, _target_sha = prepare_frozen_validation_checkout(
         project, repository, monkeypatch=monkeypatch, name="closed-fds"
@@ -5890,6 +5975,7 @@ def test_frozen_parser_reads_immutable_initial_snapshot_during_live_restore(
 def test_frozen_validate_checkout_recovers_each_durable_crash_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
 ) -> None:
+    require_host_temp_exclusion_view(tmp_path)
     project, repository, _remote = make_project(tmp_path)
     checkout, record, _target_sha = prepare_frozen_validation_checkout(
         project,
@@ -5966,6 +6052,7 @@ def test_frozen_validate_recovery_refuses_exclusion_identity_tampering(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
 ) -> None:
+    require_host_temp_exclusion_view(tmp_path)
     project, repository, _remote = make_project(tmp_path)
     checkout, record, _target_sha = prepare_frozen_validation_checkout(
         project,
@@ -6032,6 +6119,7 @@ def test_frozen_validate_batch_accepts_exact_validation_removal_proof(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    require_host_temp_exclusion_view(tmp_path)
     project, repository, _remote = make_project(tmp_path)
     commit_validation_removal_schema(repository, schema_version=3)
     checkout, record, _target_sha = prepare_frozen_validation_checkout(
@@ -10230,6 +10318,7 @@ def test_recover_ownerless_validate_cargo_home_requires_terminal_or_manual_evide
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
 ) -> None:
+    require_host_temp_exclusion_view(tmp_path)
     project, _repository, _remote = make_project(
         tmp_path,
         worktrees_directory="worktrees/slots",
@@ -11751,6 +11840,7 @@ def test_ownerless_validate_recovery_resumes_without_reauthorizing(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
 ) -> None:
+    require_host_temp_exclusion_view(tmp_path)
     project, _repository, _remote = make_project(
         tmp_path,
         worktrees_directory="worktrees/slots",
@@ -59188,6 +59278,9 @@ def test_release_frozen_incomplete_resumes_from_its_journal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str], boundary: str,
 ) -> None:
+    if boundary.startswith("after-ownerless-validate-"):
+        # Only the ownerless-validate boundaries reach the exclusion (#2465).
+        require_host_temp_exclusion_view(tmp_path)
     project, source, checkout, record, _sidecar = prepare_current_incomplete_frozen_checkout(
         tmp_path, monkeypatch, unpushed_target=True
     )
