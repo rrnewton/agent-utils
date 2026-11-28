@@ -27,8 +27,11 @@ use std::sync::Arc;
 
 /// Maximum UTF-8 size of a replay cursor or live delivery receipt.
 pub const MAX_TOKEN_BYTES: usize = 8_192;
-/// Maximum UTF-8 size of a normalized message body.
-pub const MAX_MESSAGE_TEXT_BYTES: usize = 32_000;
+/// Maximum UTF-8 size of a normalized message body: 160 KiB, every Slack message (40,000
+/// characters of up to 4 bytes each) whole. It was 32,000 bytes, and a longer owner message
+/// reached the bridge with its tail cut (#2439 chat-never-truncate, S4). One message still fits a
+/// delivery batch ([`MAX_BATCH_BYTES`]) with room for its JSON escaping.
+pub const MAX_MESSAGE_TEXT_BYTES: usize = 160 * 1_024;
 /// Maximum UTF-8 size of a channel, message, or thread identifier.
 pub const MAX_RESOURCE_ID_BYTES: usize = 2_048;
 /// Maximum UTF-8 size of a sender identifier.

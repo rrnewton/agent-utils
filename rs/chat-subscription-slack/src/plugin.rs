@@ -214,6 +214,9 @@ const MAX_IGNORED_PREFIXES: usize = 32;
 // bot posts) is not a request.
 const MESSAGE_SUBTYPES: &[&str] = &["thread_broadcast", "file_share", "me_message"];
 const TRUNCATION_MARKER: &str = "\n[message truncated by the Slack provider]";
+/// Most JSON-escaped bytes one message's text may take, so it always fits a delivery batch
+/// (`chat_subscription::MAX_BATCH_BYTES`, 512 KiB) with the rest of its event.
+const MAX_ESCAPED_TEXT_BYTES: usize = 384 * 1_024;
 /// Default `cursor_refresh_seconds`: well inside the stream's retention of about eight hours.
 pub const DEFAULT_CURSOR_REFRESH: Duration = Duration::from_secs(2 * 60 * 60);
 /// How long a stream may stay subscribed without any event before the diagnostics log notes it.
@@ -1527,10 +1530,24 @@ impl SlackDriver {
             rescued,
         );
         let limit = chat_subscription::MAX_MESSAGE_TEXT_BYTES.saturating_sub(note.len());
-        if text.len() > limit {
-            let mut boundary = limit.saturating_sub(TRUNCATION_MARKER.len());
-            while !text.is_char_boundary(boundary) {
-                boundary -= 1;
+        // Cut only past the text bound, or where the JSON-escaped text would not fit a delivery
+        // batch (a text of control characters escapes to six bytes each), never below it
+        // (#2439 chat-never-truncate, S4).
+        let escaped_fits = |text: &str| {
+            serde_json::to_string(text).is_ok_and(|encoded| encoded.len() <= MAX_ESCAPED_TEXT_BYTES)
+        };
+        if text.len() > limit || !escaped_fits(&text) {
+            let mut boundary = limit
+                .min(text.len())
+                .saturating_sub(TRUNCATION_MARKER.len());
+            loop {
+                while !text.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                if escaped_fits(&text[..boundary]) || boundary == 0 {
+                    break;
+                }
+                boundary -= boundary / 8 + 1;
             }
             text.truncate(boundary);
             text.push_str(TRUNCATION_MARKER);

@@ -50,8 +50,10 @@ use crate::transport::{
     SubscribeSpec, TextFormat, TransportError, UpdateMessage,
 };
 
-/// Largest accepted stream line; longer lines are dropped with a notice.
-pub const MAX_LINE_BYTES: usize = 256 * 1024;
+/// Largest accepted stream line; longer lines are dropped with a notice. 1 MiB, so an event
+/// carrying a message of the full text bound (`chat_subscription::MAX_MESSAGE_TEXT_BYTES`) with
+/// every character JSON-escaped is never dropped (#2439 chat-never-truncate, S4).
+pub const MAX_LINE_BYTES: usize = 1_024 * 1024;
 pub(crate) const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_STDERR_BYTES: usize = 64 * 1024;
 const TAIL_STOP_GRACE: Duration = Duration::from_secs(3);

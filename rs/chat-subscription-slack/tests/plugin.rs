@@ -1309,3 +1309,30 @@ fn relay_poll_seconds_is_absent_by_default_and_validated() {
         assert_eq!(error.code(), "slack_configuration_invalid");
     }
 }
+
+#[test]
+fn a_long_owner_message_reaches_the_bridge_whole() {
+    // #2439 chat-never-truncate (S4): an owner message over 32,000 bytes reached the bridge with
+    // its tail cut. One of 100 KB, and one with every byte a JSON escape, arrive whole.
+    let long: String = (0..4_000)
+        .map(|n| format!("line {n:05} of a long brief\n"))
+        .collect();
+    assert!(long.len() > 100_000);
+    let escaped = "\"\\".repeat(30_000);
+    let fake = FakeTransport::new();
+    fake.push_script(vec![
+        owner_message(101, "1792000801.000100", None, &long),
+        owner_message(102, "1792000802.000100", None, &escaped),
+        FakeStep::Line(r#"{"type":"HEARTBEAT","ts":1.0}"#.to_owned()),
+    ]);
+    let mut backend = make_backend(&fake);
+    let mut subscription = ChatSubscription::open(&mut backend, &request(None, json!({}))).unwrap();
+    let first = commit_next(&mut subscription);
+    assert_eq!(first.events(), [CommittableEvent::Checkpoint]);
+    let batch = commit_next(&mut subscription);
+    let text = single_message(&batch).text();
+    assert_eq!(text.len(), long.len(), "whole, not cut");
+    assert!(!text.contains("truncated"), "no truncation marker");
+    let batch = commit_next(&mut subscription);
+    assert_eq!(single_message(&batch).text(), escaped);
+}

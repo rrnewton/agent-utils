@@ -231,7 +231,7 @@ not. `fatal` says the sender cannot continue this connection.
 
 Canonical domain limits are 32 channels, 256 allowed senders, 256 events and
 524,288 JSON-encoded variable payload bytes per batch, 8,192-byte cursors and delivery IDs,
-2,048-byte resource IDs, 256-byte sender IDs, 32,000-byte message text,
+2,048-byte resource IDs, 256-byte sender IDs, 160 KiB message text (every Slack message whole; it was 32,000 bytes before #2439),
 128-byte timestamps and schema/backend labels, 2,000-byte gap reasons and error
 details, and 262,144 encoded bytes for each complete provider payload
 `{"schema":...,"data":...}` envelope, with 64 nesting levels inside its data.

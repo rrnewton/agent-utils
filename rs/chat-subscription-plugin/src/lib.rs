@@ -3773,6 +3773,29 @@ mod tests {
 
     #[test]
     fn every_core_valid_worst_case_batch_fits_one_protocol_frame() {
+        // The batch byte bound, not the text bound, limits a batch: two messages of 32,000
+        // escaped NULs (six bytes each) are the largest pair a batch carries. A single message of
+        // maximum text (160 KiB since #2439) made of NULs does not fit a batch at all, so a plugin
+        // bounds a text's escaping as well as its length (the Slack plugin cuts at 384 KiB
+        // escaped).
+        const TEXT: usize = 32_000;
+        let too_escaped = InboundMessage::new(
+            ChannelId::new("c").expect("channel"),
+            MessageId::new("m").expect("message"),
+            ThreadId::new("t").expect("thread"),
+            SenderId::new("s").expect("sender"),
+            "\0".repeat(chat_subscription::MAX_MESSAGE_TEXT_BYTES),
+            "2026-01-01T00:00:00Z",
+            false,
+        )
+        .expect("a maximum-length text is a valid message");
+        assert!(DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("c").expect("cursor"),
+            DeliveryId::new("d").expect("delivery"),
+            vec![CommittableEvent::message_created(too_escaped)],
+        )
+        .is_err());
         let message = || {
             InboundMessage::new(
                 ChannelId::new("\0".repeat(chat_subscription::MAX_RESOURCE_ID_BYTES))
@@ -3783,7 +3806,7 @@ mod tests {
                     .expect("maximum escaped thread"),
                 SenderId::new("\0".repeat(chat_subscription::MAX_SENDER_ID_BYTES))
                     .expect("maximum escaped sender"),
-                "\0".repeat(chat_subscription::MAX_MESSAGE_TEXT_BYTES),
+                "\0".repeat(TEXT),
                 "2026-01-01T00:00:00Z",
                 false,
             )
