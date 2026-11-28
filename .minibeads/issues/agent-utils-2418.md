@@ -8,7 +8,7 @@ labels:
 - safety
 - testing
 created_at: 2026-11-27T19:40:00-05:00
-updated_at: 2026-11-27T19:40:00-05:00
+updated_at: 2026-11-27T20:15:00-05:00
 ---
 
 # Description
@@ -67,6 +67,13 @@ This is a removal-path change. It needs a cold review, both editions with parity
 # Notes
 
 Filed by `cl-flaketriage` at the coordinator's request (2026-11-27), from the #2065 Step A' final gate (aa943857) and the local namespace runs that named the holder. Not staffed yet.
+
+Host opt-out trial (2026-11-27, one paired trial, load1 about 220). The wrapper on the affected host has its own switch that turns off its helper.
+- Without the switch, one git call made with the checkout as its working directory left one orphaned helper in the checkout, seen 16 ms after the call.
+- With the switch set, the same call left none.
+- The result comes from one call each, not from documentation.
+- The switch is a host mitigation only. It is not repo content, and it is offered to the other team as an optional production setting.
+- It is NOT set in this harness's gate environment, because it would hide the race that this issue fixes.
 
 Related:
 - #2065: hot-host census tests; the marked differentials and the inventory.
