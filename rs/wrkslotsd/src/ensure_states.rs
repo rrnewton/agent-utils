@@ -985,6 +985,15 @@ fn path_within(candidate: &Path, root: &Path) -> bool {
 
 /// PIDs of live wrkslots removal processes for this project acting on
 /// `targets`, mirroring `_other_live_wrkslots_processes`.
+/// Whether a failed read of a process's `cmdline` only means the process
+/// has exited (#2488), as in `_other_live_wrkslots_processes`: gone before
+/// the open (ENOENT) or between the open and the read (ESRCH). Any other
+/// failure leaves the process unreadable, and an unreadable process counts,
+/// so an unreadable host never proves that no batch process is running.
+fn cmdline_read_error_is_exit(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 pub(crate) fn other_live_wrkslots_processes(root: &Path, targets: &[String]) -> Vec<i64> {
     other_live_wrkslots_processes_in(root, targets, Path::new("/proc"))
 }
@@ -1013,7 +1022,7 @@ pub(crate) fn other_live_wrkslots_processes_in(
         }
         let raw = match std::fs::read(entry.path().join("cmdline")) {
             Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if cmdline_read_error_is_exit(&error) => continue,
             Err(_) => {
                 found.push(pid);
                 continue;
@@ -1694,7 +1703,7 @@ mod lock_wait_tests {
 
 #[cfg(test)]
 mod fallback_scan_tests {
-    use super::other_live_wrkslots_processes_in;
+    use super::{cmdline_read_error_is_exit, other_live_wrkslots_processes_in};
     use std::path::{Path, PathBuf};
 
     fn table() -> (PathBuf, PathBuf, PathBuf) {
@@ -1885,5 +1894,29 @@ mod fallback_scan_tests {
             vec![4101, 4103, 4105, 4106, 4108, 4109, 4110, 4112, 4114]
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_process_that_exited_mid_read_is_skipped_and_an_unreadable_one_counts() {
+        // #2488: the same rule as the Python edition. A process gone before
+        // the open (ENOENT) or between the open and the read (ESRCH) has
+        // exited; any other read failure leaves it unreadable, and it counts.
+        let exited = [
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            std::io::Error::from_raw_os_error(libc::ENOENT),
+            std::io::Error::from_raw_os_error(libc::ESRCH),
+        ];
+        for error in &exited {
+            assert!(cmdline_read_error_is_exit(error), "{error:?}");
+        }
+        let unreadable = [
+            std::io::Error::from_raw_os_error(libc::EACCES),
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            std::io::Error::from_raw_os_error(libc::EIO),
+            std::io::Error::from_raw_os_error(libc::EISDIR),
+        ];
+        for error in &unreadable {
+            assert!(!cmdline_read_error_is_exit(error), "{error:?}");
+        }
     }
 }
