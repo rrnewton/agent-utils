@@ -1,6 +1,6 @@
 ---
 title: 'local-ci-hub-s1-usable-binary: tracked Rust entry point, TOML config, runnable quick-start'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-rustport
@@ -8,7 +8,8 @@ labels:
 - local-ci-hub
 - rust-primary
 created_at: 2026-11-28T09:05:00-05:00
-updated_at: 2026-11-28T09:05:00-05:00
+updated_at: 2026-11-28T11:56:00-05:00
+closed_at: 2026-11-28T11:56:00-05:00
 ---
 
 # Description
@@ -38,3 +39,11 @@ The Python CLI's four known help defects must not be carried over: no per-comman
 # Notes
 
 Slice S1 of the #1365 campaign; number pre-assigned by the coordinator (2026-11-28). Later slices: predicate completion, writers/connectors, run engine, metrics (both time-green forms), history queries, shadow/flip.
+
+## Resolution
+
+Landed on main 2026-11-28 as d1e12204 (entry point, TOML config, quick-start), 9b4a2bf0 (launcher registration in setup and the validation manifest, counted-repos allow-list completed) and 133473e0 (Iterator::find in discovery), gated as ab3a0ae8: full gate 363 steps with two vibe-talk browser steps red, both passing a solo exclusive rerun on the identical tree (rerun_passed) and waived by the liaison as load flakes in untouched code; every other step green, incomplete_steps empty.
+
+- `rs/bin/local-ci-hub` is tracked through the shared cargo-runner; the suite dispatcher reaches the Rust edition only via `LOCAL_CI_HUB_ENGINE=rust` (Python stays primary; generic Rust requests still refuse on the paused mirror).
+- TOML project configuration in the Python shape with the same discovery order and defaults; unknown keys and a delegated `digest_command` refuse by name; `--config` takes a `.toml` project config or the existing `.json` deployment config by extension.
+- `receipt verify` is a real verb (0/1/2), `quickstart` prints the five-step loop, the example config loads verbatim in tests, and `--help` describes only verbs that exist.
