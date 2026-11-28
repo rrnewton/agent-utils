@@ -1,0 +1,23 @@
+steps:
+  # `#2422 search-hits-vanish-after-redraw`: search results shown as cards stay while the search
+  # stands. A quoted phrase matches four messages well before the loaded window; the server's answer
+  # places four result cards; a message arrives and the poll redraws the list, then two quiet polls:
+  # the four cards and the count line stand throughout. Phones 412x915 by touch and a desk at
+  # 1280x800, light and dark, keyboard closed and open. Each poll is brought forward on the page's
+  # clock and every wait is a condition (a poll answer received whole, a row drawn), never a fixed
+  # sleep. Measured on 2026-11-27: 28 s wall for ten cells (two windowed ones since retired).
+  - group: check
+    job: search-hits-pinned-browser
+    desc: search result cards and their count stand through a poll's redraw and quiet polls while the search stands, in current Chromium at 412x915 by touch and 1280x800, light and dark, keyboard open and closed (#2422)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/search_hits_pinned_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 600
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

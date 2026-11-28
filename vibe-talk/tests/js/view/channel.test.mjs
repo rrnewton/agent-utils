@@ -783,6 +783,67 @@ test("`#1880 vibe-talk-no-programmatic-scroll-after-user-scroll` x `#1880b`: a r
     "a redraw hold moved the anchor off the reader's chosen place");
 });
 
+test("`#2422 search-hits-vanish-after-redraw`: a redraw keeps the placed search results in time order, and drops one whose own row it now draws", () => {
+  const { patchRows } = CHANNEL_VIEW;
+  const list = {
+    children: [],
+    insertBefore(row, ref) {
+      const at = this.children.indexOf(row);
+      if (at >= 0) this.children.splice(at, 1);
+      const to = ref ? this.children.indexOf(ref) : this.children.length;
+      this.children.splice(to < 0 ? this.children.length : to, 0, row);
+      row.parentNode = this;
+      return row;
+    },
+    removeChild(row) {
+      const at = this.children.indexOf(row);
+      if (at >= 0) this.children.splice(at, 1);
+      row.parentNode = null;
+      return row;
+    },
+  };
+  const at = (minute) => `2026-11-27T12:${String(minute).padStart(2, "0")}:00Z`;
+  const message = (id, minute) => ({ id, timestamp: at(minute) });
+  // A drawn row: a message row (`data-search`) standing for its messages.
+  const rowFor = (messages) => ({
+    messages,
+    parentNode: null,
+    getAttribute: (name) => (name === "data-ids" ? messages.map((m) => String(m.id)).join(" ")
+      : name === "data-search" ? "" : null),
+  });
+  // A placed result, as `placeServerHits` leaves it: marked, with its time.
+  const placedFor = (hit) => ({
+    messages: [hit],
+    parentNode: null,
+    getAttribute: (name) => (name === "data-ids" ? String(hit.id) : name === "data-search" ? ""
+      : name === "data-server-hit" ? "card" : name === "data-hit-at" ? String(Date.parse(hit.timestamp)) : null),
+  });
+  const build = (group) => rowFor(group);
+  const ids = () => list.children.map((row) => row.getAttribute("data-ids"));
+  const m10 = message("10", 10), m20 = message("20", 20), m30 = message("30", 30);
+  patchRows(list, [[m10], [m20], [m30]], build);
+  // Placement put two results in: one older than every row, one between 20 and 30.
+  const old = placedFor(message("5", 5)), mid = placedFor(message("25", 25));
+  list.insertBefore(old, list.children[0]);
+  list.insertBefore(mid, list.children[3]);
+  assert.deepStrictEqual(ids(), ["5", "10", "20", "25", "30"]);
+  // A message arrives; the redraw is handed the store's groups alone. The results stay, in place.
+  patchRows(list, [[m10], [m20], [m30], [message("40", 40)]], build);
+  assert.deepStrictEqual(ids(), ["5", "10", "20", "25", "30", "40"], "a redraw removed or misplaced the placed results");
+  assert.equal(list.children[0], old, "the placed result older than every row was not kept");
+  assert.equal(list.children[3], mid, "the placed result between two rows was not kept");
+  // A redraw that drops rows keeps them too, still in time order.
+  patchRows(list, [[m20], [m30]], build);
+  assert.deepStrictEqual(ids(), ["5", "20", "25", "30"]);
+  // The result at 25 loads for real: the redraw draws its own row, and the placed copy goes (`#1864`).
+  const m25 = message("25", 25);
+  patchRows(list, [[m20], [m25], [m30]], build);
+  assert.deepStrictEqual(ids(), ["5", "20", "25", "30"], "a result was drawn beside its own row");
+  assert.equal(list.children[2].messages[0], m25, "the row at 25 is not the real row");
+  assert.equal(mid.parentNode, null, "the placed copy stayed after its own row was drawn");
+  assert.equal(list.children[0], old);
+});
+
 test("`#1229 keyed-row-patching`: a redraw keeps the node of every row whose messages are the very objects it was drawn from", () => {
   const { patchRows } = CHANNEL_VIEW;
   const list = {

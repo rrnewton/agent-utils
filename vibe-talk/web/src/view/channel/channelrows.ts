@@ -16,7 +16,7 @@ import { editedTitle, messageDate, messageTimeLabel, shortLocalTime } from "../.
 import { createRowMenus } from "./rowmenu.ts";
 import type { RowMenus } from "./rowmenu.ts";
 import { renderedText } from "./text.ts";
-import { patchRows, rowMessages } from "./rows.ts";
+import { isPlacedHit, patchRows, rowMessages } from "./rows.ts";
 import type { DressPass } from "./rowdress.ts";
 import type { ReplyTally } from "../../core/channels/index.ts";
 import { EDITED_MARK, timeNode } from "./time.ts";
@@ -1103,7 +1103,9 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     // aggregated span inside it (#2282's B1 suspect).
     span("rows-dress", () => {
       const labels = deps.debugTally ? deps.debugTally("label-measure") : null;
-      const dressed = [...rows, ...deps.byId("pinned-log").children];
+      // `#2422`: a placed search result stands as placement drew it (a result card), never dressed
+      // as a loaded row: a redraw keeps it, and dressing it here restyled it under the reader.
+      const dressed = [...rows, ...deps.byId("pinned-log").children].filter((row) => !isPlacedHit(row));
       for (const row of dressed) {
         deps.dressChannelRow(row as HTMLElement, { tally, answered, viewing,
           inMain: deps.selectionView() === "main" && mainList.has(row), inAll: inAll && mainList.has(row) });

@@ -37,6 +37,77 @@ const idsOf = (row: Element | null | undefined): string[] =>
 /** The time a row was sent, in milliseconds, from its first message; NaN when it cannot be read. */
 const rowSentMs = (row: Element): number => Date.parse(String((rowMessages(row)[0] || ({} as Partial<Message>)).timestamp || ""));
 
+/**
+ * `#2422 search-hits-vanish-after-redraw`: the mark of a placed search result in a list — a server
+ * hit standing as a card or a quoted row (olderwalks `placeServerHits`). Those rows are not the
+ * store's, so a redraw that builds the list from the store's groups keeps them where they stand
+ * instead of removing them: while the search stands they are pinned residents of the list, and
+ * only placement (a new answer, a closed search) takes them away.
+ */
+const SERVER_HIT_MARK = "data-server-hit";
+
+/** Where a placed result stands in time, in milliseconds, as placement noted it. */
+const SERVER_HIT_AT = "data-hit-at";
+
+/** Whether `row` is a placed search result. */
+const isPlacedHit = (row: Element): boolean => row.getAttribute(SERVER_HIT_MARK) !== null;
+
+/** The placed search results among `list`'s children, in list order. */
+const placedHitsOf = (list: Element): Element[] => [...list.children].filter(isPlacedHit);
+
+/**
+ * Put each of `hits` (oldest first) in `list` in time order among its message rows: before the
+ * first message row sent after it, else at the end. The one placement rule, shared by placement
+ * and by every redraw that keeps the placed results; a result already standing there is not moved.
+ */
+const insertPlacedHits = (list: Element, hits: readonly { at: number; node: Element }[]): void => {
+  for (const { at, node } of hits) {
+    let before: Element | null = null;
+    for (const row of list.children) {
+      if (isPlacedHit(row) || !isMessageRow(row)) continue;
+      const sent = rowSentMs(row);
+      if (Number.isFinite(sent) && sent > at) {
+        before = row;
+        break;
+      }
+    }
+    if (node.parentNode !== list || node.nextElementSibling !== before) list.insertBefore(node, before);
+  }
+};
+
+/**
+ * After a redraw of `list`, the placed results that stood in it before (`hits`) stand again in
+ * time order among the rows drawn — except one whose message the redraw now draws as a real row,
+ * which goes, as placement would drop it (`#1864`: a hit is never drawn beside its own row).
+ */
+const keepPlacedHits = (list: Element, hits: readonly Element[]): void => {
+  if (hits.length === 0) return;
+  const drawn = new Set([...list.children].filter((row) => !isPlacedHit(row)).flatMap(idsOf));
+  const staying: { at: number; node: Element }[] = [];
+  for (const node of hits) {
+    if (idsOf(node).some((id) => drawn.has(id))) {
+      if (node.parentNode === list) list.removeChild(node);
+      continue;
+    }
+    staying.push({ at: Number(node.getAttribute(SERVER_HIT_AT)), node });
+  }
+  staying.sort((a, b) => a.at - b.at);
+  insertPlacedHits(list, staying);
+};
+
+/**
+ * Order `list` as `next` with the fewest moves, passing over the placed results where they stand
+ * (`#2422`); `keepPlacedHits` then puts those back in time order among the rows.
+ */
+const orderRows = (list: Element, next: readonly Element[]): void => {
+  let at = 0;
+  for (const wanted of next) {
+    while (list.children[at] && isPlacedHit(list.children[at] as Element)) at += 1;
+    if (list.children[at] !== wanted) list.insertBefore(wanted, list.children[at] ?? null);
+    at += 1;
+  }
+};
+
 /** The time a row's newest message was sent, in milliseconds; NaN when it cannot be read. */
 const rowNewestMs = (row: Element): number => {
   const held = rowMessages(row);
@@ -147,8 +218,10 @@ const patchRows = (
   unchanged: (drawn: Message, incoming: Message) => boolean = (drawn, incoming) => drawn === incoming,
   view?: string,
 ): void => {
+  // `#2422`: the placed search results are not the store's rows; they are kept, not patched.
+  const hits = placedHitsOf(list);
   const byKey = new Map<string, Element[]>();
-  for (const row of [...list.children].slice(kept.length)) {
+  for (const row of [...list.children].filter((child) => !isPlacedHit(child)).slice(kept.length)) {
     const key = idsOf(row).join(" ");
     const held = byKey.get(key);
     if (held) held.push(row);
@@ -171,11 +244,9 @@ const patchRows = (
     next.push(row ?? build(group as Message[]));
   }
   const keep = new Set(next);
-  for (const row of [...list.children]) if (!keep.has(row) && row.parentNode === list) list.removeChild(row);
-  for (let at = 0; at < next.length; at += 1) {
-    const wanted = next[at] as Element;
-    if (list.children[at] !== wanted) list.insertBefore(wanted, list.children[at] ?? null);
-  }
+  for (const row of [...list.children]) if (!keep.has(row) && !isPlacedHit(row) && row.parentNode === list) list.removeChild(row);
+  orderRows(list, next);
+  keepPlacedHits(list, hits);
   listDraws.set(list, (listDraws.get(list) ?? 0) + 1);
 };
 
@@ -186,16 +257,23 @@ const listDraws = new WeakMap<Element, number>();
 const listDrawCount = (list: Element): number => listDraws.get(list) ?? 0;
 
 export {
+  SERVER_HIT_AT,
+  SERVER_HIT_MARK,
   anchorOfRow,
   authorLabel,
   doneButtonOf,
   idsOf,
+  insertPlacedHits,
   isMessageRow,
+  isPlacedHit,
+  keepPlacedHits,
   listDrawCount,
   messageTop,
   notNoiseButtonOf,
   noteRowBuilt,
+  orderRows,
   patchRows,
+  placedHitsOf,
   rowIn,
   rowMessages,
   rowNewestMs,

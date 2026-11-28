@@ -12,7 +12,7 @@ import { DISCORD_PAGE_LIMIT, exactReplyCount, threadOf } from "../../core/channe
 import type { ChannelStore, ReplyTally } from "../../core/channels/index.ts";
 import { failureWords, searchMomentWords, searchWalkProgress, searchWalkWords } from "../../present/notices/index.ts";
 import { setClassWord, setTextIfChanged } from "../dom/index.ts";
-import { isMessageRow, rowSentMs, rowShown } from "./rows.ts";
+import { SERVER_HIT_AT, SERVER_HIT_MARK, insertPlacedHits, isMessageRow, rowSentMs, rowShown } from "./rows.ts";
 import type { TimelineColumn, TimelineColumnSteps, TimelineOlderPages, TimelineSelection } from "./readcore.ts";
 import type { CancelSignal } from "../../ports/index.ts";
 
@@ -1324,9 +1324,6 @@ function bucketOnFor(id: string): boolean | null {
   return bucketOnNow(id);
 }
 
-/** The attribute marking a row the server search placed in the timeline. */
-const SERVER_HIT_MARK = "data-server-hit";
-
 /**
  * Every message id the timeline already stands a real row for, server-placed
  * rows aside (`#1864`): the on-screen half of "already held", for rows the
@@ -1389,6 +1386,10 @@ searchBuckets.register({
 /** The placement last built, and the answer state it was built from. */
 let placedFor = "";
 
+/** `#2422`: the rows that placement put in the list. The memo above stands only while every one
+ * of them still stands there; a list rebuilt around them otherwise left a blank page. */
+let placedNow: Element[] = [];
+
 /** Placed rows by hit, bucket and shape, reused across answers. Entries for
  * hits a later answer no longer holds are simply never placed again. */
 const placedNodes = new Map<string, HTMLElement>();
@@ -1403,7 +1404,8 @@ function placeServerHits(grouped: Map<string, Message[]>): void {
   const key = `${now.ticket}|${now.hits.length}|${(now.transcriptHits || []).length}|` +
     `${[...grouped.values()].map((hits) => hits.length).join()}|` +
     `${[...bucketOn.entries()].join()}|${bucketView()}|${String(selectedChannelId() || "")}|${serverSearchOwner.allChannels()}`;
-  if (key === placedFor) return;
+  const list = el("discord-log");
+  if (key === placedFor && placedNow.every((node) => node.parentNode === list)) return;
   placedFor = key;
   clearServerHits();
   const placed: { at: number; node: HTMLElement }[] = [];
@@ -1448,19 +1450,11 @@ function placeServerHits(grouped: Map<string, Message[]>): void {
     }
   }
   placed.sort((a, b) => a.at - b.at);
-  const list = el("discord-log");
-  for (const { at, node } of placed) {
-    let before: Element | null = null;
-    for (const row of list.children) {
-      if (row.hasAttribute(SERVER_HIT_MARK) || !isMessageRow(row)) continue;
-      const sent = rowSentMs(row);
-      if (Number.isFinite(sent) && sent > at) {
-        before = row;
-        break;
-      }
-    }
-    list.insertBefore(node, before);
-  }
+  // `#2422`: each placed row carries its time, so a redraw that keeps it (rows.ts `keepPlacedHits`)
+  // puts it back by the same rule as here.
+  for (const { at, node } of placed) node.setAttribute(SERVER_HIT_AT, String(at));
+  insertPlacedHits(list, placed);
+  placedNow = placed.map(({ node }) => node);
 }
 
 /** A bucket's chip, or null where the page has none (a bucket plugged in later brings its own). */
