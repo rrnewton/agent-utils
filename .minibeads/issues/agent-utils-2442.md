@@ -9,7 +9,7 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-27T23:40:00-05:00
-updated_at: 2026-11-28T06:10:00-05:00
+updated_at: 2026-11-28T12:05:00-05:00
 ---
 
 # Description
@@ -37,6 +37,7 @@ Four defects already on main, found by the advisory design review of `#2423` sea
 
 - Filed at the coordinator's request after the liaison accepted `#2423` (follow-up of its design review; issue file only). To be fixed after `#2424`.
 - R5 resolved (2026-11-28, cl-filternote, owner-UI fast track at liaison 1156: "announce, don't float; and it shouldn't survive the clear at all"): the filter place's substitute sentences are said in the polite live region and floated over no row, only while the selection is hidden, and the change that shows the selected message again takes them away (commit "vibe-talk: the filter place's "Filtered out" sentence is announced, never floated, and goes with the clear that shows the selection (#2442 R5)"). Walk: `tests/search_clear_note_browser.py` (desk, desk with two columns, phone with the keyboard closed and open, Discuss open; every clear path; fails on main before it). R8 and R12 stay open.
+- R5 live in 458854c6 (2026-11-28, cl-filternote): landed 11:33 AM ET (gate on the pre-replay commit: one unrelated step failed, `vibe-talk.check.bridge-even-browser`, a hover read under load, unreproduced in 26 local runs, passed on its rerun; walk fix `#2473`) and deployed about 11:39 AM ET with a clean watch. On the landed page afterwards: `tests/search_clear_note_browser.py` 16 of 16 walks pass, `tests/search_clear_stays_browser.py` 51 of 51 plus the two-column walk (worst drift 0.48 px, limit 0.5).
 - Floating controls may cover text; floating notes may not. Owner decision 2026-11-27 on `#2314` (floating controls covering message text: the freshness pill, the phone's corner Send): "these kind of floating controls necessarily do that". The coordinator applies it to every floating control (the floating search button, the "Newest (N)" jump pill), over a row's text or its controls, so design reviews stop re-flagging them; a floating note (a status sentence, a toast) still never stands over a row (R5 above, `#2350`, `#2365`, `#2375`). R9 is closed on that basis (2026-11-28, the coordinator's routing of the R5 design review, which also found the button over the top row's Done at a desk with two columns and over a row's body text on a phone with Discuss open), and so is the folded `#2424` R9 below (the "Newest (N)" pill over the "N in main" bucket chip: a floating control over a chip, not a note over row text).
 - The review and its crops: the `#2423` evidence (design-review.md and crops/ of that lane's evidence).
 - Three more, from the advisory design review of `#2424` search-view-unstable-while-searching (also in the stills of the page before that change; folded in at the coordinator's request):
