@@ -437,24 +437,8 @@ pub fn recognize(line: &str) -> Option<TestEvent> {
     }
 
     // 2) Rust libtest: "test some::name ... ok" (END) or a bare "test some::name ... " (START).
-    //    Captured mode emits the whole line at once, so the same text yields END; --nocapture
-    //    flushes the prefix before running the test, which is what makes START reachable at all.
-    if let Some(rest) = raw.strip_prefix("test ") {
-        // `" ... "` (with a verdict or not) and a bare `" ..."` at end of buffer are the two forms.
-        let split = rest
-            .split_once(" ... ")
-            .or_else(|| rest.strip_suffix(" ...").map(|n| (n, "")));
-        if let Some((name, after)) = split {
-            let name = name.trim();
-            if !name.is_empty() && !name.contains(' ') {
-                let verdict = after.trim();
-                return Some(if verdict.is_empty() {
-                    TestEvent::Start(name.to_string())
-                } else {
-                    TestEvent::End(name.to_string(), first_token(verdict))
-                });
-            }
-        }
+    if let Some(event) = recognize_libtest(raw) {
+        return Some(event);
     }
 
     // 3) pytest -v / -rA: "path/to/test_x.py::test_name PASSED" (also FAILED/ERROR/SKIPPED/XFAIL).
@@ -491,6 +475,88 @@ pub fn recognize(line: &str) -> Option<TestEvent> {
 
 fn first_token(s: &str) -> String {
     s.split_whitespace().next().unwrap_or("").to_string()
+}
+
+/// The verdict journaled for a serial libtest test closed by the next test's line (#2484):
+/// it finished, but its verdict was printed where no boundary could be recognized.
+pub const UNKNOWN_VERDICT: &str = "unknown";
+
+/// The mode annotations libtest prints after a test's name (`TestDesc::test_mode`), as in
+/// `test some::name - should panic ... ok`. They are not part of the name.
+const LIBTEST_MODES: [&str; 3] = [" - should panic", " - compile fail", " - compile"];
+
+/// Recognize a Rust libtest boundary: `test NAME ... VERDICT` (END) or `test NAME ... ` (START).
+///
+/// Captured mode prints the whole line at once, so it is an END. A serial run prints the
+/// `test NAME ... ` prefix before the test starts and the verdict when it ends, which is what
+/// makes START reachable at all; without output capture the test's own output lands between the
+/// two, glued onto the prefix (#2484). So the text after `" ... "` is a verdict only when it
+/// begins with one of libtest's result words; anything else is that split line, a START.
+pub fn recognize_libtest(line: &str) -> Option<TestEvent> {
+    let raw = line.trim_start().trim_end_matches(['\n', '\r']);
+    let rest = raw.strip_prefix("test ")?;
+    // `" ... "` (with a verdict or not) and a bare `" ..."` at end of buffer are the two forms.
+    let (name, after) = rest
+        .split_once(" ... ")
+        .or_else(|| rest.strip_suffix(" ...").map(|n| (n, "")))?;
+    let name = libtest_name(name)?;
+    let after = after.trim();
+    if after.is_empty() {
+        return Some(TestEvent::Start(name));
+    }
+    Some(match libtest_verdict(after) {
+        Some(verdict) => TestEvent::End(name, verdict),
+        None => TestEvent::Start(name),
+    })
+}
+
+/// The test name in a libtest line's name field, or `None` when it is not one.
+///
+/// One trailing mode annotation is dropped. After that a name may contain a space only in the
+/// doc-test shape `PATH - ITEM (line N)`; any other spaced text (`test that it works ... done`)
+/// is prose, and a false boundary would rename the culprit.
+fn libtest_name(field: &str) -> Option<String> {
+    let mut name = field.trim();
+    for mode in LIBTEST_MODES {
+        if let Some(stripped) = name.strip_suffix(mode) {
+            name = stripped.trim_end();
+            break;
+        }
+    }
+    if name.is_empty() || (name.contains(' ') && !is_doctest_name(name)) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Whether `name` has rustdoc's doc-test shape `PATH - ITEM (line N)`.
+fn is_doctest_name(name: &str) -> bool {
+    let Some(body) = name.strip_suffix(')') else {
+        return false;
+    };
+    let Some((head, line)) = body.rsplit_once(" (line ") else {
+        return false;
+    };
+    if line.is_empty() || !line.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some((path, item)) = head.split_once(" - ") else {
+        return false;
+    };
+    !path.is_empty() && !path.contains(' ') && !item.trim().is_empty()
+}
+
+/// The libtest verdict that `after` (the text after `" ... "`) begins with, if any: `ok`,
+/// `FAILED` (also `FAILED (time limit exceeded)`), `ignored` (also `ignored, <reason>`) or
+/// `bench` (`bench: <samples>`).
+fn libtest_verdict(after: &str) -> Option<String> {
+    let token = first_token(after);
+    match token.as_str() {
+        "ok" | "FAILED" => Some(token),
+        "ignored" | "ignored," => Some("ignored".to_string()),
+        "bench:" => Some("bench".to_string()),
+        _ => None,
+    }
 }
 
 /// The last test seen to start, the last seen to finish, and how many finished.
@@ -898,6 +964,10 @@ pub struct StepStream {
     tracker: Mutex<TestTracker>,
     /// The last START already announced from an UNTERMINATED tail, so it is journaled once.
     tail_announced: Mutex<Option<String>>,
+    /// The test opened by the latest libtest START line and not yet ended (#2484). libtest
+    /// prints START lines only when it runs tests one at a time, so a libtest line naming another
+    /// test means this one has finished, even when its verdict was never recognized.
+    serial_open: Mutex<Option<String>>,
     evidence: Option<std::sync::Arc<RunEvidence>>,
     /// Ceiling on durable bytes for this step's log; `None` = unlimited.
     log_max_bytes: Option<u64>,
@@ -930,6 +1000,7 @@ impl StepStream {
             partial: Mutex::new(String::new()),
             tracker: Mutex::new(TestTracker::default()),
             tail_announced: Mutex::new(None),
+            serial_open: Mutex::new(None),
             evidence,
             log_max_bytes,
             written: Mutex::new((0, false)),
@@ -1055,6 +1126,12 @@ impl StepStream {
                 .map(|g| g.as_deref() == Some(name.as_str()))
                 .unwrap_or(true);
             if !already {
+                if recognize_libtest(&tail).is_some() {
+                    self.close_serial(&name);
+                    if let Ok(mut g) = self.serial_open.lock() {
+                        *g = Some(name.clone());
+                    }
+                }
                 if let Ok(mut g) = self.tail_announced.lock() {
                     *g = Some(name.clone());
                 }
@@ -1068,8 +1145,56 @@ impl StepStream {
         }
     }
 
+    /// Close the open serial libtest test when a libtest line names another one (#2484): it
+    /// counts as completed, and the journal gets its `test_end` with the verdict `unknown`.
+    fn close_serial(&self, name: &str) {
+        let open = match self.serial_open.lock() {
+            Ok(mut g) if g.as_deref().is_some_and(|open| open != name) => g.take(),
+            _ => None,
+        };
+        let Some(open) = open else { return };
+        if let Ok(mut g) = self.tail_announced.lock() {
+            if g.as_deref() == Some(open.as_str()) {
+                *g = None;
+            }
+        }
+        let closed = match self.tracker.lock() {
+            Ok(mut t) => {
+                let was_open = t.in_flight.remove(&open).is_some();
+                if was_open {
+                    t.last_completed = Some(open.clone());
+                    t.completed += 1;
+                }
+                was_open
+            }
+            Err(_) => false,
+        };
+        if closed {
+            if let Some(e) = &self.evidence {
+                e.record(
+                    "test_end",
+                    &[
+                        ("step", self.tag.clone()),
+                        ("test", open),
+                        ("verdict", UNKNOWN_VERDICT.to_string()),
+                    ],
+                );
+            }
+        }
+    }
+
     fn classify(&self, line: &str) {
         let Some(ev) = recognize(line) else { return };
+        if recognize_libtest(line).is_some() {
+            let (name, start) = match &ev {
+                TestEvent::Start(n) => (n.clone(), true),
+                TestEvent::End(n, _) => (n.clone(), false),
+            };
+            self.close_serial(&name);
+            if let Ok(mut g) = self.serial_open.lock() {
+                *g = start.then_some(name);
+            }
+        }
         // A line that COMPLETES a marker already announced from the tail clears the announcement,
         // so the same test is not counted as started twice.
         if let Ok(mut g) = self.tail_announced.lock() {
@@ -1383,6 +1508,136 @@ mod tests {
             recognize("test detcore::sched::hang ... "),
             Some(TestEvent::Start("detcore::sched::hang".into()))
         );
+    }
+
+    // #2484 dagrun-libtest-attribution: synthetic libtest lines; py/tests/test_attribution.py
+    // asserts the same events for the same inputs in the Python engine.
+
+    fn end(name: &str, verdict: &str) -> Option<TestEvent> {
+        Some(TestEvent::End(name.into(), verdict.into()))
+    }
+
+    #[test]
+    fn libtest_names_with_libtest_spaces_are_recognized() {
+        assert_eq!(
+            recognize("test a::b - should panic ... ok"),
+            end("a::b", "ok")
+        );
+        assert_eq!(
+            recognize("test a::b - should panic ... "),
+            Some(TestEvent::Start("a::b".into()))
+        );
+        assert_eq!(
+            recognize("test src/lib.rs - m::f (line 3) ... ok"),
+            end("src/lib.rs - m::f (line 3)", "ok")
+        );
+        assert_eq!(
+            recognize("test src/lib.rs - m::f (line 3) - compile fail ... ok"),
+            end("src/lib.rs - m::f (line 3)", "ok")
+        );
+        assert_eq!(
+            recognize("test src/lib.rs - m::Thing<T>::new (line 40) - compile ... FAILED"),
+            end("src/lib.rs - m::Thing<T>::new (line 40)", "FAILED")
+        );
+    }
+
+    #[test]
+    fn libtest_verdict_words_are_normalized() {
+        assert_eq!(
+            recognize("test a::b ... ignored, needs a network"),
+            end("a::b", "ignored")
+        );
+        assert_eq!(
+            recognize("test a::b ... FAILED (time limit exceeded)"),
+            end("a::b", "FAILED")
+        );
+        assert_eq!(
+            recognize("test a::bench_it ... bench:       1,234 ns/iter (+/- 56)"),
+            end("a::bench_it", "bench")
+        );
+    }
+
+    #[test]
+    fn a_split_libtest_line_is_a_start_not_an_end() {
+        assert_eq!(
+            recognize("test a::slow ... 2026-11-28T10:00:00.123Z  INFO a::slow: starting"),
+            Some(TestEvent::Start("a::slow".into()))
+        );
+    }
+
+    #[test]
+    fn spaced_prose_is_still_not_a_libtest_boundary() {
+        for line in [
+            "test that it works ... done",
+            "test the thing - should panic ... ok",
+            "test src/lib.rs - m::f ... ok",
+            "test a b (line 3) ... ok",
+        ] {
+            assert_eq!(recognize(line), None, "misrecognized: {line:?}");
+        }
+    }
+
+    #[test]
+    fn the_next_serial_test_closes_a_split_line_test() {
+        let dir = temp_evidence("serial-close");
+        let evidence = std::sync::Arc::new(RunEvidence::open(Some(dir.clone())).unwrap());
+        let stream = StepStream::new("g.j", Some(evidence));
+        stream
+            .ingest(b"test a::one ... INFO one: working\nINFO one: done\nok\ntest a::two ... ok\n");
+        let journal = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+        let got: Vec<(String, String, Option<String>)> = journal
+            .lines()
+            .map(|line| {
+                let r: serde_json::Value = serde_json::from_str(line).unwrap();
+                let field = |k: &str| r.get(k).and_then(|v| v.as_str()).map(str::to_string);
+                (
+                    field("event").unwrap(),
+                    field("test").unwrap(),
+                    field("verdict"),
+                )
+            })
+            .collect();
+        let want = vec![
+            ("test_start".to_string(), "a::one".to_string(), None),
+            (
+                "test_end".into(),
+                "a::one".into(),
+                Some(UNKNOWN_VERDICT.to_string()),
+            ),
+            ("test_end".into(), "a::two".into(), Some("ok".to_string())),
+        ];
+        assert_eq!(got, want, "{journal}");
+        let counts = stream.counts();
+        assert_eq!(counts.completed, 2);
+        assert!(counts.in_flight.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hang_after_a_split_line_test_names_the_hanging_test() {
+        let s = StepStream::new("g.j", None);
+        s.ingest(b"test a::one ... INFO one\nok\ntest a::hangs ... INFO begin\n");
+        let c = s.culprit();
+        assert_eq!(c.test.as_deref(), Some("a::hangs"));
+        assert_eq!(c.completed, 1);
+        assert_eq!(c.last_completed.as_deref(), Some("a::one"));
+        // A test that hangs after printing on its own start line is the culprit, not "completed".
+        let stuck = StepStream::new("g.k", None);
+        stuck.ingest(b"test a::stuck ... INFO starting\n");
+        let c = stuck.culprit();
+        assert_eq!(c.test.as_deref(), Some("a::stuck"));
+        assert_eq!(c.completed, 0);
+    }
+
+    #[test]
+    fn a_split_line_announced_from_the_tail_is_one_start() {
+        let s = StepStream::new("g.j", None);
+        s.ingest(b"test a::one ... ");
+        s.ingest(b"INFO glued on\n");
+        s.ingest(b"ok\ntest a::two ... ok\n");
+        let counts = s.counts();
+        assert_eq!((counts.started, counts.completed), (2, 2));
+        assert!(counts.in_flight.is_empty());
     }
 
     #[test]

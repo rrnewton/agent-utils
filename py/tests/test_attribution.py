@@ -207,3 +207,79 @@ def test_log_ceiling_env_parsing() -> None:
         os.environ.pop("DAGRUN_LOG_MAX_BYTES", None)
         if saved is not None:
             os.environ["DAGRUN_LOG_MAX_BYTES"] = saved
+
+
+# #2484 dagrun-libtest-attribution: synthetic libtest lines; the Rust engine's tests in
+# rs/dagrun/src/attribution.rs assert the same events for the same inputs.
+
+
+def _event(line: str) -> tuple[str, str, str] | None:
+    event = recognize(line)
+    return None if event is None else (event.kind, event.name, event.verdict)
+
+
+def test_libtest_names_with_libtest_spaces_are_recognized() -> None:
+    assert _event("test a::b - should panic ... ok") == ("end", "a::b", "ok")
+    assert _event("test a::b - should panic ... ") == ("start", "a::b", "")
+    assert _event("test src/lib.rs - m::f (line 3) ... ok") == (
+        "end", "src/lib.rs - m::f (line 3)", "ok")
+    assert _event("test src/lib.rs - m::f (line 3) - compile fail ... ok") == (
+        "end", "src/lib.rs - m::f (line 3)", "ok")
+    assert _event("test src/lib.rs - m::Thing<T>::new (line 40) - compile ... FAILED") == (
+        "end", "src/lib.rs - m::Thing<T>::new (line 40)", "FAILED")
+
+
+def test_libtest_verdict_words_are_normalized() -> None:
+    assert _event("test a::b ... ignored, needs a network") == ("end", "a::b", "ignored")
+    assert _event("test a::b ... FAILED (time limit exceeded)") == ("end", "a::b", "FAILED")
+    assert _event("test a::bench_it ... bench:       1,234 ns/iter (+/- 56)") == (
+        "end", "a::bench_it", "bench")
+
+
+def test_a_split_libtest_line_is_a_start_not_an_end() -> None:
+    assert _event("test a::slow ... 2026-11-28T10:00:00.123Z  INFO a::slow: starting") == (
+        "start", "a::slow", "")
+
+
+def test_spaced_prose_is_still_not_a_libtest_boundary() -> None:
+    for line in ("test that it works ... done", "test the thing - should panic ... ok",
+                 "test src/lib.rs - m::f ... ok", "test a b (line 3) ... ok"):
+        assert recognize(line) is None, line
+
+
+def test_the_next_serial_test_closes_a_split_line_test(tmp_path: Path) -> None:
+    evidence = RunEvidence.open(tmp_path / "evidence")
+    assert evidence is not None
+    stream = StepStream("g.j", evidence)
+    stream.ingest(b"test a::one ... INFO one: working\nINFO one: done\nok\n"
+                  b"test a::two ... ok\n")
+    records = [json.loads(line)
+               for line in (tmp_path / "evidence" / "journal.jsonl").read_text().splitlines()]
+    assert [(r["event"], r["test"], r.get("verdict")) for r in records] == [
+        ("test_start", "a::one", None),
+        ("test_end", "a::one", "unknown"),
+        ("test_end", "a::two", "ok"),
+    ]
+    counts = stream.counts()
+    assert counts.completed == 2 and counts.in_flight == {}
+
+
+def test_a_hang_after_a_split_line_test_names_the_hanging_test() -> None:
+    stream = StepStream("g.j", None)
+    stream.ingest(b"test a::one ... INFO one\nok\ntest a::hangs ... INFO begin\n")
+    culprit = stream.culprit()
+    assert culprit.test == "a::hangs"
+    assert culprit.completed == 1 and culprit.last_completed == "a::one"
+    # A test that hangs after printing on its own start line is the culprit, not "completed".
+    stuck = StepStream("g.k", None)
+    stuck.ingest(b"test a::stuck ... INFO starting\n")
+    assert stuck.culprit().test == "a::stuck" and stuck.culprit().completed == 0
+
+
+def test_a_split_line_announced_from_the_tail_is_one_start() -> None:
+    stream = StepStream("g.j", None)
+    stream.ingest(b"test a::one ... ")
+    stream.ingest(b"INFO glued on\n")
+    stream.ingest(b"ok\ntest a::two ... ok\n")
+    counts = stream.counts()
+    assert counts.started == 2 and counts.completed == 2 and counts.in_flight == {}

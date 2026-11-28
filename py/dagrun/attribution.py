@@ -285,6 +285,90 @@ class TestEvent:
     verdict: str = ""
 
 
+#: The verdict journaled for a serial libtest test closed by the next test's line (#2484): it
+#: finished, but its verdict was printed where no boundary could be recognized.
+UNKNOWN_VERDICT = "unknown"
+
+#: The mode annotations libtest prints after a test's name (``TestDesc::test_mode``), as in
+#: ``test some::name - should panic ... ok``. They are not part of the name.
+LIBTEST_MODES = (" - should panic", " - compile fail", " - compile")
+
+
+def recognize_libtest(line: str) -> TestEvent | None:
+    """Recognize a Rust libtest boundary: ``test NAME ... VERDICT`` (end) or ``test NAME ... ``.
+
+    Captured mode prints the whole line at once, so it is an end. A serial run prints the
+    ``test NAME ... `` prefix before the test starts and the verdict when it ends; without output
+    capture the test's own output lands between the two, glued onto the prefix (#2484). So the
+    text after ``" ... "`` is a verdict only when it begins with one of libtest's result words;
+    anything else is that split line, a start.
+    """
+    raw = line.lstrip().rstrip("\n\r")
+    if not raw.startswith("test "):
+        return None
+    rest = raw.removeprefix("test ")
+    if " ... " in rest:
+        field, after = rest.split(" ... ", 1)
+    elif rest.endswith(" ..."):
+        field, after = rest.removesuffix(" ..."), ""
+    else:
+        return None
+    name = _libtest_name(field)
+    if name is None:
+        return None
+    after = after.strip()
+    if not after:
+        return TestEvent("start", name)
+    verdict = _libtest_verdict(after)
+    return TestEvent("start", name) if verdict is None else TestEvent("end", name, verdict)
+
+
+def _libtest_name(field: str) -> str | None:
+    """The test name in a libtest line's name field, or None when it is not one.
+
+    One trailing mode annotation is dropped. After that a name may contain a space only in the
+    doc-test shape ``PATH - ITEM (line N)``; any other spaced text (``test that it works ...
+    done``) is prose, and a false boundary would rename the culprit.
+    """
+    name = field.strip()
+    for mode in LIBTEST_MODES:
+        if name.endswith(mode):
+            name = name.removesuffix(mode).rstrip()
+            break
+    if not name or (" " in name and not _is_doctest_name(name)):
+        return None
+    return name
+
+
+def _is_doctest_name(name: str) -> bool:
+    """Whether ``name`` has rustdoc's doc-test shape ``PATH - ITEM (line N)``."""
+    if not name.endswith(")"):
+        return False
+    body = name.removesuffix(")")
+    if " (line " not in body:
+        return False
+    head, line = body.rsplit(" (line ", 1)
+    if not line or not all("0" <= ch <= "9" for ch in line):
+        return False
+    if " - " not in head:
+        return False
+    path, item = head.split(" - ", 1)
+    return bool(path) and " " not in path and bool(item.strip())
+
+
+def _libtest_verdict(after: str) -> str | None:
+    """The libtest verdict ``after`` begins with, if any: ``ok``, ``FAILED`` (also ``FAILED
+    (time limit exceeded)``), ``ignored`` (also ``ignored, <reason>``) or ``bench``."""
+    token = after.split()[0]
+    if token in ("ok", "FAILED"):
+        return token
+    if token in ("ignored", "ignored,"):
+        return "ignored"
+    if token == "bench:":
+        return "bench"
+    return None
+
+
 def recognize(line: str) -> TestEvent | None:
     """Conservatively recognize explicit, libtest, pytest, or TAP boundaries."""
     raw = line.lstrip().rstrip("\n\r")
@@ -295,18 +379,9 @@ def recognize(line: str) -> TestEvent | None:
     if stripped.startswith("##TEST-END "):
         parts = stripped.removeprefix("##TEST-END ").strip().split(maxsplit=1)
         return TestEvent("end", parts[0], parts[1] if len(parts) > 1 else "end") if parts else None
-    if raw.startswith("test "):
-        rest = raw.removeprefix("test ")
-        if " ... " in rest:
-            name, after = rest.split(" ... ", 1)
-        elif rest.endswith(" ..."):
-            name, after = rest.removesuffix(" ..."), ""
-        else:
-            name, after = "", ""
-        name = name.strip()
-        if name and " " not in name:
-            verdict = after.strip()
-            return TestEvent("end", name, verdict.split()[0]) if verdict else TestEvent("start", name)
+    libtest = recognize_libtest(raw)
+    if libtest is not None:
+        return libtest
     parts = stripped.rsplit(maxsplit=1)
     if len(parts) == 2:
         head, verdict = parts
@@ -561,6 +636,10 @@ class StepStream:
         self._partial = ""
         self._tracker = TestTracker()
         self._tail_announced: str | None = None
+        # The test opened by the latest libtest start line and not yet ended (#2484). libtest
+        # prints start lines only when it runs tests one at a time, so a libtest line naming
+        # another test means this one has finished, even when its verdict was never recognized.
+        self._serial_open: str | None = None
         self._lock = threading.Lock()
         self._log_max_bytes = log_max_bytes()
         self._written = 0
@@ -615,15 +694,40 @@ class StepStream:
                 self._partial = self._partial[-4096:]
             event = recognize(self._partial)
             if event is not None and event.kind == "start" and self._tail_announced != event.name:
+                if recognize_libtest(self._partial) is not None:
+                    self._close_serial(event.name)
+                    self._serial_open = event.name
                 self._tail_announced = event.name
                 self._tracker.observe(event)
                 if self.evidence is not None:
                     self.evidence.record("test_start", [("step", self.tag), ("test", event.name)])
 
+    def _close_serial(self, name: str) -> None:
+        """Close the open serial libtest test when a libtest line names another one (#2484): it
+        counts as completed, and the journal gets its ``test_end`` with the verdict ``unknown``."""
+        opened = self._serial_open
+        if opened is None or opened == name:
+            return
+        self._serial_open = None
+        if self._tail_announced == opened:
+            self._tail_announced = None
+        if opened not in self._tracker.in_flight:
+            return
+        self._tracker.in_flight.pop(opened)
+        self._tracker.last_completed = opened
+        self._tracker.completed += 1
+        if self.evidence is not None:
+            self.evidence.record(
+                "test_end", [("step", self.tag), ("test", opened), ("verdict", UNKNOWN_VERDICT)]
+            )
+
     def _classify(self, line: str) -> None:
         event = recognize(line)
         if event is None:
             return
+        if recognize_libtest(line) is not None:
+            self._close_serial(event.name)
+            self._serial_open = event.name if event.kind == "start" else None
         if self._tail_announced == event.name:
             self._tail_announced = None
             if event.kind == "end":
