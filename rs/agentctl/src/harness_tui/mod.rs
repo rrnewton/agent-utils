@@ -123,6 +123,9 @@ pub struct Denial {
     pub options: Vec<OptionItem>,
     /// The option the cursor is on, when a cursor is drawn.
     pub selected: Option<usize>,
+    /// The label of the row the cursor is drawn on, read from that row
+    /// itself: the submit key is sent only when it is a refusal.
+    pub selected_text: Option<String>,
     /// The one option that refuses; its label passes [`deny_label`].
     pub deny: usize,
     /// Keys that put a cursor on an unfocused menu (Muse draws its peer
@@ -179,14 +182,31 @@ pub fn permission_denial(harness: Option<&str>, screen: &str) -> Option<Denial> 
         Some("muse") => muse::permission_denial(screen),
         _ => None,
     }?;
-    // Defence in depth: whatever a recogniser built, the option chosen
-    // must be drawn, be the only refusal, and read as one.
+    // Defence in depth: whatever a recogniser built, the options must be
+    // numbered exactly 1..n, the option chosen must be the only refusal and
+    // read as one, and a drawn cursor must carry the label of its own row.
+    let numbered = denial
+        .options
+        .iter()
+        .enumerate()
+        .all(|(position, option)| option.number == position + 1);
     let chosen = denial
         .options
         .iter()
         .find(|option| option.number == denial.deny)?;
-    (deny_label(&chosen.text) && sole_deny_option(&denial.options) == Some(denial.deny))
-        .then_some(denial)
+    let cursor_consistent = match (denial.selected, denial.selected_text.as_deref()) {
+        (None, None) => true,
+        (Some(selected), Some(text)) => denial
+            .options
+            .get(selected.wrapping_sub(1))
+            .is_some_and(|option| option.text == text),
+        _ => false,
+    };
+    (numbered
+        && cursor_consistent
+        && deny_label(&chosen.text)
+        && sole_deny_option(&denial.options) == Some(denial.deny))
+    .then_some(denial)
 }
 
 /// Supported adapters; unknown harnesses remain unsupported.

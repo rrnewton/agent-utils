@@ -1799,7 +1799,8 @@ shown for the agent's `permission_deny_after_s` (default 60; set it on the
 profile or at the top of `.agentctl/profiles.json`), the full pass or the quick
 check after it selects the prompt's one refusing option (`No`, `Abort the entire
 command`, `Reject once`), re-reading the pane before every key, sending Enter
-only while a refusal is selected, and checking that the prompt left. The agent
+only while the row under the cursor reads as that refusal, and checking that the
+prompt left; a pane scrolled back gets no key. The agent
 is then queued a note saying what was refused, that nothing ran, and to carry on
 another way or end with `BLOCKED:`; its manager (else the coordinator) gets one
 `FYI` line; nobody is asked anything, and the owner alarm for hook
@@ -1808,7 +1809,9 @@ pending. A prompt no recogniser accepts (a folder trust dialog, a question, a
 Codex screen, an unknown harness) is never answered: the `approval-prompt`
 notice reports it as before. Two failed refusals of the same prompt hand it back
 to that notice. `permission_prompts: "report"` on a profile or at the top level
-keeps the old report-only behaviour. The pass report lists every prompt seen
+keeps the old report-only behaviour, as does a policy that cannot be read and an
+adopted foreign pane, which agentctl never types into: those prompts are paged at
+once. The pass report lists every prompt seen
 under `permission_denials` with its action (`waiting`, `denied`, `failed`,
 `gave-up`, `reported`, `due` under `--check-only`).
 
@@ -3698,7 +3701,8 @@ judge it (`detail`: the shell command, or the input as JSON, credential-shaped w
 masked, up to 3000 bytes; `complete` is false when it had to be cut or masked).
 **By default nobody is asked** (#2421 agentctl-asks-never-block): the agent's
 approval timeout is 0, so after a 3 s grace for the host's own hooks the wrapper
-denies the call by policy (`approval.decided` with `by: policy`), and the model
+denies the call by policy (`approval.requested` is marked `policy: deny-at-once`
+and posted by no bridge; `approval.decided` says `by: policy`), and the model
 reads that nothing ran, why the harness asked, and to do it a way that needs no
 approval or say what it needs; a bridge posts nothing for it. To ask the owner
 instead, set `approval_timeout_s` (10 to 86400) on the agent's profile or at the top

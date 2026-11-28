@@ -1376,6 +1376,8 @@ fn a_zero_timeout_denies_by_policy_after_the_grace_with_the_reason() {
     });
     let requested = fixture.event_data("approval.requested");
     assert_eq!(requested["timeout_s"], 0, "{requested}");
+    // Informational: nobody is asked, so no bridge posts it (finding 6).
+    assert_eq!(requested["policy"], "deny-at-once", "{requested}");
     let decided = fixture.event_data("approval.decided");
     assert_eq!(decided["decision"], "denied", "{decided}");
     assert_eq!(decided["by"], "policy", "{decided}");

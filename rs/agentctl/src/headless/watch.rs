@@ -65,6 +65,8 @@ pub fn view(events: &[Event]) -> View {
                 pending.clear();
                 text.clear();
             }
+            // #2421: a prompt denied at once by policy waits for nobody.
+            "approval.requested" if event.data["policy"] == "deny-at-once" => {}
             "approval.requested" => {
                 let field = |key: &str| event.data[key].as_str().unwrap_or("").to_owned();
                 pending.push((

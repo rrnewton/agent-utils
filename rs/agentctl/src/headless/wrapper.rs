@@ -1845,6 +1845,9 @@ impl Wrapper {
                 "blocked_path": request.blocked_path,
                 "tool_use_id": request.tool_use_id,
                 "timeout_s": timeout.as_secs(),
+                // #2421: under deny-at-once nobody is asked; the event is
+                // informational, and a bridge never posts it as a question.
+                "policy": if timeout.is_zero() { Value::from("deny-at-once") } else { Value::Null },
             }),
         )?;
         let now = Instant::now();

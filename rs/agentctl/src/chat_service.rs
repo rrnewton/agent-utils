@@ -7744,6 +7744,10 @@ impl ApprovalRelay {
         for event in events {
             let id = event.data["id"].as_str().unwrap_or_default().to_owned();
             match event.kind.as_str() {
+                // #2421: a prompt the policy denies at once asks nobody, so
+                // it is never posted as a question, whatever the timing.
+                "approval.requested"
+                    if !id.is_empty() && event.data["policy"] == "deny-at-once" => {}
                 "approval.requested" if !id.is_empty() => {
                     self.held.push((id, event.data, now));
                 }
@@ -18273,6 +18277,19 @@ esac
         assert_eq!(roots.posts.len(), 3, "{:?}", roots.posts);
         assert!(relay.held.is_empty());
         assert_eq!(relay.posted, BTreeSet::from(["a3".to_owned()]));
+        // #2421: a prompt the policy denies at once asks nobody: it is never
+        // held for posting, however long its decision takes.
+        writer
+            .append(
+                "approval.requested",
+                None,
+                json!({"id": "a12", "tool": "Bash", "summary": "rm -rf \"$OUT\"", "timeout_s": 0, "policy": "deny-at-once"}),
+            )
+            .expect("append");
+        relay.next_look = Instant::now();
+        relay.relay(&state, Some(&mut roots));
+        assert!(relay.held.is_empty(), "{:?}", relay.held);
+        assert_eq!(roots.posts.len(), 3, "{:?}", roots.posts);
         // An answer from chat the wrapper did not take is posted back at once; a console one is
         // not the channel's business.
         writer

@@ -366,15 +366,25 @@ impl Denying<'_> {
             prompt = self.landed(&prompt, Some(next))?;
         }
         // The last look before the submit key: still this prompt, the cursor
-        // on its refusing option, and that option reads as a refusal.
+        // on its refusing option, and the label read from the very row the
+        // cursor is drawn on is that refusal.
         let last = self.landed(&prompt, Some(deny))?;
-        let chosen = last
+        let refusal = last
             .options
             .iter()
-            .find(|option| option.number == deny && Some(option.number) == last.selected)
-            .filter(|option| crate::harness_tui::deny_label(&option.text))
-            .ok_or_else(|| fail("the selected option is not a refusal; no submit key sent"))?
-            .clone();
+            .find(|option| option.number == deny)
+            .map(|option| option.text.clone());
+        let chosen = last
+            .selected_text
+            .clone()
+            .filter(|text| {
+                last.selected == Some(deny)
+                    && crate::harness_tui::deny_label(text)
+                    && Some(text) == refusal.as_ref()
+            })
+            .ok_or_else(|| {
+                fail("the row under the cursor is not the refusal; no submit key sent")
+            })?;
         self.key("Enter")?;
         let deadline = self.runtime.monotonic() + Duration::from_secs(3);
         loop {
@@ -384,7 +394,7 @@ impl Denying<'_> {
                     "pane_id": self.pane,
                     "kind": last.kind,
                     "prompt": last.prompt,
-                    "option": chosen.text,
+                    "option": chosen,
                 })));
             }
             if self.runtime.monotonic() >= deadline {

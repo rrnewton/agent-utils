@@ -677,6 +677,16 @@ pub fn render_lines(event: &Event, cx: &Context<'_>) -> Vec<Line> {
                     palette::DETAIL,
                 ));
             }
+            // #2421: under deny-at-once nobody is asked; say so instead of
+            // inviting an answer that can never be taken.
+            if data["policy"] == "deny-at-once" {
+                lines.extend(cx.detail(
+                    "   policy: ",
+                    "denied at once (approval_timeout_s 0); nobody is asked",
+                    palette::APPROVAL.dimmed(),
+                ));
+                return lines;
+            }
             lines.extend(cx.detail(
                 "   waiting for the owner: ",
                 &format!(
@@ -705,6 +715,7 @@ pub fn render_lines(event: &Event, cx: &Context<'_>) -> Vec<Line> {
             };
             let who = match by {
                 "timeout" => "no answer in time".to_owned(),
+                "policy" => "denied by policy, nobody asked".to_owned(),
                 "harness" => "the harness withdrew it".to_owned(),
                 "harness-exit" => "the harness exited".to_owned(),
                 "turn-end" => "the turn ended".to_owned(),
@@ -1344,6 +1355,40 @@ mod tests {
         assert!(
             named[1].contains("reason: Permission for this tool use was denied."),
             "{named:?}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_denied_at_once_by_policy_invites_no_answer() {
+        // #2421: under deny-at-once nobody is asked, so tail says so and
+        // shows no approve/deny hint; the decision names the policy.
+        let asked = render(
+            &event(
+                7,
+                "approval.requested",
+                json!({"id": "a8", "tool": "Bash", "summary": "rm -rf \"$OUT\"",
+                       "reason": "Dangerous rm operation", "reason_type": "safetyCheck",
+                       "timeout_s": 0, "policy": "deny-at-once"}),
+            ),
+            200,
+        )
+        .join("\n");
+        assert!(
+            asked.contains("denied at once (approval_timeout_s 0); nobody is asked"),
+            "{asked}"
+        );
+        assert!(!asked.contains("approve a8"), "{asked}");
+        let decided = render(
+            &event(
+                7,
+                "approval.decided",
+                json!({"id": "a8", "decision": "denied", "by": "policy", "waited_ms": 3000}),
+            ),
+            120,
+        );
+        assert!(
+            decided[0].contains("approval a8 denied · denied by policy, nobody asked"),
+            "{decided:?}"
         );
     }
 

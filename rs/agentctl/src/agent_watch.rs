@@ -3763,6 +3763,25 @@ fn report_coordinator_blocked(
     Some(row)
 }
 
+/// An agent's permission policy, or report-only when it could not be read
+/// (#2421): an unknown policy never sends a key, so it can never override a
+/// `permission_prompts: "report"` it failed to read; the prompt is paged.
+fn policy_or_report(
+    agent: &str,
+    policy: std::result::Result<crate::profiles::PermissionPolicy, String>,
+) -> crate::profiles::PermissionPolicy {
+    policy.unwrap_or_else(|error| {
+        log(format_args!(
+            "agent {agent}: permission policy unreadable ({error}); its prompts are reported, not refused"
+        ));
+        crate::profiles::PermissionPolicy {
+            deny: false,
+            source: format!("unreadable: {error}"),
+            ..crate::profiles::PermissionPolicy::default()
+        }
+    })
+}
+
 /// Whether the deny sweep will refuse the prompt `screen` shows for `agent`
 /// (#2421): recognised, the agent's policy denies, and the sweep has not
 /// given up on it.
@@ -4166,6 +4185,10 @@ fn watch_agents_once(
             }
             state.batches.retain(|batch| !batch.keys.is_empty());
             state.agents.retain(|name, _| registered.contains(name));
+            // #2421: a refusal pending for an agent that is gone is gone too.
+            state
+                .permission_denials
+                .retain(|name, _| registered.contains(name));
         }
     }
     // The auto-interrupt policy ([`AutoDeliver`]): a stuck turn with input queued behind it is
@@ -7133,13 +7156,18 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
     }
 
     fn permission_policy(&self, agent: &str) -> crate::profiles::PermissionPolicy {
-        // An unreadable record or profile file leaves the built-in policy
-        // (refuse after 60 s): a broken configuration never leaves an agent
-        // waiting at a prompt.
-        ManagedAgents::new(self.client, &self.registry)
-            .ok()
-            .and_then(|manager| manager.permission_policy_for(agent).ok())
-            .unwrap_or_default()
+        // A record or profile file that cannot be read means the policy is
+        // unknown: report only (no key is sent, the prompt is paged as
+        // before), never the built-in refusal, which could override an
+        // agent's `permission_prompts: "report"`.
+        let policy = ManagedAgents::new(self.client, &self.registry)
+            .map_err(|error| error.to_string())
+            .and_then(|manager| {
+                manager
+                    .permission_policy_for(agent)
+                    .map_err(|error| error.to_string())
+            });
+        policy_or_report(agent, policy)
     }
 
     fn team_undeliverable_notices(&mut self) -> Vec<(PathBuf, Value)> {
@@ -9922,6 +9950,110 @@ mod tests {
                 .expect("a blocked row");
         assert_eq!(row["permission_denials"][0]["action"], "denied", "{row}");
         assert_eq!(notifier.denials, ["coordinator"]);
+    }
+
+    #[test]
+    fn an_unreadable_policy_reports_and_never_refuses() {
+        // Review finding 4: an unreadable record or profiles.json must not
+        // become the refusing default over a `report` it could not read.
+        let policy = policy_or_report("lane", Err("profiles.json: bad".to_owned()));
+        assert!(!policy.deny, "{policy:?}");
+        assert!(policy.source.contains("unreadable"), "{}", policy.source);
+        let read = policy_or_report("lane", Ok(report_policy()));
+        assert!(!read.deny);
+        let passes = (0..2)
+            .map(|_| vec![claude_at("lane", HOOK_SCREEN)])
+            .collect();
+        let mut probe = PolicyProbe::new(passes, policy);
+        let mut notifier = RecordingNotifier {
+            deny_ok: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let options = options();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 2_000.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "reported",
+            "{report}"
+        );
+        assert!(notifier.denials.is_empty());
+        assert!(
+            !notifier.alarms.is_empty(),
+            "the owner is paged as before: {report}"
+        );
+    }
+
+    #[test]
+    fn a_coordinator_that_cannot_be_refused_is_paged_at_once() {
+        // Review finding 2: an adopted coordinator (report-only policy)
+        // or one whose refusals keep failing is paged, never left waiting.
+        struct ReportingCoordinator(CoordScreenProbe);
+        impl Probe for ReportingCoordinator {
+            fn observe(&mut self) -> Result<Vec<Observation>> {
+                Ok(Vec::new())
+            }
+            fn coordinator_screen(&mut self) -> Option<(String, Option<String>, String)> {
+                self.0.coordinator_screen()
+            }
+            fn permission_policy(&self, _agent: &str) -> crate::profiles::PermissionPolicy {
+                report_policy()
+            }
+        }
+        let mut probe =
+            ReportingCoordinator(CoordScreenProbe(vec![Some(PERMISSION_SCREEN.to_owned())]));
+        let mut notifier = RecordingNotifier {
+            deny_ok: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let mut options = options();
+        options.notice_fallback = vec!["liaison".to_owned()];
+        let row =
+            report_coordinator_blocked(&mut probe, &mut notifier, &mut state, 1_000.0, &options)
+                .expect("a blocked row");
+        assert!(row.get("will_deny").is_none(), "{row}");
+        assert_eq!(notifier.sent.len(), 1, "paged at once: {:?}", notifier.sent);
+        assert!(notifier.denials.is_empty());
+        // A refusable coordinator whose refusals fail is paged once the
+        // attempts run out.
+        let screens = (0..4).map(|_| Some(PERMISSION_SCREEN.to_owned())).collect();
+        let mut probe = CoordScreenProbe(screens);
+        let mut notifier = RecordingNotifier::default(); // every refusal fails
+        let mut state = WatchState::default();
+        for at in [1_000.0, 1_060.0, 1_100.0] {
+            let row =
+                report_coordinator_blocked(&mut probe, &mut notifier, &mut state, at, &options);
+            assert!(notifier.sent.is_empty(), "{row:?}");
+        }
+        assert_eq!(notifier.denials.len(), 2);
+        let row =
+            report_coordinator_blocked(&mut probe, &mut notifier, &mut state, 1_140.0, &options)
+                .expect("a blocked row");
+        assert!(row.get("will_deny").is_none(), "{row}");
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
+    }
+
+    #[test]
+    fn a_pending_refusal_for_an_agent_no_longer_registered_is_pruned() {
+        // Review finding 7.
+        let mut state = WatchState::default();
+        state.permission_denials.insert(
+            "gone".to_owned(),
+            DenialEntry {
+                prompt: "f".to_owned(),
+                since: 1.0,
+                attempts: 1,
+                last_attempt: Some(2.0),
+            },
+        );
+        let mut probe = RegistryProbe {
+            registered: vec!["coordinator".to_owned()],
+            seen: Vec::new(),
+        };
+        let mut notifier = RecordingNotifier::default();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options());
+        assert!(state.permission_denials.is_empty());
     }
 
     #[test]

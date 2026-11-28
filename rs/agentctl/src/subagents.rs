@@ -16112,11 +16112,25 @@ its drain would also type, so it was not queued",
         agent_name: &str,
     ) -> Result<crate::profiles::PermissionPolicy> {
         let record = self.load(agent_name)?;
-        crate::profiles::permission_policy(
+        let mut policy = crate::profiles::permission_policy(
             std::path::Path::new(&record.cwd),
             &self.registry,
             record.profile.as_deref(),
-        )
+        )?;
+        // A pane agentctl never types into can only be reported: the
+        // watcher then pages as before rather than wait on a refusal.
+        let unrefusable = if record.is_foreign() {
+            Some("adopted foreign pane")
+        } else if record.pane_id.is_none() {
+            Some("no pane")
+        } else {
+            None
+        };
+        if let Some(why) = unrefusable {
+            policy.deny = false;
+            policy.source = format!("{why}: report only; {}", policy.source);
+        }
+        Ok(policy)
     }
 
     /// Refuse the permission or approval prompt `agent_name`'s pane shows
@@ -16139,8 +16153,18 @@ its drain would also type, so it was not queued",
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
         // Adopted foreign panes are someone else's agent: never typed into.
-        if record.is_foreign() || record.pane_id.is_none() {
-            return Ok(None);
+        // "Could not act" is an error, never `Ok(None)` ("nothing to
+        // refuse"), so the watcher counts it towards giving up and pages
+        // as before instead of waiting on a refusal that cannot come.
+        if record.is_foreign() {
+            return Err(fail(format!(
+                "agent {agent_name} is an adopted foreign pane; agentctl never types into it, so its prompt cannot be refused"
+            )));
+        }
+        if record.pane_id.is_none() {
+            return Err(fail(format!(
+                "agent {agent_name} has no pane, so its prompt cannot be refused"
+            )));
         }
         self.checked_policy(&record, false)?;
         record.input_allowed()?;
@@ -16159,21 +16183,29 @@ its drain would also type, so it was not queued",
             .pane_id
             .as_deref()
             .ok_or_else(|| fail("interactive pane required"))?;
-        // A pane scrolled back shows old rows, perhaps an old prompt, and a
-        // key would land on whatever is live: someone is reading it, so the
-        // refusal waits until it is at the bottom again.
-        if !self.client.pane_at_bottom(pane) {
-            return Ok(None);
-        }
         let runtime = agent::SystemRuntime::default();
         let (_pane_lock, _info) = agent::lock_resolved_target(&workspace, &self.target(&record)?)?;
         let terminal = workspace.guarded(&runtime)?;
+        // Every observation, so every key, first proves the recipient and
+        // that the pane is at its bottom: a pane scrolled back shows old
+        // rows, perhaps an old prompt, while a key lands on what is live.
+        let client = self.client;
+        let verify = |pane: &str| -> crate::error::Result<()> {
+            workspace.verify_recipient(pane, true)?;
+            if client.pane_at_bottom(pane) {
+                Ok(())
+            } else {
+                Err(crate::error::AdapterError::unavailable(format!(
+                    "pane {pane} is scrolled back or its scroll position is unknown; a refusal is typed only at the bottom"
+                )))
+            }
+        };
         crate::tui_prompts::deny(
             &terminal,
             pane,
             &record.harness,
             expected,
-            &|pane| workspace.verify_recipient(pane, true),
+            &verify,
             &runtime,
         )
     }
@@ -26588,6 +26620,8 @@ fi
     mod nested;
     /// Registry-wide scans beside a directory that holds a queue but no record.
     mod orphan_queue;
+    /// Permission-prompt refusals: who can be refused and when not (#2421).
+    mod permission_denial;
     /// Turn age and queued input in status and send, urgent delivery, and agents found by their
     /// pinned harness when Herdr misdetects their pane.
     mod progress;

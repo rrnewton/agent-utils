@@ -444,19 +444,33 @@ screen; a harness recogniser (`permission_denial` in
 prompt has shown for `permission_deny_after_s` (profile, then registry,
 default 60), `tui_prompts::deny` moves the cursor one verified step at a
 time onto the one option `deny_label` reads as a refusal, sends Enter only
-then, and checks the prompt left. The agent is queued a note (what was
+while the label read from the row under the cursor is that refusal, and
+checks the prompt left. Before every key it re-proves the recipient and
+that the pane is at its bottom (a pane scrolled back, or one whose scroll
+position is unknown, gets no key). The agent is queued a note (what was
 refused, nothing ran, carry on or end with `BLOCKED:`) and its manager one
 FYI line. `permission_prompts: "report"` (profile or registry) keeps
-report-only. Two failed refusals hand the prompt back to the
-`approval-prompt` notice and, for a hook confirmation, the owner alarm.
+report-only, and so does a policy that cannot be read and an adopted
+foreign pane or a record with no pane (agentctl never types into those):
+such a prompt is paged at once, as before. A refusal that could not act
+(scrolled pane, changed prompt, keys failed) counts as failed; two failed
+refusals hand the prompt back to the `approval-prompt` notice, the
+coordinator page and, for a hook confirmation, the owner alarm.
 
 - **Claude Code**: supported — hook confirmations (`Hook ... requires
   confirmation`), built-in safety checks (a dangerous-operation warning)
-  and permission-rule or `Bash command` confirmations, each with `Do you
-  want to proceed?`, a `Yes` option and exactly one refusal (`No`, or
-  only `No, and tell Claude what to do differently` when that is the one
-  refusal besides a plain `No`). The folder trust dialog (`No, exit`
-  would quit the harness) and question forms are not recognised.
+  and permission-rule or `Bash command` confirmations. Strict form
+  (`permission_denial` in `harness_tui/claude.rs`, separate from the
+  looser `classify`): the menu is the contiguous run of option rows right
+  under the last `Do you want to proceed?`, numbered exactly 1..n with
+  one cursor, followed only by footer hints, so it is the live bottom of
+  the screen and no text above the proceed line (a command preview) is
+  ever an option; the permission context must sit in the dialog box (from
+  the last solid rule, at most 20 rows above); no question-form marks; a
+  `Yes` option and exactly one refusal (`No`, or the plain `No` when
+  `No, and tell Claude what to do differently` also shows). The folder
+  trust dialog (`No, exit` would quit the harness) and question forms
+  are not recognised.
 - **Codex**: none (report only) — Codex lanes run with approvals off
   (`--dangerously-bypass-approvals-and-sandbox`) and no Codex approval
   screen is recorded here, so none is answered; the watcher reports one
@@ -465,7 +479,9 @@ report-only. Two failed refusals hand the prompt back to the
   run the following command?`; refusal `Abort the entire command`) and
   the peer-approval dialog (`Message from PEER`; refusal `Reject once`,
   never `Block`), the dialog's unfocused menu focused with one Down key
-  first. This supersedes #974's detection-only rule for the refusal
+  first. The menu is the last contiguous run of option rows under the
+  heading, numbered 1..n, followed only by Muse's hints up to its rule, so
+  rows quoted in a peer message or a command are never options. This supersedes #974's detection-only rule for the refusal
   only. The plugin-hooks trust dialog keeps its own policy (Trust
   dialogs row).
 - **Unknown TUI**: none — no recogniser, so nothing is answered.
@@ -473,7 +489,9 @@ report-only. Two failed refusals hand the prompt back to the
   built-in default (profile, then registry; `run-headless
   --approval-timeout` wins), denies every prompt by policy after
   `POLICY_GRACE` (3 s, for the host's own permission hooks), logging
-  `approval.requested` and `approval.decided` with `by: policy`; the
+  `approval.requested` (marked `policy: deny-at-once`, which no bridge
+  posts and `tail` shows as asking nobody) and `approval.decided` with
+  `by: policy`; the
   model reads `policy_denial_message` (nothing ran, why it asked, what to
   do instead) (`rs/agentctl/src/headless/wrapper.rs`,
   `rs/agentctl/src/headless/approval.rs`,

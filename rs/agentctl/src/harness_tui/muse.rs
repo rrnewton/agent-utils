@@ -102,23 +102,52 @@ pub(crate) fn permission_denial(screen: &str) -> Option<super::Denial> {
     } else {
         return None;
     };
-    let mut options = Vec::new();
-    let mut selected = None;
-    let mut detail = None;
-    for row in &window[heading + 1..] {
-        if let Some((option, is_selected)) = super::option_row(row, '⟩') {
-            if is_selected {
-                selected = Some(option.number);
-            }
-            options.push(option);
-        } else if detail.is_none() && options.is_empty() {
-            let text = row.trim();
-            let quoted = text.starts_with('"') || text.starts_with('$');
-            if quoted {
-                detail = Some(text.to_owned());
-            }
+    // The menu is the LAST contiguous run of option rows under the heading;
+    // below it, up to the next rule, only blank rows and Muse's own hints;
+    // text above it (a quoted peer message, a command) is never an option.
+    let body = &window[heading + 1..];
+    let end = body
+        .iter()
+        .rposition(|row| super::option_row(row, '⟩').is_some())?;
+    let mut start = end;
+    while start > 0 && super::option_row(body[start - 1], '⟩').is_some() {
+        start -= 1;
+    }
+    let hint = |row: &str| {
+        let lower = row.to_lowercase();
+        row.trim().is_empty()
+            || lower.contains("approval defaults")
+            || lower.contains("to navigate")
+            || lower.contains("enter to select")
+    };
+    for row in &body[end + 1..] {
+        let trimmed = row.trim();
+        if trimmed.chars().count() >= 3 && trimmed.chars().all(|c| c == '─') {
+            break;
+        }
+        if !hint(row) {
+            return None;
         }
     }
+    let mut options = Vec::new();
+    let mut selected = None;
+    let mut selected_text = None;
+    for row in &body[start..=end] {
+        let (option, is_selected) = super::option_row(row, '⟩')?;
+        if is_selected {
+            if selected.is_some() {
+                return None;
+            }
+            selected = Some(option.number);
+            selected_text = Some(option.text.clone());
+        }
+        options.push(option);
+    }
+    let detail = body[..start]
+        .iter()
+        .map(|row| row.trim())
+        .find(|text| text.starts_with('"') || text.starts_with('$'))
+        .map(str::to_owned);
     let numbers: Vec<usize> = options.iter().map(|option| option.number).collect();
     if numbers != (1..=numbers.len()).collect::<Vec<_>>() {
         return None;
@@ -144,6 +173,7 @@ pub(crate) fn permission_denial(screen: &str) -> Option<super::Denial> {
         prompt: prompt.chars().take(super::DENIAL_PROMPT_CHARS).collect(),
         options,
         selected,
+        selected_text,
         deny,
         focus_keys: if selected.is_none() && kind == "peer-approval" {
             &["Down"]
