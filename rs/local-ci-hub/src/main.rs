@@ -1,11 +1,13 @@
 //! `local-ci-hub` front door (Rust edition).
 //!
-//! M1 surface is read-only: `receipt show` judges one exact commit by
-//! tailing the git least-common-denominator store through the disposable
-//! index, and `ledger rows` / `ledger digest-rows` expose the folded
-//! history for measurement. Every answer names the read authority and
-//! cursor it folded. Exit codes: 0 qualified, 1 not-qualified or refused,
-//! 2 no-result or cannot-tell, 75 could-not-run.
+//! The surface is the read side: `receipt show` / `receipt verify`
+//! judge one exact commit by tailing the git least-common-denominator
+//! store through the disposable index, and `ledger rows` /
+//! `ledger digest-rows` / `ledger verdicts` expose the folded history.
+//! Every answer names the read authority and cursor it folded. Exit
+//! codes: 0 qualified, 1 not-qualified or refused, 2 no-result or
+//! cannot-tell, 75 could-not-run. Run, publish, health and landing
+//! verbs arrive in later slices and are absent (never stubbed) here.
 
 use clap::{Parser, Subcommand};
 use local_ci_hub::deployment::{
@@ -17,6 +19,7 @@ use local_ci_hub::event::{check_events, is_fixture_event, union, Refusal};
 use local_ci_hub::expand::{expand_line_with, ExpandConfig, FileEvidence, NoEvidence};
 use local_ci_hub::fold::terminal_row;
 use local_ci_hub::index::{Cursor, Index};
+use local_ci_hub::project_config::ProjectConfig;
 use local_ci_hub::pyjson::{dumps_sorted, PyValue};
 use local_ci_hub::store::{GitStore, ReadLimits, Role, Store};
 use local_ci_hub::verdict::{assess, Policy, Verdict};
@@ -24,17 +27,20 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command as ProcCommand;
 
-/// Local CI hub: runs, ledger, receipts, remotes, health, and landing locks.
 #[derive(Parser)]
 #[command(
     name = "local-ci-hub",
     version,
-    about,
-    after_help = "EXAMPLES:\n  local-ci-hub --config deployment.json ledger digest-rows\n  local-ci-hub --repo . --git-ref HEAD ledger rows --terminals\nSee rs/local-ci-hub/README.md for every deployment flag."
+    about = "Local CI hub (Rust edition, read side): ledger history and receipt verdicts.",
+    after_help = "EXAMPLES:\n  local-ci-hub quickstart\n  local-ci-hub --config local-ci-hub.toml receipt verify HEAD\n  local-ci-hub --config deployment.json ledger digest-rows\n  local-ci-hub --repo . --git-ref HEAD ledger rows --terminals\nSee rs/local-ci-hub/README.md for configuration and every deployment flag."
 )]
 struct Cli {
-    /// Deployment config file (JSON; see deployment.example.json).
-    /// Precedence: explicit flag, then config, then built-in default.
+    /// Config file: a `.toml` project config (`local-ci-hub.toml`;
+    /// see local-ci-hub.example.toml) or a `.json` deployment config
+    /// (see deployment.example.json). Without `--config`, a project
+    /// config is discovered as `./local-ci-hub.toml`, then
+    /// `./ci/local-ci-hub.toml`. Precedence: explicit flag, then
+    /// deployment config, then project config, then built-in default.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Git repository holding the ledger shards (default: `.`;
@@ -84,6 +90,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print the five-step quick-start.
+    Quickstart,
     /// Receipt verdicts for exact commits.
     Receipt {
         #[command(subcommand)]
@@ -100,6 +108,12 @@ enum Command {
 enum ReceiptAction {
     /// Show the verdict for COMMIT (exact id, or HEAD).
     Show {
+        /// Exact commit id to judge.
+        commit: String,
+    },
+    /// Verify COMMIT qualifies: one terse line, exit 0 qualified,
+    /// 1 not-qualified, 2 no-result.
+    Verify {
         /// Exact commit id to judge.
         commit: String,
     },
@@ -128,7 +142,7 @@ struct Loaded {
 }
 
 /// Flag values after `--config` resolution: explicit flag, then
-/// config, then built-in default.
+/// deployment config, then project config, then built-in default.
 struct Effective {
     repo: PathBuf,
     git_ref: String,
@@ -138,18 +152,60 @@ struct Effective {
     fixture_producers: Vec<String>,
     evidence_head_field: String,
     index: Option<PathBuf>,
+    counted_repos: Option<BTreeSet<String>>,
     json: bool,
 }
 
+/// Load whichever config files `--config` and discovery select.
+///
+/// An explicit `--config` names exactly one file (TOML project config
+/// or JSON deployment config, by extension) and suppresses discovery;
+/// without it, a project config is discovered under the working
+/// directory, as the Python loader does.
+fn load_configs(cli: &Cli) -> Result<(DeploymentConfig, Option<ProjectConfig>), String> {
+    match &cli.config {
+        Some(path) => match path.extension().and_then(|ext| ext.to_str()) {
+            Some("toml") => Ok((
+                DeploymentConfig::default(),
+                Some(ProjectConfig::load(path)?),
+            )),
+            Some("json") => Ok((DeploymentConfig::load(path)?, None)),
+            _ => Err(format!(
+                "config {}: expected a .toml project config or a .json deployment config",
+                path.display()
+            )),
+        },
+        None => {
+            let project = match ProjectConfig::discover(&PathBuf::from(".")) {
+                Some(path) => Some(ProjectConfig::load(&path)?),
+                None => None,
+            };
+            Ok((DeploymentConfig::default(), project))
+        }
+    }
+}
+
 fn effective(cli: &Cli) -> Result<Effective, String> {
-    let config = match &cli.config {
-        Some(path) => DeploymentConfig::load(path)?,
-        None => DeploymentConfig::default(),
-    };
+    let (config, project) = load_configs(cli)?;
+    let project_repo = project.as_ref().and_then(|project| {
+        if project.ledger_dir_explicit {
+            Some(project.ledger_dir.clone())
+        } else {
+            None
+        }
+    });
+    let counted_repos = project.as_ref().and_then(|project| {
+        if project.counted_repos.is_empty() {
+            None
+        } else {
+            Some(project.counted_repos.iter().cloned().collect())
+        }
+    });
     let repo = cli
         .repo
         .clone()
         .or_else(|| config.repo.map(PathBuf::from))
+        .or(project_repo)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_REPO));
     let git_ref = cli
         .git_ref
@@ -159,7 +215,12 @@ fn effective(cli: &Cli) -> Result<Effective, String> {
     let evidence_root = cli
         .evidence_root
         .clone()
-        .or_else(|| config.evidence_root.map(PathBuf::from));
+        .or_else(|| config.evidence_root.map(PathBuf::from))
+        .or_else(|| {
+            project
+                .as_ref()
+                .and_then(|project| project.evidence_root.clone())
+        });
     let binding_tree_field = cli
         .binding_tree_field
         .clone()
@@ -193,6 +254,7 @@ fn effective(cli: &Cli) -> Result<Effective, String> {
         fixture_producers,
         evidence_head_field,
         index,
+        counted_repos,
         json: cli.json,
     })
 }
@@ -300,8 +362,40 @@ fn policy(eff: &Effective) -> Policy {
             policy.base_fields.push(field.clone());
         }
     }
+    policy.counted_repos.clone_from(&eff.counted_repos);
     policy
 }
+
+const QUICKSTART: &str = "\
+local-ci-hub (Rust edition) quick-start — read-side loop in five steps:
+
+1. Build through the tracked launcher (first call builds; needs cargo):
+     rs/bin/local-ci-hub --help
+   Through the suite dispatcher, opt in to the Rust edition with
+   LOCAL_CI_HUB_ENGINE=rust (Python stays the default edition).
+
+2. Copy the example project config into your repository and edit the
+   ledger location to the checkout that holds your ledger shards:
+     cp rs/local-ci-hub/local-ci-hub.example.toml local-ci-hub.toml
+
+3. Confirm the configuration loads (unknown keys and a delegated
+   digest_command refuse by name):
+     local-ci-hub --config local-ci-hub.toml ledger rows --terminals
+
+4. Judge one exact commit (exit 0 qualified, 1 not-qualified,
+   2 no-result; absence is never green):
+     local-ci-hub receipt verify HEAD
+     local-ci-hub receipt show HEAD        # the same verdict, explained
+
+5. Survey history (one JSON object per line on stdout):
+     local-ci-hub ledger verdicts
+     local-ci-hub ledger digest-rows
+
+Without --config, ./local-ci-hub.toml (then ./ci/local-ci-hub.toml) is
+discovered automatically. Deployment data that is not project policy
+(field names, evidence roots, fixture producers) goes in a JSON
+deployment config instead; see deployment.example.json and
+rs/local-ci-hub/README.md.";
 
 fn main() {
     let cli = Cli::parse();
@@ -309,6 +403,10 @@ fn main() {
         println!("local-ci-hub {} (see --help)", env!("CARGO_PKG_VERSION"));
         return;
     };
+    if matches!(command, Command::Quickstart) {
+        println!("{QUICKSTART}");
+        return;
+    }
     let eff = match effective(&cli) {
         Ok(eff) => eff,
         Err(error) => {
@@ -324,9 +422,17 @@ fn main() {
         }
     };
     match command {
+        Command::Quickstart => {
+            // Handled before any config or ledger load above.
+            println!("{QUICKSTART}");
+        }
         Command::Receipt {
-            action: ReceiptAction::Show { commit },
+            action: action @ (ReceiptAction::Show { .. } | ReceiptAction::Verify { .. }),
         } => {
+            let (commit, verify) = match action {
+                ReceiptAction::Show { commit } => (commit, false),
+                ReceiptAction::Verify { commit } => (commit, true),
+            };
             let commit = resolve_commit(&eff, commit);
             let rows = match loaded.index.rows_for_commit(&commit) {
                 Ok(rows) => rows,
@@ -362,6 +468,8 @@ fn main() {
                     ("rows".to_owned(), PyValue::Int(rows.len().to_string())),
                 ]);
                 println!("{}", dumps_sorted(&object));
+            } else if verify {
+                println!("{verdict_text}: {commit} ({})", assessment.reason);
             } else {
                 println!("{commit}: {verdict_text} ({})", assessment.reason);
                 println!(

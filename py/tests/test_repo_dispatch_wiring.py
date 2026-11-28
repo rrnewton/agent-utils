@@ -130,16 +130,18 @@ def test_tracked_rust_launchers_share_the_cargo_runner() -> None:
     assert runner.is_file()
     assert runner.stat().st_mode & stat.S_IXUSR
     assert runner.read_bytes().startswith(b"#!/usr/bin/env bash\n")
-    # wrkslotsd and wrkvizd are the tracked non-published edition launchers:
-    # they ship the wrkslots and wrkviz Rust editions behind
-    # WRKSLOTS_ENGINE=rust (#562) and WRKVIZ_ENGINE=rust (#706).
+    # wrkslotsd, wrkvizd and local-ci-hub are the tracked non-published
+    # edition launchers: they ship the wrkslots, wrkviz and local-ci-hub
+    # Rust editions behind WRKSLOTS_ENGINE=rust (#562),
+    # WRKVIZ_ENGINE=rust (#706) and LOCAL_CI_HUB_ENGINE=rust (#2467).
     assert {path.name for path in rust_bin.iterdir()} == {
         "cargo-runner",
         *RUST_TOOLS,
         "wrkslotsd",
         "wrkvizd",
+        "local-ci-hub",
     }
-    for tool in (*RUST_TOOLS, "wrkslotsd", "wrkvizd"):
+    for tool in (*RUST_TOOLS, "wrkslotsd", "wrkvizd", "local-ci-hub"):
         link = rust_bin / tool
         assert link.is_symlink(), tool
         assert link.readlink() == Path("cargo-runner"), tool

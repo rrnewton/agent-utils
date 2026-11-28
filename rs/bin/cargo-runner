@@ -62,6 +62,10 @@ case "$TOOL" in
     PACKAGE="herdr-run"
     PACKAGE_TOOLS=(herdr-run)
     ;;
+  local-ci-hub)
+    PACKAGE="local-ci-hub"
+    PACKAGE_TOOLS=(local-ci-hub)
+    ;;
   wrkslotsd)
     PACKAGE="wrkslotsd"
     PACKAGE_TOOLS=(wrkslotsd)

@@ -6,15 +6,55 @@ qualifying predicate, one canonical digest — behind a fan-out `Store`
 contract with one read authority per deployment, a disposable SQLite index,
 and the existing six-object CLI.
 
-M1 scope: typed core events with a refusing union and fold, the versioned
-SQLite index with a rebuild-from-authority test, the `Store` trait with the
-git least-common-denominator connector, read-only `receipt show`, and the
-versioned `ci-hub-store-wire/v1` contract (implementation in M2). Python
-remains the primary edition until parity and shadow gates pass; this crate is
-reached with `cargo run -p local-ci-hub` meanwhile.
+Built so far: typed core events with a refusing union and fold, the
+versioned SQLite index with a rebuild-from-authority test, the `Store`
+trait with the git least-common-denominator connector, read-only
+`receipt show` / `receipt verify` and the `ledger rows|digest-rows|verdicts`
+views, the versioned `ci-hub-store-wire/v1` contract (connector
+implementation in a later slice), and the TOML project configuration
+below. Python remains the primary edition until parity and shadow
+gates pass. The Rust edition ships through the tracked launcher
+`rs/bin/local-ci-hub`; through the suite dispatcher it is an explicit
+opt-in:
+
+```bash
+rs/bin/local-ci-hub --help
+LOCAL_CI_HUB_ENGINE=rust local-ci-hub receipt verify HEAD
+```
 
 See `common/docs/local-ci-hub/` for operator documentation and the wire
 contract.
+
+## Quick start
+
+`local-ci-hub quickstart` prints the five-step read-side loop. In
+short: copy `local-ci-hub.example.toml` (this directory) to
+`local-ci-hub.toml` in your repository, point `[ledger.location]` at
+the checkout holding your ledger shards, then
+
+```bash
+local-ci-hub receipt verify HEAD   # exit 0 qualified, 1 not, 2 no-result
+local-ci-hub receipt show HEAD     # the same verdict, explained
+local-ci-hub ledger verdicts       # one JSON verdict per commit
+```
+
+## Project configuration (`local-ci-hub.toml`)
+
+The user-facing configuration is the TOML shape the Python edition
+established — sections `[project]`, `[validate]`, `[ledger]`,
+`[remote]`, `[receipt]`, `[health]`, `[land]` — discovered as
+`./local-ci-hub.toml`, then `./ci/local-ci-hub.toml`, when `--config`
+is absent. Relative paths resolve against the config file's
+directory. The read side consumes `[ledger.location]` (steers
+`--repo` when explicit), `[ledger] evidence_root` and
+`[ledger] counted_repos` today; the remaining sections are parsed
+and validated now and consumed by the run/publish slices as they
+land. Two tightenings over the Python loader: unknown keys refuse,
+and `[receipt] digest_command` refuses by name — digests are
+computed by the one canonical serializer in the core, never
+delegated to a subprocess. `--config` selects the format by
+extension and suppresses discovery; precedence is flag, then
+deployment config, then project config, then built-in default.
 
 ## Deployment
 

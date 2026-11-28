@@ -15,6 +15,7 @@ pub mod event;
 pub mod expand;
 pub mod fold;
 pub mod index;
+pub mod project_config;
 pub mod pyjson;
 pub mod run_handle;
 pub mod store;

@@ -1,0 +1,42 @@
+# Example local-ci-hub project configuration.
+#
+# Copy to `local-ci-hub.toml` at your repository root (or
+# `ci/local-ci-hub.toml`) and edit. Relative paths resolve against
+# the directory holding this file. Unknown keys refuse by name, so
+# a typo fails loudly instead of being ignored. Deployment data
+# that is not project policy (evidence field names, fixture
+# producers) belongs in a JSON deployment config instead; see
+# deployment.example.json.
+
+[project]
+name = "example"
+
+[validate]
+# The command the run engine executes per exact commit (later slice).
+command = ["make", "validate"]
+admission_slots = 2
+
+[ledger]
+team = "team"
+publish = "none"
+# Repositories whose ledger rows count toward verdicts.
+# Empty (or absent) counts every repository.
+# counted_repos = ["example"]
+
+[ledger.location]
+# The checkout (or directory) holding the ledger shards; the read
+# side treats its git objects as the read authority.
+path = "ci-ledger"
+
+[remote]
+provider = "none"
+
+[receipt]
+qualifying = ["local-ledger-pass"]
+require_full_evidence = true
+# NOTE: there is deliberately no digest_command setting. Receipt
+# digests are computed by the hub's one canonical serializer; a
+# delegated digest subprocess exists only as a test oracle.
+
+[land]
+state_dir = "ignored/local-ci-hub"

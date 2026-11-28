@@ -244,9 +244,9 @@
         "paused_at": "f04187977b2164062a557d97f4e45bddfaf57cfa"
       },
       "parity_check": null,
-      "rust_entrypoint": null,
+      "rust_entrypoint": "rs/bin/local-ci-hub",
       "python_entrypoint": "py/bin/local-ci-hub",
-      "note": "Python primary. The Rust crate is the ledger read core (typed events, one fold, one predicate) plus the run-handle schema type; it has no tracked entrypoint yet, so the mirror is paused, not absent."
+      "note": "Python primary until the coordinator-approved primary flip (#1365 rust-ci-hub-ledger). Since #2467 the Rust edition has a tracked entrypoint and is reachable only via the explicit LOCAL_CI_HUB_ENGINE=rust opt-in; parity tracking stays paused (the Rust surface is the ledger read core — typed events, one fold, one predicate — plus the run-handle schema type, growing slice by slice under #1365)."
     }
   ],
   "formats": [
