@@ -136,7 +136,6 @@ def test_legacy_journal_without_actor_generation_gets_legacy_wording(
     assert "if no wrkslots process is running, run 'wrkslots recover'" in message
 
 
-@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: adopt after journal wait runs live censuses under host churn
 def test_wait_lock_waits_for_a_live_journal_then_proceeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -168,6 +167,7 @@ def test_wait_lock_waits_for_a_live_journal_then_proceeds(
         ]
         started = threading.Event()
         waiting = threading.Event()
+        finished = threading.Event()
         outcome: dict[str, object] = {}
         real_wait = cli._wait_for_control_change
 
@@ -188,7 +188,10 @@ def test_wait_lock_waits_for_a_live_journal_then_proceeds(
 
         def run_adopt() -> None:
             started.set()
-            outcome["returncode"] = cli.main(adopt)
+            try:
+                outcome["returncode"] = cli.main(adopt)
+            finally:
+                finished.set()
 
         worker = threading.Thread(target=run_adopt, daemon=True)
         worker.start()
@@ -202,8 +205,11 @@ def test_wait_lock_waits_for_a_live_journal_then_proceeds(
         # The journaled mutation finishes and clears its journal.
         cli._clear_journal(config, raw, journal_path=journal_path)
 
-        worker.join(timeout=300)
-        assert not worker.is_alive()
+        # Wait for the adopt's own verdict (#2065, owner rule 346). The
+        # backstop outlasts the adopt's --wait-lock bound plus its censuses,
+        # so it only catches a hang; a slow, loaded host decides nothing.
+        assert finished.wait(timeout=900), "the adopt neither finished nor refused"
+        worker.join()
         assert outcome["returncode"] == 0
     finally:
         sleeper.terminate()
