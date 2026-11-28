@@ -42,7 +42,8 @@ export interface TimelineReaderLike {
   staleAsOf(payload: TimelineResponse): number | null;
 }
 import { READ_MODE_LABELS, READ_MODE_TITLES, READ_MODE_VERBS, allNoticeWords, nextReadMode } from "../../present/rows/index.ts";
-import { createOlderPager } from "../../core/channels/index.ts";
+import { createOlderPager, gapsAboveFloor, islandBudget, noteRepliesLeftOut, removeMessage, upsertMessage, upsertThread } from "../../core/channels/index.ts";
+import { createIslandView } from "./islandview.ts";
 import { isMessageRow, patchRows, rowShown, shownRowFor } from "./rows.ts";
 import { cardRunIds, threadCardId } from "./cards.ts";
 import { childByClass } from "../dom/index.ts";
@@ -74,6 +75,8 @@ export interface TimelineOlderPages {
   /** `#2264`: see `OlderPagesRecord` (web/src/view/channel/olderpages.ts). */
   pendingAt?: string | null;
   failedAt?: string | null;
+  /** `#2426` R2: see `OlderPagesRecord`. */
+  aroundSeed?: string | null;
 }
 
 /** The column being worked on's read state (`loadState()`), as far as this view touches it. */
@@ -340,7 +343,7 @@ export interface TimelineViewDependencies {
   /**
    * `#2427 vibe-talk-windowed-default-on`: how many rows a channel view keeps resident (its newest
    * window), from the device settings (core/settings/residency.ts). Absent or null: everything held
-   * stays resident.
+   * stays resident. `#2426` R2 reads its `islandRows` too: a far-back reader's island.
    */
   residency?(): ResidencyBudgetShape | null;
   screensView(): string;
@@ -508,6 +511,57 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const discordNode = deps.discordNode;
   const threadCards = deps.threadCards;
   const glom = deps.glom;
+  // `#2426` R2: the islands of the channel list (islandview.ts): a far-back reader's island breaks
+  // off from the newest window, the stretch between is let go of and stands as a seam, and a seam
+  // fills from the side the reader comes from. Channel views of a threading provider only: a
+  // provider without threads draws its older steps straight into the list, not from the store.
+  const islands = createIslandView({
+    list: () => el("discord-log"),
+    area: () => el("scroll-area"),
+    canon: () => channelStore.current(),
+    viewKey: () => viewKey(),
+    view: () => selection().view,
+    shown: () => timelineRows().messages,
+    readingRow: () => (jumpAnchorRow ? jumpAnchorRow() : null) || heldFilterRow() || scrollAnchor(el("scroll-area")),
+    idsOf: (row) => idsOf(row),
+    // The residency layer's pins (#2427: the jump anchor, the selection, a row being replied to, read
+    // aloud or pending) and the placed search hits (#2422), which stay while the search stands.
+    pinned: () => new Set([...residencyPins(),
+      ...[...el("discord-log").children].filter((row) => row.hasAttribute("data-server-hit")).flatMap((row) => idsOf(row))]),
+    searchOpen: () => searchOffered(),
+    budget: () => {
+      const view = selection().view;
+      if (!providerFacts.threading() || (view !== "main" && view !== "flat") || screens.view() !== "discord") return null;
+      const resident = deps.residency ? deps.residency() : null;
+      if (resident) return { newestRows: resident.newestRows, islandRows: resident.islandRows };
+      return islandBudget((el("scroll-area").clientWidth || 0) < 600);
+    },
+    holding: (change) => preservingScroll(change),
+    redraw: () => islandRedraw(),
+    readAround: async (id, below, above) => {
+      const path = `${timelineReader.timelinePath(null, null, "older")}&around=${encodeURIComponent(id)}&below=${below}&above=${above}`;
+      try {
+        return await within(CHANNEL_READ_TIMEOUT_MS, (signal) => timelineReader.readTimeline(path, { signal }));
+      } catch (_error) {
+        return null;
+      }
+    },
+    foldAround: (payload) => foldAroundPage(payload),
+    forget: (ids) => { const canon = channelStore.current(); for (const id of ids) removeMessage(canon, id); },
+    trimTop: (firstId, firstMs) => {
+      const cover = channelStore.current().views.get(viewKey());
+      if (cover) {
+        cover.floor = firstMs;
+        cover.more = true;
+        cover.cursor = null;
+      }
+      olderPages().cursor = null;
+      olderPages().moreAbove = true;
+      olderPages().aroundSeed = firstId;
+    },
+    save: () => saveChannelScope(),
+    now: () => Date.now(),
+  });
 
   const idsOf = deps.idsOf;
   const rowMessages = deps.rowMessages;
@@ -877,6 +931,14 @@ function applyResidency(wasAtNewest: boolean): void {
     for (const raised of done.raised) {
       const held = residencyBoundaries.get(boundaryKey(raised));
       if (held) residencyBoundaries.set(boundaryKey(raised), held.filter((boundary) => boundary.oldestMs >= span.cutMs));
+      // `#2426` R2: a far-back island given up takes the seam below it along: its stretch is under the
+      // raised floor now, which the walk back reaches from the cursor.
+      const cover = canon.views.get(raised);
+      if (cover && cover.gaps) {
+        const standing = gapsAboveFloor(cover.gaps, cover.floor);
+        if (standing.length) cover.gaps = standing;
+        else delete cover.gaps;
+      }
     }
     // The rows given up stand above the reader. They are taken out of the list as they are, nothing
     // else redrawn (a redraw's landing work would clear the "N new" an arrival below the reader just
@@ -895,6 +957,7 @@ function applyResidency(wasAtNewest: boolean): void {
       const ids = idsOf(row);
       if (ids.length > 0 && ids.every((id) => !kept.has(id))) row.remove();
     }
+    islands.placeGaps();
     renderOlderControl();
     const again = heldId ? [...list.children].find((row) => (row.getAttribute("data-context-id") || idsOf(row)[0]) === heldId) : null;
     if (again) deps.nudge(area, again.getBoundingClientRect().top - heldTop);
@@ -1071,6 +1134,7 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
     const list = el("discord-log");
     const heldIds = new Set([...list.children].flatMap(idsOf));
     list.replaceChildren(...glom(shown.filter((m) => !heldIds.has(String(m.id)))).map(discordNode), ...list.children);
+    islands.placeGaps();
     const cards = el("thread-list");
     const heldThreads = new Set([...cards.children].map((row) => row.getAttribute("data-context-id")));
     cards.replaceChildren(...threadCards(timelineRows().threads.filter((t) => !heldThreads.has(String(t.id)))), ...cards.children);
@@ -1081,6 +1145,7 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
     const groups = glom(shown);
     span("page-draw", () => {
       patchRows(list, groups, (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
+      islands.placeGaps();
     });
     el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
@@ -1127,6 +1192,7 @@ function renderCachedTimeline(): void {
     const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
     const groups = glom(shown);
     patchRows(list, groups, (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
+    islands.placeGaps();
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     holdingReplyArrows(renderChannelRows);
     listState().backlog = shown.length;
@@ -1568,11 +1634,13 @@ async function readWalkCursor(): Promise<void> {
 /** @param {AbortSignal} [signal] Stops the read on the wire: see `loadOlder`. */
 
 async function loadOlderTimeline(signal?: CancelSignal): Promise<void> {
-  if (!olderPages().cursor && olderPages().moreAbove && !olderPages().inFlight && walkCursorOwed()) {
+  // `#2426` R2: after a top trim the walk goes on below the oldest row held, by one around read.
+  const seed = !olderPages().cursor && olderPages().moreAbove ? olderPages().aroundSeed || null : null;
+  if (!seed && !olderPages().cursor && olderPages().moreAbove && !olderPages().inFlight && walkCursorOwed()) {
     await readWalkCursor();
     return;
   }
-  if (!olderPages().moreAbove || !olderPages().cursor || olderPages().inFlight) return;
+  if (!olderPages().moreAbove || (!olderPages().cursor && !seed) || olderPages().inFlight) return;
   // `#229 desktop-two-column`. The column this step is for, which its work after the wait is done in.
   const steps = columnSteps();
   const context = channelContextKey();
@@ -1581,7 +1649,9 @@ async function loadOlderTimeline(signal?: CancelSignal): Promise<void> {
   renderOlderControl();
   try {
     const sent = olderPages().cursor;
-    const path = timelineReader.timelinePath(sent, null, timelineReader.olderReadReason());
+    const path = seed
+      ? `${timelineReader.timelinePath(null, null, timelineReader.olderReadReason())}&around=${encodeURIComponent(seed)}&below=${DISCORD_PAGE_LIMIT}&above=0`
+      : timelineReader.timelinePath(sent, null, timelineReader.olderReadReason());
     steps.pause();
     let payload;
     try {
@@ -1591,6 +1661,17 @@ async function loadOlderTimeline(signal?: CancelSignal): Promise<void> {
     }
     if (context !== channelContextKey() || generation !== loadState().generation) return;
     olderPages().inFlight = false;
+    if (seed) {
+      olderPages().aroundSeed = null;
+      // A server without the read answered its newest page, which says nothing below the seed: the
+      // walk goes on from a newest read's cursor instead (re-reading rows the store holds only adds).
+      const around = (payload as { around?: { held?: unknown } }).around;
+      if (!around || around.held !== true) {
+        olderPages().cursor = null;
+        channelReads.oweCursor(true);
+        return;
+      }
+    }
     // `#2264 vibe-talk-all-view-older-load-stuck`. An empty step at the same cursor is the server
     // saying no rows can be given yet: its one walk of the view is fetching them (`older_pending`),
     // and the stream's `older` event says when it ends (`takeOlderEvent`); or a failed walk backs the
@@ -1622,6 +1703,9 @@ async function loadOlderTimeline(signal?: CancelSignal): Promise<void> {
       if (readRunsSuspended()) applySearch();
     });
     saveChannelScope();
+    // `#2426` R2: a reader this far back may hold more than the budgets: the middle breaks off. Never
+    // at the cost of the step itself: a failure here is reported quietly, the step stands.
+    guardQuietly(() => islands.maybeBreakOff())();
     renderScrollTools();
     requestVisibleSummaries();
   } catch (error) {
@@ -1679,6 +1763,7 @@ function applyNewestPage(payload: TimelineResponse, saved = false): number {
   const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
   patchRows(list, glom(messages), (group) => discordNode(group), kept,
     (drawn, incoming) => drawn === incoming || sameMessage(drawn, incoming), selection().view);
+  islands.placeGaps();
   if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
   // The archive BEFORE the derivation that reads it. `kept` rows were already on screen and their
   // ids are still in the set from the read that brought them, so a reset here would un-grey them.
@@ -1812,9 +1897,58 @@ async function loadOlderPage(signal?: CancelSignal): Promise<void> {
   }
 }
 
+/**
+ * `#2426` R2: the current channel view drawn again from the store, keyed in place, with its seams:
+ * after a break-off let rows go, or a fill brought some into a gap. The caller holds the row being
+ * read (`preservingScroll`).
+ */
+
+function islandRedraw(): void {
+  const rows = projectView();
+  if (!rows) return;
+  timelineRows().messages = rows;
+  const keeps = readFilterKeeps();
+  const shown = rows.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
+  const list = el("discord-log");
+  const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
+  patchRows(list, glom(shown), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
+  islands.placeGaps();
+  if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
+  holdingReplyArrows(renderChannelRows);
+  listState().backlog = shown.length;
+  renderChannelSeam(channelSummary(shown.length, olderPager.loadedIsWhole(olderPages().moreAbove),
+    channelName(knownChannel(selectedChannelId()))));
+}
+
+/**
+ * `#2426` R2: an around answer (one stretch of the view, id-based) into the store, every view, by id:
+ * no cover's floor moves and nothing is removed by absence (it is a stretch, not a newest page).
+ * Answers the view's messages it carried, as the store keeps them.
+ */
+
+function foldAroundPage(payload: TimelineResponse): Message[] {
+  const canon = channelStore.current();
+  noteServerThreadHuesIn(payload.messages || [], [], String(selectedChannelId()));
+  observeOutgoingMessages(payload.messages || []);
+  const carried: Message[] = [];
+  for (const message of payload.messages || []) {
+    const kept = upsertMessage(canon, message);
+    if (inView(kept, selection().view, selection().threadId)) carried.push(kept);
+  }
+  for (const thread of payload.threads || []) upsertThread(canon, thread);
+  // Slack's All: the threads whose replies the server could not prove whole came as roots alone;
+  // their chips say so (replycounts.ts) until the thread's own read brings them.
+  const leftOut = (payload as { around?: { replies_left_out?: unknown } }).around?.replies_left_out;
+  if (Array.isArray(leftOut)) noteRepliesLeftOut(canon, leftOut);
+  noteArchived(payload, false);
+  return carried;
+}
+
 /** The reader has arrived at the top of what is loaded. Take the next step for them. */
 
 function maybeLoadOlder() {
+  // `#2426` R2: a seam the reader is reaching fills from their side (islandview.ts), at the head or not.
+  if (screens.view() === "discord") guardQuietly(() => islands.onScroll())();
   // Not at the head of the Pinned list, which is every pin already: older history adds none to it, and
   // a step taken behind it reads for a list that is not on screen. A pin older than what is loaded is
   // walked back to when the filter goes (`walkToFilterAnchor`, `#243 filter-keeps-selection`).

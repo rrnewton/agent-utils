@@ -69,6 +69,9 @@ export function coverViewOf(
     // which says whether another newest page of the view is older or newer than it. In memory only,
     // as the order is.
     fullSent: prior ? prior.fullSent || 0 : 0,
+    // `#2426`: the gaps between this view's islands outlive every read that does not cross them;
+    // the reads that fill them narrow them (islands.ts `narrowGap`).
+    ...(prior && prior.gaps && prior.gaps.length ? { gaps: prior.gaps } : {}),
   });
 }
 

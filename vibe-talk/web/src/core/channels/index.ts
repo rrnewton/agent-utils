@@ -90,6 +90,25 @@ export {
   versionOf,
 } from "./incremental.ts";
 export { DEFAULT_ROW_PX, correctionFor, estimatedHeightFor, forgetHeight, heightFor, measuredHeight, noteMeasured, rangeHeight, rowClassOf } from "./heights.ts";
+export {
+  ISLAND_NEWEST_DESKTOP,
+  ISLAND_NEWEST_PHONE,
+  ISLAND_ROWS_DESKTOP,
+  ISLAND_ROWS_PHONE,
+  gapForRun,
+  gapLine,
+  gapPlaces,
+  gapsAboveFloor,
+  islandBudget,
+  forgetRepliesLeftOut,
+  narrowGap,
+  noteRepliesLeftOut,
+  planBreakOff,
+  planTopTrim,
+  repliesLeftOut,
+  withGap,
+} from "./islands.ts";
+export type { FillSide, IslandBudget, ViewGap } from "./islands.ts";
 export { LAYOUT_CHARS_PER_LINE, LAYOUT_FOLDED_LINES, LAYOUT_LINE_STEP, PENDING_REPLY_BOXES_MAX, PENDING_REPLY_PX_DEFAULT, layoutReplyPx, pendingRepliesLine, pendingReplyPx, planLayoutReplies, planPendingReplies } from "./pending.ts";
 export type { LayoutReply, PendingRepliesPlan } from "./pending.ts";
 export type { RowClass } from "./heights.ts";

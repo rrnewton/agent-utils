@@ -7,6 +7,7 @@
 // the switch between them is drawn without a blank list, and what a held view missed. The
 // store, the views' rows and the reads are handed in; the words are the page's.
 
+import type { ViewGap } from "../../core/channels/index.ts";
 import type { Message, ThreadSummary } from "../../contract/index.ts";
 import { createThreadHues } from "./hues.ts";
 import type { ThreadHues } from "./hues.ts";
@@ -61,7 +62,7 @@ export interface ChannelViewsDependencies {
   el(id: string): HTMLElement;
   leftEl(id: string): HTMLElement;
   columnSide(): boolean;
-  channelCanon(): { channel: string; threads: ThreadSummary[]; messages: Message[]; views: Map<string, { live?: boolean; at?: number; dense?: number; top?: number; fromAll?: boolean; landedHidden?: boolean; notice?: string; cursor?: unknown; newest?: unknown; fullAt?: number }>; dismissed: Set<string> };
+  channelCanon(): { channel: string; threads: ThreadSummary[]; messages: Message[]; views: Map<string, { live?: boolean; at?: number; dense?: number; top?: number; fromAll?: boolean; landedHidden?: boolean; notice?: string; cursor?: unknown; newest?: unknown; fullAt?: number; gaps?: readonly ViewGap[] }>; dismissed: Set<string> };
   view(): string;
   threading(): boolean;
   entryState(): EntryState;
@@ -818,8 +819,10 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     // Not All's forward cursor, which is bound to All: the view's first refresh reads in full.
     // `#203 incremental-refresh`.
     if (view === "main" && !own) {
-      const { landedHidden: _hidden, ...cover } = all;
-      deps.channelCanon().views.set(key, { ...cover, notice: "", cursor: null, newest: null, fullAt: 0, fromAll: true });
+      const { landedHidden: _hidden, gaps, ...cover } = all;
+      // `#2426`: All's gaps stand in Main's order too, but All's counts and heights are not Main's.
+      const mainGaps = gaps && gaps.length ? { gaps: gaps.map((gap) => ({ ...gap, count: null, heightPx: null })) } : {};
+      deps.channelCanon().views.set(key, { ...cover, ...mainGaps, notice: "", cursor: null, newest: null, fullAt: 0, fromAll: true });
     } else if (view === "main" && own && all.live && (!own.live || (all.at as number) > (own.at as number))) {
       own.live = true;
       own.at = all.at;

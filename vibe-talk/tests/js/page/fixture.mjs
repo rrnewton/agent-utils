@@ -6601,6 +6601,17 @@ const TUNING_BANDS = {
   MAX_DATA_REACH_BACK: [1000, 100000, "the most kept reach-back"],
   DEFAULT_DATA_REACH_BACK: [0, 0, "kept reach-back meaning device default"],
   DEFAULT_ROW_PX: [40, 200, "row height before anything is measured, px"],
+  // `#2426 vibe-talk-sparse-loading-program` R2: islands. The owner asked for small, incremental
+  // loading ("even on desktop I think 5000 messages is too large a target"): a newest window and a
+  // far-back island of a few hundred, a fill a page at a time, seams filled before the reader reaches them.
+  ISLAND_NEWEST_PHONE: [50, 1000, "messages always held at the newest on a phone"],
+  ISLAND_NEWEST_DESKTOP: [50, 2000, "messages always held at the newest on a desk"],
+  ISLAND_ROWS_PHONE: [50, 1000, "messages a far-back reader's island keeps on a phone"],
+  ISLAND_ROWS_DESKTOP: [50, 2000, "messages a far-back reader's island keeps on a desk"],
+  GAP_FILL_MARGIN_PX: [100, 4000, "how far beyond the band a seam starts filling, px"],
+  GAP_FILL_PAGE: [10, 98, "messages one seam fill asks for (the server caps a page at 98)"],
+  BREAK_OFF_SLACK: [0, 200, "rows past the budgets before a break-off, so it is not taken back and forth"],
+  GAP_RETRY_MS: [1000, 120000, "how long scrolling waits before refilling a seam whose fill failed, ms"],
   SAMPLES_KEPT: [4, 200, "measured heights kept per row class for its median"],
   // `#2385 vibe-talk-thread-open-layout-first`: the boxes for an open thread's replies on their way.
   PENDING_REPLY_BOXES_MAX: [50, 50, "boxes at once: the bodies read brings the thread's newest page of 50"],

@@ -20,6 +20,12 @@ export interface OlderPagesRecord {
    */
   pendingAt?: string | null;
   failedAt?: string | null;
+  /**
+   * `#2426 vibe-talk-sparse-loading-program` R2: the oldest message held after the islands let every
+   * row older than it go (a far-back reader's top trim). With no cursor, the next step back is an
+   * `around` read below it, whose answer brings the served cursor the walk goes on from.
+   */
+  aroundSeed?: string | null;
 }
 
 /** What the older pages ask of the page. */

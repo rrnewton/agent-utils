@@ -1,0 +1,22 @@
+steps:
+  # `#2426 vibe-talk-sparse-loading-program` R2 on the shipped server (fake chat upstream through the
+  # fake-seed route, the message cache serving the whole history its own walk read): a long
+  # scroll-back in Main breaks off into ONE seam within the budgets, Newest from far back sends no
+  # timeline request, and the seam fills through the REAL around route (200, held) until it closes
+  # with no hole, the row being read within 1 px on every frame. Counts, geometry and the server's
+  # own answers; waits are on conditions, never a clock. Phone (touch, dark) and desk (light).
+  - group: check
+    job: islands-server-browser
+    desc: on a real server holding the channel's history, a scroll-back in Main breaks off into one seam within the budgets, Newest sends no timeline request, and the seam fills through the real around route (answered 200, held) until it closes with no hole, the row being read within 1 px, in current Chromium at 412x915 by touch and 1280x800 (#2426)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/islands_server_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 900
+    cpu_timeout: 240
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 180
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

@@ -10,6 +10,20 @@
 
 import type { Message, ThreadSummary } from "../../contract/index.ts";
 
+/** `#2426` R2: a stretch of one view's order the page does not hold, between two stretches it does (islands.ts). */
+export interface ViewGap {
+  /** The newest message held on the gap's OLDER side (the row drawn just above it). */
+  readonly olderId: string;
+  readonly olderMs: number;
+  /** The oldest message held on the gap's NEWER side (the row drawn just below it). */
+  readonly newerId: string;
+  readonly newerMs: number;
+  /** How many of the view's messages lie in it, when known (the page let them go itself), else null. */
+  readonly count: number | null;
+  /** Their measured height in CSS px at the width they were drawn at, when known, else null. */
+  readonly heightPx: number | null;
+}
+
 /** How far back one view's own pages reached, and what its reads last said. */
 export interface ViewCover {
   /** The oldest time its pages reached when there is more below; null for "unknown" or "all of it". */
@@ -41,6 +55,12 @@ export interface ViewCover {
   fromAll?: boolean;
   /** Rows a landed page carried that the view hid. */
   landedHidden?: unknown;
+  /**
+   * `#2426 vibe-talk-sparse-loading-program`: the stretches between islands this view's pages
+   * covered and the page has since let go of, oldest first (islands.ts). In memory only, as the
+   * rows around them are: absent means none.
+   */
+  gaps?: readonly ViewGap[];
 }
 
 /** The selected channel's store. */

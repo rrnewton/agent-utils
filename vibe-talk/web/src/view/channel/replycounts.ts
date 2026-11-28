@@ -4,7 +4,7 @@
 // timing are as they were in the script. What the store holds of every thread's replies stays
 // core/channels' (`replyTallyOf`).
 
-import { allReachesThread, emptyTally, exactReplyCount, replyTallyOf, tallyRecord, threadOf, unseenRepliesIn } from "../../core/channels/index.ts";
+import { allReachesThread, emptyTally, exactReplyCount, forgetRepliesLeftOut, replyTallyOf, repliesLeftOut, tallyRecord, threadOf, unseenRepliesIn } from "../../core/channels/index.ts";
 import type { ChannelCanon, ReplyTally } from "../../core/channels/index.ts";
 import { countOf, filedThreadSlug, firstLineOf, replyMarkerName } from "../../present/rows/index.ts";
 import { childByClass, replyRowOf } from "../../view/dom/index.ts";
@@ -501,7 +501,15 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
       const gather = childByClass(row, "thread-replies");
       if (gather && message.thread!.is_root) {
         const { count, exact } = deps.gatherCount(own, message, entry.held);
-        const words = deps.threadCount(count, exact);
+        let words = deps.threadCount(count, exact);
+        // `#2426` R2: a root of a refilled stretch of All whose replies the server left out says they
+        // are not loaded (its count is the thread's, not what stands here) until the thread's read
+        // brings them; opening it stands their boxes at once (`#2385`).
+        const canon = deps.channelStore().current();
+        if (inAll && repliesLeftOut(canon, own)) {
+          if (typeof count === "number" && entry.held < count) words = `${words} · not loaded`;
+          else forgetRepliesLeftOut(canon, own);
+        }
         if (gather.textContent !== words) gather.textContent = words;
       }
     }

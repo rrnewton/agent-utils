@@ -5,8 +5,9 @@
 held-rows cap, the residency layer of `#2426`): a page used to hold and draw every message a
 session read or was sent. This walk serves the checked-out page and a fake API with real paging
 (a newest page of 50 that says more exists, older pages by cursor) from one loopback origin, walks
-a channel back until it holds 300 rows, goes to the newest, and lets a message arrive. With the
-device's resident rows at 100 it checks, at 412x915 by touch and 1280x800:
+a channel back 300 rows deep, goes to the newest, and lets a message arrive. With the device's
+resident rows at 100 (an island of 100 too, `#2426` R2: so that deep, the page holds its far-back
+island and the newest window with one seam between) it checks, at 412x915 by touch and 1280x800:
 
   * the arrival leaves at most the newest window plus one walked page on screen, and the rows given
     up are the oldest (the newest row and the arrival stay);
@@ -14,12 +15,14 @@ device's resident rows at 100 it checks, at 412x915 by touch and 1280x800:
     arrival and the rows given up above it (owner rule 370), and the jump still says "1 new";
   * the first step back after the cap asks for exactly the rows below the first kept row, and the
     rows on screen afterwards are one unbroken run (no hole);
+  * the island given up takes its seam along: no seam stands after the arrival (`#2426` R2);
 
 and with the resident rows at 20000 (the negative control) nothing is given up. Two pins (the
-liaison's condition on the evidence): a reply box opened, with a typed draft, on the row 180 above the
-newest, and a read aloud started on that row; the reader goes to the newest and two messages arrive:
-the row stays, with its reply box and draft, or still being read. Counts and
-geometry only; every wait is a condition, no wall-clock budget.
+liaison's condition on the evidence): a reply box opened, with a typed draft, on the row 120 above the
+newest (in the far-back island, outside the newest window), and a read aloud started on that row; the
+reader goes to the newest and two messages arrive: rows are given up and the row stays, with its reply
+box and draft, or still being read. Counts and geometry only; every wait is a condition, no wall-clock
+budget.
 Pass --screenshots DIR to keep PNGs; --web-root DIR for another page copy.
 """
 
@@ -196,6 +199,7 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
 
 ROWS_JS = "() => document.querySelectorAll('#discord-log > li[data-id]').length"
 IDS_JS = "() => [...document.querySelectorAll('#discord-log > li[data-id]')].map((li) => li.getAttribute('data-id'))"
+SEAMS_JS = "() => [...document.querySelectorAll('#discord-log > li.island-gap')].map((li) => li.textContent.trim())"
 TO_TOP_JS = "() => { const a = document.getElementById('scroll-area'); a.scrollTop = 0; a.dispatchEvent(new Event('scroll')); }"
 TO_FOOT_JS = "() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }"
 READING_JS = """() => {
@@ -238,21 +242,31 @@ def wait_until(page: "Page", script: str, why: str, arg: object = None) -> None:
     check(bool(page.evaluate(script, arg)), why)
 
 
+def walk_back(page: "Page", api: FakeApi, label: str) -> int:
+    """Walk the channel back until its oldest row on screen is WALKED rows deep; return the depth. Deep,
+    not held: with an island budget below WALKED the page breaks the middle off on the way (`#2426` R2)."""
+    def depth() -> int:
+        ids = page.evaluate(IDS_JS)
+        return TOTAL - api.index_of(str(ids[0])) if ids else 0
+    deadline = time.monotonic() + browser_waits.HANG_BACKSTOP_MS / 1000
+    while depth() < WALKED and time.monotonic() < deadline:
+        before = depth()
+        page.evaluate(TO_TOP_JS)
+        stepped = time.monotonic() + 10
+        while time.monotonic() < stepped and depth() == before:
+            page.wait_for_timeout(50)
+            page.evaluate(TO_TOP_JS)
+    walked = depth()
+    check(walked >= WALKED, f"{label}: the walk back stopped {walked} rows deep")
+    return walked
+
+
 def walk(page: "Page", api: FakeApi, label: str, resident: int, shots: Path | None) -> str:
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     wait_until(page, f"() => ({ROWS_JS})() >= {PAGE}", f"{label}: the channel never opened")
-    # A long session: walk back until the page holds WALKED rows.
-    deadline = time.monotonic() + browser_waits.HANG_BACKSTOP_MS / 1000
-    while int(page.evaluate(ROWS_JS)) < WALKED and time.monotonic() < deadline:
-        before = int(page.evaluate(ROWS_JS))
-        page.evaluate(TO_TOP_JS)
-        stepped = time.monotonic() + 10
-        while time.monotonic() < stepped and int(page.evaluate(ROWS_JS)) == before:
-            page.wait_for_timeout(50)
-            page.evaluate(TO_TOP_JS)
-    walked = int(page.evaluate(ROWS_JS))
-    check(walked >= WALKED, f"{label}: the walk back stopped at {walked} rows")
+    # A long session: walk back WALKED rows deep.
+    walk_back(page, api, label)
     page.evaluate(TO_FOOT_JS)
     page.evaluate(FOOT_STILL_JS)
     page.evaluate(TO_FOOT_JS)
@@ -290,6 +304,8 @@ def walk(page: "Page", api: FakeApi, label: str, resident: int, shots: Path | No
         return f"{label}: nothing given up ({len(ids)} rows), reading row moved {moved:.2f}px"
     check(resident <= len(ids) <= resident + PAGE + 1,
           f"{label}: {len(ids)} rows after the arrival, not the newest {resident} plus at most one page")
+    seams = page.evaluate(SEAMS_JS)
+    check(not seams, f"{label}: a seam stands after the island was given up: {seams}")
     first = ids[0]
     first_index = api.index_of(first)
     asked_before = len(api.befores)
@@ -321,7 +337,7 @@ DEVICE_VOICE = """(() => {
   try { localStorage.setItem('vibe-talk.voice.read-audio-source', 'device'); } catch (e) {}
 })();"""
 DRAFT = "a draft kept while older rows go"
-ROW_UP = 180
+ROW_UP = 120
 
 
 def press(page: "Page", selector: str, mobile: bool) -> None:
@@ -341,16 +357,11 @@ def pinned_walk(page: "Page", api: FakeApi, label: str, case: str, mobile: bool,
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     wait_until(page, f"() => ({ROWS_JS})() >= {PAGE}", f"{label}: the channel never opened")
-    deadline = time.monotonic() + browser_waits.HANG_BACKSTOP_MS / 1000
-    while int(page.evaluate(ROWS_JS)) < WALKED and time.monotonic() < deadline:
-        before = int(page.evaluate(ROWS_JS))
-        page.evaluate(TO_TOP_JS)
-        stepped = time.monotonic() + 10
-        while time.monotonic() < stepped and int(page.evaluate(ROWS_JS)) == before:
-            page.wait_for_timeout(50)
-            page.evaluate(TO_TOP_JS)
+    walk_back(page, api, label)
     held = [str(x) for x in page.evaluate(IDS_JS)]
-    check(len(held) > ROW_UP + RESIDENT, f"{label}: only {len(held)} rows held")
+    # The row ROW_UP above the newest held lies outside the newest window (in the far-back island when
+    # the page broke the middle off, `#2426` R2), so residency must keep it as a pin.
+    check(ROW_UP > RESIDENT and len(held) > ROW_UP, f"{label}: only {len(held)} rows held")
     target = held[-ROW_UP]
     row = f"#discord-log > li[data-id='{target}']"
     if case == "reply":
@@ -393,6 +404,8 @@ def pinned_walk(page: "Page", api: FakeApi, label: str, case: str, mobile: bool,
         page.evaluate(FOOT_STILL_JS)
         page.screenshot(path=str(shots / f"{label}.png"), full_page=False)
     gone = len(held) + 2 - len(after)
+    # Rows were given up around the pinned row, or the pin was never put to the test.
+    check(gone > 0, f"{label}: nothing was given up ({len(held)} rows -> {len(after)}), so the {case} row was never at risk")
     return (f"{label}: {case} on the row {ROW_UP} above the newest kept through the newest and two arrivals "
             f"({len(held)} rows -> {len(after)}, {max(gone, 0)} given up)")
 

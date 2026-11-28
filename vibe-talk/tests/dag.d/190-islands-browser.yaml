@@ -1,0 +1,20 @@
+steps:
+  # `#2426 vibe-talk-sparse-loading-program` R2: islands in the channel list. A long scroll-back breaks
+  # off into the reader's island and the newest window with ONE seam between them; the row being read
+  # holds within 1 px through every step, break-off, top trim and fill; Newest from far back reads
+  # nothing; a seam fills from the reader's side (around reads) until it closes with no hole. Counts
+  # and geometry, no wall-clock budget.
+  - group: check
+    job: islands-browser
+    desc: islands in the channel list (break-off into one seam past the budgets, rows held within 1 px through steps, trims and fills, Newest from far back with zero reads, seams filled from the reader's side until closed) in current Chromium at 412x915 by touch and 1280x800 (#2426)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/islands_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 900
+    cpu_timeout: 240
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 120
+      classification: latency-bound
+      preferred_inner_jobs: 4

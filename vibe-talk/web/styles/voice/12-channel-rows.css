@@ -439,3 +439,21 @@
   font-size: 0.78rem;
   color: var(--muted);
 }
+
+/*
+ * `#2426 vibe-talk-sparse-loading-program` R2: the seam that stands for a stretch of the channel the
+ * page let go of between two islands (the reader's far-back island and the newest window), and
+ * fills from the reader's side when they reach it. The same seam as a folded read run (one seam
+ * visual, one verb): a full-width line with a dashed hairline each side and the words saying how
+ * much is not loaded. No box, no card: a place in the list, not a message.
+ */
+.messages li.island-gap {
+  background: none;
+  border: none;
+  padding: 0.25rem 0;
+  margin: 0.35rem 0;
+}
+
+.messages li.island-gap[aria-busy="true"] .island-gap-line {
+  color: var(--ink);
+}
