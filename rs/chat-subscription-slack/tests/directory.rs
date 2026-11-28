@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentctl::chat_runtime::{BridgeConfiguration, BridgeState};
 use serde_json::{json, Value};
@@ -144,6 +144,51 @@ fn assert_no_post_intent(root: &Path) {
         !root.join("ledger").join(format!("{ID}.json")).exists(),
         "rejections never create posting intents"
     );
+}
+
+/// Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// A dated load quarantine (owner rule 346), the Rust form of the Python suites'
+/// `load_quarantine(issue=..., expires=...)`: until `expires` (a UTC date, inclusive) the case
+/// returns at once and says why on stderr; after it the case runs again by itself, so the
+/// quarantine can never be forgotten. `CHAT_SUBSCRIPTION_INCLUDE_QUARANTINED=1` runs it on demand.
+fn load_quarantined(issue: &str, expires: (i64, u32, u32), why: &str) -> bool {
+    if std::env::var_os("CHAT_SUBSCRIPTION_INCLUDE_QUARANTINED").is_some_and(|value| value == "1") {
+        return false;
+    }
+    let today = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after 1970")
+            .as_secs()
+            / 86_400,
+    )
+    .expect("days since 1970 fit in i64");
+    let (year, month, day) = expires;
+    if today > days_from_civil(year, month, day) {
+        eprintln!(
+            "quarantine expired {year}-{month:02}-{day:02} ({issue}): running the case again"
+        );
+        return false;
+    }
+    eprintln!("quarantined until {year}-{month:02}-{day:02} ({issue}): {why}");
+    true
+}
+
+#[test]
+fn days_from_civil_matches_known_dates() {
+    assert_eq!(days_from_civil(1970, 1, 1), 0);
+    assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+    assert_eq!(days_from_civil(2026, 12, 5), 20_792);
 }
 
 fn assert_refused(response: &Value, code: &str) {
@@ -297,6 +342,15 @@ fn rejection_lookup_errors_or_timeouts_never_start_a_write() {
 
 #[test]
 fn rejection_lookup_and_write_share_one_deadline_even_through_the_warm_wrapper() {
+    if load_quarantined(
+        "#2477",
+        (2026, 12, 5),
+        "the fake's 0.45 s lookup and 0.65 s write race a 1000 ms wall-clock deadline; on a busy \
+         host the lookup spends all of it, the write never starts and the outcome is not_applied, \
+         not unknown (7 gate heads that never touched this crate, 2026-11-22 to 11-28)",
+    ) {
+        return;
+    }
     let root = workspace("rejection-shared-deadline");
     fixture(
         &root,

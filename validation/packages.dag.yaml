@@ -117,7 +117,7 @@ steps:
   # command, sibling package, or Herdr visible, and run its quickstart workflow end to end. The
   # package steps above prove each artifact installs alone; these prove it also works alone.
   # The wrkslots lifecycle spends most of its time in removal's process census, which scales with
-  # the host's process count: about 40 CPU-seconds on a busy shared workstation, a few on a runner.
+  # the host's process count: 150 to 290 CPU-seconds in gates on a busy shared workstation, a few on a runner.
   - group: standalone
     job: wrkslots
     desc: install only wrkslots in a clean environment and run a whole slot lifecycle
@@ -125,7 +125,10 @@ steps:
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-wrkslots]
     timeout: 2400
-    cpu_timeout: 300
+    # A hang guard, not a speed budget (owner rule 346): about twice the hot-host p90. Passing
+    # gates from 2026-11-26 to 11-28 spent p50 215, p90 261, max 288 CPU-s (46 runs), within 4%
+    # of the old 300 (#2475).
+    cpu_timeout: 600
     hint:
       resources: {python-package: 1}
       est_duration_s: 45

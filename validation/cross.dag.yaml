@@ -159,10 +159,13 @@ steps:
     # Main phase (#1249 cross-differentials-robust): de-timed (generous
     # hang guard; the held-pipe check compares against the fake
     # descendant's own lifetime, not a speed budget) and qualified under
-    # topped-up load above 75% CPU; record in #1249.
+    # topped-up load above 75% CPU; record in #1249. The CPU guard is about
+    # twice the hot-host p90: passing gates from 2026-11-26 to 11-28 spent
+    # p50 772, p90 1135, max 1168 CPU-s (28 runs; the old guard was 1200),
+    # up from p90 620 before; #2475 finds what grew.
     labels: [component-herdr-run]
     timeout: 9600
-    cpu_timeout: 1200
+    cpu_timeout: 2400
     hint: *cross_hint
 
   - group: agentctl
