@@ -1791,6 +1791,13 @@ pub fn relay_in(
                 // claimed there, so the message must become retryable here.
                 "deferred",
                 "undeliverable",
+                // Every other answer a receiver gives (#2420 R9): refusing them left the
+                // entry `in-custody`, silently. `route-refused` is retried as `deferred`;
+                // the rest are recorded as they are, so `status` shows what happened.
+                "possibly_submitted",
+                "quarantined",
+                NOT_RECORDED,
+                "route-refused",
             ];
             if !crate::envelope::valid_message_id(&id)
                 || !KNOWN_STATES.contains(&receipt_state.as_str())

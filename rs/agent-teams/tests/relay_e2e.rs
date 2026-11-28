@@ -3226,3 +3226,54 @@ fn a_failed_hand_over_is_not_a_terminal_refusal_and_the_next_copy_delivers() {
     assert_eq!(delivered.len(), 1, "{delivered:?}");
     assert!(delivered[0].contains("deliver me after the inbox is back"));
 }
+
+#[test]
+fn every_state_a_receiver_answers_settles_the_senders_outbox() {
+    // #2420 R9: a receiver answers `possibly_submitted`, `quarantined`, `not-recorded` and
+    // `route-refused` too, but the sender refused those receipts ("bad ID or state"), so its
+    // entry stayed `in-custody` and never showed what happened. Each is now recorded, and
+    // `route-refused` becomes `deferred`, which the pump retries.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let tools_announce = agent_teams::relay::build_announce(
+        "tools",
+        "host-a",
+        "UBOTTOOLS",
+        "https://example.invalid/org/repo.git",
+    );
+    let outcome = world.relay_in(
+        "UBOTTOOLS",
+        &agent_teams::relay::render_announce(&tools_announce),
+    );
+    assert_eq!(outcome["outcome"], "candidate-recorded", "{outcome}");
+    let (code, out, err) = world.run(&["relay", "confirm", "UBOTTOOLS", "--owner-approved"]);
+    assert_eq!(code, 0, "{out} {err}");
+    for (n, (state, expected)) in [
+        ("possibly_submitted", "possibly_submitted"),
+        ("quarantined", "quarantined"),
+        ("not-recorded", "not-recorded"),
+        ("route-refused", "deferred"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (id, post) =
+            world.send_sim_to_tools(&format!("Receipt state {state}."), &format!("r9-{n}"));
+        let fence = post
+            .split("```agent-teams-envelope\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n```").next())
+            .expect("fence");
+        let envelope: serde_json::Value = serde_json::from_str(fence).expect("envelope");
+        let receipt = serde_json::json!({
+            "schema": "agent-teams-receipt/v1", "id": id, "state": state,
+            "detail": format!("receiver answered {state}"), "at": "2026-11-27T00:00:00.000Z",
+        });
+        let text = agent_teams::relay::render_receipt(&envelope, &receipt);
+        let outcome = world.relay_in("UBOTTOOLS", &text);
+        assert_eq!(outcome["outcome"], "receipt-recorded", "{state}: {outcome}");
+        let (_, out, _) = world.run(&["status", &id, "--json"]);
+        let value: serde_json::Value = serde_json::from_str(&out).expect("status json");
+        assert_eq!(value["outbox"]["state"], expected, "{state}: {out}");
+    }
+}

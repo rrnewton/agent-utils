@@ -649,6 +649,9 @@ pub fn map_receiver_state(state: &str) -> String {
         "fenced" => "refused".to_string(),
         // The first #721 build's spelling; retried as `deferred`.
         "undeliverable" => "deferred".to_string(),
+        // The receiver had no route for it (no declaration or relay channel yet): retried
+        // as `deferred`, never left `in-custody` (#2420 R9).
+        "route-refused" => "deferred".to_string(),
         other => other.to_string(),
     }
 }
