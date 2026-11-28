@@ -1,6 +1,6 @@
 ---
 title: 'live-seal-classify-edition-disagreement: with a live actor and no wrkslots process on the sealed target, the Rust classify sometimes calls a validation-batch seal in progress where Python calls it interrupted'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-flaketriage
@@ -9,7 +9,8 @@ labels:
 - rust
 - editions
 created_at: 2026-11-28T13:08:00-05:00
-updated_at: 2026-11-28T13:08:00-05:00
+updated_at: 2026-11-28T15:29:00-05:00
+closed_at: 2026-11-28T15:29:00-05:00
 ---
 
 # Description
@@ -40,3 +41,19 @@ The Python edition, in the same runs, said interrupted. So the Rust edition some
 # Notes
 
 Filed by `cl-flaketriage` at the coordinator's request (2026-11-28; number pre-assigned), from the 48-hour triage (item E, recurring).
+
+## Resolution
+
+Fixed in d1c1c116 (`rs/wrkslotsd/src/ensure_states.rs`), gated as c545284f: gate 1795893788680089755-7502e6da (full selection).
+- In that gate the changed path was green: `rust.wrkslots.test`, the wrkslots debug test, and every `python.wrkslots` shard, including this case's own.
+- Its off-path reds: `rust.agent-teams.test` and `vibe-talk.check.documents-read-browser` passed in a solo rerun on the unchanged commit (gate 1795897455310050737-8e2204de); `vibe-talk.check.read-pause-reply-browser` is known-red in an untouched component.
+
+Cause, from a reproduction:
+- With process churn inside the test's own PID namespace, the case failed 1 in 30 on the old code. The Rust classify named an exiting churn process as the seal's live operator.
+- The Rust scan counted every `/proc/<pid>/cmdline` read failure except NotFound as a live wrkslots process acting on the sealed targets. A process that exits between the open and the read fails with ESRCH. The Python edition skips it as exited.
+
+Fix:
+- `cmdline_read_error_is_exit`: NotFound (ENOENT) and ESRCH mean the process exited, and it is skipped; any other failure still counts.
+- A deterministic unit test covers the error kinds.
+- After the fix, the churn repro passed 60 of 60, 54 of them at load1 >= 237.
+
