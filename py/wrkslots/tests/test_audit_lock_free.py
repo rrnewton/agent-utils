@@ -799,6 +799,7 @@ def _comparable_rust_audit(root: Path, tmp_path: Path, jobs: int) -> tuple[dict[
 
 
 @pytest.mark.git_stand_in  # a host git wrapper's detached helper outlives the git calls (#2065)
+@pytest.mark.load_quarantine(issue="#2464", expires="2026-12-05")  # census-counts-own-descendants: the pooled audit's one shared census can count a sibling row's in-flight git child as a running agent
 def test_other_edition_pools_rows_with_the_same_report(tmp_path: Path) -> None:
     """#1200 rust-status-consistency: Rust audit --jobs 4 reports exactly what --jobs 1 does."""
     root = _verdict_mix_fixture(tmp_path / "case")

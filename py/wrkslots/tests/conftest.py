@@ -15,6 +15,7 @@ if str(PY_ROOT) not in sys.path:
 # representation; image slots have their own tests (test_slot_images.py and
 # e2e_images.sh). New projects created by these tests therefore default to
 # worktrees. Subprocesses inherit this.
+import datetime as dt  # noqa: E402
 import os  # noqa: E402
 
 os.environ.setdefault("WRKSLOTS_INIT_REPRESENTATION", "worktree")
@@ -159,8 +160,19 @@ def pytest_collection_modifyitems(
         return
     kept: list[pytest.Item] = []
     quarantined: list[pytest.Item] = []
+    expired: list[str] = []
+    today = dt.date.today()
     for item in items:
-        if item.get_closest_marker("load_quarantine") is not None:
+        marker = item.get_closest_marker("load_quarantine")
+        expires = issue = None
+        if marker is not None:
+            expires, issue = marker.kwargs.get("expires"), marker.kwargs.get("issue", "?")
+        if expires is not None and today > dt.date.fromisoformat(str(expires)):
+            # A dated quarantine ends by itself: the case runs again, and the
+            # summary names it with its issue, so it is never forgotten.
+            expired.append(f"{item.nodeid} (expired {expires}, {issue})")
+            kept.append(item)
+        elif marker is not None:
             quarantined.append(item)
         elif not _git_stand_in.on and item.get_closest_marker("git_stand_in") is not None:
             # Without the stand-in a host git wrapper's detached helper can
@@ -172,6 +184,7 @@ def pytest_collection_modifyitems(
         config.hook.pytest_deselected(items=quarantined)
         items[:] = kept
     config._quarantined_nodeids = [item.nodeid for item in quarantined]  # type: ignore[attr-defined]
+    config._quarantine_expired = expired  # type: ignore[attr-defined]
 
 
 #: Session-wide guard against tests writing the real global git config
@@ -222,6 +235,11 @@ def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
     if sentinel_note:
         terminalreporter.write_sep("=", "global git config guard (#1474)")
         terminalreporter.write_line(f"  note: {sentinel_note}")
+    expired = getattr(terminalreporter.config, "_quarantine_expired", [])
+    if expired:
+        terminalreporter.write_sep("=", "load quarantines past their expiry run again")
+        for line in expired:
+            terminalreporter.write_line(f"  expired: {line}")
     nodeids = getattr(terminalreporter.config, "_quarantined_nodeids", [])
     if nodeids:
         terminalreporter.write_sep(
