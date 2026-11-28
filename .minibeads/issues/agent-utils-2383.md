@@ -113,3 +113,17 @@ The scoped exception (interim until #2415, approved by the lead coordinator afte
    - It runs at every host-temp activation and at gate start, and the daily tick runs `python3 scripts/private_tmp.py sweep`.
 3. The wrapper measures the root every 10 s. Past 5,000,000,000 bytes it prints a named REFUSED line, stops the command (SIGTERM, then SIGKILL after 30 s), removes the root, and exits 73.
 4. #2415 names this exception, and every DAG comment on a wrapped step points to it.
+
+## The second gate: merge-queue registry discovery stops at home (#2431)
+
+[opus 5.5] cl-tmpfix, 2026-11-27. The second gate (27570ce1, ticket 1795823535897912719-fa064122) failed 4 steps, one of them from the temp-root move.
+
+- `rust.merge-queue.test` (from this change): merge-queue's `registry_above` walked from a fixture to the filesystem root. With the temp root under the home directory, it reached the home directory's real `.agentctl` (agentctl's plugin home).
+  - `registry_above_finds_the_nearest_registry` failed on it, and six CLI tests saw an unexpected `--registry <home>/.agentctl` argv. Their fake agentctl refused it, so nothing was sent.
+  - agentctl stopped its own discovery at the home directory in #1169. merge-queue now follows the same rule, as its own production fix #2431, stacked on this tree so one gate covers both: the walk stops before home, comparing canonical paths, and with no home it checks only the anchor itself.
+  - A unit test with a fake home covers this. Production gains the same protection: a queue under home with no project registry no longer addresses the plugin home.
+- Not from this change:
+  - `python-lifecycle.namespace.shard-1`: a wall-clock bound, `assert 17.76 < 8.0` on a rollback at load1 about 270 (#2413 family).
+  - `packages.standalone.wrkslots`: CPU 301 s against its 300 s budget. It passed in the first gate in the same layout at 256 s (#2219 family).
+  - `vibe-talk.check.keyboard-browser`: a page status race; no vibe-talk change is in this range.
+- The watcher logged exactly the 27 allowlisted steps making `/tmp/aut-<uid>` roots, and nothing else. Both temp bases were empty after the run.
