@@ -3440,3 +3440,26 @@ fn one_entry_whose_route_is_undefined_does_not_stop_the_pump() {
     );
     assert_ne!(code, 2, "not a pump failure: {out} {err}");
 }
+
+#[test]
+fn an_entry_the_pump_cannot_resolve_is_reported_never_skipped_silently() {
+    // #2420 R15: an outbox entry addressed to a team no longer in teams.json was skipped
+    // with no word, so it was never walked, never expired and never reported. It is now
+    // printed as skipped with the reason and the reason is kept on the entry.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let (good, _) = world.send_sim_to_tools("Source of the copy.", "r15-good");
+    deferred_copy_addressed_to(&world, &good, "tm-sim-2420a7a7a7a7a7a7", "ghost@host-a");
+    let (_, out, err) = world.run(&["pump"]);
+    assert!(
+        out.contains("tm-sim-2420a7a7a7a7a7a7: skipped:"),
+        "reported: {out} {err}"
+    );
+    let entry = world.outbox("tm-sim-2420a7a7a7a7a7a7");
+    assert!(
+        entry["pump_skipped"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("ghost")),
+        "{entry}"
+    );
+}

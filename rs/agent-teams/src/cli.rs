@@ -2236,12 +2236,22 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             }
             let (to_team, to_host_arg) =
                 parse_target(entry["addressed_to"].as_str().unwrap_or_default());
-            let Ok(team_entry) = teams.pick_entry(&to_team, to_host_arg.as_deref(), &globals.host)
-            else {
-                continue;
+            // An entry whose team or host is no longer in teams.json is reported and kept, never
+            // skipped silently (#2420 R15): it would otherwise never be walked, never expire
+            // and never be seen.
+            let team_entry = match teams.pick_entry(&to_team, to_host_arg.as_deref(), &globals.host)
+            {
+                Ok(team_entry) => team_entry.clone(),
+                Err(error) => {
+                    report_pump_skip(globals, &mut entry, &error.to_string());
+                    count += 1;
+                    continue;
+                }
             };
-            let team_entry = team_entry.clone();
             let Some(host_obj) = teams.hosts.get(&team_entry.host).cloned() else {
+                let reason = format!("no host {:?} in teams.json", team_entry.host);
+                report_pump_skip(globals, &mut entry, &reason);
+                count += 1;
                 continue;
             };
             let sender_decl = entry["envelope"]["from"]["team"]
