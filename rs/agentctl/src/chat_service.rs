@@ -21701,10 +21701,7 @@ printf '%s\n' "$request" >> "$1" || exit 4
         for key in &requests {
             send_keys.send(key.clone()).expect("announce the reply");
         }
-        let tripped = |logs: &[String]| {
-            logs.iter()
-                .any(|line| line.contains("post-rate breaker tripped"))
-        };
+        let tripped = |logs: &[String]| logs.iter().any(|line| line.contains("chat reply paced"));
         // The tripped log line is the condition; the bound only
         // reports a hang.
         let deadline = Instant::now() + Duration::from_secs(180);

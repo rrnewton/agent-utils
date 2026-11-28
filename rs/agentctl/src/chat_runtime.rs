@@ -156,8 +156,15 @@ const MAX_REPLY_ALIAS_BYTES: usize = 1_024 * 1_024;
 // trips 24 s in. After each hold it sends 8 more posts and trips again, about 96 posts an hour.
 const MAX_THREAD_REPLIES_PER_WINDOW: usize = 8;
 const THREAD_REPLY_WINDOW_MILLIS: u64 = 60_000;
-// A tripped thread holds its replies this long unless an operator deletes the breaker record.
-const THREAD_BREAKER_COOLDOWN_MILLIS: u64 = 300_000;
+// #2420 D1 (owner decision: never hold, pace only): a thread over the window's limit is paced,
+// each reply going the moment the window has a free slot, never held for a cooldown. A thread
+// that sends more than RUNAWAY_REPLIES in RUNAWAY_WINDOW_MILLIS is a runaway: one alarm, and it
+// keeps pacing. Sends are kept that long so the runaway count can see them; a runaway mark
+// (a `trips` event) lasts as long.
+const RUNAWAY_REPLIES: usize = 60;
+const RUNAWAY_WINDOW_MILLIS: u64 = 600_000;
+// A reply paced longer than this is reported by `chat health` (liaison 1105: visible over ~30 s).
+pub(crate) const PACED_VISIBLE_AFTER_SECONDS: u64 = 30;
 const MAX_REPLY_BREAKER_EVENTS: usize = 4_096;
 const MAX_REPLY_BREAKER_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_OUTBOUND_EXECUTABLE_BYTES: u64 = 64 * 1_024 * 1_024;
@@ -2688,7 +2695,16 @@ fn current_reply_id(record: &RequestRecord, alias: Option<u64>) -> String {
 struct ReplyBreakerRecord {
     version: u32,
     sends: Vec<ThreadEvent>,
+    // Since #2420 D1: runaway alarms, one per thread per runaway window (never a hold).
     trips: Vec<ThreadEvent>,
+    // Replies waiting for a free slot in their thread's window, by operation ID (#2420 D1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paced: Vec<ThreadEvent>,
+    // The latest and the longest a paced reply waited for its slot, in seconds (#2420 D1).
+    #[serde(default)]
+    last_paced_seconds: u64,
+    #[serde(default)]
+    max_paced_seconds: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2732,6 +2748,12 @@ impl ReplyBreakerRecord {
                 .trips
                 .iter()
                 .any(|trip| trip.send_request_id.is_some() || trip.pending)
+            || self.paced.len() > MAX_REPLY_BREAKER_EVENTS
+            || self.paced.iter().any(|paced| {
+                paced.send_request_id.is_none()
+                    || paced.channel_id.is_empty()
+                    || paced.thread_id.is_empty()
+            })
         {
             return Err(ChatRuntimeError::invalid(
                 "reply post-rate breaker record is inconsistent or outside protocol bounds",
@@ -2747,18 +2769,47 @@ impl ReplyBreakerRecord {
     /// whether any stamp moved, so a caller that otherwise writes nothing can persist the move.
     fn prune(&mut self, now: u64) -> bool {
         let mut clamped = false;
-        for event in self.sends.iter_mut().chain(self.trips.iter_mut()) {
+        for event in self
+            .sends
+            .iter_mut()
+            .chain(self.trips.iter_mut())
+            .chain(self.paced.iter_mut())
+        {
             if event.at_millis > now {
                 event.at_millis = now;
                 clamped = true;
             }
         }
         self.sends.retain(|send| {
-            send.pending || now.saturating_sub(send.at_millis) < THREAD_REPLY_WINDOW_MILLIS
+            send.pending || now.saturating_sub(send.at_millis) < RUNAWAY_WINDOW_MILLIS
         });
         self.trips
-            .retain(|trip| now.saturating_sub(trip.at_millis) < THREAD_BREAKER_COOLDOWN_MILLIS);
+            .retain(|trip| now.saturating_sub(trip.at_millis) < RUNAWAY_WINDOW_MILLIS);
+        // A paced entry whose reply never came back for its slot is dropped after a day.
+        self.paced
+            .retain(|paced| now.saturating_sub(paced.at_millis) < 86_400_000);
         clamped
+    }
+
+    /// The sends of `thread` that count against its window at `now` (pending, or within the
+    /// window), and when the oldest of them frees its slot.
+    fn window_of(&self, channel_id: &str, thread_id: &str, now: u64) -> (usize, Option<u64>) {
+        let in_window: Vec<&ThreadEvent> = self
+            .sends
+            .iter()
+            .filter(|send| {
+                send.channel_id == channel_id
+                    && send.thread_id == thread_id
+                    && (send.pending
+                        || now.saturating_sub(send.at_millis) < THREAD_REPLY_WINDOW_MILLIS)
+            })
+            .collect();
+        let frees_at = in_window
+            .iter()
+            .filter(|send| !send.pending)
+            .map(|send| send.at_millis.saturating_add(THREAD_REPLY_WINDOW_MILLIS))
+            .min();
+        (in_window.len(), frees_at)
     }
 }
 
@@ -13238,36 +13289,22 @@ still skipped, but a block under an old number that is out of view then could re
 
     /// Persist budget before provider IO. Unknown outcomes keep their reservation until a valid
     /// receipt is saved. A completed reservation can expire and must then pass admission again.
+    ///
+    /// Since #2420 D1 (owner decision: never hold) a thread over the window's limit is paced,
+    /// never held for a cooldown: the reply is refused only until the window's oldest send
+    /// frees its slot, so the sender retries it then, in order. Its wait is counted, and a
+    /// thread past the runaway bound gets one runaway mark (an alarm) and keeps pacing.
     fn reserve_reply_send_locked(
         &self,
         message: &SavedMessage,
         send_request_id: &str,
     ) -> Result<()> {
-        let path = self.root.join("reply-breaker.json");
         let mut record = self.read_reply_breaker()?;
         let now = unix_millis();
         if record.prune(now) {
             // Without this write, every refused attempt would move the stamp to its own `now`
             // again.
             self.write_reply_breaker(&record)?;
-        }
-        if let Some(trip) = record.trips.iter().rev().find(|trip| {
-            trip.is_for(message)
-                && now.saturating_sub(trip.at_millis) < THREAD_BREAKER_COOLDOWN_MILLIS
-        }) {
-            let released_at = trip
-                .at_millis
-                .saturating_add(THREAD_BREAKER_COOLDOWN_MILLIS);
-            let held = ChatRuntimeError::invalid(format!(
-                "chat reply post-rate breaker for thread {} tripped {} s ago; its replies stay \
-held for {} more s, until {released_at} ms after the Unix epoch, or until {} is deleted; the first \
-retry after that sends them in order",
-                message.thread_id,
-                now.saturating_sub(trip.at_millis) / 1_000,
-                released_at.saturating_sub(now).div_ceil(1_000),
-                path.display()
-            ));
-            return Err(held);
         }
         if let Some(reservation) = record
             .sends
@@ -13283,16 +13320,23 @@ retry after that sends them in order",
             reservation.pending = true;
             return self.write_reply_breaker(&record);
         }
-        let recent = record
-            .sends
-            .iter()
-            .filter(|send| send.is_for(message))
-            .count();
+        let (recent, frees_at) = record.window_of(&message.channel_id, &message.thread_id, now);
         if recent < MAX_THREAD_REPLIES_PER_WINDOW {
             if record.sends.len() >= MAX_REPLY_BREAKER_EVENTS {
                 return Err(ChatRuntimeError::invalid(
                     "reply post-rate breaker reservation population limit reached",
                 ));
+            }
+            // A reply that waited for its slot: how long it was paced.
+            if let Some(position) = record
+                .paced
+                .iter()
+                .position(|paced| paced.send_request_id.as_deref() == Some(send_request_id))
+            {
+                let paced = record.paced.remove(position);
+                let seconds = now.saturating_sub(paced.at_millis) / 1_000;
+                record.last_paced_seconds = seconds;
+                record.max_paced_seconds = record.max_paced_seconds.max(seconds);
             }
             record.sends.push(ThreadEvent {
                 channel_id: message.channel_id.clone(),
@@ -13301,32 +13345,60 @@ retry after that sends them in order",
                 send_request_id: Some(send_request_id.to_owned()),
                 pending: true,
             });
+            let in_runaway_window = record
+                .sends
+                .iter()
+                .filter(|send| send.is_for(message))
+                .count();
+            let marked = record.trips.iter().any(|trip| trip.is_for(message));
+            if in_runaway_window > RUNAWAY_REPLIES
+                && !marked
+                && record.trips.len() < MAX_REPLY_BREAKER_EVENTS
+            {
+                record.trips.push(ThreadEvent {
+                    channel_id: message.channel_id.clone(),
+                    thread_id: message.thread_id.clone(),
+                    at_millis: now,
+                    send_request_id: None,
+                    pending: false,
+                });
+                eprintln!(
+                    "agentctl: REPLY RUNAWAY: thread {} has sent {in_runaway_window} replies in \
+                     {} minutes, so a reply loop is likely; its replies keep going, paced at \
+                     {MAX_THREAD_REPLIES_PER_WINDOW} per {} s, and the owner is told once",
+                    message.thread_id,
+                    RUNAWAY_WINDOW_MILLIS / 60_000,
+                    THREAD_REPLY_WINDOW_MILLIS / 1_000
+                );
+            }
             return self.write_reply_breaker(&record);
         }
-        if record.trips.len() >= MAX_REPLY_BREAKER_EVENTS {
-            return Err(ChatRuntimeError::invalid(
-                "reply post-rate breaker trip population limit reached",
-            ));
+        // Over the limit: paced until the oldest send in the window frees its slot.
+        if !record
+            .paced
+            .iter()
+            .any(|paced| paced.send_request_id.as_deref() == Some(send_request_id))
+        {
+            if record.paced.len() >= MAX_REPLY_BREAKER_EVENTS {
+                record.paced.remove(0);
+            }
+            record.paced.push(ThreadEvent {
+                channel_id: message.channel_id.clone(),
+                thread_id: message.thread_id.clone(),
+                at_millis: now,
+                send_request_id: Some(send_request_id.to_owned()),
+                pending: false,
+            });
         }
-        record.trips.push(ThreadEvent {
-            channel_id: message.channel_id.clone(),
-            thread_id: message.thread_id.clone(),
-            at_millis: now,
-            send_request_id: None,
-            pending: false,
-        });
-        record.prune(now);
         self.write_reply_breaker(&record)?;
+        let next_slot = frees_at.unwrap_or(now.saturating_add(THREAD_REPLY_WINDOW_MILLIS));
         Err(ChatRuntimeError::invalid(format!(
-            "chat reply post-rate breaker tripped: thread {} has {recent} recent or unresolved \
-reply reservations (limit {MAX_THREAD_REPLIES_PER_WINDOW} per {} s), so a reply loop is likely; its \
-replies stay held for {} s, until {} ms after the Unix epoch, or until {} is deleted; the first retry \
-after that sends them in order",
+            "chat reply paced: thread {} has {recent} recent or unresolved reply reservations \
+(limit {MAX_THREAD_REPLIES_PER_WINDOW} per {} s); this reply goes when the window frees a slot, \
+in about {} s, at {next_slot} ms after the Unix epoch, in order",
             message.thread_id,
             THREAD_REPLY_WINDOW_MILLIS / 1_000,
-            THREAD_BREAKER_COOLDOWN_MILLIS / 1_000,
-            now.saturating_add(THREAD_BREAKER_COOLDOWN_MILLIS),
-            path.display()
+            next_slot.saturating_sub(now).div_ceil(1_000),
         )))
     }
 
@@ -13379,6 +13451,9 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                     version: STATE_VERSION,
                     sends: Vec::new(),
                     trips: Vec::new(),
+                    paced: Vec::new(),
+                    last_paced_seconds: 0,
+                    max_paced_seconds: 0,
                 });
             }
             Err(error) => return Err(unusable(error)),
@@ -13392,78 +13467,85 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
     /// Only threads with a live trip are listed. A trip stamped in the future counts from now,
     /// as the next send attempt to any thread will save it; until then, each call reports a full
     /// cooldown from the time of the call.
+    /// The reply breaker's report alone (the `reply_breaker` part of `status`), cheap enough for
+    /// the owner loop to read every pass (#2420 D1).
+    pub(crate) fn reply_breaker_report(&self) -> Value {
+        self.reply_breaker_status()
+    }
+
     fn reply_breaker_status(&self) -> Value {
         let now = unix_millis();
-        let mut held = BTreeMap::<(String, String), u64>::new();
-        let mut reservations = BTreeMap::<(String, String), usize>::new();
+        let mut held_threads = Vec::new();
+        let mut paced_waiting = Vec::new();
+        let mut runaways = Vec::new();
+        let mut last_paced_seconds = 0;
+        let mut max_paced_seconds = 0;
         let error = match self.read_reply_breaker() {
             Ok(record) => {
-                for trip in &record.trips {
-                    let released_at = trip
-                        .at_millis
-                        .min(now)
-                        .saturating_add(THREAD_BREAKER_COOLDOWN_MILLIS);
-                    if released_at > now {
-                        let thread = (trip.channel_id.clone(), trip.thread_id.clone());
-                        let entry = held.entry(thread).or_default();
-                        *entry = (*entry).max(released_at);
-                    }
-                }
+                // Threads at their window's limit now: their next reply is paced (#2420 D1).
+                let mut threads = BTreeSet::new();
                 for send in &record.sends {
-                    let thread = (send.channel_id.clone(), send.thread_id.clone());
-                    if held.contains_key(&thread)
-                        && (send.pending
-                            || now.saturating_sub(send.at_millis.min(now))
-                                < THREAD_REPLY_WINDOW_MILLIS)
-                    {
-                        *reservations.entry(thread).or_default() += 1;
+                    threads.insert((send.channel_id.clone(), send.thread_id.clone()));
+                }
+                for (channel_id, thread_id) in threads {
+                    let (recent, frees_at) = record.window_of(&channel_id, &thread_id, now);
+                    if recent >= MAX_THREAD_REPLIES_PER_WINDOW {
+                        let released_at =
+                            frees_at.unwrap_or(now.saturating_add(THREAD_REPLY_WINDOW_MILLIS));
+                        held_threads.push(serde_json::json!({
+                            "channel_id": channel_id,
+                            "thread_id": thread_id,
+                            "held_until_millis": released_at,
+                            "held_for_seconds": released_at.saturating_sub(now).div_ceil(1_000),
+                            "recent_or_unresolved_reservations": recent,
+                        }));
                     }
                 }
+                for paced in &record.paced {
+                    paced_waiting.push(serde_json::json!({
+                        "channel_id": paced.channel_id,
+                        "thread_id": paced.thread_id,
+                        "waiting_seconds": now.saturating_sub(paced.at_millis) / 1_000,
+                    }));
+                }
+                for trip in &record.trips {
+                    runaways.push(serde_json::json!({
+                        "channel_id": trip.channel_id,
+                        "thread_id": trip.thread_id,
+                        "at_millis": trip.at_millis,
+                    }));
+                }
+                last_paced_seconds = record.last_paced_seconds;
+                max_paced_seconds = record.max_paced_seconds;
                 Value::Null
             }
             Err(error) => Value::String(error.to_string()),
         };
-        let held_threads = held
-            .into_iter()
-            .map(|(thread, released_at)| {
-                let reservations = reservations.get(&thread).copied().unwrap_or(0);
-                serde_json::json!({
-                    "channel_id": thread.0,
-                    "thread_id": thread.1,
-                    "held_until_millis": released_at,
-                    "held_for_seconds": released_at.saturating_sub(now).div_ceil(1_000),
-                    "recent_or_unresolved_reservations": reservations,
-                })
-            })
-            .collect::<Vec<_>>();
         serde_json::json!({
             "max_replies_per_thread": MAX_THREAD_REPLIES_PER_WINDOW,
             "window_seconds": THREAD_REPLY_WINDOW_MILLIS / 1_000,
-            "cooldown_seconds": THREAD_BREAKER_COOLDOWN_MILLIS / 1_000,
+            "runaway_replies": RUNAWAY_REPLIES,
+            "runaway_window_seconds": RUNAWAY_WINDOW_MILLIS / 1_000,
             "held_threads": held_threads,
+            "paced_waiting": paced_waiting,
+            "last_paced_seconds": last_paced_seconds,
+            "max_paced_seconds": max_paced_seconds,
+            "runaways": runaways,
             "error": error,
         })
     }
 
-    /// When the reply breaker stops holding request `key`'s thread, in milliseconds after
-    /// the Unix epoch: `None` when no live trip holds it. A trip whose cooldown has passed
-    /// holds nothing, whether or not a later send has pruned it from the record yet.
+    /// When request `key`'s thread next has a free slot in its reply window, in milliseconds
+    /// after the Unix epoch: `None` when the thread is under its limit (#2420 D1: a thread over
+    /// it is paced, never held for a cooldown).
     pub(crate) fn reply_breaker_release_for_key(&self, key: &str) -> Result<Option<u64>> {
         let request = self.read_request(key)?;
         let record = self.read_reply_breaker()?;
         let now = unix_millis();
-        Ok(record
-            .trips
-            .iter()
-            .rev()
-            .find(|trip| {
-                trip.is_for(&request.message)
-                    && now.saturating_sub(trip.at_millis) < THREAD_BREAKER_COOLDOWN_MILLIS
-            })
-            .map(|trip| {
-                trip.at_millis
-                    .saturating_add(THREAD_BREAKER_COOLDOWN_MILLIS)
-            }))
+        let (recent, frees_at) =
+            record.window_of(&request.message.channel_id, &request.message.thread_id, now);
+        Ok((recent >= MAX_THREAD_REPLIES_PER_WINDOW)
+            .then(|| frees_at.unwrap_or(now.saturating_add(THREAD_REPLY_WINDOW_MILLIS))))
     }
 
     /// Build the bounded active route cache during startup or explicit recovery.
@@ -36580,7 +36662,12 @@ k │\n\
     /// Move every breaker stamp back, as if `millis` passed before the next send attempt.
     fn let_breaker_time_pass(state: &BridgeState, millis: u64) {
         let mut record = state.read_reply_breaker().expect("read breaker");
-        for event in record.sends.iter_mut().chain(record.trips.iter_mut()) {
+        for event in record
+            .sends
+            .iter_mut()
+            .chain(record.trips.iter_mut())
+            .chain(record.paced.iter_mut())
+        {
             event.at_millis = event.at_millis.saturating_sub(millis);
         }
         // A plain write, without the syncs of write_document, keeps the delay before the next
@@ -36664,9 +36751,9 @@ k │\n\
             .publish_one(&keys[limit], &mut transport)
             .expect_err("unknowns still count")
             .to_string()
-            .contains("post-rate breaker tripped"));
+            .contains("chat reply paced"));
         assert_eq!(transport.submissions.len(), limit);
-        // Status counts the unresolved reservations that tripped the thread, however old.
+        // Status counts the unresolved reservations that pace the thread, however old.
         assert_eq!(
             state.status().expect("status")["reply_breaker"]["held_threads"][0]
                 ["recent_or_unresolved_reservations"],
@@ -36741,7 +36828,7 @@ k │\n\
             .publish_one(&keys[0], &mut transport)
             .expect_err("old ID needs current budget")
             .to_string()
-            .contains("post-rate breaker tripped"));
+            .contains("chat reply paced"));
         assert_eq!(
             transport.submissions.len(),
             MAX_THREAD_REPLIES_PER_WINDOW + 1
@@ -36806,11 +36893,15 @@ k │\n\
         assert!(error.contains("reservation population limit"), "{error}");
         assert!(transport.submissions.is_empty());
         assert_eq!(stamped_by_now(), (MAX_REPLY_BREAKER_EVENTS, 0, true));
-        // With this thread's budget used, the refusal comes from the trip population instead.
+        // With this thread's budget used, the reply is paced (#2420 D1), whatever the population
+        // of runaway marks: a full mark list never refuses a reply.
         let mut full_trips = ReplyBreakerRecord {
             version: STATE_VERSION,
             sends: live_events("", MAX_THREAD_REPLIES_PER_WINDOW),
             trips: live_events("other-", MAX_REPLY_BREAKER_EVENTS),
+            paced: Vec::new(),
+            last_paced_seconds: 0,
+            max_paced_seconds: 0,
         };
         for send in &mut full_trips.sends {
             send.thread_id.clone_from(&message.thread_id);
@@ -36819,9 +36910,9 @@ k │\n\
         write_document(&root.join("reply-breaker.json"), &full_trips).expect("full trip ledger");
         let error = state
             .publish_one(&keys[0], &mut transport)
-            .expect_err("no live trip eviction")
+            .expect_err("paced, no live mark eviction")
             .to_string();
-        assert!(error.contains("trip population limit"), "{error}");
+        assert!(error.contains("chat reply paced"), "{error}");
         assert!(transport.submissions.is_empty());
         assert_eq!(
             stamped_by_now(),
@@ -36843,7 +36934,9 @@ k │\n\
             "duplicate operation IDs fail closed"
         );
         // A readable ledger near the byte cap must not be replaced by an unreadable one,
-        // even though its event population leaves room for another operation.
+        // even though its event population leaves room for another operation. (The paced entry
+        // the first refusal left is cleared, so taking it back cannot make room.)
+        record.paced.clear();
         record.sends = vec![
             ThreadEvent {
                 channel_id: "x".repeat(chat_subscription::MAX_RESOURCE_ID_BYTES),
@@ -36886,7 +36979,10 @@ k │\n\
     }
 
     #[test]
-    fn thread_post_rate_breaker_holds_a_reply_burst_until_cooldown_or_reset() {
+    fn thread_post_rate_breaker_paces_a_reply_burst_and_never_latches() {
+        // #2420 D1 (owner decision: never hold): a thread over its window's limit is paced, its
+        // next reply refused only until the window's oldest send frees a slot, never held for a
+        // cooldown; the wait is counted, and other threads keep their own budget.
         let root = temporary("reply-breaker");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let key = state
@@ -36913,14 +37009,15 @@ k │\n\
         }
         let error = state
             .publish_one(&key, &mut transport)
-            .expect_err("one more reply within the window trips the breaker")
+            .expect_err("one more reply within the window is paced")
             .to_string();
-        assert!(error.contains("post-rate breaker tripped"), "{error}");
+        assert!(error.contains("chat reply paced"), "{error}");
+        assert!(!error.contains("held for 300"), "{error}");
         assert_eq!(transport.submissions.len(), limit);
-        let held = state
+        let paced = state
             .read_reply(&key, limit as u32 + 1)
-            .expect("held reply");
-        assert_eq!(held.phase, ReplyPhase::Pending);
+            .expect("paced reply");
+        assert_eq!(paced.phase, ReplyPhase::Pending);
 
         // Other threads keep their own budget.
         let other = state
@@ -36944,66 +37041,46 @@ k │\n\
             .is_some());
         assert_eq!(transport.submissions[limit].1, "spaces/example/threads/7");
 
-        // The trip latches: sends aging out of the window do not release the thread, and
-        // neither does a restart.
+        // Once the window's sends age out the paced reply goes, under its original request
+        // ID, with no cooldown and no restart needed; the wait it had is counted.
         let breaker = root.join("reply-breaker.json");
-        let age = |sends: u64, trips: u64| {
-            let mut record: ReplyBreakerRecord =
-                read_document(&breaker, MAX_REPLY_BREAKER_BYTES).expect("read breaker");
-            for send in &mut record.sends {
-                send.at_millis = send.at_millis.saturating_sub(sends);
-            }
-            for trip in &mut record.trips {
-                trip.at_millis = trip.at_millis.saturating_sub(trips);
-            }
-            write_document(&breaker, &record).expect("write breaker");
-        };
-        age(2 * THREAD_REPLY_WINDOW_MILLIS, 0);
-        let error = state
-            .publish_one(&key, &mut transport)
-            .expect_err("tripped thread stays held")
-            .to_string();
-        assert!(error.contains("replies stay held"), "{error}");
-        drop(state);
-        let state = BridgeState::open(&root).expect("reopen tripped state");
-        assert!(state.publish_one(&key, &mut transport).is_err());
-        assert_eq!(transport.submissions.len(), limit + 1);
-
-        // After the cooldown the held reply goes out under its original request ID.
-        age(0, THREAD_BREAKER_COOLDOWN_MILLIS);
+        let mut record: ReplyBreakerRecord =
+            read_document(&breaker, MAX_REPLY_BREAKER_BYTES).expect("read breaker");
+        for send in &mut record.sends {
+            send.at_millis = send.at_millis.saturating_sub(THREAD_REPLY_WINDOW_MILLIS);
+        }
+        for paced in &mut record.paced {
+            paced.at_millis = paced.at_millis.saturating_sub(45_000);
+        }
+        write_document(&breaker, &record).expect("write breaker");
         assert!(state
             .publish_one(&key, &mut transport)
-            .expect("cooldown elapsed")
+            .expect("a free slot sends the paced reply")
             .is_some());
         assert_eq!(
             transport.submissions[limit + 1].2,
             format!("[codex coordinator] part {}", limit + 1)
         );
-        assert_eq!(transport.submissions[limit + 1].3, held.send_request_id);
-        for _ in 1..limit {
-            assert!(state
-                .publish_one(&key, &mut transport)
-                .expect("publish within the refilled budget")
-                .is_some());
-        }
-        assert!(state.publish_one(&key, &mut transport).is_err());
+        assert_eq!(transport.submissions[limit + 1].3, paced.send_request_id);
+        let status = state.status().expect("status");
+        let seconds = status["reply_breaker"]["last_paced_seconds"]
+            .as_u64()
+            .expect("paced seconds");
+        assert!((45..120).contains(&seconds), "{status}");
+        assert_eq!(status["reply_breaker"]["max_paced_seconds"], seconds);
+        assert_eq!(
+            status["reply_breaker"]["paced_waiting"],
+            serde_json::json!([])
+        );
 
-        // Deleting the record resets the breaker.
+        // Deleting the record resets the budget.
         fs::remove_file(&breaker).expect("reset breaker");
         assert!(state
             .publish_one(&key, &mut transport)
             .expect("publish after reset")
             .is_some());
-        assert_eq!(
-            state
-                .publish_one(&key, &mut transport)
-                .expect("outbox empty"),
-            None
-        );
-        assert_eq!(transport.submissions.len(), 2 * limit + 2);
         fs::remove_dir_all(root).expect("cleanup");
     }
-
     #[test]
     fn thread_post_rate_breaker_admits_a_normal_burst_and_reports_the_held_thread() {
         let root = temporary("reply-breaker-burst");
@@ -37046,9 +37123,9 @@ k │\n\
         }
         let error = state
             .publish_one(&keys[3], &mut transport)
-            .expect_err("one more reply within the window trips the breaker")
+            .expect_err("one more reply within the window is paced")
             .to_string();
-        assert!(error.contains("post-rate breaker tripped"), "{error}");
+        assert!(error.contains("chat reply paced"), "{error}");
         assert!(error.contains("ms after the Unix epoch"), "{error}");
         assert_eq!(transport.submissions.len(), limit);
 
@@ -37056,7 +37133,13 @@ k │\n\
         let breaker = &status["reply_breaker"];
         assert_eq!(breaker["max_replies_per_thread"], 8);
         assert_eq!(breaker["window_seconds"], 60);
-        assert_eq!(breaker["cooldown_seconds"], 300);
+        assert_eq!(breaker["runaway_replies"], 60);
+        assert_eq!(breaker["runaway_window_seconds"], 600);
+        assert_eq!(
+            breaker["paced_waiting"].as_array().map(Vec::len),
+            Some(1),
+            "{breaker}"
+        );
         assert!(breaker["error"].is_null(), "{breaker}");
         let held_threads = breaker["held_threads"].as_array().expect("held threads");
         assert_eq!(held_threads.len(), 1, "{breaker}");
@@ -37066,12 +37149,20 @@ k │\n\
             "spaces/example/threads/shared"
         );
         assert_eq!(held_threads[0]["recent_or_unresolved_reservations"], 8);
-        let tripped_at = state.read_reply_breaker().expect("breaker").trips[0].at_millis;
-        assert_eq!(held_threads[0]["held_until_millis"], tripped_at + 300_000);
+        // Paced, not held: the thread's next slot frees when its oldest send leaves the window.
+        let oldest = state
+            .read_reply_breaker()
+            .expect("breaker")
+            .sends
+            .iter()
+            .map(|send| send.at_millis)
+            .min()
+            .expect("sends");
+        assert_eq!(held_threads[0]["held_until_millis"], oldest + 60_000);
         let held_for = held_threads[0]["held_for_seconds"]
             .as_u64()
             .expect("held seconds");
-        assert!(held_for > 0 && held_for <= 300, "{held_for}");
+        assert!(held_for > 0 && held_for <= 60, "{held_for}");
 
         // Deleting the record releases the thread at the next retry. The held replies keep
         // their order and their original request IDs.
@@ -37106,7 +37197,8 @@ k │\n\
     }
 
     #[test]
-    fn reply_breaker_release_for_key_reports_the_cooldown_end_until_it_passes() {
+    fn reply_breaker_release_for_key_reports_the_next_free_slot() {
+        // #2420 D1: a thread at its limit is paced until its oldest send leaves the window.
         let root = temporary("reply-breaker-release");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = same_thread_reply_requests(&state, MAX_THREAD_REPLIES_PER_WINDOW as u64 + 1);
@@ -37120,14 +37212,21 @@ k │\n\
         assert!(state
             .publish_one(&keys[MAX_THREAD_REPLIES_PER_WINDOW], &mut transport)
             .is_err());
-        let tripped_at = state.read_reply_breaker().expect("breaker").trips[0].at_millis;
+        let oldest = state
+            .read_reply_breaker()
+            .expect("breaker")
+            .sends
+            .iter()
+            .map(|send| send.at_millis)
+            .min()
+            .expect("sends");
         assert_eq!(
             state
                 .reply_breaker_release_for_key(&keys[MAX_THREAD_REPLIES_PER_WINDOW])
-                .expect("release of the held thread"),
-            Some(tripped_at + THREAD_BREAKER_COOLDOWN_MILLIS)
+                .expect("next slot of the paced thread"),
+            Some(oldest + THREAD_REPLY_WINDOW_MILLIS)
         );
-        // A request in another thread is not held by this trip.
+        // A request in another thread is not paced by this one.
         let other = state
             .admit_batch(&indexed_delivery(100, 700))
             .expect("admit request in another thread")
@@ -37139,22 +37238,21 @@ k │\n\
                 .expect("other thread"),
             None
         );
-        // Once the cooldown has passed the thread is no longer held, even though no
-        // send has pruned the expired trip from the record yet.
-        let_breaker_time_pass(&state, THREAD_BREAKER_COOLDOWN_MILLIS);
+        // Once the window has passed the thread is under its limit again.
+        let_breaker_time_pass(&state, THREAD_REPLY_WINDOW_MILLIS);
         assert_eq!(
             state
                 .reply_breaker_release_for_key(&keys[MAX_THREAD_REPLIES_PER_WINDOW])
-                .expect("release after the cooldown"),
+                .expect("after the window"),
             None
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
-
     #[test]
-    fn thread_post_rate_breaker_stops_a_loop_of_eleven_posts_in_thirty_seconds() {
-        // The incident's loop posted 11 times in 30 s to one thread. The numbers here are
-        // literal, so a higher limit or a shorter hold fails this test.
+    fn thread_post_rate_breaker_paces_a_loop_of_eleven_posts_in_thirty_seconds() {
+        // The incident's loop posted 11 times in 30 s to one thread. Since #2420 D1 it is paced,
+        // never held: posts 1 to 8 go out, post 9 waits only until post 1 leaves the window
+        // (60 s after it), and every post goes out in order under its own request ID.
         let root = temporary("reply-breaker-loop");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = same_thread_reply_requests(&state, 1);
@@ -37171,11 +37269,7 @@ k │\n\
             .capture_replies(key, &blocks)
             .expect("capture the loop's replies");
         let ninth = state.read_reply(key, 9).expect("9th reply");
-        let breaker = root.join("reply-breaker.json");
-        let tripped_at = || state.read_reply_breaker().expect("breaker").trips[0].at_millis;
         let mut transport = FakeReplyTransport::default();
-
-        // One post every 3 s. Posts 1 to 8, from 0 s to 21 s, go out.
         for post in 1..=8 {
             if post > 1 {
                 let_breaker_time_pass(&state, 3_000);
@@ -37188,92 +37282,25 @@ k │\n\
                 "post {post}"
             );
         }
-        // Post 9, 24 s in, trips the breaker.
         let_breaker_time_pass(&state, 3_000);
         let error = state
             .publish_one(key, &mut transport)
-            .expect_err("the 9th post trips the breaker")
+            .expect_err("the 9th post is paced")
             .to_string();
-        assert_eq!(
-            error,
-            format!(
-                "chat reply post-rate breaker tripped: thread spaces/example/threads/shared has 8 \
-recent or unresolved reply reservations (limit 8 per 60 s), so a reply loop is likely; its replies \
-stay held for 300 s, until {} ms after the Unix epoch, or until {} is deleted; the first retry after \
-that sends them in order",
-                tripped_at() + 300_000,
-                breaker.display()
-            )
+        assert!(
+            error.starts_with(
+                "chat reply paced: thread spaces/example/threads/shared has 8 recent or unresolved \
+reply reservations (limit 8 per 60 s); this reply goes when the window frees a slot"
+            ),
+            "{error}"
         );
-        // Posts 10 and 11, 27 s and 30 s in, are held.
-        for _ in 10..=11 {
-            let_breaker_time_pass(&state, 3_000);
-            let error = state
-                .publish_one(key, &mut transport)
-                .expect_err("held")
-                .to_string();
-            assert!(
-                error.starts_with(
-                    "chat reply post-rate breaker for thread spaces/example/threads/shared tripped "
-                ),
-                "{error}"
-            );
-            assert!(
-                error.ends_with(&format!(
-                    " more s, until {} ms after the Unix epoch, or until {} is deleted; the first \
-retry after that sends them in order",
-                    tripped_at() + 300_000,
-                    breaker.display()
-                )),
-                "{error}"
-            );
-        }
         assert_eq!(transport.submissions.len(), 8);
-
-        // 299.6 s after the trip the thread is still held, and status lists it. For any delay
-        // under 400 ms before the breaker reads the clock, the age rounds down to 299 s and the
-        // remaining hold rounds up to 1 s. Rounding either one the other way, or half up, gives
-        // 300 s or 0 s however soon the clock is read.
-        let trip_age = unix_millis().saturating_sub(tripped_at());
-        let_breaker_time_pass(&state, 299_600_u64.saturating_sub(trip_age));
-        let error = state
-            .publish_one(key, &mut transport)
-            .expect_err("held 299 s after the trip")
-            .to_string();
-        assert_eq!(
-            error,
-            format!(
-                "chat reply post-rate breaker for thread spaces/example/threads/shared tripped 299 \
-s ago; its replies stay held for 1 more s, until {} ms after the Unix epoch, or until {} is \
-deleted; the first retry after that sends them in order",
-                tripped_at() + 300_000,
-                breaker.display()
-            )
-        );
-        assert_eq!(
-            state.status().expect("status")["reply_breaker"]["held_threads"],
-            serde_json::json!([{
-                "channel_id": "spaces/example",
-                "thread_id": "spaces/example/threads/shared",
-                "held_until_millis": tripped_at() + 300_000,
-                "held_for_seconds": 1,
-                "recent_or_unresolved_reservations": 0,
-            }])
-        );
-
-        // 300 s after the trip status no longer lists the thread, although the expired trip
-        // stays in the record until a send attempt prunes it.
-        let trip_age = unix_millis().saturating_sub(tripped_at());
-        let_breaker_time_pass(&state, 300_000_u64.saturating_sub(trip_age));
-        assert_eq!(state.read_reply_breaker().expect("breaker").trips.len(), 1);
-        assert_eq!(
-            state.status().expect("status")["reply_breaker"]["held_threads"],
-            serde_json::json!([])
-        );
-        // The next attempt sends the held reply under its original request ID, then the rest.
+        // When post 1 leaves the window, the paced post goes, and the rest follow as the
+        // window frees slots: nothing waits a fixed cooldown.
+        let_breaker_time_pass(&state, 60_000);
         while state
             .publish_one(key, &mut transport)
-            .expect("released 300 s after the trip")
+            .expect("paced posts go as slots free")
             .is_some()
         {}
         assert_eq!(transport.submissions[8].3, ninth.send_request_id);
@@ -37287,14 +37314,59 @@ deleted; the first retry after that sends them in order",
                 .chain((2..=11).map(|ordinal| format!("[codex coordinator] post {ordinal}")))
                 .collect::<Vec<_>>()
         );
-        assert!(state
-            .read_reply_breaker()
-            .expect("breaker")
-            .trips
-            .is_empty());
+        assert!(
+            state
+                .read_reply_breaker()
+                .expect("breaker")
+                .trips
+                .is_empty(),
+            "11 posts are no runaway"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[test]
+    fn a_thread_past_the_runaway_bound_is_marked_once_and_keeps_pacing() {
+        // #2420 D1: more than 60 replies in one thread within 10 minutes is a runaway: one mark
+        // (the owner is told once), and the thread keeps sending, paced, never stopped.
+        let root = temporary("reply-breaker-runaway");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = same_thread_reply_requests(&state, 1);
+        let key = &keys[0];
+        let nonce = state.read_request(key).expect("request").reply_nonce;
+        let blocks = (2..=70)
+            .map(|ordinal| {
+                format!(
+                    "<CHAT_REPLY_{nonce}_{ordinal}>\npost {ordinal}\n</CHAT_REPLY_{nonce}_{ordinal}>\n"
+                )
+            })
+            .collect::<String>();
+        state.capture_replies(key, &blocks).expect("capture");
+        let mut transport = FakeReplyTransport::default();
+        // 8 posts a minute, every 7.5 s: never paced, but 70 posts in under 9 minutes.
+        for post in 1..=70 {
+            if post > 1 {
+                let_breaker_time_pass(&state, 7_500);
+            }
+            assert!(
+                state
+                    .publish_one(key, &mut transport)
+                    .expect("a runaway keeps sending")
+                    .is_some(),
+                "post {post}"
+            );
+        }
+        assert_eq!(transport.submissions.len(), 70);
+        let record = state.read_reply_breaker().expect("breaker");
+        assert_eq!(record.trips.len(), 1, "one runaway mark, not one per post");
+        assert_eq!(
+            state.status().expect("status")["reply_breaker"]["runaways"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
     #[test]
     fn thread_post_rate_breaker_lets_a_loop_of_eight_posts_a_minute_through() {
         // The cost of the budget: a loop never trips if each post starts at least 60 s after the
@@ -37334,16 +37406,18 @@ deleted; the first retry after that sends them in order",
             .expect("breaker")
             .trips
             .is_empty());
+        // Never paced: no reply waited for a slot (the thread may sit at its limit after the
+        // last post, which only paces a next reply).
         assert_eq!(
-            state.status().expect("status")["reply_breaker"]["held_threads"],
+            state.status().expect("status")["reply_breaker"]["paced_waiting"],
             serde_json::json!([])
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
-    fn thread_post_rate_breaker_trips_a_loop_of_one_post_every_seven_seconds() {
-        // Just faster than the budget: the 9th post, 56 s after the 1st, trips the breaker, and
+    fn thread_post_rate_breaker_paces_a_loop_of_one_post_every_seven_seconds() {
+        // Just faster than the budget: the 9th post, 56 s after the 1st, is paced (#2420 D1), and
         // status counts all 8 posts, so a window or a status count of 56 s or less fails this.
         let root = temporary("reply-breaker-seven-seconds");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
@@ -37387,12 +37461,12 @@ deleted; the first retry after that sends them in order",
         let_breaker_time_pass(&state, 56_000_u64.saturating_sub(first_post_age()));
         let error = state
             .publish_one(key, &mut transport)
-            .expect_err("the 9th post, 56 s in, trips the breaker")
+            .expect_err("the 9th post, 56 s in, is paced")
             .to_string();
         assert!(
             error.starts_with(
-                "chat reply post-rate breaker tripped: thread spaces/example/threads/shared has 8 \
-recent or unresolved reply reservations (limit 8 per 60 s)"
+                "chat reply paced: thread spaces/example/threads/shared has 8 recent or unresolved \
+reply reservations (limit 8 per 60 s)"
             ),
             "{error}"
         );
@@ -37422,16 +37496,6 @@ recent or unresolved reply reservations (limit 8 per 60 s)"
             send_request_id: None,
             pending: false,
         };
-        let age = |sends: u64, trips: u64| {
-            let mut record = state.read_reply_breaker().expect("read breaker");
-            for send in &mut record.sends {
-                send.at_millis = send.at_millis.saturating_sub(sends);
-            }
-            for trip in &mut record.trips {
-                trip.at_millis = trip.at_millis.saturating_sub(trips);
-            }
-            write_document(&breaker, &record).expect("write breaker");
-        };
         let stamped_by_now = || {
             let now = unix_millis();
             let record = state.read_reply_breaker().expect("read breaker");
@@ -37442,7 +37506,6 @@ recent or unresolved reply reservations (limit 8 per 60 s)"
                 .all(|event| event.at_millis <= now)
         };
         let mut transport = FakeReplyTransport::default();
-
         // Future sends count once, from now: one window later they no longer fill the budget.
         write_document(
             &breaker,
@@ -37450,6 +37513,9 @@ recent or unresolved reply reservations (limit 8 per 60 s)"
                 version: STATE_VERSION,
                 sends: vec![event(future); MAX_THREAD_REPLIES_PER_WINDOW],
                 trips: Vec::new(),
+                paced: Vec::new(),
+                last_paced_seconds: 0,
+                max_paced_seconds: 0,
             },
         )
         .expect("seed future sends");
@@ -37457,61 +37523,34 @@ recent or unresolved reply reservations (limit 8 per 60 s)"
             .publish_one(&keys[0], &mut transport)
             .expect_err("future sends fill the window")
             .to_string();
-        assert!(error.contains("post-rate breaker tripped"), "{error}");
+        assert!(error.contains("chat reply paced"), "{error}");
         assert!(stamped_by_now());
-        age(THREAD_REPLY_WINDOW_MILLIS, THREAD_BREAKER_COOLDOWN_MILLIS);
+        let_breaker_time_pass(&state, THREAD_REPLY_WINDOW_MILLIS);
         assert!(state
             .publish_one(&keys[0], &mut transport)
-            .expect("window and cooldown restarted once")
+            .expect("the window restarted once")
             .is_some());
-
-        // A future trip holds the thread for one cooldown from now. The refused attempt saves
-        // the moved stamp, so a later retry does not restart the cooldown again.
+        // A future runaway mark never holds a thread (#2420 D1).
         write_document(
             &breaker,
             &ReplyBreakerRecord {
                 version: STATE_VERSION,
                 sends: Vec::new(),
                 trips: vec![event(future)],
+                paced: Vec::new(),
+                last_paced_seconds: 0,
+                max_paced_seconds: 0,
             },
         )
-        .expect("seed future trip");
-        // Status changes nothing, so until a send attempt saves the moved stamp it reports a
-        // full cooldown from the time of the call.
-        let before = unix_millis();
-        let held = state.status().expect("status")["reply_breaker"]["held_threads"][0].clone();
-        let after = unix_millis();
-        assert_eq!(held["held_for_seconds"], 300, "{held}");
-        let until = held["held_until_millis"].as_u64().expect("release time");
-        assert!(
-            (before + 300_000..=after + 300_000).contains(&until),
-            "{held}"
-        );
-        assert_eq!(
-            state.read_reply_breaker().expect("breaker").trips[0].at_millis,
-            future
-        );
-        let error = state
-            .publish_one(&keys[1], &mut transport)
-            .expect_err("future trip holds the thread")
-            .to_string();
-        assert!(error.contains("replies stay held"), "{error}");
-        assert!(stamped_by_now());
-        let saved = state.read_reply_breaker().expect("breaker").trips[0].at_millis;
-        assert_eq!(
-            state.status().expect("status")["reply_breaker"]["held_threads"][0]
-                ["held_until_millis"],
-            saved + 300_000
-        );
-        age(0, THREAD_BREAKER_COOLDOWN_MILLIS);
+        .expect("seed a future mark");
         assert!(state
             .publish_one(&keys[1], &mut transport)
-            .expect("cooldown restarted once")
+            .expect("a mark never holds")
             .is_some());
+        assert!(stamped_by_now());
         assert_eq!(transport.submissions.len(), 2);
         fs::remove_dir_all(root).expect("cleanup");
     }
-
     #[test]
     fn unusable_breaker_and_feedback_records_name_their_file() {
         let root = temporary("unusable-records");

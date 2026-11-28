@@ -883,12 +883,27 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
             age_text(stuck_millis)
         ));
     }
-    let held_threads = status["reply_breaker"]["held_threads"]
+    // #2420 D1: the breaker paces a busy thread, never holds it; only a reply paced longer than
+    // PACED_VISIBLE_AFTER_SECONDS, or a runaway thread, is a problem worth naming.
+    let longest_paced = status["reply_breaker"]["paced_waiting"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|paced| paced["waiting_seconds"].as_u64())
+        .max()
+        .unwrap_or(0);
+    if longest_paced > crate::chat_runtime::PACED_VISIBLE_AFTER_SECONDS {
+        problems.degraded.push(format!(
+            "a reply has been paced for {longest_paced} s by the reply post-rate breaker"
+        ));
+    }
+    let runaways = status["reply_breaker"]["runaways"]
         .as_array()
         .map_or(0, Vec::len);
-    if held_threads > 0 {
+    if runaways > 0 {
         problems.degraded.push(format!(
-            "the reply breaker holds {held_threads} thread(s) back"
+            "{runaways} thread(s) sent replies like a loop (more than 60 in 10 minutes); they are \
+             paced, never stopped"
         ));
     }
     if let Some(pending) = status["repoint"]["pending"].as_object() {

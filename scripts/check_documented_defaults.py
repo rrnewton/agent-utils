@@ -603,28 +603,8 @@ PINS: tuple[Pin, ...] = (
             ),
             Site(
                 "rs/agentctl/src/embedded_chat_userguide.md",
-                r"goes\s+out\s+(?P<value>[A-Za-z\d,]+)\s+at\s+a\s+time",
-                "the backlog batch the chat guide states",
-            ),
-            Site(
-                "rs/agentctl/src/embedded_chat_userguide.md",
-                r"after\s+each\s+group\s+of\s+(?P<value>[A-Za-z\d,]+)\.",
-                "the backlog batch the chat guide repeats",
-            ),
-            Site(
-                "rs/agentctl/src/embedded_chat_userguide.md",
-                r"receipt\s+of\s+the\s+post\s+(?P<value>[A-Za-z\d,]+)\s+before\s+it",
-                "the fastest loop the chat guide says never trips",
-            ),
-            Site(
-                "rs/agentctl/src/embedded_chat_userguide.md",
-                r"sends\s+(?P<value>[A-Za-z\d,]+)\s+more\s+posts\s+after\s+each",
-                "the per-hold post count the chat guide gives for a tripped loop",
-            ),
-            Site(
-                "rs/agentctl/src/embedded_chat_userguide.md",
-                r"even\s+if\s+(?P<value>[A-Za-z\d,]+)\s+of\s+its\s+reservations",
-                "the reservation count the chat guide says trips an unlisted thread again",
+                r"at\s+most\s+(?P<value>[A-Za-z\d,]+)\s+replies\s+a\s+minute",
+                "the pace the chat guide gives a loop (#2420)",
             ),
         ),
     ),
@@ -648,42 +628,44 @@ PINS: tuple[Pin, ...] = (
             ),
             Site(
                 "rs/agentctl/src/embedded_chat_userguide.md",
-                r"starts\s+at\s+least\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+after",
-                "the window of the loop the chat guide says never trips",
-            ),
-            Site(
-                "rs/agentctl/src/embedded_chat_userguide.md",
-                r"its\s+\w+\s+post\s+within\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
-                "the window in which the chat guide says a faster loop trips",
-            ),
-            Site(
-                "rs/agentctl/src/embedded_chat_userguide.md",
                 r"(?P<value>[A-Za-z\d,]+)-second\s+retention\s+window",
                 "the receipt retention the chat guide states",
             ),
         ),
     ),
     Pin(
-        "chat-thread-breaker-cooldown-seconds",
-        "how long a tripped chat thread holds its replies, in seconds",
+        "chat-thread-runaway-replies",
+        "the replies within the runaway window that mark a chat thread a runaway (#2420)",
         code=(
-            # In milliseconds, lifted as seconds, as for the window.
             Site(
                 "rs/agentctl/src/chat_runtime.rs",
-                r"(?m)^const THREAD_BREAKER_COOLDOWN_MILLIS: u64 = (?P<value>[\d_]+)_000;$",
-                "the Rust breaker cooldown",
+                r"(?m)^const RUNAWAY_REPLIES: usize = (?P<value>[\d_]+);$",
+                "the Rust runaway bound",
             ),
         ),
         docs=(
             Site(
                 "rs/agentctl/src/embedded_chat_userguide.md",
-                r"captured\s+but\s+unsent\s+for\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
-                "the hold the chat guide states",
+                r"sends\s+more\s+than\s+(?P<value>[A-Za-z\d,]+)\s+replies\s+to\s+a\s+thread",
+                "the runaway bound the chat guide states",
             ),
+        ),
+    ),
+    Pin(
+        "chat-paced-visible-seconds",
+        "how long a paced chat reply waits before chat health reports it (#2420)",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^pub\(crate\) const PACED_VISIBLE_AFTER_SECONDS: u64 = (?P<value>[\d_]+);$",
+                "the Rust reporting bound",
+            ),
+        ),
+        docs=(
             Site(
                 "rs/agentctl/src/embedded_chat_userguide.md",
-                r"after\s+each\s+(?P<value>[A-Za-z\d,]+)-second\s+hold",
-                "the hold the chat guide's loop bound assumes",
+                r"paced\s+for\s+more\s+than\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
+                "the reporting bound the chat guide states",
             ),
         ),
     ),

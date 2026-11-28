@@ -188,6 +188,8 @@ pub(crate) struct ReplySourceWatch {
     held_told: BTreeSet<String>,
     /// The held-replies notice not given yet.
     held_notice: Option<Notice>,
+    /// The reply runaways the owner has been told of, by thread and mark time (#2420 D1).
+    runaways_told: BTreeSet<String>,
 }
 
 impl Default for ReplySourceWatch {
@@ -199,6 +201,7 @@ impl Default for ReplySourceWatch {
             written: None,
             held_told: BTreeSet::new(),
             held_notice: None,
+            runaways_told: BTreeSet::new(),
         }
     }
 }
@@ -334,6 +337,25 @@ impl ReplySourceWatch {
                     attempts: 0,
                 },
             );
+        }
+        // A reply runaway is paced, never stopped (#2420 D1); the owner is told once per runaway.
+        {
+            let breaker = state.reply_breaker_report();
+            for runaway in breaker["runaways"].as_array().into_iter().flatten() {
+                let thread = runaway["thread_id"].as_str().unwrap_or("?");
+                let handle = format!("{thread}@{}", runaway["at_millis"]);
+                if self.runaways_told.insert(handle) {
+                    service_log(format_args!(
+                        "agentctl: REPLY RUNAWAY told: thread {thread} sent more than 60 replies in \
+                         10 minutes; its replies are paced, never stopped"
+                    ));
+                    owner.push(format!(
+                        "[chat-bridge WARNING] {agent}'s replies in one thread look like a loop: \
+                         more than 60 in 10 minutes. They keep going, paced at 8 a minute, and \
+                         nothing is stopped; ask {agent} to look at it if this is not expected."
+                    ));
+                }
+            }
         }
         post_owner_notices(owner, state, transport, "capture-miss warning");
         self.tell_coordinator(state, manager, stop, delivery, now);

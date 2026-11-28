@@ -1959,45 +1959,36 @@ thread may reserve 8 distinct reply operations within 60 seconds. That leaves
 room for several requests in one thread, each with progress updates and a
 multi-message answer. Request prompts do not state this budget, because short
 progress updates are welcome.
-The next reply to that thread trips the breaker. Replies to that thread then
-stay captured but unsent for 300 seconds; replies to other threads are
-unaffected. Held replies go out in order, under their original operation IDs, at
-the first retry after the cooldown ends: the next reconciliation (every 300
-seconds by default; see `--reconcile-interval`), the next time the agent pane
-settles idle or done, the next captured reply for the same request, a restart of
-`chat run`, or `chat tick` while the daemon is stopped. Those sends count
-against a new window, so a longer backlog goes out 8 at a time, with a new hold
-after each group of 8. The breaker therefore bounds only fast loops. A loop
-never trips if each post starts at least 60 seconds after the receipt of the
-post 8 before it, so it can post up to 480 times an hour to one thread. A faster
-loop trips on its 9th post within 60 seconds; one that posts every 3 seconds
-trips 24 seconds in. It then sends 8 more posts after each 300-second hold,
-about 96 an hour. While a thread is held, every attempt fails with a
-`post-rate breaker` error that names the thread and the release time in
-milliseconds after the Unix epoch. `chat run` logs that error, and `chat tick`
-reports it and exits with status 75. `chat status` reports the breaker under
-`reply_breaker`: its limits (`max_replies_per_thread`, `window_seconds`, and
-`cooldown_seconds`), each held thread in `held_threads` with
-`held_until_millis`, `held_for_seconds`, and
-`recent_or_unresolved_reservations`, and an `error` that is null unless the
-record is unusable. Status never changes the record, and it lists only threads
-whose trip is still live: a thread whose trip has expired is not listed even if
-8 of its reservations are still unresolved, and its next new reply trips the
-breaker again. Neither the agent nor the chat thread is told about a hold: a
-notice to the agent could prompt more replies, and a notice in the thread would
-be one more post to the thread being held.
+The next reply to that thread is paced, never held (#2420, owner decision:
+warning at most, never delay): it waits only until the oldest reservation in
+the thread's window leaves it, then goes, in order, under its original operation
+ID, and so does the rest, as slots free. Replies to other threads are
+unaffected. While a reply waits, every attempt fails with a `chat reply paced`
+error that names the thread and when the next slot frees, in milliseconds
+after the Unix epoch; `chat run` logs it and retries at that time, and
+`chat tick` reports it and exits with status 75. A loop therefore keeps posting
+at most 8 replies a minute to one thread. One that sends more than 60 replies
+to a thread within 10 minutes is a runaway: the service logs `REPLY RUNAWAY`,
+tells the owner once, and keeps pacing it; nothing is stopped. `chat status`
+reports the breaker under `reply_breaker`: its limits (`max_replies_per_thread`,
+`window_seconds`, `runaway_replies`, `runaway_window_seconds`), each thread at
+its limit now in `held_threads` with `held_until_millis` (its next free slot),
+`held_for_seconds` and `recent_or_unresolved_reservations`, each reply waiting
+for a slot in `paced_waiting` with `waiting_seconds`, `last_paced_seconds` and
+`max_paced_seconds` (how long paced replies waited), each live runaway mark in
+`runaways`, and an `error` that is null unless the record is unusable.
+`chat health` is DEGRADED while a reply has been paced for more than 30
+seconds, or while a runaway mark is live.
 
-To release held threads early, first confirm that no reply loop is running, then
-delete `reply-breaker.json` from the bridge state directory. This releases every
-thread and discards the budget history of all of them; held replies go out at
-the next retry. If that file cannot be read or is outside its bounds, replies to
+To clear the pacing early, first confirm that no reply loop is running, then
+delete `reply-breaker.json` from the bridge state directory. This discards the
+budget history of every thread; paced replies go out at the next retry. If that file cannot be read or is outside its bounds, replies to
 every thread stay held until it is repaired or deleted: each publish error names
 the file, and `chat status` shows the failure in `reply_breaker.error`. A
-reservation or trip stamped later than the current time, as after the wall clock
-steps back, is moved to the current time, so its window or cooldown restarts
-once instead of lasting as long as the step. The next send attempt to any thread
-saves the moved stamps; until then, `chat status` reports such a trip as held
-for a full cooldown from the time of each call. Reservations are durable before
+reservation or runaway mark stamped later than the current time, as after the
+wall clock steps back, is moved to the current time, so its window restarts once
+instead of lasting as long as the step; the next send attempt to any thread
+saves the moved stamps. Reservations are durable before
 a provider call, including calls whose outcome is unknown. Unresolved
 reservations keep their budget until the same operation is reconciled or the
 ledger is explicitly reset. A valid receipt starts its 60-second retention
@@ -3550,7 +3541,7 @@ is 90% full, the owner rescan has been held back by the host listing budget
 for over 30 minutes without a pass that made a listing call (back-offs between
 passes that list are not one hold), a captured reply is
 still unsent after 10 minutes (one held back after a restart is reported as
-held instead), the reply breaker holds a thread back, a restart held replies
+held instead), a reply has been paced more than 30 s or a thread's replies look like a loop, a restart held replies
 back as stale, a repoint is not applied yet, the target's record names no native session and its
 transcript was discovered or not found at all (the line names the transcript
 read, or says replies come only from the screen, and how the conversation gets
