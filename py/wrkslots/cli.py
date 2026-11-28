@@ -27196,6 +27196,114 @@ def _boot_started_at() -> dt.datetime | None:
     return _boot_started_at_cache
 
 
+#: Characters of a live owner's command line shown by status and doctor (#2466).
+_OWNER_ARGV_DISPLAY_LIMIT = 300
+
+#: How long past its time-to-live a live owner's heartbeat must have lapsed
+#: before doctor reports it (#2466): at least one more time-to-live and never
+#: less than this many seconds, so a heartbeat that lapses during one long
+#: turn or gate reports nothing. Measured from the recorded heartbeat.
+_OWNER_LIVE_EXPIRED_FINDING_FLOOR_SECONDS = 3600
+
+
+def _owner_live_expired_finding_threshold(ttl_seconds: int) -> int:
+    """Heartbeat age, in seconds, past which doctor reports a live owner (#2466)."""
+
+    return ttl_seconds + max(ttl_seconds, _OWNER_LIVE_EXPIRED_FINDING_FLOOR_SECONDS)
+
+
+def _clock_ticks_per_second() -> int:
+    return os.sysconf("SC_CLK_TCK")
+
+
+def _live_owner_process(identity: ProcessIdentity) -> dict[str, object]:
+    """What the live recorded owner process is, by name only (#2466).
+
+    For a row whose owner reads live while its heartbeat has expired, status
+    and doctor name that process: PID, start instant (the boot start plus
+    the recorded start ticks), command name, command line (truncated) and
+    cgroup. Read from /proc for display; the verdict stays _process_state's.
+    A field that cannot be read is None.
+    """
+
+    pid_dir = Path("/proc") / str(identity.pid)
+
+    def read(name: str) -> str | None:
+        try:
+            return (pid_dir / name).read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+
+    comm_text = read("comm")
+    comm = None if comm_text is None else comm_text.strip()
+    cmdline = read("cmdline")
+    argv = (
+        None
+        if cmdline is None
+        else " ".join(part for part in cmdline.split("\0") if part)[:_OWNER_ARGV_DISPLAY_LIMIT]
+    )
+    cgroup: str | None = None
+    cgroup_text = read("cgroup")
+    if cgroup_text is not None:
+        for line in cgroup_text.splitlines():
+            if line.startswith("0::"):
+                cgroup = line[3:]
+                break
+    boot = _boot_started_at()
+    started_at = (
+        None
+        if boot is None
+        else (
+            boot + dt.timedelta(seconds=identity.start_ticks // _clock_ticks_per_second())
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    return {
+        "pid": identity.pid,
+        "started_at": started_at,
+        "comm": comm,
+        "argv": argv,
+        "cgroup": cgroup,
+    }
+
+
+def _owner_live_heartbeat_expired_finding(
+    record: ActiveRecord, machine: str
+) -> dict[str, object] | None:
+    """Doctor's finding for a live owner whose heartbeat lapsed (#2466), or None.
+
+    Reported only past _owner_live_expired_finding_threshold, and keyed by
+    its slot, so a consumer that alerts on new findings sees one stable
+    finding per stuck slot, never one per long turn.
+    """
+
+    if record.owner is None:
+        return None
+    age, _expired = _heartbeat_diagnosis(record)
+    if age <= _owner_live_expired_finding_threshold(record.heartbeat_ttl_seconds):
+        return None
+    if _process_state(record.owner)[0] != "live":
+        return None
+    process = _live_owner_process(record.owner)
+    finding = _operational_finding(
+        "owner-live-heartbeat-expired",
+        record.slot,
+        machine,
+        f"recorded owner PID {process['pid']} ({process['comm']}, started "
+        f"{process['started_at']}, cgroup {process['cgroup']}) is still running "
+        f"although its heartbeat lapsed (last {record.heartbeat_at}, time-to-live "
+        f"{record.heartbeat_ttl_seconds}s, reported past "
+        f"{_owner_live_expired_finding_threshold(record.heartbeat_ttl_seconds)}s); "
+        f"command line: {process['argv']}",
+    )
+    finding["remedy"] = (
+        "if that process is a leftover of the slot's agent, stop it by its PID "
+        "(never by a name pattern) or have the owner release the slot; if it is "
+        "the real owner, have it renew its heartbeat; diagnosis alone "
+        "authorizes no mutation"
+    )
+    return finding
+
+
 def _host_id() -> str:
     candidates = (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id"))
     failures: list[str] = []
@@ -64187,6 +64295,10 @@ def _status_record(
     value["liveness_detail"] = liveness_detail
     value["heartbeat_age_seconds"] = int(age)
     value["heartbeat_expired"] = expired
+    if process_state == "live" and expired and record.owner is not None:
+        # Name the process that keeps the owner live (#2466): the heartbeat
+        # alone cannot say whether a leftover or a real owner is running.
+        value["owner_process"] = _live_owner_process(record.owner)
     hold = hold_result.value
     hold_error = hold_result.error
     if hold_error is not None and not tolerate_hold_error:
@@ -64753,6 +64865,10 @@ def _slot_findings(
                         "is held by a row whose owner has exited",
                     )
                 )
+            elif process_state == "live":
+                live_expired = _owner_live_heartbeat_expired_finding(record, state.machine)
+                if live_expired is not None:
+                    findings.append(live_expired)
             released = releases.get((record.machine, record.slot))
             if released is not None:
                 release, void_reason = released
@@ -65193,6 +65309,12 @@ def _doctor_quick(args: argparse.Namespace, config: Config) -> int:
                             "the slot is held by a row whose owner has exited",
                         )
                     )
+                elif process_state == "live":
+                    live_expired = _owner_live_heartbeat_expired_finding(
+                        record, state.machine
+                    )
+                    if live_expired is not None:
+                        findings.append(live_expired)
         journal_paths = [
             *_outstanding_journals(config),
             *_validate_batch_seal_journals(config),
@@ -66285,6 +66407,14 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             print(
                 f"  {release_obj['summary']} "
                 f"(event {release_obj['event_sequence']})"
+            )
+        process_value = value.get("owner_process")
+        if process_value is not None:
+            process_obj = _as_mapping(process_value, "status owner_process")
+            print(
+                f"  owner process: pid={process_obj['pid']} comm={process_obj['comm']} "
+                f"started={process_obj['started_at']} cgroup={process_obj['cgroup']} "
+                f"argv={process_obj['argv']}"
             )
     harness_rows = [v for v in records if v.get("harness_checkout") is True]
     if harness_rows:
