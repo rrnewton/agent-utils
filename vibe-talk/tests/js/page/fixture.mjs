@@ -6612,6 +6612,8 @@ const TUNING_BANDS = {
   GAP_FILL_PAGE: [10, 98, "messages one seam fill asks for (the server caps a page at 98)"],
   BREAK_OFF_SLACK: [0, 200, "rows past the budgets before a break-off, so it is not taken back and forth"],
   GAP_RETRY_MS: [1000, 120000, "how long scrolling waits before refilling a seam whose fill failed, ms"],
+  // `#2426` R3: a link's first fill, messages each way around its target (owner choice O3: about ten).
+  LINK_AROUND_EACH_WAY: [3, 49, "messages each way a link's around read brings with its target"],
   SAMPLES_KEPT: [4, 200, "measured heights kept per row class for its median"],
   // `#2385 vibe-talk-thread-open-layout-first`: the boxes for an open thread's replies on their way.
   PENDING_REPLY_BOXES_MAX: [50, 50, "boxes at once: the bodies read brings the thread's newest page of 50"],
@@ -7028,7 +7030,7 @@ async function tapArrow(page, li) {
 }
 
 const rowWithId = (page, id) =>
-  page.el("discord-log").children.find((li) => li.getAttribute("data-ids").split(" ").includes(id));
+  page.el("discord-log").children.find((li) => (li.getAttribute("data-ids") || "").split(" ").includes(id));
 
 /**
  * What the status line said — asserted to FIT. The line is one line, ellipsised, and on a 360px

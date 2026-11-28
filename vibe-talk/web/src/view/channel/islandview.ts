@@ -85,6 +85,8 @@ export function createIslandView(deps: IslandViewDependencies): IslandView {
   const filling = new Set<string>();
   /** When a seam's last fill failed or brought nothing, by key: scrolling waits GAP_RETRY_MS after it. */
   const stalled = new Map<string, number>();
+  /** Seams whose last fill failed (an error, or no around answer): they say "· tap to load" (liaison 1126). */
+  const failed = new Set<string>();
 
   const keyOf = (gap: ViewGap): string => `${gap.olderId}|${gap.newerId}`;
 
@@ -122,7 +124,9 @@ export function createIslandView(deps: IslandViewDependencies): IslandView {
       seams.set(key, seam);
     }
     const line = seam.firstElementChild as HTMLElement;
-    const words = filling.has(key) ? `Loading — ${gapLine(gap).replace(" not loaded", "")}` : gapLine(gap);
+    // An uncounted seam (a link's island, `#2426` R3) says what it is doing without a count.
+    const loading = gap.count === null ? "Loading messages…" : `Loading — ${gapLine(gap).replace(" not loaded", "")}`;
+    const words = filling.has(key) ? loading : gapLine(gap, failed.has(key));
     if (line.textContent !== words) line.textContent = words;
     seam.setAttribute("aria-busy", filling.has(key) ? "true" : "false");
     return seam;
@@ -147,6 +151,10 @@ export function createIslandView(deps: IslandViewDependencies): IslandView {
       if (!wanted.has(node)) node.remove();
     }
     for (const [key, seam] of seams) if (!wanted.has(seam)) seams.delete(key);
+    if (failed.size) {
+      const standing = new Set(gapsNow().map(keyOf));
+      for (const key of failed) if (!standing.has(key)) failed.delete(key);
+    }
   }
 
   /** The measured height of the rows standing for `ids` in the list, or null when one is not drawn. */
@@ -272,6 +280,8 @@ export function createIslandView(deps: IslandViewDependencies): IslandView {
     // Only an around answer narrows a gap: a server without the read answers its newest page, which
     // says nothing about this stretch (and would look like the far edge, closing the gap on a hole).
     const around = payload ? (payload as { around?: { held?: unknown; more_below?: unknown; more_above?: unknown } }).around : undefined;
+    if (!payload || !around || around.held !== true) failed.add(key);
+    else failed.delete(key);
     if (!payload || !standing || !around || around.held !== true) {
       stalled.set(key, deps.now());
       placeGaps();

@@ -42,9 +42,9 @@ export interface TimelineReaderLike {
   staleAsOf(payload: TimelineResponse): number | null;
 }
 import { READ_MODE_LABELS, READ_MODE_TITLES, READ_MODE_VERBS, allNoticeWords, nextReadMode } from "../../present/rows/index.ts";
-import { createOlderPager, gapsAboveFloor, islandBudget, noteRepliesLeftOut, removeMessage, upsertMessage, upsertThread } from "../../core/channels/index.ts";
+import { PENDING_REPLY_PX_DEFAULT, createOlderPager, gapsAboveFloor, islandBudget, noteRepliesLeftOut, placeStretch, removeMessage, timeOfId, typicalRowPx, upsertMessage, upsertThread } from "../../core/channels/index.ts";
 import { createIslandView } from "./islandview.ts";
-import { isMessageRow, patchRows, rowShown, shownRowFor } from "./rows.ts";
+import { isMessageRow, patchRows, rowNewestMs, rowShown, shownRowFor } from "./rows.ts";
 import { cardRunIds, threadCardId } from "./cards.ts";
 import { childByClass } from "../dom/index.ts";
 import { neighbourStayed, rowNeighbours } from "./cardplace.ts";
@@ -364,6 +364,13 @@ export interface TimelineFoldRead {
 
 /** The timeline view's commands and questions: the legacy names, unchanged. */
 export interface TimelineView {
+  /**
+   * `#2426` R3, links always work: read `target` and about ten messages each way from the server's
+   * copy (`around`) and land them as an island of the current channel view (or a stretch joining
+   * what it holds). True when the target is now held; false (nothing changed) when the view has no
+   * islands, the server lacks the read or the target, or the reader went elsewhere meanwhile.
+   */
+  jumpAround(target: string, place?: (box: HTMLElement) => void): Promise<boolean>;
   loadCanon(channel: string): void;
   drawProjection(): boolean;
   walkCursorOwed(): boolean;
@@ -410,6 +417,8 @@ export interface TimelineView {
 
 /** How long one timeline read may run before the page gives up on it. */
 const CHANNEL_READ_TIMEOUT_MS = 20000;
+/** `#2426` R3: a link's first fill, messages each way around its target (owner choice O3: about ten). */
+const LINK_AROUND_EACH_WAY = 10;
 /**
  * `#2264 vibe-talk-all-view-older-load-stuck`: how long after a pending step back the page asks again
  * by itself, with no live stream open to hear the walk end on (live delivery off, or the stream down),
@@ -1944,11 +1953,133 @@ function foldAroundPage(payload: TimelineResponse): Message[] {
   return carried;
 }
 
+/** `#2426` R3: one message and its neighbours, from the server's copy, as an island of this view. */
+
+/**
+ * `#2426` R3 (owner request 383): the box a link jumps to at once, before its message is read: a
+ * dashed place where the message will land, by the time its id says it was written (at the head of
+ * the list when it says nothing), brought to the middle of the screen. The message, once it comes,
+ * takes the box's place.
+ */
+
+function standLinkBox(target: string, place?: (box: HTMLElement) => void): HTMLElement {
+  const list = el("discord-log");
+  const area = el("scroll-area");
+  const box = document.createElement("li");
+  box.className = "pending-reply link-box";
+  box.setAttribute("data-link-box", target);
+  box.setAttribute("aria-busy", "true");
+  const line = document.createElement("span");
+  line.className = "pending-replies-line";
+  line.textContent = "Loading the message…";
+  box.append(line);
+  const ms = timeOfId(target);
+  const before = ms === null ? null : [...list.children].find((row) => isMessageRow(row) && rowNewestMs(row) > ms) || null;
+  // As tall as a typical message where it stands (review 0a3d, R12): the message then lands with its
+  // top near the box's top, not 66 px above it.
+  const rows = [...list.children].filter((row) => isMessageRow(row));
+  const at = before ? rows.indexOf(before) : rows.length;
+  const near = rows.slice(Math.max(0, at - 8), at + 8).map((row) => row.getBoundingClientRect().height);
+  box.style.height = `${typicalRowPx(near, PENDING_REPLY_PX_DEFAULT, (area.clientHeight || 0) * 0.6)}px`;
+  // The neighbours older than it come with it (ten each way): their boxes stand above it now, so the
+  // box can stand mid-screen at once and the message, when it comes, takes its place without moving.
+  const above = Array.from({ length: LINK_AROUND_EACH_WAY }, () => {
+    const neighbour = document.createElement("li");
+    neighbour.className = "pending-reply link-box-neighbour";
+    neighbour.setAttribute("aria-hidden", "true");
+    neighbour.style.height = `${PENDING_REPLY_PX_DEFAULT}px`;
+    return neighbour;
+  });
+  preservingScroll(() => {
+    const at = before || (ms === null ? list.firstElementChild : null);
+    for (const neighbour of above) list.insertBefore(neighbour, at);
+    list.insertBefore(box, at);
+  });
+  linkBoxNeighbours.set(box, above);
+  if (place) {
+    place(box);
+  } else {
+    const rect = box.getBoundingClientRect();
+    const band = area.getBoundingClientRect();
+    deps.nudge(area, rect.top - (band.top + (area.clientHeight - rect.height) / 2));
+  }
+  return box;
+}
+
+const linkBoxNeighbours = new WeakMap<HTMLElement, HTMLElement[]>();
+
+async function jumpAround(target: string, place?: (box: HTMLElement) => void): Promise<boolean> {
+  const view = selection().view;
+  if (!providerFacts.threading() || (view !== "main" && view !== "flat")) return false;
+  const context = channelContextKey();
+  // The row the reader stood on before the box: a read that brings nothing to land puts them back on
+  // it (review e1d6/0a3d, R12), rather than wherever taking the boxes out leaves the scroll.
+  const area = el("scroll-area");
+  const was = scrollAnchor(area);
+  const wasId = was ? was.getAttribute("data-context-id") || idsOf(was)[0] || null : null;
+  const wasTop = was ? was.getBoundingClientRect().top : 0;
+  const wasAtFoot = area.scrollHeight - area.scrollTop - area.clientHeight <= 1;
+  const box = standLinkBox(target, place);
+  let landed = false;
+  try {
+    landed = await jumpAroundFrom(target, view, context);
+    return landed;
+  } finally {
+    const standing = [box, ...(linkBoxNeighbours.get(box) || [])].filter((node) => node.parentNode);
+    if (standing.length) preservingScroll(() => { for (const node of standing) node.parentNode?.removeChild(node); });
+    if (!landed && context === channelContextKey()) {
+      const again = wasId ? [...el("discord-log").children].find((row) => (row.getAttribute("data-context-id") || idsOf(row)[0]) === wasId) : undefined;
+      if (wasAtFoot) deps.nudge(area, area.scrollHeight - area.scrollTop - area.clientHeight);
+      else if (again) deps.nudge(area, again.getBoundingClientRect().top - wasTop);
+    }
+  }
+}
+
+async function jumpAroundFrom(target: string, view: string, context: string): Promise<boolean> {
+  const path = `${timelineReader.timelinePath(null, null, "older")}&around=${encodeURIComponent(target)}&below=${LINK_AROUND_EACH_WAY}&above=${LINK_AROUND_EACH_WAY}`;
+  let payload: TimelineResponse;
+  try {
+    payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => timelineReader.readTimeline(path, { signal }));
+  } catch (_error) {
+    return false;
+  }
+  const around = (payload as { around?: { held?: unknown; more_below?: unknown } }).around;
+  if (!around || around.held !== true || context !== channelContextKey() || selection().view !== view) return false;
+  preservingScroll(() => {
+    const before = timelineRows().messages.map((row) => ({ id: String(row.id), ms: timeOf(row, "timestamp") }));
+    const arrived = foldAroundPage(payload);
+    const stretch = arrived.map((row) => ({ id: String(row.id), ms: timeOf(row, "timestamp") })).sort((a, b) => a.ms - b.ms);
+    const cover = channelStore.current().views.get(viewKey());
+    if (cover) {
+      const placed = placeStretch(before, cover.gaps || [], stretch);
+      if (placed.gaps.length) cover.gaps = placed.gaps;
+      else delete cover.gaps;
+      if (placed.lowersFloor && placed.floorMs !== null) {
+        const more = around.more_below !== false;
+        cover.floor = more ? placed.floorMs : null;
+        cover.more = more;
+        cover.cursor = payload.next_before || null;
+        olderPages().cursor = payload.next_before || null;
+        olderPages().moreAbove = more;
+        olderPages().aroundSeed = null;
+      }
+    }
+    // The landing that follows (in the same task, before any paint) centres the message where the
+    // box was centred (`place`), so it takes the box's place.
+    islandRedraw();
+  });
+  saveChannelScope();
+  return timelineRows().messages.some((row) => String(row.id) === target);
+}
+
 /** The reader has arrived at the top of what is loaded. Take the next step for them. */
 
 function maybeLoadOlder() {
   // `#2426` R2: a seam the reader is reaching fills from their side (islandview.ts), at the head or not.
   if (screens.view() === "discord") guardQuietly(() => islands.onScroll())();
+  // `#2426` R3: a link's box stands at the head while its message is read: the head reached that
+  // way is the link's place, not the reader asking for older history.
+  if ([...el("discord-log").children].some((row) => row.hasAttribute("data-link-box"))) return;
   // Not at the head of the Pinned list, which is every pin already: older history adds none to it, and
   // a step taken behind it reads for a list that is not on screen. A pin older than what is loaded is
   // walked back to when the filter goes (`walkToFilterAnchor`, `#243 filter-keeps-selection`).
@@ -2911,7 +3042,7 @@ function readRunsSuspended() {
 
   return {
     placeReplyTarget,
-    loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows,
+    jumpAround, loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows,
     rowsAsDrawn, applyTimelinePage,
     renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage,
     loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta,

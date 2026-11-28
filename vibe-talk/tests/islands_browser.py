@@ -218,6 +218,10 @@ def island_handler(api: IslandApi) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+# The step back at the list's head has settled: not left saying "Loading older messages…" (liaison 1131).
+OLDER_SETTLED_JS = """() => { const b = document.getElementById('load-older');
+  return !b || b.hidden || (!b.disabled && !/^Loading (older|earlier) messages/.test(b.textContent.trim())); }"""
+
 CENSUS_JS = """() => {
   const list = document.getElementById('discord-log');
   const ids = [...list.querySelectorAll(':scope > li[data-id]')].flatMap((li) =>
@@ -387,7 +391,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(ids == sorted(ids), f"{label}: held rows out of order")
             # 1a. A fill that FAILS (liaison 1122): the server answers the around read with an error. The
             # seam stands "Loading — N messages" only while the read is out, then falls back to
-            # "N messages not loaded" (tap to load), never stuck; a tap after the server recovers fills it.
+            # "N messages not loaded · tap to load" (liaison 1126: it says it is tappable), never stuck; a tap
+            # after the server recovers fills it, and the seam left after that fill no longer says "tap to load".
             quiet(page)
             api.error_around = True
             errors_before = api.count("around-error")
@@ -409,8 +414,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 if words and words[1] == "false":
                     break
                 frames(page, 1)
-            check(words is not None and words[1] == "false" and words[0].endswith("messages not loaded"),
-                  f"{label}: after a failed fill the seam reads {words}, not 'N messages not loaded' at rest")
+            check(words is not None and words[1] == "false" and words[0].endswith("messages not loaded · tap to load"),
+                  f"{label}: after a failed fill the seam reads {words}, not 'N messages not loaded · tap to load' at rest")
             if args.screenshots:
                 page.screenshot(path=str(args.screenshots / f"{label}-1a-fill-failed.png"))
             # Scrolling again does not hammer the failed read (it waits); a tap after the server recovers fills.
@@ -427,6 +432,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 waited += 1
             check(api.count("around") > fills_before, f"{label}: a tap on the failed seam asked no fill")
             settle(page)
+            after_tap = page.evaluate(CENSUS_JS)["seams"]
+            check(not any("tap to load" in one for one in after_tap),
+                  f"{label}: after the tap's fill landed a seam still says 'tap to load': {after_tap}")
             notes.append(f"failed fill: the seam fell back to {(words or ['?'])[0]!r} (not stuck loading), scrolling did not retry at once, "
                          "a tap after recovery filled it")
             # 1b. Down from the far-back island to its seam: it fills from that side (above=50, below=0),
@@ -507,6 +515,15 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             census = page.evaluate(CENSUS_JS)
             ids = [int(one) for one in census["ids"]]
             check(ids[0] < first_held and ids == sorted(ids), f"{label}: the steps back after the trim brought nothing older")
+            # The control at the head resolves once its step lands (liaison 1131): never left busy.
+            settled = False
+            for _ in range(600):
+                if page.evaluate(OLDER_SETTLED_JS):
+                    settled = True
+                    break
+                frames(page, 1)
+            check(settled, f"{label}: the head's step back stayed busy: "
+                  + str(page.evaluate("() => (document.getElementById('load-older') || {}).textContent || ''")))
             notes.append(f"after the top trim: steps back {steps} (around below the oldest held, then the cursor)")
             # 2. Newest from the far-back island: zero timeline reads, lands on the newest message.
             reads = len(api.read_log)

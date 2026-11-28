@@ -32,7 +32,10 @@ const IDLE_STATUS_WORDS: ReadonlySet<string> = new Set(["Ready.", "ready",
   // `#2375 vibe-talk-reading-off-toast-covers-sent-row`: reading mode turned off. The reader turned
   // it off; the Read control already shows it. A toast floated over the row they sent next, its
   // time and Unarchive under it. Announced, not floated.
-  "reading mode off."]);
+  "reading mode off.",
+  // `#2426` R3 (liaison 1150): a link's message being read. Its box, standing where the message will
+  // land, already says it; a toast floated over the rows under it. Announced, not floated.
+  "Loading the message…"]);
 
 /** How long the connection banner stays before it takes itself away, in ms. */
 const BANNER_DISMISS_MS = 8000;

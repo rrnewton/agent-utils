@@ -15,7 +15,8 @@ island and the newest window with one seam between) it checks, at 412x915 by tou
     arrival and the rows given up above it (owner rule 370), and the jump still says "1 new";
   * the first step back after the cap asks for exactly the rows below the first kept row, and the
     rows on screen afterwards are one unbroken run (no hole);
-  * the island given up takes its seam along: no seam stands after the arrival (`#2426` R2);
+  * the island given up takes its seam along: no seam stands after the arrival (`#2426` R2), and the
+    step back at the head resolves: its control does not stay "Loading older messages…";
 
 and with the resident rows at 20000 (the negative control) nothing is given up. Two pins (the
 liaison's condition on the evidence): a reply box opened, with a typed draft, on the row 120 above the
@@ -199,6 +200,16 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
 
 ROWS_JS = "() => document.querySelectorAll('#discord-log > li[data-id]').length"
 IDS_JS = "() => [...document.querySelectorAll('#discord-log > li[data-id]')].map((li) => li.getAttribute('data-id'))"
+# The step back at the list's head has settled: not hidden behind "Loading older messages…" for good
+# (liaison 1131: the pill at the head resolves, by a fill or by settling, once the reader reaches it).
+OLDER_SETTLED_JS = """() => { const b = document.getElementById('load-older');
+  return !b || b.hidden || (!b.disabled && !/^Loading (older|earlier) messages/.test(b.textContent.trim())); }"""
+# The list at rest: what it holds, and no step back on its way (the head's control not busy).
+STILL_JS = """() => { const ids = [...document.querySelectorAll('#discord-log > li[data-id]')].map((li) => li.getAttribute('data-id'));
+  const b = document.getElementById('load-older');
+  const idle = !b || b.hidden || (!b.disabled && !/^Loading (older|earlier) messages/.test(b.textContent.trim()));
+  return { n: ids.length, first: ids[0] || null, last: ids[ids.length - 1] || null, idle }; }"""
+TWO_FRAMES_JS = "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(() => done(true))))"
 SEAMS_JS = "() => [...document.querySelectorAll('#discord-log > li.island-gap')].map((li) => li.textContent.trim())"
 TO_TOP_JS = "() => { const a = document.getElementById('scroll-area'); a.scrollTop = 0; a.dispatchEvent(new Event('scroll')); }"
 TO_FOOT_JS = "() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }"
@@ -258,6 +269,17 @@ def walk_back(page: "Page", api: FakeApi, label: str) -> int:
             page.evaluate(TO_TOP_JS)
     walked = depth()
     check(walked >= WALKED, f"{label}: the walk back stopped {walked} rows deep")
+    # The last scroll to the head can have started one more step back. Wait until no step is on its
+    # way and the rows, with any break-off after the step, stand still for a few frames. Otherwise
+    # the rows the walk picks from could still be let go of (a hot host lands that step late).
+    still = 0
+    last: object = None
+    while still < 6 and time.monotonic() < deadline:
+        now = page.evaluate(STILL_JS)
+        still = still + 1 if now == last and now["idle"] else 0
+        last = now
+        page.evaluate(TWO_FRAMES_JS)
+    check(still >= 6, f"{label}: the list never stood still after the walk back")
     return walked
 
 
@@ -318,6 +340,8 @@ def walk(page: "Page", api: FakeApi, label: str, resident: int, shots: Path | No
     after = [api.index_of(str(x)) for x in page.evaluate(IDS_JS)]
     gaps = [(a, b) for a, b in zip(after, after[1:]) if b != a + 1]
     check(not gaps, f"{label}: the rows after the step back are not one run: {gaps[:3]}")
+    wait_until(page, OLDER_SETTLED_JS, f"{label}: the head's step back stayed busy: "
+               + str(page.evaluate("() => (document.getElementById('load-older') || {}).textContent || ''")))
     if shots is not None:
         page.screenshot(path=str(shots / f"{label}-walkback.png"), full_page=False)
     return (f"{label}: {len(held)} rows -> {len(ids)} after the arrival (resident {resident}), reading row moved "

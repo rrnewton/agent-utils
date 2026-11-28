@@ -103,9 +103,12 @@ export {
   forgetRepliesLeftOut,
   narrowGap,
   noteRepliesLeftOut,
+  placeStretch,
   planBreakOff,
   planTopTrim,
   repliesLeftOut,
+  typicalRowPx,
+  timeOfId,
   withGap,
 } from "./islands.ts";
 export type { FillSide, IslandBudget, ViewGap } from "./islands.ts";

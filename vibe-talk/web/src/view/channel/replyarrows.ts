@@ -63,13 +63,18 @@ export interface ReplyArrowsDependencies {
   inView(message: unknown, view: string, threadId: string | null): boolean;
   selection(): { view: string; threadId: string | null };
   threading(): boolean;
-  olderPages(): { moreAbove: boolean; cursor: unknown };
+  olderPages(): { moreAbove: boolean; cursor: unknown; inFlight?: boolean };
   viewKey(): string;
   channelCanon(): { views: Map<string, { more?: boolean }> };
   selectedChannelId(): unknown;
   changeChannelView(view: string): Promise<void>;
   channelReadsBusy(): boolean;
   loadOlder(): Promise<void> | null;
+  /**
+   * `#2426` R3, links always work: the target and its neighbours from the server's copy, as an island
+   * of the view (readcore `jumpAround`). True when the target is now held. Absent: the walk alone.
+   */
+  jumpAround?(target: string, place?: (box: HTMLElement) => void): Promise<boolean>;
   walkCursorOwed(): boolean;
   hidingRead(): boolean;
   timelineMessages(): readonly { id: unknown }[];
@@ -607,6 +612,20 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
    * jump, a message the view on screen cannot show; for the gathering, any view but All. Every call
    * takes a ticket, so a later tap, on either control, ends a walk still under way.
    */
+  /**
+   * `#2426` R3: put a link's box where the landing will centre its message (`revealRow`'s rule: centred
+   * in the visible room under what floats over the list), so the message, when it comes, stands where
+   * the box stood, centre on centre.
+   */
+  function placeLikeLanding(node: HTMLElement): void {
+    const area = deps.el("scroll-area");
+    const clear = floatingClearance(area) + REPLY_LANDING_GAP_PX;
+    const box = node.getBoundingClientRect();
+    const foot = visibleListFoot(area, clear);
+    const lead = box.height >= foot - clear ? clear : (clear + foot - box.height) / 2;
+    deps.nudge(area, box.top - lead);
+  }
+
   async function seekMessage(target: string, arrive: () => unknown, openAll: () => unknown): Promise<void> {
     // `#229 desktop-two-column`. The column the walk is in, which its work after every wait is done in,
     // given back before the walk's promise settles, whichever way it ends.
@@ -676,6 +695,27 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
           deps.setStatus("Could not read All — try again.");
           return;
         }
+      }
+      // `#2426` R3: a message older than what is held lands at once from the server's copy, ten each way
+      // around it, as an island of its own; the walk back below is what is left for a server without
+      // the read, or a target its copy does not hold yet.
+      // A step back already on the wire (a search walk's, just ended above) goes on as the walk's first
+      // step, as it always has: the island read is for a link that finds nothing under way.
+      if (deps.jumpAround && !deps.olderPages().inFlight) {
+        const context = deps.channelContextKey();
+        deps.setStatus("Loading the message…");
+        let placed = false;
+        try {
+          const step = deps.jumpAround(target, placeLikeLanding);
+          steps.pause();
+          placed = await step;
+          steps.resume();
+        } catch (error) {
+          steps.resume();
+          throw error;
+        }
+        if (ticket !== replyJumpTicket.current() || context !== deps.channelContextKey()) return;
+        if (placed && (arrive() || hiddenAsRead())) return;
       }
       let walked = 0;
       let stalls = 0;

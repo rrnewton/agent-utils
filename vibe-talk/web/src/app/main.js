@@ -2473,6 +2473,7 @@ const replyArrowsOwner = createReplyArrows({
   changeChannelView: (view) => changeChannelView(view),
   channelReadsBusy: () => channelReads.busy(),
   loadOlder: () => loadOlder(),
+  jumpAround: (target) => timelineView.jumpAround(target),
   walkCursorOwed: () => walkCursorOwed(),
   hidingRead: () => hidingRead(),
   timelineMessages: () => timelineRows().messages,

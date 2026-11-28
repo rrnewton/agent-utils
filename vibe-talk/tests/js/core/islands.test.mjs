@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { moduleForTests } from "../../../web/build.mjs";
 
 const CHANNELS = await moduleForTests("src/core/channels/index.ts");
-const { gapForRun, gapLine, gapPlaces, gapsAboveFloor, narrowGap, planBreakOff, planTopTrim, withGap } = CHANNELS;
+const { gapForRun, gapLine, gapPlaces, gapsAboveFloor, narrowGap, placeStretch, planBreakOff, planTopTrim, typicalRowPx, withGap } = CHANNELS;
 
 const T0 = Date.parse("2026-11-01T00:00:00Z");
 const held = (n) => Array.from({ length: n }, (_, i) => ({ id: String(1000 + i), ms: T0 + i * 60000 }));
@@ -69,6 +69,8 @@ test("`#2426` R2: a run leaves a gap with its edges, count and height; gaps stan
   assert.equal(gapLine(gap), "299 messages not loaded");
   assert.equal(gapLine({ ...gap, count: 1 }), "1 message not loaded");
   assert.equal(gapLine({ ...gap, count: null }), "Messages not loaded");
+  assert.equal(gapLine(gap, true), "299 messages not loaded · tap to load", "a failed fill's seam says it is tappable");
+  assert.equal(gapLine({ ...gap, count: null }, true), "Messages not loaded · tap to load");
   const shown = [...Array.from({ length: 151 }, (_, i) => message(i)), ...Array.from({ length: 150 }, (_, i) => message(450 + i))];
   const places = gapPlaces(shown, [gap]);
   assert.deepStrictEqual([...places.keys()], ["1150"]);
@@ -143,4 +145,36 @@ test("`#2426` R2: residency giving up the far-back island raises the floor past 
   assert.deepStrictEqual(gapsAboveFloor([far, near], rows[300].ms), [near], "a floor on the newer edge: the gap is under it");
   assert.deepStrictEqual(gapsAboveFloor([far], rows[299].ms), [far], "a floor inside the gap leaves it standing");
   assert.deepStrictEqual(gapsAboveFloor(undefined, rows[10].ms), []);
+});
+
+test("`#2426` R3: a link's stretch lands under the floor as a new island, grows the held top, or splits or narrows a gap", () => {
+  const all = held(1000);
+  const rows = all.slice(600);
+  // Under everything held: a new island, floor down to it, an uncounted gap above it.
+  const below = placeStretch(rows, [], all.slice(200, 221));
+  assert.equal(below.lowersFloor, true);
+  assert.equal(below.floorMs, all[200].ms);
+  assert.deepStrictEqual(below.gaps.map((g) => [g.olderId, g.newerId, g.count]), [["1220", "1600", null]]);
+  // Reaching the oldest row held: the held stretch grows down, no gap.
+  const grows = placeStretch(rows, [], all.slice(580, 601));
+  assert.deepStrictEqual([grows.lowersFloor, grows.floorMs, grows.gaps.length], [true, all[580].ms, 0]);
+  // Inside a gap, touching neither edge: two gaps around a new island.
+  const gap = gapForRun(all, { first: 701, last: 899 }, 9000);
+  const kept = all.filter((_, at) => at <= 700 || at >= 900);
+  const split = placeStretch(kept.slice(600), [gap], all.slice(790, 811));
+  assert.deepStrictEqual(split.gaps.map((g) => [g.olderId, g.newerId, g.count]), [["1700", "1790", null], ["1810", "1900", null]]);
+  // Touching the older edge: the gap narrows from it.
+  const narrowed = placeStretch(kept.slice(600), [gap], all.slice(690, 721));
+  assert.deepStrictEqual(narrowed.gaps.map((g) => [g.olderId, g.newerId]), [["1720", "1900"]]);
+  // Among held rows: nothing.
+  assert.deepStrictEqual(placeStretch(rows, [gap], all.slice(950, 960)).gaps, [gap]);
+});
+
+test("`#2426` R3: a link's box is as tall as the median message measured near it, within its bounds", () => {
+  assert.equal(typicalRowPx([], 84, 500), 84, "nothing measured: the fallback");
+  assert.equal(typicalRowPx([216, 150, 268], 84, 500), 216);
+  assert.equal(typicalRowPx([100, 200, 300, 400], 84, 500), 250);
+  assert.equal(typicalRowPx([40, 50, 60], 84, 500), 84, "never under the fallback");
+  assert.equal(typicalRowPx([900, 1000, 1100], 84, 500), 500, "never over the cap");
+  assert.equal(typicalRowPx([0, NaN, 216], 84, 500), 216, "unmeasured rows are left out");
 });

@@ -441,6 +441,19 @@
 }
 
 /*
+ * `#2426` R3: a link's box, and its neighbours' boxes, stand in the channel list where messages will
+ * land, so they take a channel message's frame: an agent's row, the commonest (edge to edge with
+ * square corners on a phone; on a desk the agent's inset on the right, in 20-desktop-regime.css),
+ * dashed and empty as above.
+ */
+#discord-log > li.link-box,
+#discord-log > li.link-box-neighbour {
+  margin-left: calc(-0.75rem - env(safe-area-inset-left));
+  margin-right: calc(-0.75rem - env(safe-area-inset-right));
+  border-radius: 0;
+}
+
+/*
  * `#2426 vibe-talk-sparse-loading-program` R2: the seam that stands for a stretch of the channel the
  * page let go of between two islands (the reader's far-back island and the newest window), and
  * fills from the reader's side when they reach it. The same seam as a folded read run (one seam

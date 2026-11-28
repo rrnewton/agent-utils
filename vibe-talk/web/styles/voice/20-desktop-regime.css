@@ -718,6 +718,13 @@
     margin-inline: var(--desk-third-inset, min(7%, 3rem));
   }
 
+  /* `#2426` R3: a link's boxes take an agent's row's frame here too (12-channel-rows.css). */
+  #discord-log > li.link-box,
+  #discord-log > li.link-box-neighbour {
+    margin-left: 0;
+    margin-right: var(--desk-agent-inset, min(15%, 6rem));
+  }
+
   /* `#204 reply-arrow`. A reply's gutter is a touch target wide everywhere, and the owner's own
      inset is wider than that here: his reply keeps the larger of the two, so it is still drawn on
      his side of the column. The arrow follows the box (`right: 100%`). */

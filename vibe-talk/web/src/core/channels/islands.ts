@@ -284,8 +284,98 @@ export function forgetRepliesLeftOut(canon: object, id: unknown): void {
   if (held) held.delete(String(id));
 }
 
-/** The words a gap says: "42 messages not loaded", "1 message not loaded", or "Messages not loaded" uncounted. */
-export function gapLine(gap: ViewGap): string {
-  if (gap.count === null) return "Messages not loaded";
-  return `${gap.count} ${gap.count === 1 ? "message" : "messages"} not loaded`;
+/**
+ * Where a stretch an `around` read brought for a link lands among what a view holds (`#2426` R3,
+ * links always work): `rows` the view's held rows and `stretch` the stretch's messages of the view,
+ * both oldest first; `gaps` its gaps; `floorMs` its cover's floor (null when none).
+ *
+ * - Below everything held: a new island under the old floor, the floor moving down to the stretch's
+ *   oldest, with an uncounted gap between it and the oldest row held (`lowersFloor`).
+ * - Overlapping the oldest row held: the held stretch simply grows down (`lowersFloor`, no gap).
+ * - Inside a gap: the gap narrows from the edge the stretch touches, or, touching neither, splits
+ *   into two uncounted gaps around a new island.
+ * - Among held rows: nothing changes.
+ */
+export function placeStretch(
+  rows: readonly HeldRow[],
+  gaps: readonly ViewGap[],
+  stretch: readonly HeldRow[],
+): { gaps: ViewGap[]; lowersFloor: boolean; floorMs: number | null } {
+  const unchanged = { gaps: [...gaps], lowersFloor: false, floorMs: null };
+  if (!stretch.length || !rows.length) return unchanged;
+  const held = new Set(rows.map((row) => row.id));
+  const oldest = stretch[0] as HeldRow;
+  const newest = stretch[stretch.length - 1] as HeldRow;
+  const first = rows[0] as HeldRow;
+  // Under everything held, or reaching down past it from the oldest row held.
+  if (newest.ms < first.ms || (held.has(first.id) && stretch.some((row) => row.id === first.id) && oldest.ms <= first.ms)) {
+    const touching = stretch.some((row) => row.id === first.id);
+    const added: ViewGap[] = touching ? [] : [{
+      olderId: newest.id, olderMs: newest.ms, newerId: first.id, newerMs: first.ms, count: null, heightPx: null,
+    }];
+    return { gaps: [...gaps, ...added].sort((a, b) => a.olderMs - b.olderMs), lowersFloor: true, floorMs: oldest.ms };
+  }
+  const next: ViewGap[] = [];
+  let changed = false;
+  for (const gap of gaps) {
+    const overlaps = oldest.ms <= gap.newerMs && newest.ms >= gap.olderMs;
+    if (!overlaps) { next.push(gap); continue; }
+    changed = true;
+    const ids = new Set(stretch.map((row) => row.id));
+    const asMessages = stretch.map((row) => ({ id: row.id, timestamp: new Date(row.ms).toISOString() }) as unknown as Message);
+    if (ids.has(gap.olderId) || oldest.ms < gap.olderMs) {
+      const narrowed = narrowGap(gap, "older", asMessages, false);
+      if (narrowed) next.push({ ...narrowed, count: null, heightPx: null });
+    } else if (ids.has(gap.newerId) || newest.ms > gap.newerMs) {
+      const narrowed = narrowGap(gap, "newer", asMessages, false);
+      if (narrowed) next.push({ ...narrowed, count: null, heightPx: null });
+    } else {
+      next.push({ ...gap, newerId: oldest.id, newerMs: oldest.ms, count: null, heightPx: null });
+      next.push({ ...gap, olderId: newest.id, olderMs: newest.ms, count: null, heightPx: null });
+    }
+  }
+  if (!changed) return unchanged;
+  next.sort((a, b) => a.olderMs - b.olderMs);
+  return { gaps: next, lowersFloor: false, floorMs: null };
+}
+
+/**
+ * When message `id` was written, by its id alone, in ms, or null when the id says nothing of it: a
+ * Slack id is its `ts` (seconds with a fraction), a Discord id a snowflake (ms since 2015 in its high
+ * bits). Used only to put a link's box where its message will land before the message is held
+ * (`#2426` R3); never as the message's time once it is.
+ */
+export function timeOfId(id: string): number | null {
+  if (/^\d{9,11}\.\d{1,6}$/.test(id)) return Math.round(parseFloat(id) * 1000);
+  if (/^\d{17,20}$/.test(id)) {
+    try {
+      return Number((BigInt(id) >> 22n) + 1420070400000n);
+    } catch (_error) {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The height a link's box takes (`#2426` R3): the median of the message rows measured around where
+ * it stands, so the message, when it comes, lands with its top near the box's (a typical message
+ * moves nothing). `fallback` when nothing is measured; never under it, never over `max`.
+ */
+export function typicalRowPx(heights: readonly number[], fallback: number, max: number): number {
+  const sorted = heights.filter((h) => Number.isFinite(h) && h > 0).sort((a, b) => a - b);
+  if (!sorted.length) return fallback;
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 ? (sorted[mid] as number) : ((sorted[mid - 1] as number) + (sorted[mid] as number)) / 2;
+  return Math.round(Math.min(Math.max(median, fallback), Math.max(fallback, max)));
+}
+
+/**
+ * The words a gap says: "42 messages not loaded", "1 message not loaded", or "Messages not loaded" uncounted.
+ * After its last fill failed, it says the seam is tappable too ("· tap to load"): the reader's tap
+ * is then the way to ask again (liaison 1126).
+ */
+export function gapLine(gap: ViewGap, failed = false): string {
+  const words = gap.count === null ? "Messages not loaded" : `${gap.count} ${gap.count === 1 ? "message" : "messages"} not loaded`;
+  return failed ? `${words} · tap to load` : words;
 }
