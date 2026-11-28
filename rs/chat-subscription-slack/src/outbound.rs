@@ -1189,7 +1189,67 @@ pub fn split_body(text: &str, limit: usize) -> Vec<String> {
 struct LedgerChunk {
     ts: Option<String>,
     intent_millis: Option<u64>,
+    /// Set once Slack refused this chunk as too long (#2439 chat-never-truncate, S8): the chunk
+    /// is posted as pieces of at most `bytes` (cut by [`split_body`], so the same pieces come back
+    /// on a retry), each with its own post record. The chunk's `ts` is its first piece's.
+    split: Option<LedgerSplit>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LedgerSplit {
+    bytes: usize,
+    pieces: Vec<LedgerChunk>,
+}
+
+impl LedgerChunk {
+    fn empty() -> Self {
+        LedgerChunk {
+            ts: None,
+            intent_millis: None,
+            split: None,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut value = json!({"ts": self.ts, "intent_millis": self.intent_millis});
+        if let Some(split) = &self.split {
+            value["split"] = json!({
+                "bytes": split.bytes,
+                "pieces": split.pieces.iter().map(LedgerChunk::to_json).collect::<Vec<_>>(),
+            });
+        }
+        value
+    }
+
+    fn from_json(chunk: &Value) -> Option<Self> {
+        Some(LedgerChunk {
+            ts: match chunk.get("ts")? {
+                Value::Null => None,
+                Value::String(ts) if ids::valid_ts(ts) => Some(ts.clone()),
+                _ => return None,
+            },
+            intent_millis: match chunk.get("intent_millis")? {
+                Value::Null => None,
+                other => Some(other.as_u64()?),
+            },
+            split: match chunk.get("split") {
+                None | Some(Value::Null) => None,
+                Some(split) => Some(LedgerSplit {
+                    bytes: usize::try_from(split.get("bytes")?.as_u64()?).ok()?,
+                    pieces: split
+                        .get("pieces")?
+                        .as_array()?
+                        .iter()
+                        .map(LedgerChunk::from_json)
+                        .collect::<Option<Vec<_>>>()?,
+                }),
+            },
+        })
+    }
+}
+
+/// The smallest piece a chunk Slack refuses as too long is cut into (#2439 S8).
+const MIN_SPLIT_PIECE_BYTES: usize = 2_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LedgerRecord {
@@ -1208,10 +1268,7 @@ impl LedgerRecord {
             "thread_ts": self.thread_ts,
             "text_bytes": self.text_bytes,
             "format": self.format,
-            "chunks": self.chunks.iter().map(|chunk| json!({
-                "ts": chunk.ts,
-                "intent_millis": chunk.intent_millis,
-            })).collect::<Vec<_>>(),
+            "chunks": self.chunks.iter().map(LedgerChunk::to_json).collect::<Vec<_>>(),
         })
     }
 
@@ -1223,19 +1280,7 @@ impl LedgerRecord {
             .get("chunks")?
             .as_array()?
             .iter()
-            .map(|chunk| {
-                Some(LedgerChunk {
-                    ts: match chunk.get("ts")? {
-                        Value::Null => None,
-                        Value::String(ts) if ids::valid_ts(ts) => Some(ts.clone()),
-                        _ => return None,
-                    },
-                    intent_millis: match chunk.get("intent_millis")? {
-                        Value::Null => None,
-                        other => Some(other.as_u64()?),
-                    },
-                })
-            })
+            .map(LedgerChunk::from_json)
             .collect::<Option<Vec<_>>>()?;
         Some(Self {
             channel_id: value.get("channel_id")?.as_str()?.to_owned(),
@@ -1365,6 +1410,182 @@ fn fingerprint(text: &str, limit: usize) -> String {
         .collect()
 }
 
+/// One post the send loop makes: a whole chunk, or a piece of one Slack refused as too long.
+struct PieceTarget<'a> {
+    label: String,
+    text: &'a str,
+    blocks: Option<&'a str>,
+}
+
+/// What posting one piece came to.
+enum PieceResult {
+    /// Posted, or an earlier post adopted; its ts is in the ledger.
+    Done,
+    /// Slack refused it as too long (`msg_too_long`), and nothing was posted.
+    TooLong(TransportError),
+}
+
+/// The ledger entry at `path`: `[chunk]` or `[chunk, piece]`.
+fn piece_ledger<'r>(record: &'r mut LedgerRecord, path: &[usize]) -> &'r mut LedgerChunk {
+    let chunk = &mut record.chunks[path[0]];
+    match path.get(1) {
+        Some(piece) => {
+            &mut chunk
+                .split
+                .as_mut()
+                .expect("a piece path names a split chunk")
+                .pieces[*piece]
+        }
+        None => chunk,
+    }
+}
+
+/// Every ts the ledger already holds (chunks and pieces), so an earlier post is adopted once.
+fn taken_ts(record: &LedgerRecord) -> Vec<String> {
+    let mut taken = Vec::new();
+    for chunk in &record.chunks {
+        taken.extend(chunk.ts.clone());
+        if let Some(split) = &chunk.split {
+            taken.extend(split.pieces.iter().filter_map(|piece| piece.ts.clone()));
+        }
+    }
+    taken
+}
+
+/// Post one piece with the crash-safe intent record: an earlier attempt's post is adopted when
+/// the channel lists it, the intent is saved before the post, and the ts after it.
+#[allow(clippy::too_many_arguments)]
+fn post_piece(
+    config: &OutboundConfig,
+    app_id: &AppId,
+    transport: &mut dyn SlackTransport,
+    id: &str,
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    post_format: TextFormat,
+    metadata: Option<&str>,
+    now_millis: &dyn Fn() -> u64,
+    diagnostics: &Diagnostics,
+    piece: &PieceTarget<'_>,
+    directory: &Path,
+    record: &mut LedgerRecord,
+    path: &[usize],
+) -> Result<PieceResult, Refusal> {
+    let label = &piece.label;
+    if let Some(intent) = piece_ledger(record, path).intent_millis {
+        let oldest = ids::ts_from_millis(intent.saturating_sub(2_000));
+        // A listing failure (for example an app without history scope) is treated like an
+        // empty listing: the uncertainty window below still bounds how long the reply waits.
+        let listed = match transport.list_messages(&ListQuery {
+            app_id,
+            channel_id,
+            thread_ts,
+            oldest: &oldest,
+        }) {
+            Ok(listed) => listed,
+            Err(error) => {
+                diagnostics.log(&format!(
+                    "send {id} {label}: reconciliation listing failed: {error}"
+                ));
+                Vec::new()
+            }
+        };
+        let wanted = fingerprint(piece.text, 48);
+        let taken = taken_ts(record);
+        let adopted = listed.into_iter().find(|message| {
+            (message.is_author_bot
+                || message
+                    .author_user_id
+                    .as_ref()
+                    .is_some_and(|author| config.bot_user_ids.contains(author)))
+                && !taken.contains(&message.ts)
+                && fingerprint(&message.content, 48) == wanted
+        });
+        if let Some(message) = adopted {
+            diagnostics.log(&format!(
+                "send {id} {label}: adopted earlier post {}",
+                message.ts
+            ));
+            let entry = piece_ledger(record, path);
+            entry.ts = Some(message.ts);
+            entry.intent_millis = None;
+            save_ledger(directory, id, record)?;
+            return Ok(PieceResult::Done);
+        }
+        let age = now_millis().saturating_sub(intent);
+        if u128::from(age) < config.uncertain_repost_after.as_millis() {
+            return Err(Refusal::unknown(
+                "outcome_unresolved",
+                format!(
+                    "an earlier attempt's outcome is unknown and no matching post is listed yet ({} s old)",
+                    age / 1_000
+                ),
+            ));
+        }
+        diagnostics.log(&format!(
+            "send {id} {label}: no earlier post found after {} s; posting again",
+            age / 1_000
+        ));
+    }
+    piece_ledger(record, path).intent_millis = Some(now_millis());
+    save_ledger(directory, id, record)?;
+    let mut posted = transport.post_message(&PostMessage {
+        app_id,
+        channel_id,
+        thread_ts,
+        text: piece.text,
+        format: post_format,
+        blocks: piece.blocks,
+        metadata,
+    });
+    // Blocks Slack refuses (a limit it counts differently, say) were not posted, and the
+    // text alone always is a valid post: say the chunk as text rather than lose it.
+    if piece.blocks.is_some()
+        && matches!(&posted, Err(error) if error.outcome == Outcome::NotApplied && error.code == "invalid_blocks")
+    {
+        diagnostics.log(&format!(
+            "send {id} {label}: blocks refused; posting the text alone"
+        ));
+        posted = transport.post_message(&PostMessage {
+            app_id,
+            channel_id,
+            thread_ts,
+            text: piece.text,
+            format: post_format,
+            blocks: None,
+            metadata,
+        });
+    }
+    match posted {
+        Ok(ts) if ids::valid_ts(&ts) => {
+            diagnostics.log(&format!(
+                "send {id} {label}: posted {channel_id} {ts} slack_format={}",
+                post_format.name()
+            ));
+            let entry = piece_ledger(record, path);
+            entry.ts = Some(ts);
+            entry.intent_millis = None;
+            save_ledger(directory, id, record)?;
+            Ok(PieceResult::Done)
+        }
+        Ok(_) => Err(Refusal::unknown(
+            "receipt_invalid",
+            "the transport returned an invalid message ts",
+        )),
+        Err(error) => {
+            diagnostics.log(&format!("send {id} {label} failed: {error}"));
+            if error.outcome == Outcome::NotApplied {
+                piece_ledger(record, path).intent_millis = None;
+                save_ledger(directory, id, record)?;
+                if error.code == "msg_too_long" || error.code == "invalid_blocks" {
+                    return Ok(PieceResult::TooLong(error));
+                }
+            }
+            Err(Refusal::from(error))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn send(
     config: &OutboundConfig,
@@ -1443,130 +1664,129 @@ fn send(
             thread_ts: thread_ts.map(str::to_owned),
             text_bytes: text.len(),
             format: Some(format.name().to_owned()),
-            chunks: vec![
-                LedgerChunk {
-                    ts: None,
-                    intent_millis: None,
-                };
-                chunks.len()
-            ],
+            chunks: vec![LedgerChunk::empty(); chunks.len()],
         },
     };
     for (index, chunk) in chunks.iter().enumerate() {
         if record.chunks[index].ts.is_some() {
             continue;
         }
-        if let Some(intent) = record.chunks[index].intent_millis {
-            let oldest = ids::ts_from_millis(intent.saturating_sub(2_000));
-            // A listing failure (for example an app without history scope) is treated like an
-            // empty listing: the uncertainty window below still bounds how long the reply waits.
-            let listed = match transport.list_messages(&ListQuery {
-                app_id,
-                channel_id,
-                thread_ts,
-                oldest: &oldest,
-            }) {
-                Ok(listed) => listed,
-                Err(error) => {
-                    diagnostics.log(&format!(
-                        "send {id} chunk {index}: reconciliation listing failed: {error}"
-                    ));
-                    Vec::new()
-                }
-            };
-            let wanted = fingerprint(chunk, 48);
-            let taken: Vec<&str> = record
-                .chunks
-                .iter()
-                .filter_map(|chunk| chunk.ts.as_deref())
-                .collect();
-            let adopted = listed.into_iter().find(|message| {
-                (message.is_author_bot
-                    || message
-                        .author_user_id
-                        .as_ref()
-                        .is_some_and(|author| config.bot_user_ids.contains(author)))
-                    && !taken.contains(&message.ts.as_str())
-                    && fingerprint(&message.content, 48) == wanted
-            });
-            if let Some(message) = adopted {
-                diagnostics.log(&format!(
-                    "send {id} chunk {index}: adopted earlier post {}",
-                    message.ts
-                ));
-                record.chunks[index].ts = Some(message.ts);
-                record.chunks[index].intent_millis = None;
-                save_ledger(directory, id, &record)?;
-                continue;
-            }
-            let age = now_millis().saturating_sub(intent);
-            if u128::from(age) < config.uncertain_repost_after.as_millis() {
-                return Err(Refusal::unknown(
-                    "outcome_unresolved",
-                    format!(
-                        "an earlier attempt's outcome is unknown and no matching post is listed yet ({} s old)",
-                        age / 1_000
-                    ),
-                ));
-            }
-            diagnostics.log(&format!(
-                "send {id} chunk {index}: no earlier post found after {} s; posting again",
-                age / 1_000
-            ));
-        }
-        record.chunks[index].intent_millis = Some(now_millis());
-        save_ledger(directory, id, &record)?;
         let blocks = chunk_blocks.get(index).and_then(Option::as_deref);
-        let mut posted = transport.post_message(&PostMessage {
-            app_id,
-            channel_id,
-            thread_ts,
-            text: chunk,
-            format: post_format,
-            blocks,
-            metadata,
-        });
-        // Blocks Slack refuses (a limit it counts differently, say) were not posted, and the
-        // text alone always is a valid post: say the chunk as text rather than lose it.
-        if blocks.is_some()
-            && matches!(&posted, Err(error) if error.outcome == Outcome::NotApplied && error.code == "invalid_blocks")
-        {
-            diagnostics.log(&format!(
-                "send {id} chunk {index}: blocks refused; posting the text alone"
-            ));
-            posted = transport.post_message(&PostMessage {
+        if record.chunks[index].split.is_none() {
+            let piece = PieceTarget {
+                label: format!("chunk {index}"),
+                text: chunk,
+                blocks,
+            };
+            let outcome = post_piece(
+                config,
                 app_id,
+                transport,
+                id,
                 channel_id,
                 thread_ts,
-                text: chunk,
-                format: post_format,
-                blocks: None,
+                post_format,
                 metadata,
-            });
-        }
-        match posted {
-            Ok(ts) if ids::valid_ts(&ts) => {
-                diagnostics.log(&format!(
-                    "send {id} chunk {index}: posted {channel_id} {ts} slack_format={}",
-                    format.name()
-                ));
-                record.chunks[index].ts = Some(ts);
-                record.chunks[index].intent_millis = None;
-                save_ledger(directory, id, &record)?;
-            }
-            Ok(_) => {
-                return Err(Refusal::unknown(
-                    "receipt_invalid",
-                    "the transport returned an invalid message ts",
-                ));
-            }
-            Err(error) => {
-                diagnostics.log(&format!("send {id} chunk {index} failed: {error}"));
-                if error.outcome == Outcome::NotApplied {
-                    record.chunks[index].intent_millis = None;
+                now_millis,
+                diagnostics,
+                &piece,
+                directory,
+                &mut record,
+                &[index],
+            )?;
+            match outcome {
+                PieceResult::Done => continue,
+                PieceResult::TooLong(error) => {
+                    // Slack refused the chunk as too long (#2439 chat-never-truncate, S8): post
+                    // it as smaller pieces instead of giving up, halving down to 2 KB.
+                    let bytes = (chunk.len() / 2).max(MIN_SPLIT_PIECE_BYTES);
+                    if bytes >= chunk.len() {
+                        return Err(Refusal::from(error));
+                    }
+                    diagnostics.log(&format!(
+                        "send {id} chunk {index}: refused as too long; posting it in pieces of {bytes} bytes"
+                    ));
+                    let pieces = split_body(chunk, bytes).len();
+                    record.chunks[index].split = Some(LedgerSplit {
+                        bytes,
+                        pieces: vec![LedgerChunk::empty(); pieces],
+                    });
                     save_ledger(directory, id, &record)?;
                 }
-                return Err(Refusal::from(error));
+            }
+        }
+        while let Some(split) = record.chunks[index].split.clone() {
+            let pieces = split_body(chunk, split.bytes);
+            if pieces.len() != split.pieces.len() {
+                return Err(Refusal::not_applied(
+                    "operation_conflict",
+                    "this operation id's saved pieces do not match the message",
+                    false,
+                ));
+            }
+            let mut halve = None;
+            for (piece_index, text) in pieces.iter().enumerate() {
+                if split.pieces[piece_index].ts.is_some() {
+                    continue;
+                }
+                let piece = PieceTarget {
+                    label: format!("chunk {index} piece {piece_index}"),
+                    text,
+                    blocks: None,
+                };
+                match post_piece(
+                    config,
+                    app_id,
+                    transport,
+                    id,
+                    channel_id,
+                    thread_ts,
+                    post_format,
+                    metadata,
+                    now_millis,
+                    diagnostics,
+                    &piece,
+                    directory,
+                    &mut record,
+                    &[index, piece_index],
+                )? {
+                    PieceResult::Done => {}
+                    PieceResult::TooLong(error) => {
+                        halve = Some(error);
+                        break;
+                    }
+                }
+            }
+            match halve {
+                None => {
+                    let first = record.chunks[index]
+                        .split
+                        .as_ref()
+                        .and_then(|split| split.pieces.first())
+                        .and_then(|piece| piece.ts.clone());
+                    record.chunks[index].ts = first;
+                    save_ledger(directory, id, &record)?;
+                    break;
+                }
+                Some(error) => {
+                    // A piece still too long: cut every piece smaller, but only while none has
+                    // been posted (a posted piece keeps its boundaries) and above 2 KB.
+                    let posted = split.pieces.iter().any(|piece| piece.ts.is_some());
+                    let bytes = (split.bytes / 2).max(MIN_SPLIT_PIECE_BYTES);
+                    if posted || bytes >= split.bytes {
+                        diagnostics.log(&format!(
+                            "send {id} chunk {index}: a piece of {} bytes is still refused as too long",
+                            split.bytes
+                        ));
+                        return Err(Refusal::from(error));
+                    }
+                    let pieces = split_body(chunk, bytes).len();
+                    record.chunks[index].split = Some(LedgerSplit {
+                        bytes,
+                        pieces: vec![LedgerChunk::empty(); pieces],
+                    });
+                    save_ledger(directory, id, &record)?;
+                }
             }
         }
     }

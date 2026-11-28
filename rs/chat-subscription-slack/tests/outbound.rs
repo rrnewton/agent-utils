@@ -1292,3 +1292,104 @@ fn an_update_rewrites_in_place_and_a_delete_removes_the_message() {
     assert_eq!(state.updates.len(), 1, "refusals wrote nothing");
     assert_eq!(state.deletes.len(), 1, "refusals wrote nothing");
 }
+
+/// A transport that refuses any post longer than `limit` bytes as Slack does, `msg_too_long`.
+struct TooLongOver {
+    inner: FakeTransport,
+    limit: usize,
+}
+
+impl SlackTransport for TooLongOver {
+    fn open_stream(
+        &mut self,
+        spec: &chat_subscription_slack::transport::SubscribeSpec,
+    ) -> Result<Box<dyn chat_subscription_slack::transport::EventStream>, TransportError> {
+        self.inner.open_stream(spec)
+    }
+
+    fn post_message(
+        &mut self,
+        post: &chat_subscription_slack::transport::PostMessage<'_>,
+    ) -> Result<String, TransportError> {
+        if post.text.len() > self.limit {
+            return Err(TransportError::not_applied(
+                "msg_too_long",
+                "msg_too_long",
+                false,
+            ));
+        }
+        self.inner.post_message(post)
+    }
+
+    fn add_reaction(
+        &mut self,
+        app_id: &chat_subscription_slack::ids::AppId,
+        channel_id: &str,
+        message_ts: &str,
+        name: &str,
+    ) -> Result<bool, TransportError> {
+        self.inner
+            .add_reaction(app_id, channel_id, message_ts, name)
+    }
+
+    fn list_messages(
+        &mut self,
+        query: &chat_subscription_slack::transport::ListQuery<'_>,
+    ) -> Result<Vec<chat_subscription_slack::transport::ListedMessage>, TransportError> {
+        self.inner.list_messages(query)
+    }
+}
+
+#[test]
+fn a_chunk_slack_refuses_as_too_long_is_posted_in_smaller_pieces_never_given_up() {
+    // #2439 chat-never-truncate (S8): a permanent `msg_too_long` gave the reply up. The chunk is
+    // cut in half (down to 2 KB) and posted as pieces, in order, the whole text kept.
+    let body = (0..100)
+        .map(|line| format!("line {line:03} {}\n", "x".repeat(80)))
+        .collect::<String>();
+    assert!(body.len() > 8_000);
+    let ledger = ledger("too-long");
+    let mut config = config(&ledger, Some(APP));
+    config.max_chunk_bytes = 10_000;
+    let fake = FakeTransport::new();
+    let request = send(ID, None, &body);
+    let response = run_transport(
+        &config,
+        &request,
+        TooLongOver {
+            inner: fake.clone(),
+            limit: 3_000,
+        },
+    );
+    assert_eq!(response["ok"], json!(true), "{response}");
+    let posts = fake.state().posts.clone();
+    assert!(
+        posts.len() >= 4,
+        "pieces of at most 2,500 bytes: {}",
+        posts.len()
+    );
+    assert!(posts.iter().all(|post| post.text.len() <= 3_000));
+    assert_eq!(
+        posts
+            .iter()
+            .map(|post| post.text.as_str())
+            .collect::<String>(),
+        body,
+        "the whole text, in order"
+    );
+    assert_eq!(
+        response["receipt"]["message_id"],
+        json!(format!("{CHANNEL}/messages/{}", posts[0].ts))
+    );
+    // The same operation again returns the recorded message and posts nothing more.
+    let again = run_transport(
+        &config,
+        &request,
+        TooLongOver {
+            inner: fake.clone(),
+            limit: 3_000,
+        },
+    );
+    assert_eq!(again["ok"], json!(true), "{again}");
+    assert_eq!(fake.state().posts.len(), posts.len());
+}
