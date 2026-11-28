@@ -1,6 +1,6 @@
 ---
 title: 'gate-test-foreign-scope-leak: the gate admission test''s leaked-scope check compares every gate scope on the host before and after, so a real gate starting mid-test reads as a leak'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-flaketriage
@@ -9,7 +9,8 @@ labels:
 - tests
 - hot-host
 created_at: 2026-11-28T05:52:00-05:00
-updated_at: 2026-11-28T05:52:00-05:00
+updated_at: 2026-11-28T06:19:00-05:00
+closed_at: 2026-11-28T06:19:00-05:00
 ---
 
 # Description
@@ -47,3 +48,19 @@ This breaks owner rule 346: a gating check must be high-signal and robust on a b
 Filed by `cl-flaketriage` at the coordinator's request (liaison 1159, 2026-11-28).
 
 Evidence: gate 1795861230471579070-bf00db0c, step log `python.repository-infrastructure.test.log` (the assertion is at `tests/test_gate_admission.py:524`). The foreign scope's gate is 1795861381328074066-25de3953 in the same host ledger.
+
+## Resolution
+
+Fixed in f4881096 (`py/tests/test_gate_admission.py` only), gated as eec263bf: gate 1795864147203505761-51c3eb94, pass, path-selected, 42 steps, no failed, known-red or incomplete step.
+
+- The leak check now names only the scopes the test's own gates could make. That is `agent-utils-gate-<run id>` for each run id in its private admission directory (history rows, queue and runs tickets; a torn ticket counts by its file name), plus `agent-utils-gate-preflight-<pid>` for each of its gate processes. It never diffs the host's set. The teardown wait stays a condition wait.
+- Controls, in-process with a stubbed unit list:
+  - a foreign gate scope and a foreign preflight scope that appear mid-test are ignored;
+  - scopes for the test's own finished, waiting or running run id, or for its preflight, still fail the check;
+  - a teardown that lags three polls is waited out.
+- End to end, with a stub `systemctl` on PATH that lists a foreign gate scope from its second call on:
+  - the test from main failed ("test leaked gate scope(s): ['agent-utils-gate-1-foreign.scope']") after its 120 s wait;
+  - the fixed test passed in 4.9 s.
+  - No other real gate started during the gate run itself, so the "another gate starts mid-test" criterion rests on this stub run and the controls.
+- The other gate tests have no host-wide before/after unit, process or temp-file census. The rest check their own processes, files or stubbed units.
+
