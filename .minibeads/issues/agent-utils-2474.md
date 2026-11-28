@@ -1,6 +1,6 @@
 ---
 title: 'image-status-test-bare-107: the wrkslotsd image-status test rules out Errno 107 by the bare digits 107, which the temp path in the same message can contain'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-flaketriage
@@ -9,7 +9,8 @@ labels:
 - tests
 - rust
 created_at: 2026-11-28T11:10:00-05:00
-updated_at: 2026-11-28T11:10:00-05:00
+updated_at: 2026-11-28T11:49:00-05:00
+closed_at: 2026-11-28T11:49:00-05:00
 ---
 
 # Description
@@ -47,3 +48,12 @@ Filed by `cl-flaketriage` at the coordinator's request (2026-11-28; number pre-a
 Related:
 - #2383: the gate's private temp root, whose pid-named directory carries the digits.
 - #2464: the change whose gate hit it (unrelated to the case).
+
+## Resolution
+
+Fixed in 601f86ba (`rs/wrkslotsd/src/image_status.rs`, test only), gated as 28ff45c0: gate 1795882932366352768-5c72c195, pass, full selection, 67 steps, no failed or incomplete step.
+
+- The assertion now rules out the statvfs error by its text: no `[Errno 107]` and no `Transport endpoint`, instead of no bare `107`.
+- Control, with `TMPDIR` set to a directory named `root-1075891`: before the change, the debug-profile test failed at that assertion (the error embeds the path); after it, the test passed in the debug and the release profile.
+- In the gate: `usage_and_rendering_on_temp_images` passed in both `rust.wrkslots.test` (228 of 230 cases passed, 0 failed) and `repository.check.wrkslots-debug-test` (227 of 229 passed, 0 failed).
+
