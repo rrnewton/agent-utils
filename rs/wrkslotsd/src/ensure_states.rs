@@ -379,7 +379,9 @@ pub(crate) fn acquire_lock_with_deadline(
 
 /// As `acquire_lock`, for a shared lock on `path` (#1200): readers may
 /// hold it together, and no writer holds it while they do. It waits as
-/// long as `acquire_lock` (`WRKSLOTS_WAIT_LOCK`).
+/// long as `acquire_lock` (`WRKSLOTS_WAIT_LOCK`). No reader measures under
+/// it any more (#2468); the turnstile tests still take it.
+#[cfg(test)]
 pub(crate) fn acquire_shared_lock(path: &Path, subject: &Path) -> Result<Flock> {
     let file = open_lock_file(path, subject)?;
     let deadline = std::time::Instant::now() + lock_wait();

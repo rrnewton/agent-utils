@@ -823,29 +823,31 @@ pub(crate) fn registry_read_identity(control: &Path) -> Result<Vec<Value>> {
 /// does (#1172). `measure` runs lock-free between two reads of the
 /// registry content identity, and its result (a report or a refusal) is
 /// published only when the identity did not change across it. Otherwise
-/// it is measured again, and after PHASED_READ_RETRIES repeats the last
-/// measurement runs under the shared registry lock, which no writer can
-/// hold at the same time. The Python reader re-measures only the rows
-/// that changed; this repeats the whole read, with the same report.
+/// it is measured again, up to PHASED_READ_RETRIES repeats, and then the
+/// last measurement is published as it is.
+///
+/// A measurement never runs under the shared registry lock (#2468, the
+/// Python readers' rule since #1247): on a busy registry the identity
+/// changes during every long read, so a final locked measurement held the
+/// lock for a whole status or doctor scan and every create, finish and
+/// remove on the host waited for it. The Python reader re-measures only
+/// the rows that changed; this repeats the whole read.
 pub(crate) fn consistent_read<T>(
     control: &Path,
     mut measure: impl FnMut() -> Result<T>,
 ) -> Result<T> {
-    for attempt in 0..=PHASED_READ_RETRIES {
+    let mut attempt = 0;
+    loop {
         let before = registry_read_identity(control)?;
         let measured = measure();
         if attempt == 0 {
             change_registry_for_test();
         }
-        if registry_read_identity(control)? == before {
+        if attempt == PHASED_READ_RETRIES || registry_read_identity(control)? == before {
             return measured;
         }
+        attempt += 1;
     }
-    let _lock = crate::ensure_states::acquire_shared_lock(
-        &control.join("ACTIVE.global.lock"),
-        &control.join("ACTIVE"),
-    )?;
-    measure()
 }
 
 /// Test seam (#1200): run `WRKSLOTS_TEST_REGISTRY_CHANGE` once, after a
@@ -922,8 +924,9 @@ mod read_identity_tests {
         })
         .unwrap();
         assert_eq!((report, calls), ("current", 2));
-        // A registry that changes on every measurement is read once more
-        // under the shared lock, after the bounded repeats.
+        // A registry that changes on every measurement is measured at most
+        // PHASED_READ_RETRIES more times, and the last one is published:
+        // never a further measurement under the shared lock (#2468).
         let mut calls = 0;
         let report = consistent_read(&dir, || {
             calls += 1;
@@ -931,7 +934,32 @@ mod read_identity_tests {
             Ok(calls)
         })
         .unwrap();
-        assert_eq!(report, PHASED_READ_RETRIES + 2);
+        assert_eq!(report, PHASED_READ_RETRIES + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_measurement_holds_the_registry_lock_so_a_writer_proceeds() {
+        let dir = control("unlocked");
+        let lock = dir.join("ACTIVE.global.lock");
+        let mut calls = 0;
+        consistent_read(&dir, || {
+            calls += 1;
+            // An exclusive writer (another open file description, as
+            // another process would have) takes the registry lock at once
+            // during every measurement, the retaken ones included.
+            let writer = std::fs::OpenOptions::new().write(true).open(&lock).unwrap();
+            rustix::fs::flock(
+                &writer,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            )
+            .expect("the registry lock is free while a reader measures");
+            rustix::fs::flock(&writer, rustix::fs::FlockOperation::Unlock).unwrap();
+            std::fs::write(dir.join("ACTIVE.host.json"), format!("{{\"w\": {calls}}}")).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, PHASED_READ_RETRIES + 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
