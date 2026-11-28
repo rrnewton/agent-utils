@@ -1,0 +1,22 @@
+steps:
+  # `#2453 filter-walk-landing-note-floats` (ui-rules R5; the owner's #2314 rule: floating notes never
+  # stand over a row): the filter walk-back's landing line ("Here is the selected message." / "Here is
+  # where you were.") is announced and floats over no row's text. Real Chromium at 1280x800 and 412x915
+  # by touch, Discuss open on two: an old pin chosen under Pinned (or parked
+  # at the head with nothing chosen), the filter cleared, the walk back landed; the line's own timer is
+  # let go so a hot host sees the same walk as a quiet one.
+  - group: check
+    job: filter-walk-note-browser
+    desc: the filter walk-back's landing line is said and floats over no row's text, for a chosen old pin and for one parked at the head, in current Chromium at 1280x800 and 412x915 by touch, Discuss open on two (#2453)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/filter_walk_note_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 600
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 45
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

@@ -4548,6 +4548,9 @@ test("`#243 filter-keeps-selection`: a pin older than anything loaded is walked 
   assert.deepStrictEqual(lines, Array(3).fill("Loading earlier messages…"), "the step-back line did not say what the walk was doing");
   keptAt(page, "997", y, "the old pin, walked back to");
   assert.equal(statusText(page), "Here is the selected message.");
+  // `#2453` filter-walk-landing-note-floats: announced, not floated over the row it landed on.
+  assert.equal(page.el("status-line").hidden, false, "the landing line was not said");
+  assert.equal(page.el("status-line").hasAttribute("data-idle"), true, "the landing line floats as the pill over the rows");
   assert.equal(page.el("load-older").textContent, "Older messages", "the line still says it is loading");
   await press(page, page.el("scroll-area"), "ArrowDown");
   assert.equal(selectedId(page), "998", "the old pin did not come back as the selection");

@@ -807,8 +807,11 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
         endFilterWalk();
         if (place) {
           placeFilterAnchor(anchor, false, true);
+          // `#2453` filter-walk-landing-note-floats: announced, not floated, as `#2365` and `#2426` R3 have
+          // their landings. The row standing where the reader left it is the confirmation; the pill
+          // stood over it and the rows around it.
           if (anchorRow(anchor)) {
-            deps.setStatus(anchor.selected !== null ? "Here is the selected message." : "Here is where you were.");
+            deps.setStatus(anchor.selected !== null ? "Here is the selected message." : "Here is where you were.", { float: false });
           }
         }
       }
