@@ -8,7 +8,7 @@ labels:
 - agentctl
 - testing
 created_at: 2026-11-21T12:45:00-05:00
-updated_at: 2026-11-28T13:08:00-05:00
+updated_at: 2026-11-28T14:08:00-05:00
 ---
 
 # Description
@@ -146,6 +146,7 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
   - E -> #2488: `test_classify_journals_rust::test_classify_live_seal_structured_blocking_reason_matches_python`. The Rust edition called a live-actor seal "in progress" where Python called it interrupted. It recurred: head ecf2fab5 (`python.wrkslots.shard-6`, cl-autodeny's console log) and `python.wrkslots.shard-2` of another gate (cl-flaketriage's console log). Repro first.
   - J, one occurrence, no number yet: agentctl `registry_layout::tests::an_agent_whose_wrapper_holds_its_lock_is_left_and_an_identity_agent_moves`. migrate moved the agent although the test held its wrapper lock (head 1b540308, `rust.agentctl.test`, cl-flaketriage's console log for that gate). Cause not established.
   - F, unexplained: `python.wrkslots.shard-6` ended at its CPU budget ("CPU-TIMEOUT >2400s cpu" after 2,184 s) with no failing test (head 3e4b7acd, cl-svcreload's console log). Whether that tree's file set was heavier, or a case ran away, is not known.
+  - One occurrence since the stand-in, no number yet: `test_validate_nested_git_policy::test_audit_and_validation_removal_agree_on_one_tree[core-worktree]` returned DELETABLE where the test expects the census to leave the expired row UNKNOWN (#1107), with the stand-in on (7,979 calls, none fell back). Gate 1795890126740230136-2a0515e3, step log `python.wrkslots.shard-1.log`. The [linked-worktree] parameter failed once before the stand-in (cl-flaketriage's console log for an earlier #2065 gate). Cause not established.
   - Fixed or filed elsewhere: the helper-race reds before the stand-in (above); the third shared-submodules case under #2459; the long-path edition mismatch (#2485); the lock-wait test race (#2481).
 - **Related.**
   - Two `test_worktrees_image` busy-holder tests hit the 600 s per-test timeout inside `scan_mount_holders` on another gate. #2372's test fix (906b54fc) gives them a fixture proc root, and its production change (#2372 50a174b4, pending) parses each distinct mount table once.
