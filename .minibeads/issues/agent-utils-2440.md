@@ -10,7 +10,7 @@ labels:
 - slack
 - bridge
 created_at: 2026-11-27T23:12:00-05:00
-updated_at: 2026-11-27T23:12:00-05:00
+updated_at: 2026-11-28T01:20:00-05:00
 ---
 
 # Description
@@ -36,3 +36,4 @@ Step (c) of #2420 relay-never-lossy. The owner decided on 2026-11-27: no lossy t
 # Notes
 
 - Split from #2420 (audit rows D4, D5, D6) on 2026-11-27, numbered by coordb. Chat size limits are #2439.
+- Boundary mismatch keeps its halt (coordb, 2026-11-28: a different batch at the current cursor can mean corruption, not just a gap); D5 covers provider gaps only. Follow-up proposal: when the batch offered at the current cursor differs from the saved boundary only by messages the bridge already holds under the same keys with the same content (a provider re-render), admit it as a boundary replacement with one alarm; any key with different content keeps the halt.
