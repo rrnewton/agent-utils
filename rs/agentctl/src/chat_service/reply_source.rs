@@ -100,6 +100,56 @@ pub(crate) fn find_misses(
         .collect()
 }
 
+/// Store a capture miss's transcript block as its request's reply, with a warning line, so the
+/// service posts it (#2420 C4). Returns whether it was stored; logged either way.
+fn post_missed_block(
+    state: &BridgeState,
+    miss: &Miss,
+    blocks: &[TranscriptBlock],
+    now: u64,
+) -> bool {
+    let Some(block) = blocks.iter().find(|block| {
+        block.identifier == miss.reply_id && block.at_millis == Some(miss.block_at_millis)
+    }) else {
+        return false;
+    };
+    let minutes = now.saturating_sub(miss.block_at_millis) / 60_000;
+    let body = format!(
+        "[chat-bridge warning: the bridge missed this reply when it was printed and posted it \
+         from the coordinator's transcript {minutes} min later]\n{}",
+        block.body
+    );
+    match state.submit_reply(&miss.key, &miss.reply_id, &body) {
+        Ok(chat_runtime::ReplyStoreOutcome::Stored(_)) => {
+            service_log(format_args!(
+                "agentctl: CAPTURE MISS POSTED: the coordinator's transcript held a reply block for \
+                 reply ID {} (request {}) since {} that no capture stored; it is posted from the \
+                 transcript with a warning line",
+                miss.reply_id,
+                miss.key.get(..12).unwrap_or(&miss.key),
+                chat_runtime::utc_timestamp(miss.block_at_millis)
+            ));
+            true
+        }
+        Ok(other) => {
+            service_log(format_args!(
+                "agentctl: CAPTURE MISS: the transcript block for reply ID {} could not be posted \
+                 from the transcript ({other:?}); the owner and the coordinator are told",
+                miss.reply_id
+            ));
+            false
+        }
+        Err(error) => {
+            service_log(format_args!(
+                "agentctl: CAPTURE MISS: the transcript block for reply ID {} could not be posted \
+                 from the transcript ({error}); the owner and the coordinator are told",
+                miss.reply_id
+            ));
+            false
+        }
+    }
+}
+
 /// Why a reply did not go out.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
@@ -247,8 +297,16 @@ impl ReplySourceWatch {
                 },
             );
         }
+        let blocks = state.transcript_blocks();
         for miss in &misses {
             if self.told.contains_key(&miss.key) {
+                continue;
+            }
+            // The block is the coordinator's own reply: it is posted from the transcript with a
+            // warning line, never left unsent until the coordinator resends it (#2420 C4,
+            // owner decision: warning at most, never hold). Only when it cannot be stored are
+            // the owner and the coordinator told, as before.
+            if post_missed_block(state, miss, &blocks, now) {
                 continue;
             }
             let line = format!(

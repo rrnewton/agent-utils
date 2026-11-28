@@ -17818,11 +17818,12 @@ esac
         fs::remove_dir_all(root).ok();
     }
 
-    /// #783 chat-reply-capture-miss: a reply block the coordinator's transcript holds while the
-    /// bridge holds no reply to its request warns the owner once, and is recorded, with where
-    /// the reply text comes from, for `chat health`.
+    /// #783 chat-reply-capture-miss, changed by #2420 C4: a reply block the coordinator's
+    /// transcript holds while the bridge holds no reply to its request is posted from the
+    /// transcript with a warning line (it used to wait for the coordinator to resend it, with an
+    /// owner warning), once, however many scans see it.
     #[test]
-    fn a_reply_block_the_bridge_never_captured_warns_the_owner_once() {
+    fn a_reply_block_the_bridge_never_captured_is_posted_from_the_transcript_with_a_warning() {
         let fixture = crate::subagents::tests::Fixture::new();
         let (state, key, root) = state_with_request();
         state
@@ -17858,24 +17859,25 @@ esac
         let mut watch = reply_source::ReplySourceWatch::with_grace(Duration::ZERO);
         let mut roots = RecordingRoots::default();
         watch.step(&state, &manager, &stop, delivery, Some(&mut roots));
-        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
-        assert!(roots.posts[0].1.starts_with("[chat-bridge WARNING]"));
         assert!(
-            roots.posts[0]
-                .1
-                .contains(&format!("reply ID {}", candidate.reply_id)),
-            "{}",
-            roots.posts[0].1
+            roots.posts.is_empty(),
+            "posted, not warned about: {:?}",
+            roots.posts
         );
-        let record = state.reply_source_record().expect("recorded");
-        assert_eq!(
-            record["capture_misses"][0]["reply_id"],
-            candidate.reply_id.as_str()
+        let stored = state
+            .reply_body(&key, 1)
+            .expect("posted from the transcript");
+        assert!(
+            stored.starts_with(
+                "[chat-bridge warning: the bridge missed this reply when it was printed"
+            ),
+            "{stored}"
         );
-        assert_eq!(record["source"]["discovered"], true);
-        // Told once, however many scans see it.
+        assert!(stored.ends_with("| a | b |"), "{stored}");
+        // Once, however many scans see it.
         watch.step(&state, &manager, &stop, delivery, Some(&mut roots));
-        assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
+        assert!(roots.posts.is_empty(), "{:?}", roots.posts);
+        assert!(state.reply_body(&key, 2).is_err(), "not stored twice");
         fs::remove_dir_all(root).ok();
     }
 
