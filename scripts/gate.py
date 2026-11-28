@@ -42,6 +42,19 @@ variable), printed at admission, and recorded as the ledger row's
 log_path. Retention is bounded: the newest $GATE_LOG_KEEP (default
 20) directories stay, older ones are pruned when a gate finishes.
 
+Red-step evidence (#2409 gate-red-step-logs-kept): when a gate or
+rerun has failed or NO_RESULT steps, it copies those steps' logs and
+their journal lines (test boundaries included) to
+<evidence root>/runs/<run-id>/ with a manifest.json, before the
+pruning above, and records that directory as the row's evidence_path
+(null otherwise). The evidence root is $GATE_EVIDENCE_ROOT, else
+gate-evidence beside the gate-log root. Each log keeps at most
+$GATE_EVIDENCE_LOG_CAP_BYTES (default 2 MiB: its head and tail, the
+cut marked); entries older than $GATE_EVIDENCE_MAX_AGE_DAYS (default
+30) go, then the oldest until the root fits $GATE_EVIDENCE_MAX_BYTES
+(default 1 GiB). Best effort: a failed copy is printed and never
+changes the verdict or the exit status.
+
 When a run finishes and has released its slot, it prunes this checkout's cargo
 target dirs of builds nothing can reuse, under cargo's own locks, and reports
 the bytes before and after, both under the target dirs and allocated on the
@@ -1409,6 +1422,404 @@ def prune_gate_logs(keep: int | None = None) -> int:
         shutil.rmtree(stale, ignore_errors=True)
         removed += 1
     return removed
+
+
+#: Red-step evidence (#2409 gate-red-step-logs-kept). The gate-log
+#: directories above keep only the newest GATE_LOG_KEEP runs, so most
+#: red rows lost their step logs within a day. A red row's failed and
+#: NO_RESULT step logs, with their journal lines, are copied to
+#: <evidence root>/runs/<run-id>/ instead, which that pruning never
+#: touches, and the row's evidence_path names the copy. The evidence
+#: root is bounded by age and total size, each log by a head-and-tail cap.
+GATE_EVIDENCE_LOG_CAP_BYTES = 2 * 1024 * 1024
+GATE_EVIDENCE_MAX_BYTES = 1024 * 1024 * 1024
+GATE_EVIDENCE_MAX_AGE_DAYS = 30
+#: One entry may take at most 1/GATE_EVIDENCE_ENTRY_SHARE of the root's
+#: bound: a run with hundreds of red steps keeps every step's log with a
+#: smaller head and tail, and the root stays inside its bound.
+GATE_EVIDENCE_ENTRY_SHARE = 4
+#: How long a finishing gate waits for another gate's copy or prune.
+GATE_EVIDENCE_LOCK_WAIT_S = 30.0
+_EVIDENCE_CUT_RESERVE = 512
+_EVIDENCE_MANIFEST_RESERVE = 64 * 1024
+_EVIDENCE_MIN_LOG_CAP = 4096
+_EVIDENCE_BLOCK = 4096
+#: Run-level journal events (no "step" field) left out of the copy:
+#: one per step cgroup, and they say nothing about why a step was red.
+_EVIDENCE_SKIPPED_RUN_EVENTS = frozenset({"containment"})
+_JOURNAL_STEP = re.compile(rb'"step":"([^"\\]*)"')
+
+
+def gate_evidence_root() -> Path:
+    """The evidence root: $GATE_EVIDENCE_ROOT, else the sibling of the
+    gate-log root (by default ~/.local/state/agent-utils/gate-evidence),
+    so anything that redirects the gate-log root redirects this too."""
+    configured = os.environ.get("GATE_EVIDENCE_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    return gate_log_root().parent / "gate-evidence"
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    """A non-negative integer setting; an unusable value keeps the default."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= minimum else default
+
+
+def dagrun_log_name(step: str) -> str:
+    """dagrun's step-log file name for `step`: its injective ASCII
+    encoding of the tag (both engines write the same names)."""
+    safe = bytearray()
+    for byte in step.encode("utf-8"):
+        if (ord("A") <= byte <= ord("Z") or ord("a") <= byte <= ord("z")
+                or ord("0") <= byte <= ord("9") or byte in b"._-"):
+            safe.append(byte)
+        else:
+            safe.extend(f"~{byte:02x}".encode("ascii"))
+    return safe.decode("ascii") + ".log"
+
+
+def _disk_bytes(size: int) -> int:
+    """`size` rounded up to whole filesystem blocks."""
+    return -(-size // _EVIDENCE_BLOCK) * _EVIDENCE_BLOCK
+
+
+def _entry_bytes(path: Path) -> int:
+    """Bytes an evidence entry uses: per file, the larger of its length
+    and its allocated blocks, so a bound in bytes is a bound on disk."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            total += max(st.st_size, st.st_blocks * 512)
+    return total
+
+
+def prune_gate_evidence(*, root: Path | None = None, max_bytes: int | None = None,
+                        max_age_days: float | None = None, room: int = 0,
+                        now: float | None = None) -> list[str]:
+    """Bound the evidence root (#2409): remove entries older than
+    `max_age_days`, then the oldest (by modification time) until the
+    entries total at most `max_bytes - room` bytes. Returns the names of
+    the entries removed. $GATE_EVIDENCE_MAX_BYTES and
+    $GATE_EVIDENCE_MAX_AGE_DAYS override the defaults."""
+    root = root if root is not None else gate_evidence_root()
+    if max_bytes is None:
+        max_bytes = _env_int("GATE_EVIDENCE_MAX_BYTES", GATE_EVIDENCE_MAX_BYTES, 1)
+    if max_age_days is None:
+        max_age_days = _env_int("GATE_EVIDENCE_MAX_AGE_DAYS", GATE_EVIDENCE_MAX_AGE_DAYS, 0)
+    now = time.time() if now is None else now
+    runs = root / "runs"
+    entries: list[tuple[float, str, Path, int]] = []
+    try:
+        children = list(runs.iterdir())
+    except OSError:
+        return []
+    for child in children:
+        try:
+            st = child.lstat()
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            entries.append((st.st_mtime, child.name, child, _entry_bytes(child)))
+    entries.sort()
+    removed: list[str] = []
+    kept: list[tuple[float, str, Path, int]] = []
+    for entry in entries:
+        if now - entry[0] > max_age_days * 86400.0:
+            shutil.rmtree(entry[2], ignore_errors=True)
+            removed.append(entry[1])
+        else:
+            kept.append(entry)
+    total = sum(entry[3] for entry in kept)
+    for entry in kept:
+        if total + room <= max_bytes:
+            break
+        shutil.rmtree(entry[2], ignore_errors=True)
+        removed.append(entry[1])
+        total -= entry[3]
+    return removed
+
+
+def _open_source(path: Path) -> tuple[int, int] | str:
+    """(fd, size) of a regular source file, or why it cannot be read.
+    No-follow and nonblocking, so a stale FIFO or symlink in a log
+    directory can neither hang nor redirect the copy."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        return f"unreadable ({exc.strerror or exc})"
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        return "not a regular file"
+    return fd, st.st_size
+
+
+def _write_private(path: Path, chunks: list[bytes]) -> int:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        for chunk in chunks:
+            out.write(chunk)
+    return sum(len(chunk) for chunk in chunks)
+
+
+def _read_exactly(fd: int, offset: int, length: int) -> bytes:
+    parts: list[bytes] = []
+    while length > 0:
+        part = os.pread(fd, min(length, 1 << 20), offset)
+        if not part:
+            break
+        parts.append(part)
+        offset += len(part)
+        length -= len(part)
+    return b"".join(parts)
+
+
+def copy_capped(fd: int, size: int, dst: Path, cap: int) -> tuple[int, bool]:
+    """Copy the first `size` bytes of `fd` to a new private file `dst`,
+    at most `cap` bytes long: a longer source keeps its head and tail
+    with a marked cut between them. Returns (bytes written, cut)."""
+    if size <= cap:
+        return _write_private(dst, [_read_exactly(fd, 0, size)]), False
+    keep = max(cap - _EVIDENCE_CUT_RESERVE, 2)
+    head, tail = keep // 2, keep - keep // 2
+    marker = (f"\n[gate] EVIDENCE CUT (#2409): {size - head - tail} of {size} bytes omitted "
+              f"here; kept the first {head} and the last {tail} bytes\n").encode()
+    return _write_private(dst, [_read_exactly(fd, 0, head), marker,
+                                _read_exactly(fd, size - tail, tail)]), True
+
+
+def _journal_selection(fd: int, size: int, steps: set[str], cap: int) -> tuple[list[bytes], dict[str, object]]:
+    """The run journal's lines about `steps` (records whose "step" is
+    one of them, including the test_start/test_end boundaries) and its
+    run-level records (no "step"; containment records left out), in
+    order. Whole lines only; past `cap` bytes the middle is replaced by
+    one gate_evidence_cut record, so the copy stays valid JSONL."""
+    keep = max(cap - _EVIDENCE_CUT_RESERVE, 2)
+    head_budget, tail_budget = keep // 2, keep - keep // 2
+    head: list[bytes] = []
+    head_bytes = 0
+    tail: list[bytes] = []
+    tail_bytes = 0
+    tail_start = 0
+    selected = 0
+    selected_bytes = 0
+    unparsed = 0
+    in_head = True
+    with os.fdopen(os.dup(fd), "rb") as fh:
+        os.lseek(fh.fileno(), 0, os.SEEK_SET)
+        remaining = size
+        for line in fh:
+            if remaining <= 0:
+                break
+            line = line[:remaining]
+            remaining -= len(line)
+            # Fast path: dagrun writes compact JSON, so a record about one
+            # other step is skipped without decoding it.
+            named = _JOURNAL_STEP.findall(line)
+            if len(named) == 1 and named[0].decode("utf-8", "replace") not in steps:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                unparsed += 1
+                continue
+            if not isinstance(record, dict):
+                unparsed += 1
+                continue
+            step = record.get("step")
+            if step is None:
+                if record.get("event") in _EVIDENCE_SKIPPED_RUN_EVENTS:
+                    continue
+            elif step not in steps:
+                continue
+            if not line.endswith(b"\n"):
+                line += b"\n"
+            selected += 1
+            selected_bytes += len(line)
+            if in_head and head_bytes + len(line) <= head_budget:
+                head.append(line)
+                head_bytes += len(line)
+                continue
+            in_head = False
+            tail.append(line)
+            tail_bytes += len(line)
+            while tail_bytes > tail_budget and tail_start < len(tail):
+                tail_bytes -= len(tail[tail_start])
+                tail_start += 1
+            if tail_start > 4096:
+                del tail[:tail_start]
+                tail_start = 0
+    tail = tail[tail_start:]
+    omitted = selected - len(head) - len(tail)
+    chunks = list(head)
+    if omitted:
+        chunks.append((json.dumps({
+            "event": "gate_evidence_cut", "issue": "#2409", "omitted_lines": omitted,
+            "omitted_bytes": selected_bytes - head_bytes - tail_bytes,
+        }, sort_keys=True) + "\n").encode())
+    chunks.extend(tail)
+    return chunks, {"lines": selected, "kept_lines": len(head) + len(tail),
+                    "truncated": bool(omitted), "unparsed_lines": unparsed}
+
+
+def _evidence_lock(root: Path, wait_s: float) -> int | None:
+    """An exclusive lock on the evidence root, or None after `wait_s`."""
+    fd = os.open(root / "lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.1)
+
+
+@dataclasses.dataclass
+class _EvidenceStep:
+    """One red step's line in an evidence entry's manifest.json."""
+
+    step: str
+    result: str  # "failed" or "incomplete" (NO_RESULT)
+    log: str | None = None  # the copied file's name in the entry
+    bytes: int | None = None  # the source log's length
+    kept_bytes: int | None = None
+    truncated: bool = False
+    missing: str | None = None  # why there was no log to copy
+
+
+def _copy_red_evidence(root: Path, run_id: str, log_dir: Path, failed: set[str],
+                       incomplete: set[str]) -> tuple[Path | None, str]:
+    """Plan, prune, then copy; the caller holds the root's lock."""
+    log_cap = _env_int("GATE_EVIDENCE_LOG_CAP_BYTES", GATE_EVIDENCE_LOG_CAP_BYTES,
+                       _EVIDENCE_MIN_LOG_CAP)
+    max_bytes = _env_int("GATE_EVIDENCE_MAX_BYTES", GATE_EVIDENCE_MAX_BYTES, 1)
+    red = sorted(failed | incomplete)
+    steps = [_EvidenceStep(step, "failed" if step in failed else "incomplete") for step in red]
+    sources: dict[str, tuple[int, int]] = {}
+    journal: tuple[int, int] | None = None
+    try:
+        for item in steps:
+            opened = _open_source(log_dir / dagrun_log_name(item.step))
+            if isinstance(opened, str):
+                item.missing = opened
+            else:
+                sources[item.step] = opened
+                item.bytes = opened[1]
+        opened_journal = _open_source(log_dir / "journal.jsonl")
+        journal_missing = opened_journal if isinstance(opened_journal, str) else None
+        journal = None if isinstance(opened_journal, str) else opened_journal
+        if not sources and journal is None:
+            return None, (f"no step log or journal for {len(red)} red step(s) in {log_dir} "
+                          f"(journal {journal_missing})")
+        # Every present log, and the journal, share the entry budget.
+        parts = len(sources) + (journal is not None)
+        budget = max(max_bytes // GATE_EVIDENCE_ENTRY_SHARE - _EVIDENCE_MANIFEST_RESERVE, 0)
+        cap = min(log_cap, max(_EVIDENCE_MIN_LOG_CAP, budget // max(parts, 1)))
+        planned = _EVIDENCE_MANIFEST_RESERVE + sum(
+            _disk_bytes(min(size, cap)) for _fd, size in sources.values())
+        if journal is not None:
+            planned += _disk_bytes(min(journal[1], cap))
+        if planned > max_bytes:
+            return None, (f"{len(red)} red steps need {planned} bytes, over the root's "
+                          f"{max_bytes}-byte bound")
+        prune_gate_evidence(root=root, max_bytes=max_bytes, room=planned)
+        (root / "runs").mkdir(mode=0o700, exist_ok=True)
+        entry = root / "runs" / run_id
+        entry.mkdir(mode=0o700)
+        errors: list[str] = []
+        for item in steps:
+            if item.step not in sources:
+                continue
+            fd, size = sources[item.step]
+            name = dagrun_log_name(item.step)
+            try:
+                item.kept_bytes, item.truncated = copy_capped(fd, size, entry / name, cap)
+                item.log = name
+            except OSError as exc:
+                errors.append(f"{name}: {exc}")
+        journal_info: dict[str, object] = {"file": None, "missing": journal_missing}
+        if journal is not None:
+            try:
+                chunks, info = _journal_selection(journal[0], journal[1], set(red), cap)
+                journal_info.update(info)
+                journal_info.update(bytes=journal[1], file="journal.jsonl",
+                                    kept_bytes=_write_private(entry / "journal.jsonl", chunks))
+            except OSError as exc:
+                errors.append(f"journal.jsonl: {exc}")
+        manifest = {"issue": "#2409", "run_id": run_id, "source_log_dir": str(log_dir),
+                    "created_utc": _utc(time.time()), "log_cap_bytes": cap,
+                    "steps": [dataclasses.asdict(item) for item in steps],
+                    "journal": journal_info, "errors": errors}
+        _write_private(entry / "manifest.json",
+                       [(json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode()])
+        kept = sum(1 for item in steps if item.log)
+        note = (f"{kept} of {len(red)} red step log(s)"
+                + (", journal lines" if journal_info["file"] else ", no journal")
+                + (f"; {len(errors)} copy error(s): {'; '.join(errors)}" if errors else ""))
+        return entry, note
+    finally:
+        for fd, _size in sources.values():
+            os.close(fd)
+        if journal is not None:
+            os.close(journal[0])
+
+
+def keep_red_evidence(run_id: str, log_dir: Path, failed: set[str],
+                      incomplete: set[str]) -> str | None:
+    """Keep a red run's failed and NO_RESULT step logs past the gate-log
+    pruning (#2409) and return the entry's path for the ledger row, or
+    None (green run, nothing to copy, or the copy failed). A finished
+    gate always applies the root's age and size bounds. Best effort and
+    in-process: any failure is printed, and the gate's verdict and exit
+    status never depend on it."""
+    root = gate_evidence_root()
+    red = set(failed) | set(incomplete)
+    lock: int | None = None
+    try:
+        if not red and not root.is_dir():
+            return None
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock = _evidence_lock(root, GATE_EVIDENCE_LOCK_WAIT_S)
+        if lock is None:
+            if red:
+                print(f"gate: warning: red-step evidence not kept: {root} stayed locked for "
+                      f"{GATE_EVIDENCE_LOCK_WAIT_S:.0f}s; the verdict is unchanged (#2409)", flush=True)
+            return None
+        if not red:
+            prune_gate_evidence(root=root)
+            return None
+        started = time.monotonic()
+        entry, note = _copy_red_evidence(root, run_id, log_dir, set(failed), set(incomplete))
+        if entry is None:
+            print(f"gate: warning: red-step evidence not kept: {note}; the verdict is "
+                  "unchanged (#2409)", flush=True)
+            return None
+        print(f"gate: red-step evidence kept in {entry} ({note}; "
+              f"{time.monotonic() - started:.2f}s; outlives the gate-log pruning, #2409)", flush=True)
+        return str(entry)
+    except Exception as exc:  # best effort: never the verdict
+        print(f"gate: warning: red-step evidence not kept: {type(exc).__name__}: {exc}; "
+              "the verdict is unchanged (#2409)", flush=True)
+        return None
+    finally:
+        if lock is not None:
+            os.close(lock)
 
 
 #: The known-red list (#2114): in-repo, versioned, every entry with
@@ -3670,6 +4081,9 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                     "log_path": str(log_dir),
                     "memory_peak_gib": mem_peak_gib,
                     "memory_peak_source": mem_peak_source})
+        # #2409: a red run's step logs, copied out before the prune below
+        # can remove its log directory; in-process and best effort.
+        evidence_path = keep_red_evidence(run_id, log_dir, failed_steps, incomplete_steps)
         # After the slot is released, so no other gate waits on it (#940). A
         # nested gate leaves it to its parent, which is still building.
         prune_gate_logs()
@@ -3687,7 +4101,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                        defer_waiting=defer_ever, defer_wait_s=defer_wait_s,
                        memory_waiting=memory_ever, memory_wait_s=memory_wait_s,
                        memory_class=mem_cls, memory_need_gib=mem_need,
-                       log_path=str(log_dir),
+                       log_path=str(log_dir), evidence_path=evidence_path,
                        memory_peak_gib=mem_peak_gib, memory_peak_source=mem_peak_source,
                        identity_at_start=identity_at_start, identity_at_end=identity_at_end,
                        base_sha_at_start=base_sha_at_start, invalid_reason=invalid_reason)
@@ -3801,6 +4215,7 @@ def _record_ledger(
     identity_at_end: tuple[str | None, str | None] | None = None,
     base_sha_at_start: str | None = None,
     invalid_reason: str | None = None,
+    evidence_path: str | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
@@ -3866,6 +4281,8 @@ def _record_ledger(
             "memory_class": memory_class,
             "memory_need_gib": memory_need_gib,
             "log_path": log_path,
+            # #2409: the red steps' kept logs; null when green or not kept.
+            "evidence_path": evidence_path,
             "memory_peak_gib": memory_peak_gib,
             "memory_peak_source": memory_peak_source,
             "target_bytes_before": (pruned or {}).get("target_bytes_before"),
