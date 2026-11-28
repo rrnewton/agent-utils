@@ -3,7 +3,7 @@
 //! and 9.2). One file per ID under `teams.d/<team>/ledger/`.
 
 use crate::deliver::{Deliverer, Handover};
-use crate::envelope::{check_envelope, envelope_sender, render_with_warning, sha256_hex};
+use crate::envelope::{check_envelope, envelope_sender, render_with_warnings, sha256_hex};
 use crate::jsonfile::{
     create_private_dir_all, write_json_atomic, write_new, write_new_atomic, DataResult,
 };
@@ -115,6 +115,98 @@ impl AcceptAnswer {
             "findings": self.findings,
         })
     }
+}
+
+/// A body above this many bytes, and above the team's `max_bytes`, reaches the coordinator as a
+/// saved file: its path, its sha256 and its first lines, never inline (#2420, lead-014:
+/// lossless without flooding a lane's context).
+pub const PANE_INLINE_MAX_BYTES: usize = 16_384;
+/// How much of a saved body is shown inline: its first lines, at most this many bytes.
+const PREVIEW_MAX_BYTES: usize = 2_000;
+const PREVIEW_MAX_LINES: usize = 20;
+
+/// What a delivery says beside the message when a check did not pass (#2420 relay-never-lossy,
+/// owner decision 2026-11-27: a warning at most, never a lossy transport). `head` warnings ride
+/// on the first line (late, superseded); `under` warnings are the `[relay warning: ...]` line
+/// under the team tag; `proof_note` replaces the proof in the meta line; `display_body` replaces
+/// the body shown (a saved body's preview).
+#[derive(Debug, Clone, Default)]
+struct DeliveryWarnings {
+    head: Vec<String>,
+    under: Vec<String>,
+    proof_note: Option<String>,
+    display_body: Option<String>,
+}
+
+impl DeliveryWarnings {
+    fn from_body_warning(body_warning: Option<&str>) -> Self {
+        DeliveryWarnings {
+            under: body_warning.map(str::to_string).into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    fn all(&self) -> Vec<String> {
+        self.head.iter().chain(self.under.iter()).cloned().collect()
+    }
+
+    fn render(&self, ctx: &AcceptContext<'_>, envelope: &Value) -> String {
+        let shown = self.display_body.as_ref().map(|body| {
+            let mut copy = envelope.clone();
+            copy["body"] = json!(body);
+            copy
+        });
+        let head = (!self.head.is_empty()).then(|| self.head.join("; "));
+        let under = (!self.under.is_empty()).then(|| self.under.join("; "));
+        render_with_warnings(
+            shown.as_ref().unwrap_or(envelope),
+            ctx.via,
+            self.proof_note.as_deref().unwrap_or(ctx.proof_note),
+            head.as_deref(),
+            under.as_deref(),
+        )
+    }
+}
+
+/// Where a team keeps bodies too large to show inline: `teams.d/<team>/bodies/<id>.txt`.
+pub fn body_file_path(state: &Path, team: &str, id: &str) -> PathBuf {
+    state
+        .join("teams.d")
+        .join(team)
+        .join("bodies")
+        .join(format!("{id}.txt"))
+}
+
+/// Save a body too large to show inline (private file, kept as long as its ledger entry) and
+/// return its path and sha256.
+fn save_body(state: &Path, team: &str, id: &str, body: &str) -> std::io::Result<(PathBuf, String)> {
+    let path = body_file_path(state, team, id);
+    if let Some(dir) = path.parent() {
+        create_private_dir_all(dir)?;
+    }
+    let _ = write_new_atomic(&path, body.as_bytes())?;
+    Ok((path, sha256_hex(body.as_bytes())))
+}
+
+/// The first lines of a body, at most [`PREVIEW_MAX_LINES`] lines and [`PREVIEW_MAX_BYTES`].
+fn body_preview(body: &str) -> String {
+    let mut preview = String::new();
+    for line in body.lines().take(PREVIEW_MAX_LINES) {
+        if preview.len() + line.len() + 1 > PREVIEW_MAX_BYTES {
+            let room = PREVIEW_MAX_BYTES.saturating_sub(preview.len());
+            let mut end = room.min(line.len());
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            preview.push_str(&line[..end]);
+            preview.push('\n');
+            break;
+        }
+        preview.push_str(line);
+        preview.push('\n');
+    }
+    preview.push_str("…\n");
+    preview
 }
 
 /// Record a refusal of the message as a durable ledger entry (a fence in
@@ -299,7 +391,13 @@ fn accept_checked(
                     findings: Vec::new(),
                 });
             }
-            let recovered = recover_claim(ctx, envelope, deliverer, &existing, body_warning)?;
+            let recovered = recover_claim(
+                ctx,
+                envelope,
+                deliverer,
+                &existing,
+                &DeliveryWarnings::from_body_warning(body_warning),
+            )?;
             return Ok(recovered);
         }
         // A retry of an accepted-but-maybe-undrained item nudges delivery:
@@ -395,16 +493,35 @@ fn accept_checked(
             );
         }
     }
+    // Policy and freshness checks past this point never refuse the message (#2420
+    // relay-never-lossy, owner decision 2026-11-27: a warning at most, never a lossy
+    // transport); each failed check is one short warning on the delivered text.
+    let mut warnings = DeliveryWarnings::from_body_warning(body_warning);
+    // A body over max_bytes is delivered with a warning (#2420 R3); above
+    // PANE_INLINE_MAX_BYTES too, it is saved to a file and the coordinator gets its path, its
+    // sha256 and its first lines, so nothing is lost and a lane's context is not flooded.
     if body.len() > ctx.declaration.max_bytes {
-        return refuse(
-            "refused",
-            format!(
-                "body of {} bytes over the limit {}",
-                body.len(),
-                ctx.declaration.max_bytes
-            ),
-            lock,
+        let limit = ctx.declaration.max_bytes;
+        let mut warning = format!("{} bytes, over this team's max_bytes {limit}", body.len());
+        if body.len() > limit.max(PANE_INLINE_MAX_BYTES) {
+            match save_body(ctx.state, team, &id, body) {
+                Ok((path, digest)) => {
+                    warning.push_str(&format!(
+                        "; full body saved: {} sha256 {digest}",
+                        path.display()
+                    ));
+                    warnings.display_body = Some(body_preview(body));
+                }
+                Err(error) => {
+                    warning.push_str(&format!("; saving it failed ({error}), shown inline"));
+                }
+            }
+        }
+        crate::sender::log_event(
+            ctx.state,
+            &json!({"event": "accept", "outcome": "over-max-bytes-delivered", "team": team, "id": id, "bytes": body.len(), "limit": limit}),
         );
+        warnings.under.push(warning);
     }
     if not_after_ms <= now_ms {
         return refuse("expired", "not_after has passed".to_string(), lock);
@@ -413,11 +530,12 @@ fn accept_checked(
         .as_str()
         .and_then(parse_rfc3339_ms)
         .unwrap_or(now_ms);
+    // A TTL beyond max_ttl_seconds is delivered and logged (#2420 R5): the entry keeps the
+    // envelope's own not_after, so the ledger still dedupes every copy for as long as it lives.
     if not_after_ms - created_ms > ctx.declaration.max_ttl_seconds * 1000 {
-        return refuse(
-            "refused",
-            "not_after beyond max_ttl_seconds".to_string(),
-            lock,
+        crate::sender::log_event(
+            ctx.state,
+            &json!({"event": "accept", "outcome": "over-max-ttl-delivered", "team": team, "id": id, "max_ttl_seconds": ctx.declaration.max_ttl_seconds}),
         );
     }
     // Rate limit: arrivals from one sender in the trailing hour, counted
@@ -486,6 +604,10 @@ fn accept_checked(
         "recorded_at": format_rfc3339_ms(now_ms),
         "envelope": envelope,
     });
+    let mut claim = claim;
+    if !warnings.all().is_empty() {
+        claim["delivery_warnings"] = json!(warnings.all());
+    }
     let claimed = write_new_atomic(
         &entry_path(ctx.state, team, &id),
         format!("{}\n", serde_json::to_string_pretty(&claim)?).as_bytes(),
@@ -507,7 +629,7 @@ fn accept_checked(
     // Supersede older untyped messages on the topic and explicit keys.
     apply_supersede(ctx, envelope, deliverer)?;
 
-    let rendered = render_with_warning(envelope, ctx.via, ctx.proof_note, body_warning);
+    let rendered = warnings.render(ctx, envelope);
     let outcome = deliverer.handover(&id, envelope, &rendered);
     finish_handover(ctx, &id, outcome)
 }
@@ -592,7 +714,7 @@ fn recover_claim(
     envelope: &Value,
     deliverer: &dyn Deliverer,
     existing: &Value,
-    body_warning: Option<&str>,
+    warnings: &DeliveryWarnings,
 ) -> DataResult<AcceptAnswer> {
     let id = envelope["id"].as_str().unwrap_or_default();
     match deliverer.contains(id) {
@@ -609,7 +731,7 @@ fn recover_claim(
             })
         }
         Some(false) => {
-            let rendered = render_with_warning(envelope, ctx.via, ctx.proof_note, body_warning);
+            let rendered = warnings.render(ctx, envelope);
             let outcome = deliverer.handover(id, envelope, &rendered);
             finish_handover(ctx, id, outcome)
         }
@@ -1160,6 +1282,10 @@ fn retention_horizon_ms(entry: &Value) -> Option<i64> {
 fn remove_entry_files(dir: &Path, id: &str) {
     let base = format!("{id}.json");
     let _ = fs::remove_file(dir.join(&base));
+    // A body saved because it was too large to show inline lives as long as its entry.
+    if let Some(team_dir) = dir.parent() {
+        let _ = fs::remove_file(team_dir.join("bodies").join(format!("{id}.txt")));
+    }
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();

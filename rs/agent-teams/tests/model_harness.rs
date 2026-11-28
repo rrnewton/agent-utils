@@ -1716,3 +1716,115 @@ fn accept_to_missing_target_is_undeliverable_and_claims_nothing() {
         .exists());
     let _ = std::fs::remove_dir_all(&state);
 }
+
+/// The hook-inbox item delivered for `id`, as its rendered text.
+fn delivered_text(state: &Path, team: &str, id: &str) -> Option<String> {
+    let inbox = state.join("teams.d").join(team).join("hook-inbox");
+    [inbox.clone(), inbox.join("claimed")]
+        .iter()
+        .find_map(|dir| std::fs::read_to_string(dir.join(format!("{id}.json"))).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|item| item["text"].as_str().map(str::to_string))
+}
+
+fn envelope_with(id: &str, body: &str, created_ms: i64, not_after_ms: i64) -> Value {
+    build_envelope(
+        id,
+        "k",
+        "sim",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        created_ms,
+        not_after_ms,
+        None,
+        body,
+    )
+}
+
+/// #2420 R3 (relay-never-lossy): a body over the team's max_bytes was refused, so the message
+/// was lost. It is delivered with one warning line; above 16 KiB the body is saved to a file and
+/// the coordinator gets its path, its sha256 and its first lines.
+#[test]
+fn a_body_over_max_bytes_is_delivered_with_a_warning_and_a_huge_one_by_file() {
+    let state = temp_state("max-bytes");
+    declaration_for(&state, "tools", "sim");
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let id = "tm-sim-a0a0a0a0a0a0a0a0";
+    let body = "x".repeat(10_000);
+    let answer = handle_verb(
+        &state,
+        "host-a",
+        "host-a",
+        "accept",
+        &envelope_with(id, &body, now_ms, now_ms + 7_200_000),
+    );
+    assert_eq!(answer["outcome"], "accepted", "{answer}");
+    let text = delivered_text(&state, "tools", id).expect("delivered");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].starts_with("[from sim@host-a via agent-teams"),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines[1],
+        "[relay warning: 10000 bytes, over this team's max_bytes 8192]"
+    );
+    assert!(text.contains(&body), "inline, whole");
+
+    let id = "tm-sim-a1a1a1a1a1a1a1a1";
+    let body: String = (0..2_000).map(|n| format!("line {n}\n")).collect();
+    assert!(body.len() > 16_384);
+    let answer = handle_verb(
+        &state,
+        "host-a",
+        "host-a",
+        "accept",
+        &envelope_with(id, &body, now_ms, now_ms + 7_200_000),
+    );
+    assert_eq!(answer["outcome"], "accepted", "{answer}");
+    let text = delivered_text(&state, "tools", id).expect("delivered");
+    let saved = agent_teams::ledger::body_file_path(&state, "tools", id);
+    assert_eq!(std::fs::read_to_string(&saved).expect("saved"), body);
+    let digest = agent_teams::envelope::sha256_hex(body.as_bytes());
+    let warning = text.lines().nth(1).expect("warning line");
+    assert!(
+        warning.starts_with(&format!(
+            "[relay warning: {} bytes, over this team's max_bytes 8192; full body saved: {} sha256 {digest}",
+            body.len(),
+            saved.display()
+        )),
+        "{warning}"
+    );
+    assert!(
+        text.contains("line 0\n") && text.contains("line 19\n"),
+        "{text}"
+    );
+    assert!(!text.contains("line 20\n"), "only the first lines inline");
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// #2420 R5: a TTL beyond max_ttl_seconds was refused; it is delivered (and logged).
+#[test]
+fn a_ttl_beyond_max_ttl_is_delivered() {
+    let state = temp_state("max-ttl");
+    declaration_for(&state, "tools", "sim");
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let id = "tm-sim-a2a2a2a2a2a2a2a2";
+    let answer = handle_verb(
+        &state,
+        "host-a",
+        "host-a",
+        "accept",
+        &envelope_with(id, "long-lived", now_ms, now_ms + 30 * 86_400_000),
+    );
+    assert_eq!(answer["outcome"], "accepted", "{answer}");
+    assert!(delivered_text(&state, "tools", id).is_some());
+    let _ = std::fs::remove_dir_all(&state);
+}

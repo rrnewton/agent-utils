@@ -18,6 +18,17 @@ pub fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A span in milliseconds as a short age: `45s`, `12m`, `3h` or `4d` (#2420 late tags).
+pub fn age_text(span_ms: i64) -> String {
+    let seconds = span_ms.max(0) / 1_000;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
 /// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };

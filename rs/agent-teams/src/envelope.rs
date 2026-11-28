@@ -150,6 +150,68 @@ pub fn render_with_warning(
     proof_note: &str,
     warning: Option<&str>,
 ) -> String {
+    render_with_warnings(envelope, via, proof_note, None, warning)
+}
+
+/// A value fit for one sender-header field: no line breaks, no `·` and no `]`.
+fn header_field_value(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\n' | '\r' | '·' => ' ',
+            ']' => ')',
+            '[' => '(',
+            other => other,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Add `warning` to the first line of a delivered text as a `warning:` field of its sender
+/// header, so a late or superseded message reads as one on its very first line and the line
+/// stays the header agentctl's drainers parse (#2420, lead-014: a late post must never read as
+/// a fresh instruction). A header that already carries a warning gets this one appended after
+/// `; `. A text whose first line is not a header gets the warning as a line of its own above it.
+pub fn add_header_warning(text: &str, warning: &str) -> String {
+    let value = header_field_value(warning);
+    let (first, rest) = match text.split_once('\n') {
+        Some((first, rest)) => (first, Some(rest)),
+        None => (text, None),
+    };
+    let rebuilt = if first.starts_with("[from ") && first.ends_with(']') {
+        let inner = &first[..first.len() - 1];
+        if inner.contains(" · warning: ") {
+            format!("{inner}; {value}]")
+        } else {
+            format!("{inner} · warning: {value}]")
+        }
+    } else {
+        return format!("[relay warning: {value}]\n{text}");
+    };
+    match rest {
+        Some(rest) => format!("{rebuilt}\n{rest}"),
+        None => rebuilt,
+    }
+}
+
+/// [`render_with_warning`] with a `head` warning on the first line, as a `warning:` field of the
+/// team tag (see [`add_header_warning`]): late, superseded and replay-unproven deliveries
+/// (#2420). `under` is the `[relay warning: ...]` line under the tag.
+pub fn render_with_warnings(
+    envelope: &Value,
+    via: &str,
+    proof_note: &str,
+    head: Option<&str>,
+    under: Option<&str>,
+) -> String {
+    let rendered = render_plain(envelope, via, proof_note, under);
+    match head {
+        Some(head) => add_header_warning(&rendered, head),
+        None => rendered,
+    }
+}
+
+fn render_plain(envelope: &Value, via: &str, proof_note: &str, warning: Option<&str>) -> String {
     let kind = envelope
         .get("kind")
         .and_then(Value::as_str)

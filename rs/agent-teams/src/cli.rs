@@ -1723,11 +1723,11 @@ fn cmd_send(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     // expired in the relay-fallback incident were mostly replies waiting
     // out a down route, and a relayed reply must also survive the
     // bridges' rescan window. An explicit --ttl/--expires always wins.
-    // The receiver does not clamp to max_ttl_seconds — it REFUSES an
-    // envelope whose not_after is beyond it — so where the destination's
-    // declaration is readable here, cap the default at its max; where it
-    // is not (a remote team), the destination must allow 24 h
-    // (max_ttl_seconds >= 86400; the declaration default is 7 days).
+    // Older receivers REFUSE an envelope whose not_after is beyond their
+    // max_ttl_seconds (current ones deliver it, #2420), so where the
+    // destination's declaration is readable here, cap the default at its
+    // max; where it is not (a remote team), an older destination must
+    // allow 24 h (max_ttl_seconds >= 86400; the default is 7 days).
     let default_ttl = if kind == "reply" {
         let wanted = default_ttl.max(86_400);
         let receiver_max = load_declarations(&globals.state)

@@ -142,12 +142,17 @@ explicit rule.
     `--kind reply`) get at least 24 hours by default instead: replies
     were the messages that expired while a direct route was down, and a
     relayed reply must survive the bridges' rescan window. An explicit
-    `--ttl` or `--expires` always wins. The receiver refuses (it does
-    not clamp) an envelope beyond its `max_ttl_seconds`, so the sender
-    caps the reply default at the destination's max when that
-    declaration is readable locally; a remote destination must allow
-    24 hours (`max_ttl_seconds` >= 86400 — the declaration default is
-    7 days, so only a team that lowered it is affected).
+    `--ttl` or `--expires` always wins. The sender caps the reply default
+    at the destination's `max_ttl_seconds` when that declaration is
+    readable locally. A receiver delivers an envelope beyond its
+    `max_ttl_seconds` and logs it (older receivers refused it, #2420).
+  - A body over the receiving team's `max_bytes` (default 8192) is
+    delivered with a `[relay warning: N bytes, over this team's max_bytes
+    M]` line, never refused (#2420). A body over both `max_bytes` and
+    16 KiB is saved to `teams.d/<team>/bodies/<id>.txt` (private, kept as
+    long as the message's ledger entry), and the coordinator gets the
+    file's path and sha256 on the warning line and the body's first 20
+    lines, so nothing is lost and a lane's context is not flooded.
   - A team's declaration may carry a `may_send_to` allow list: entries are
     `team` (any host) or `team@host` (only that host — the front door).
     `send` and `reply` refuse a destination outside the sender team's list
