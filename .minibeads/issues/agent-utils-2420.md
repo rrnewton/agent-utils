@@ -136,3 +136,29 @@ So no check in the relay or the chat bridges may lose or delay a message unless 
     teams.d/<team>/bodies/; the notice events replay-unproven-notice,
     rate-paced-notice and overdue-notice.
   - The chunking wire change (R12) is gate 2, behind lead-014's five points.
+- 2026-11-28 (cl-bridgeretire), step (c) c-relay gate 2 (R12 chunking), stacked on gate 1.
+  lead-014 confirmed the design. Land note:
+  - Wire: the first post carries body_parts and part_sha256, signed by the new
+    relay.sig3; sig and sig2 are unchanged. Parts 2..N are agent-teams-body-part/v1
+    posts.
+  - The sender switch, route `chunk_posts`, defaults to OFF. Only signed senders
+    chunk.
+  - Every part is verified against the signed list. Anything unverifiable is
+    delivered on its own as UNVERIFIED (first-line field, no proof line, tag names
+    only the posting bot), never dropped.
+  - Part fields are untrusted: the id is validated before it names
+    relay/body-parts/<id>.json; index and of must fit the signed N.
+  - Bounds: 16 per posting bot and 8 MiB in total. The arriving bot's own oldest
+    assembly is delivered early, never another bot's (lead-014's tweak).
+  - A partial is delivered after 10 min ("parts 1-2 of 4 verified; 3-4 missing;
+    reconfirm before acting"). Late parts are a SECOND delivery with the
+    whole-body verdict. Orphans after 24 h are delivered as UNVERIFIED.
+  - Rollout (lead-014 point 4): new receivers on every host first, each proven by
+    chunked messages to and from it (1, 2 and 3 parts, a missing part, a forged
+    part). Only then chunk_posts ON. The receivers on devbig030 and devbig176
+    belong to their hosts' coordinators: their rollout note goes to them through
+    coordb and lead-014 before anyone touches their serve.
+  - Older receivers: a build with part A delivers part 1 with a body-hash warning
+    (unit test: sig and sig2 verify, and the first post is only a body mismatch).
+    Part posts are delivered as unparseable with R1, else quarantined with an
+    alarm.
