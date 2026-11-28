@@ -1,6 +1,6 @@
 ---
 title: 'census-counts-own-descendants: the Rust process census skips only its own ancestry, so a pooled audit counts its own in-flight git children as running agents'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-flaketriage
@@ -9,7 +9,8 @@ labels:
 - hot-host
 - census
 created_at: 2026-11-28T08:22:00-05:00
-updated_at: 2026-11-28T08:22:00-05:00
+updated_at: 2026-11-28T13:05:00-05:00
+closed_at: 2026-11-28T13:05:00-05:00
 ---
 
 # Description
@@ -64,3 +65,17 @@ Related:
 - #2065: the hot-host census tests and the session git stand-in.
 - #2418: the git helper race (orphaned helpers, which are no longer the caller's descendants).
 - #1200: rust-status-consistency, the test's origin.
+
+## Resolution
+
+Fixed in 2b600367 (`rs/wrkslotsd/src/remove_write.rs`, `rs/wrkslotsd/src/audit_state.rs`, two test files and this issue's Design), gated as 0728e7f7: gate 1795880439235867443-78e85b6a.
+- In that gate the #2464 cases passed in their namespaced shard: `test_other_edition_pools_rows_with_the_same_report` (out of quarantine), `test_other_edition_audit_never_counts_its_own_child_as_an_agent`, and `test_remove_still_counts_its_own_child_in_the_slot`.
+- Its two red steps were one unrelated Rust test, the bare-107 assertion, under a liaison step waiver. That is #2474, fixed in 601f86ba.
+- Landed with the coordinator's overlap exception: `test_remove_write_rust.py`, shared with 6c0f7500, in disjoint hunks. On the combined tree: clippy clean, the remove_write unit tests 14 of 14, and 47 passed in the namespace (the #2464 cases, plus all of `test_remove_write_rust.py` and `test_remove_lock_scope_rust.py`).
+- On main: the first gate carrying 2b600367 (gate 1795883841170273936-02c92bc8, on 7582169c) ran the pooled-audit case out of quarantine with the git stand-in on. It passed: no wrkslots shard reported it, and every shard but one passed (that one failed only on the unrelated #2481).
+- What changed:
+  - The audit's census skips the audit's own descendants, start-time checked. Remove's census is unchanged.
+  - The unit test covers both sides. In the end-to-end seam tests, the audit ignores its own child at `--jobs 1` and `--jobs 4` while a stranger still counts, and remove still refuses for its own child.
+  - The negative control: with the audit call reverted to the old census, the audit test fails.
+- No wall-clock budget; no new persisted field.
+
