@@ -1,0 +1,24 @@
+steps:
+  # `#2425 vibe-talk-search-date-filter`: the search bar reminds the date syntax and offers a
+  # calendar. The open bar shows the hint with a real example under it (inside the bar's width, the
+  # first row below it); the calendar's panel writes Last 7 as an absolute after: into the field,
+  # the server is asked with it inside q and the reader's zone, and only the week's hits stand
+  # (loaded rows and server cards); a typed after:7d leaves the same rows and the hint says it moves
+  # with today; Clear brings the old results back. Phones 412x915 by touch and a desk at 1280x800,
+  # light and dark, keyboard closed and open. The browser's clock is fixed and every wait is a
+  # condition, never a fixed sleep. Measured on 2026-11-28: about 60 s wall for eight cells.
+  - group: check
+    job: search-date-filter-browser
+    desc: the search bar's date hint, its calendar panel (Last 7 written as an absolute after:) and a typed after:7d leave only the week's hits, loaded and from the server, in current Chromium at 412x915 by touch and 1280x800, light and dark, keyboard open and closed (#2425)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/search_date_filter_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 600
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

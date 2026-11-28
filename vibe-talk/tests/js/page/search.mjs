@@ -3675,3 +3675,158 @@ test("`#1816 vibe-talk-search-history-up-arrow`: Up recalls the last search, Dow
   // The terms stand on the device, newest first, under their own key.
   assert.deepStrictEqual(JSON.parse(page.storage.get("vibe-talk.search-history")), ["mac", "runner"]);
 });
+
+// --- `#2425 vibe-talk-search-date-filter`: the calendar, the hint, and dates in the text ---------------
+
+/** Whether the Dates panel stands open. */
+const datesOpen = (page) => !page.el("search-dates-panel").hidden;
+
+/** Open the Dates panel from the open bar. */
+async function openDates(page) {
+  await page.el("search-dates").click();
+  await page.settle();
+}
+
+/** Press Use dates and let the search the text now holds run. */
+async function useDates(page) {
+  await page.el("search-dates-use").click();
+  await page.settle();
+}
+
+test("`#2425`: the calendar stands on the open bar over the channel, the hint shows the date syntax with a real example, and Last 7 writes an absolute after: the server is asked for", async () => {
+  // The owner (2026-11-27): "support after: like gmail and remind me the syntax ... a calendar icon
+  // in the search bar and clicking it should provide an option for last K days or since DATE".
+  const page = await serverSearchPage();
+  page.serverSearch = async () => searchAnswer([], [searchedScope()]);
+  assert.equal(page.el("search-dates").hidden, true, "the calendar stands on a shut bar");
+  await page.el("search-toggle").click();
+  await page.settle();
+  const button = page.el("search-dates");
+  const hint = page.el("search-date-hint");
+  assert.equal(button.hidden, false, "no calendar on the open bar");
+  assert.equal(hint.hidden, false, "no syntax hint under the open bar");
+  // The page's clock reads 2026-08-19: the example is a real date, a week back.
+  assert.equal(hint.textContent, "after:2026-08-12 · after:7d · before:2026-08-19");
+  assert.equal(button.getAttribute("aria-label"), "Dates: any time");
+  assert.equal(button.getAttribute("aria-pressed"), "false");
+  // As served: the calendar opens a dialog, and the field's description and name carry the syntax.
+  assert.match(HTML_CODE, /<button id="search-dates"[^>]*aria-haspopup="dialog"[^>]*aria-controls="search-dates-panel"/);
+  assert.match(HTML_CODE, /id="search-field"[^>]*aria-label="[^"]*after: and before: take a date[^"]*"[^>]*aria-describedby="search-date-hint"/);
+  assert.match(HTML_CODE, /<div id="search-dates-panel" role="dialog"/);
+
+  await openDates(page);
+  assert.equal(datesOpen(page), true, "the calendar opened no panel");
+  assert.equal(button.getAttribute("aria-expanded"), "true");
+  assert.equal(page.el("search-dates-any").checked, true, "with no date standing the panel says Any time");
+  await page.el("search-dates-k7").click();
+  assert.equal(page.el("search-dates-last").checked, true, "a K chip did not choose Last");
+  assert.equal(page.el("search-dates-k7").getAttribute("aria-pressed"), "true");
+  assert.equal(page.el("search-dates-preview").textContent, "Searches after:2026-08-12",
+    "the panel does not say what it will write before it writes it");
+  await useDates(page);
+  assert.equal(datesOpen(page), false, "Use dates left the panel open");
+  assert.equal(page.el("search-field").value, "after:2026-08-12", "Last 7 did not write the absolute day");
+  assert.equal(button.getAttribute("aria-pressed"), "true", "the calendar does not say a date stands");
+  assert.equal(button.getAttribute("aria-label"), "Dates: since Aug 12, 2026");
+  assert.equal(hint.textContent, "Since Aug 12", "the hint does not name the standing date");
+  // The same path typing takes: the server is asked with the date inside q.
+  page.expireTimers(SERVER_SEARCH_DELAY_MS);
+  await page.settle();
+  const asked = new URL(page.serverSearchCalls.at(-1), "http://fixture.test");
+  assert.equal(asked.searchParams.get("q"), "after:2026-08-12");
+  assert.ok(asked.searchParams.get("tz") !== null, "the reader's zone did not go with it");
+
+  // Clear takes the date out and the calendar goes quiet again. The hint opens the panel too.
+  await page.el("search-date-hint").click();
+  await page.settle();
+  assert.equal(page.el("search-dates-since-mode").checked, true, "reopening blanked the standing date");
+  assert.equal(page.el("search-dates-since").value, "2026-08-12");
+  await page.el("search-dates-clear").click();
+  await page.settle();
+  assert.equal(page.el("search-field").value, "");
+  assert.equal(button.getAttribute("aria-label"), "Dates: any time");
+  assert.equal(hint.textContent, "after:2026-08-12 · after:7d · before:2026-08-19");
+});
+
+test("`#2425`: the panel replaces only the dates it owns, keeps every other word, writes Between's last day inclusively, and refuses a day that is not one", async () => {
+  const page = await serverSearchPage();
+  page.serverSearch = async () => searchAnswer([], [searchedScope()]);
+  await search(page, "deploy after:2026-08-01 \"after:2026-08-02\" x OR after:2026-08-05 -before:2026-07-01 after:2026-08-10");
+  await page.settle();
+  const button = page.el("search-dates");
+  // The latest plain after: is the one that holds; the OR'd, negated and quoted ones are not the calendar's.
+  assert.equal(button.getAttribute("aria-label"), "Dates: since Aug 10, 2026");
+  await openDates(page);
+  assert.equal(page.el("search-dates-since").value, "2026-08-10", "the panel did not pre-fill the standing date");
+  await page.el("search-dates-from").setValue("2026-08-11");
+  assert.equal(page.el("search-dates-between-mode").checked, true, "a Between box did not choose Between");
+  await page.el("search-dates-to").setValue("2026-08-15");
+  assert.equal(page.el("search-dates-preview").textContent, "Searches after:2026-08-11 before:2026-08-16");
+  await useDates(page);
+  assert.equal(page.el("search-field").value,
+    "deploy \"after:2026-08-02\" x OR after:2026-08-05 -before:2026-07-01 after:2026-08-11 before:2026-08-16",
+    "the calendar did not replace exactly the dates it owns");
+  assert.equal(button.getAttribute("aria-label"), "Dates: Aug 11 – Aug 15, 2026");
+  assert.equal(page.el("search-date-hint").textContent, "Aug 11 – Aug 15");
+
+  // Either end may stay empty: Between with only a last day is a before:.
+  await openDates(page);
+  assert.equal(page.el("search-dates-from").value, "2026-08-11", "reopening blanked the range");
+  assert.equal(page.el("search-dates-to").value, "2026-08-15");
+  await page.el("search-dates-from").setValue("");
+  await useDates(page);
+  assert.equal(page.el("search-field").value,
+    "deploy \"after:2026-08-02\" x OR after:2026-08-05 -before:2026-07-01 before:2026-08-16");
+  assert.equal(button.getAttribute("aria-label"), "Dates: before Aug 16, 2026");
+
+  // A day that is not one is refused in the panel, with its words; the text is untouched.
+  await openDates(page);
+  await page.el("search-dates-since").setValue("2026-02-30");
+  assert.equal(page.el("search-dates-since-mode").checked, true);
+  await useDates(page);
+  assert.equal(datesOpen(page), true, "an impossible date closed the panel");
+  assert.equal(page.el("search-dates-error").hidden, false);
+  assert.equal(page.el("search-dates-error").textContent, "2026-02-30 isn't a date");
+  assert.equal(page.el("search-field").value,
+    "deploy \"after:2026-08-02\" x OR after:2026-08-05 -before:2026-07-01 before:2026-08-16");
+  // A range the wrong way round is refused too.
+  await page.el("search-dates-from").setValue("2026-08-15");
+  await page.el("search-dates-to").setValue("2026-08-11");
+  await useDates(page);
+  assert.equal(page.el("search-dates-error").textContent, "The first day is after the last");
+  // Escape puts the panel away and the reader back in the field.
+  await page.el("search-dates-panel").dispatch("keydown", { key: "Escape", preventDefault: () => {} });
+  assert.equal(datesOpen(page), false, "Escape left the panel open");
+  assert.equal(FakeElement.focused, page.el("search-field"), "Escape did not return the reader to the field");
+});
+
+test("`#2425`: typed after:7d and before:7d filter the loaded rows by the reader's today, and the hint says a typed relative day moves with today", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "901", content: "kestrel, long ago", timestamp: "2026-08-02T09:00:00Z" }),
+    message({ id: "902", content: "kestrel, lately" }),
+  ]);
+  await search(page, "kestrel");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["901", "902"]);
+  await search(page, "kestrel after:7d");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["902"], "after:7d let an older row through");
+  assert.equal(page.el("search-dates").getAttribute("aria-label"), "Dates: last 7 days");
+  assert.equal(page.el("search-date-hint").textContent, "Last 7 days");
+  assert.equal(page.el("search-date-hint").getAttribute("title"), "Dates: last 7 days, moving with today",
+    "the hint's title does not say a typed relative day moves with today");
+  await openDates(page);
+  assert.equal(page.el("search-dates-last").checked, true, "a typed after:7d did not pre-fill Last");
+  assert.equal(page.el("search-dates-days").value, "7");
+  await page.el("search-dates-panel").dispatch("keydown", { key: "Escape", preventDefault: () => {} });
+  await search(page, "kestrel before:7d");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), ["901"], "before:7d kept a recent row");
+  // A value that is no date stays a word, as the language says: nothing matches it here.
+  await search(page, "kestrel after:7w");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), []);
+  assert.equal(page.el("search-dates").getAttribute("aria-label"), "Dates: any time");
+});

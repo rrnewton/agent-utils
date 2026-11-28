@@ -237,6 +237,20 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
       // A host without the screen keeps the button's own drawing.
     }
     if (deps.el("labels-button").hidden) deps.el("labels-panel").hidden = true;
+    // `#2425 vibe-talk-search-date-filter`. The calendar beside Labels, over the channel only as
+    // Labels is, and the hint line under the bar with it; the panel goes with its button. The
+    // screen says whether the hint stands while the bar is open (`data-date-hint`), and says it
+    // while the bar is shut too: the head room the list keeps for the hint is keyed on it AND
+    // `data-searching`, so the room comes and goes with the bar inside the reader hold that
+    // opening and closing already take (`showSearchOpen`), never in a step after it (R12).
+    deps.el("search-dates").hidden = deps.el("labels-button").hidden;
+    if (deps.el("search-dates").hidden) deps.el("search-dates-panel").hidden = true;
+    deps.el("search-date-hint").hidden = deps.el("search-dates").hidden;
+    try {
+      deps.el("screen-main").toggleAttribute("data-date-hint", deps.screen() === "main" && deps.view() === "discord");
+    } catch {
+      // A host without the screen keeps the hint's own drawing.
+    }
     // `#211 link-filter`. Beside Pinned while the bar is open, and over the call view as well: it
     // filters what the search filters, and a turn can hold a link as a channel message can.
     deps.el("links-filter").hidden = deps.el("search-field").hidden;

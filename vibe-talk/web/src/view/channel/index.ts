@@ -121,6 +121,8 @@ export { createLastPane } from "./lastpane.ts";
 export type { LastPane } from "./lastpane.ts";
 export type { ReplyRouting, ReplyState } from "./replystate.ts";
 export { createLabelsFilter, loneLabelOf } from "./labelsfilter.ts";
+export { createSearchDates, dateTokens, datesWords, standingDates } from "./searchdates.ts";
+export type { DateToken, DatesDay, SearchDates, SearchDatesDependencies, StandingDates } from "./searchdates.ts";
 export type { LabelsFilter, LabelsFilterDependencies } from "./labelsfilter.ts";
 export { createLabelPicker } from "./labelpicker.ts";
 export type { LabelPicker, LabelPickerDependencies, LabelPickerEntry, LabelWriteAnswer } from "./labelpicker.ts";

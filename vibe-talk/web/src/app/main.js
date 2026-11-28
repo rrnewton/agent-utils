@@ -10,6 +10,7 @@ import {createGathering,
   createSearchField,
   createSearchHistory,
   createServerSearch,
+  searchDateValue,
   searchFold,
   searchQueryExpandLabels,
   searchQueryMatches,
@@ -98,6 +99,7 @@ import {doneReadWords, failureWords, localReadWords, messagesWords, reachBackWor
 import {LINK_KINDS_KEY, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, editedDrawn, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, renderedHtmlOf, savedReadMode, undoLabel, undoName, upstreamUrlOf} from "../present/rows/index.ts";
 import {PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, createCardFlight, createCardPlaces, createColumnSplitter, createColumnReplies, createColumnWork, createColumnStateAccess, createColumns, createElementLookup, createFootRooms, createLayoutShown, createJumpAnchor, createLinkedMark, createPackSlides, screenMotionMs, createPullToRefresh, createQuoting, createReadingColumn, createReplyArrows, createSentRead, createReplyGathering, createReplySession, createChannelViews, createChannelScope, createChannelLoading, createDayTap, createMessageDetails, createNoiseActs, createRichHeaders, createStartsRead, createFilterPlace, createFreshRead, createHeldDone, createReadState, createPendingSends, createPendingReplies, createOlderPages, createOpeningView, createPlacing, createReplyCounts, createDoneAct, createLiveState, createSideCards, createThreadEntry, createTwoColumns, createRowDrawing, createRowGestures, createScrollKeeping, createAnchorDebug, createUnderLists, createUnpackWatch, FOLLOW_REST_PX, fillCardText, freshenDayTitle, freshComposerState, freshEntryState, freshDoneState, freshLoadState, freshOlderPages, freshPinsView, freshScrollPlace, freshScrollTools, freshSelection, freshTimelineRows, freshFilterState, freshGatherState, freshListState, freshReplyArrows, fromGatheredThread, idsOf, markCardLayout, messageTop, mountChannelViewControls, mountColumnSplitterControls, mountTextSelection, createLabelsFilter, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, shownRowFor, createChannelHead,
   createSearchOpenControl,
+  createSearchDates,
   createServiceWords,
   createOpenInView,
   createFreshness,} from "../view/channel/index.ts";
@@ -3404,7 +3406,13 @@ const {
 } = searchRows;
 // The search's passes, as the client debug mode's spans (`#2276`): the typing-fast pass inside the key,
 // and the full pass (the settled one runs it, under `search-settled`).
-const applySearch = clientDebug.spanned("search", applySearchPass);
+// `#2425`: the full pass also restates the Dates button and hint, whichever way the text changed
+// (typed, recalled, a label chosen, the bar closed).
+let searchDatesRef = null;
+const applySearch = clientDebug.spanned("search", () => {
+  applySearchPass();
+  searchDatesRef?.sync();
+});
 const applySearchFast = clientDebug.spanned("search-fast", applySearchFastPass);
 const markSearchHits = clientDebug.spanned("search-marks", markSearchHitsPass);
 
@@ -10405,7 +10413,7 @@ application.track(postFactoLabels.picker);
 // The keyboard opening or closing moves what the picker may cover: place it again.
 window.visualViewport?.addEventListener("resize", () => { if (postFactoLabels.picker.isOpen()) postFactoLabels.picker.refresh(); });
 
-application.track(mountFilterChips({
+const filterChips = mountFilterChips({
   intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
   byId: (id) => el(id),
   searchOpen: () => searchField.open(),
@@ -10439,7 +10447,26 @@ application.track(mountFilterChips({
   landSearchEntry: () => landSearchEntry(),
   settleFocus: () => settleFocus(),
   swallow: (event) => swallow(event),
-}));
+});
+application.track(filterChips);
+// `#2425 vibe-talk-search-date-filter`: the calendar on the search bar. Its panel writes after: /
+// before: into the field's text and runs it through the one change typing makes.
+const searchDates = createSearchDates({
+  byId: (id) => el(id),
+  today: () => {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate() };
+  },
+  dateValue: (value, today) => searchDateValue(value, today),
+  query: () => searchField.query(),
+  applyText: (text) => {
+    el("search-field").value = text;
+    filterChips.applyField();
+  },
+  closeLabels: () => labelsFilter.setOpen(false),
+});
+searchDatesRef = searchDates;
+application.track(searchDates);
 
 // Watching the lists move (`#207 scrollback-jump`, `#245 done-feedback`, `#204 reply-arrow`, `#49 cached-summaries`,
 // `#340 composer-grow-box`, `#261 two-column-connectors`, `#229 desktop-two-column`, `#338 column-overscroll`):

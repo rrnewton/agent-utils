@@ -5104,6 +5104,43 @@ test("`#2259` thread-view parking, forced order: an answer that leaves the first
   assert.deepStrictEqual(parked, ["201 start", "201 start", "201 start"], "a reopened search did not park its covered first result");
 });
 
+test("`#2425` thread-view parking: a first result WHOLLY under the taller floating stack (the date hint over the chips) is parked; one wholly above the list's screen is not", () => {
+  const { createSearchRows } = CHANNEL_VIEW;
+  const box = (top, bottom) => ({ top, bottom, left: 0, right: 400, width: 400, height: bottom - top });
+  const row = (id, top, bottom) => ({
+    id, top, bottom, hidden: false, className: "",
+    getAttribute: (name) => (name === "data-search" ? "" : name === "data-id" ? id : null),
+    getBoundingClientRect() { return box(this.top, this.bottom); },
+  });
+  // The thread's list starts at 85 on the screen; the hint and the chips float to 226 over it.
+  const panel = { hidden: false, getBoundingClientRect() { return box(172, 226); } };
+  const area = { getBoundingClientRect() { return box(85, 750); } };
+  const log = { children: [] };
+  const nodes = { "search-bucket-row": panel, "discord-log": log, "scroll-area": area };
+  const parked = [];
+  let key = "lantern";
+  const nothing = () => {};
+  const given = {
+    byId: (id) => nodes[id], leftById: (id) => nodes[id],
+    searchField: { open: () => true, markSoon: nothing, markNow: nothing, query: () => key, links: () => false },
+    language: { parsedQueries: new Map(), searchQueryTree: () => null, searchFold: (text) => text },
+    threadListOnScreen: () => false, selectionView: () => "thread", searchKey: () => key,
+    intoView: (element, block) => parked.push(`${element.id} ${block}`),
+    mainColumnRecord: () => ({ searched: null }),
+  };
+  const deps = new Proxy(given, { get: (target, name) => (name in target ? target[name] : nothing) });
+  const rows = createSearchRows(deps);
+  // Above the list's screen (it scrolled off the top): left alone, as `#2258` asks.
+  log.children = [row("151", 10, 80), row("201", 240, 300)];
+  rows.renderSearchCount(true, false);
+  assert.deepStrictEqual(parked, [], "a first result above the list's screen was parked");
+  // Wholly under the floating stack (142 to 208, the stack's foot at 226): parked, once.
+  log.children = [row("201", 142, 208), row("204", 216, 282)];
+  rows.renderSearchCount(true, false);
+  rows.renderSearchCount(true, false);
+  assert.deepStrictEqual(parked, ["201 start"], "a first result wholly under the stack was not parked exactly once");
+});
+
 test("`#2346 vibe-talk-search-landed-reader-follows-foot`: a search that leaves the list too short to scroll to the reader's place holds the nearest hit there with room, not a clamped nudge", () => {
   const { createFilterPlace, freshFilterState } = CHANNEL_VIEW;
   // The reader mid-list reads row 12; the key's search hides it and keeps row 14, 58 px below it.
@@ -5321,4 +5358,43 @@ test("`#2385` S-t1: the layout goes out before the bodies' read and prices each 
   } finally {
     globalThis.document = was;
   }
+});
+
+test("`#2425 vibe-talk-search-date-filter`: the dates a query's text stands on, as the calendar owns them, from the module alone", () => {
+  const { dateTokens, standingDates, datesWords } = CHANNEL_VIEW;
+  const today = { year: 2026, month: 11, day: 27 };
+  // The language's own reading of a value, as the page hands it in (searchDateValue's shape).
+  const dateValue = (value, now) => {
+    const absolute = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(value);
+    if (absolute) return { year: Number(absolute[1]), month: Number(absolute[2]), day: Number(absolute[3]) };
+    const back = /^(\d{1,5})d$/i.exec(value);
+    if (back && now) {
+      const at = new Date(Date.UTC(now.year, now.month - 1, now.day - Number(back[1])));
+      return { year: at.getUTCFullYear(), month: at.getUTCMonth() + 1, day: at.getUTCDate() };
+    }
+    return null;
+  };
+  const text = "deploy after:2026-11-01 \"after:2026-01-01 inside\" -after:2026-11-02 a OR before:2026-11-03 after:7d before:2026-11-25";
+  const tokens = dateTokens(text);
+  assert.deepStrictEqual(tokens.map((t) => [t.field, t.value, t.owned]), [
+    ["after", "2026-11-01", true],
+    ["after", "2026-11-02", false],
+    ["before", "2026-11-03", false],
+    ["after", "7d", true],
+    ["before", "2026-11-25", true],
+  ], "a quoted phrase, a negated date and a date beside OR are not the calendar's");
+  assert.equal(text.slice(tokens[0].start, tokens[0].end), "after:2026-11-01");
+  const standing = standingDates(text, today, dateValue);
+  assert.deepStrictEqual(standing.after, { year: 2026, month: 11, day: 20 }, "the latest owned after: holds");
+  assert.equal(standing.afterValue, "7d");
+  assert.deepStrictEqual(standing.before, { year: 2026, month: 11, day: 25 });
+  assert.equal(standing.tokens.length, 3);
+  assert.equal(datesWords(standing, today), "Nov 20 – Nov 24", "Between names its last day inclusively");
+  assert.equal(datesWords(standingDates("after:7d", today, dateValue), today), "last 7 days");
+  assert.equal(datesWords(standingDates("after:0d", today, dateValue), today), "today");
+  assert.equal(datesWords(standingDates("after:2025-12-30", today, dateValue), today), "since Dec 30, 2025");
+  assert.equal(datesWords(standingDates("before:2026-11-01", today, dateValue), today, true), "before Nov 1, 2026");
+  assert.equal(datesWords(standingDates("after:x after:", today, dateValue), today), null, "no valid date is any time");
+  // A field before a quote takes the phrase as its value, as the language reads it.
+  assert.deepStrictEqual(dateTokens("after:\"2026-11-20\" x").map((t) => [t.value, t.owned]), [["2026-11-20", true]]);
 });

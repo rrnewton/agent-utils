@@ -884,7 +884,8 @@ li[data-labels-below] > .meta > .label-chips {
    width the gap would have cost is the field's. */
 #author-filter,
 #links-filter,
-#search-entire-threads {
+#search-entire-threads,
+#search-dates {
   position: relative;
   width: var(--toggle-hit);
   height: var(--toggle-hit);
@@ -969,7 +970,8 @@ li[data-labels-below] > .meta > .label-chips {
 
 #author-filter::before,
 #links-filter::before,
-#search-entire-threads::before {
+#search-entire-threads::before,
+#search-dates::before {
   content: "";
   position: absolute;
   inset: calc((var(--toggle-hit) - var(--search-disc)) / 2);
@@ -979,7 +981,8 @@ li[data-labels-below] > .meta > .label-chips {
 
 #author-filter .icon,
 #links-filter .icon,
-#labels-button .icon {
+#labels-button .icon,
+#search-dates .icon {
   position: relative;
   width: 21px;
   height: 21px;
@@ -1017,7 +1020,8 @@ li[data-labels-below] > .meta > .label-chips {
    pushing messages down), full-width on a phone, anchored to the bar on a
    desktop; rows keep the bar's 44px target and the list scrolls at half the
    viewport with the filter box sticky at its head. */
-#labels-panel {
+#labels-panel,
+#search-dates-panel {
   position: absolute;
   top: calc(100% + 0.4rem);
   right: 0;
@@ -1090,6 +1094,152 @@ li[data-labels-below] > .meta > .label-chips {
   color: var(--muted);
   font-size: 0.85rem;
   white-space: nowrap;
+}
+
+/* `#2425 vibe-talk-search-date-filter`: the Dates panel's rows, in the Labels panel's surface
+   (above). Each row is one choice at the bar's 44px target height; on a phone a row's controls
+   wrap under its label rather than squeeze. The one filled button is Use dates (R3). */
+.search-dates-title {
+  margin: 0 0 0.25rem;
+  padding: 0 0.5rem;
+  font-weight: 700;
+}
+
+.search-dates-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* One label column for every row, so every value starts on one edge (R7); a value too wide for
+   its column wraps inside it. Every target is 48px (R9) with 8px between rows and controls. */
+.search-dates-choice {
+  display: grid;
+  grid-template-columns: 6.5rem minmax(0, 1fr);
+  align-items: center;
+  column-gap: 8px;
+  padding: 0 0.5rem;
+}
+
+.search-dates-choice > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 48px;
+}
+
+.search-dates-choice > label:only-child {
+  grid-column: 1 / -1;
+}
+
+/* The page's `select, input` rule grows every input (flex 1, padding, edge): a radio keeps its
+   own size, beside its word. */
+.search-dates-choice input[type="radio"] {
+  flex: 0 0 auto;
+  width: 1.25rem;
+  height: 1.25rem;
+  margin: 0;
+  padding: 0;
+}
+
+.search-dates-value,
+.search-dates-range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.search-dates-k {
+  min-width: 48px;
+  min-height: 48px;
+  justify-content: center;
+}
+
+.search-dates-k[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.search-dates-days {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.search-dates-days input {
+  flex: 0 0 4.5rem;
+  width: 4.5rem;
+  min-height: 48px;
+}
+
+.search-dates-choice input[type="date"] {
+  min-height: 48px;
+  max-width: 100%;
+}
+
+.search-dates-preview,
+.search-dates-error {
+  margin: 0.25rem 0.5rem 0;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.search-dates-preview {
+  color: var(--muted);
+}
+
+.search-dates-error {
+  color: var(--danger);
+}
+
+.search-dates-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  padding: 0 0.5rem;
+}
+
+.search-dates-actions button {
+  min-height: 48px;
+  font-size: 0.95rem;
+}
+
+/* The open panel stands over the hint and the bucket chips, which float beside the bar: the
+   bar's own stacking context (its transform) would otherwise put the panel under them on a desk. */
+#search-float:has(> #search-dates-panel:not([hidden])) {
+  z-index: var(--z-menu);
+}
+
+/* All its rows show at once on a desk and an ordinary phone; it scrolls only past that. */
+#search-dates-panel {
+  width: min(29rem, calc(100vw - 1rem));
+  max-height: min(40rem, 85vh);
+}
+
+/* On a phone the panel hangs full width under the bar, as the bar spans it (R2), and each value
+   takes its own full-width row under its label, so every value starts on one edge (R7) and two
+   date boxes never squeeze. */
+@media (max-width: 480px) {
+  #search-dates-panel {
+    left: 0;
+    right: 0;
+    width: auto;
+  }
+
+  .search-dates-choice {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.search-dates-use {
+  padding: 0 1rem;
+  border: none;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 700;
 }
 
 /* `#2279 vibe-talk-post-facto-labels`: the label picker. Fixed in the top layer
@@ -1374,11 +1524,15 @@ li[data-labels-below] > .meta > .label-chips {
 
 /* `#211 link-filter`. Links ON in the accent, the colour every other pressed toggle here wears and
    the colour its links are drawn in; gold is the pin's alone. */
-#links-filter[aria-pressed="true"] {
+#links-filter[aria-pressed="true"],
+#search-dates[aria-pressed="true"],
+#search-dates[aria-expanded="true"] {
   color: var(--accent);
 }
 
-#links-filter[aria-pressed="true"]::before {
+#links-filter[aria-pressed="true"]::before,
+#search-dates[aria-pressed="true"]::before,
+#search-dates[aria-expanded="true"]::before {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
   box-shadow: inset 0 0 0 1px var(--accent);
 }
@@ -1480,6 +1634,69 @@ li[data-labels-below] > .meta > .label-chips {
   }
 }
 
+/* `#2425 vibe-talk-search-date-filter`. The date hint's line stands under the bar whenever the
+   bar is open over the channel (`data-date-hint`), above the bucket chips; its height is folded
+   into `--bucket-head`, which every head-room rule already carries, so the first row is never
+   under it and opening it is the only time it changes the head (typing never does, R12). */
+#screen-main {
+  --date-hint: 0px;
+}
+
+#screen-main[data-searching][data-date-hint] {
+  /* The pill's 1.6rem and the bar's own 4px row gap under it, so the chips stand just below. */
+  --date-hint: calc(1.6rem + 4px);
+  --bucket-head: var(--date-hint);
+}
+
+#screen-main[data-searching][data-bucket-head][data-date-hint] {
+  --bucket-head: calc(3.7rem + var(--date-hint));
+}
+
+@media (max-width: 480px) {
+  #screen-main[data-searching][data-bucket-head][data-date-hint] {
+    --bucket-head: calc(3.7rem + 2.9rem + var(--date-hint));
+  }
+}
+
+/* The hint: one line in the chips' panel dress, where the chips' row would start; the chips
+   stand under it. Never wider than the bar; cut with an ellipsis (its title holds it whole). */
+#search-date-hint:not([hidden]) {
+  position: absolute;
+  top: calc(var(--search-bar) / 2 + 0.35rem);
+  left: calc(var(--float-edge) + env(safe-area-inset-left));
+  right: calc(var(--float-edge) + env(safe-area-inset-right));
+  box-sizing: border-box;
+  height: 1.6rem;
+  /* Up to 400px the author disc hangs under the bar's left end: the hint stands under it. */
+  margin: var(--hint-drop, 0px) 0 0;
+  padding: 0 0.75rem;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--shadow) 35%, transparent);
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: calc(1.6rem - 2px);
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  z-index: var(--z-chips);
+  /* A tap on it opens the Dates panel (the detail one tap away, R5). */
+  cursor: pointer;
+}
+
+#screen-main[data-date-hint] #search-bucket-row:not([hidden]) {
+  margin-top: calc(var(--date-hint) + var(--hint-drop, 0px));
+}
+
+/* While a panel hangs under the bar it covers the hint but for a sliver: the hint steps aside
+   (the Dates panel says what it will write in its own line). */
+#search-float:has(> #search-dates-panel:not([hidden])) ~ #search-date-hint,
+#search-float:has(> #labels-panel:not([hidden])) ~ #search-date-hint {
+  visibility: hidden;
+}
+
 #search-bucket-row:not([hidden]) {
   position: absolute;
   top: calc(var(--search-bar) / 2 + 0.35rem);
@@ -1502,19 +1719,22 @@ li[data-labels-below] > .meta > .label-chips {
 
 /* The two-row phone bar is taller: the chips stand under its foot. */
 @media (max-width: 480px) {
-  #screen-main[data-searching][data-labels] #search-bucket-row:not([hidden]) {
+  #screen-main[data-searching][data-labels] #search-bucket-row:not([hidden]),
+  #screen-main[data-searching][data-labels] #search-date-hint:not([hidden]) {
     top: calc(var(--search-bar) / 2 + var(--toggle-hit) + 11px);
   }
 }
 
 /* The kinds of link hang under the bar while Links is on: the chips stand
    under them, never over them. */
-#screen-main[data-link-kinds] #search-bucket-row:not([hidden]) {
+#screen-main[data-link-kinds] #search-bucket-row:not([hidden]),
+#screen-main[data-link-kinds] #search-date-hint:not([hidden]) {
   top: calc(var(--search-bar) / 2 + 0.35rem + var(--toggle-hit) + 3px);
 }
 
 @media (max-width: 480px) {
-  #screen-main[data-link-kinds][data-searching][data-labels] #search-bucket-row:not([hidden]) {
+  #screen-main[data-link-kinds][data-searching][data-labels] #search-bucket-row:not([hidden]),
+  #screen-main[data-link-kinds][data-searching][data-labels] #search-date-hint:not([hidden]) {
     top: calc(var(--search-bar) / 2 + 2 * var(--toggle-hit) + 14px);
   }
 }
@@ -1751,6 +1971,13 @@ li[data-labels-below] > .meta > .label-chips {
    up as well it hangs under their row, so the two never meet. Wider, it stays on the line, left of
    Links. */
 @media (max-width: 400px) {
+  /* `#2425 vibe-talk-search-date-filter`: the date hint and the chips stand below the hung disc
+     too (`--hint-drop` on the hint's margin and the chips'), never over it, so it stays a whole
+     target; the list already starts below it (`--hang-foot`). */
+  #screen-main[data-searching][data-date-hint] {
+    --hint-drop: calc(var(--kinds-gap) + var(--toggle-hit));
+  }
+
   #screen-main[data-searching] #author-filter {
     position: absolute;
     top: calc(100% + 1px + var(--kinds-gap));
@@ -1808,11 +2035,13 @@ li[data-labels-below] > .meta > .label-chips {
     padding-top: calc(0.35rem + var(--bucket-head));
   }
 
-  #screen-main[data-searching] #search-bucket-row:not([hidden]) {
+  #screen-main[data-searching] #search-bucket-row:not([hidden]),
+  #screen-main[data-searching] #search-date-hint:not([hidden]) {
     top: calc(var(--search-bar) / 2 + 0.35rem + var(--toggle-hit) + 3px);
   }
 
-  #screen-main[data-link-kinds][data-searching] #search-bucket-row:not([hidden]) {
+  #screen-main[data-link-kinds][data-searching] #search-bucket-row:not([hidden]),
+  #screen-main[data-link-kinds][data-searching] #search-date-hint:not([hidden]) {
     top: calc(var(--search-bar) / 2 + 0.35rem + 2 * var(--toggle-hit) + 6px);
   }
 }

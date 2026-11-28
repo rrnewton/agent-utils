@@ -83,6 +83,8 @@ export interface FilterChipsDependencies {
 
 /** The listeners, mounted. */
 export interface FilterChips {
+  /** `#2425`: the field's text was set by a control (the Dates panel): run it as if typed. */
+  applyField(): void;
   /** Take every listener down again. */
   unmount(): void;
 }
@@ -230,5 +232,5 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
       deps.swallow(event);
     }
   });
-  return { unmount };
+  return { applyField: () => { deps.historyReset(); fieldChanged(); }, unmount };
 }

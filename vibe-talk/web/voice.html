@@ -324,11 +324,30 @@
                 autocomplete="off"
                 data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                 placeholder="Search loaded messages"
-                aria-label="Search loaded messages; Enter searches older messages; Up and Down recall previous searches"
-                title="Filters the messages loaded here, and searches the server's copy past them. Words match anywhere, in any case and without accents; &quot;a phrase&quot;, OR, -word, from:name, in:thread, in:main, has:link, before: and after: a date. Enter searches older messages, a few pages at a time. Up and Down step through the searches you ran before."
+                aria-label="Search loaded messages; after: and before: take a date or a number of days, as after:7d; Enter searches older messages; Up and Down recall previous searches"
+                aria-describedby="search-date-hint"
+                title="Filters the messages loaded here, and searches the server's copy past them. Words match anywhere, in any case and without accents; &quot;a phrase&quot;, OR, -word, from:name, in:thread, in:main, has:link, before: and after: a date (2026-11-20) or days back (7d, today, yesterday). Enter searches older messages, a few pages at a time. Up and Down step through the searches you ran before."
                 hidden
               />
               <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>
+              <!--
+                `#2425 vibe-talk-search-date-filter` (owner 2026-11-27: "a calendar icon in the
+                search bar and clicking it should provide an option for last K days or since
+                DATE"). First of the bar's toggles, over the channel only, as Labels stands: the toggles after
+                it keep the adjacency the owner set (Whose beside Links `#251`, Links beside Pinned `#211`,
+                Pinned beside the glass `#206`, `#1853`). It opens the Dates
+                panel below; what the panel chooses is written into the field's text as after: /
+                before: tokens, so the text stays the one source of truth. Pressed while a date
+                stands in the text; its name says which.
+              -->
+              <button id="search-dates" class="icon-button" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="search-dates-panel" aria-pressed="false" aria-label="Dates: any time" title="Dates: any time" hidden>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3.5" y="5" width="17" height="15.5" rx="2" />
+                  <path d="M3.5 9.5h17" />
+                  <path d="M8 3v4" />
+                  <path d="M16 3v4" />
+                </svg>
+              </button>
               <!--
                 `#1852 vibe-talk-search-whole-threads-toggle`. Whole threads, a fixed-width toggle
                 icon on this bar with the others (it stood as an "Entire threads" chip in the
@@ -458,7 +477,61 @@
                 <ol id="labels-listbox" role="listbox" aria-label="Filter by label"></ol>
                 <p id="labels-panel-state" class="hint" role="status"></p>
               </div>
+              <!--
+                `#2425 vibe-talk-search-date-filter`. The Dates panel, in the Labels panel's shape:
+                hung under the bar over the list, full width on a phone. Last K days, Since,
+                Before and Between (either end may stay empty). It says the tokens it will write
+                before it writes them; Use dates writes them into the field (replacing the ones it
+                owns, keeping every other word) and runs the search at once, as typing would.
+              -->
+              <div id="search-dates-panel" role="dialog" aria-labelledby="search-dates-title" hidden>
+                <p id="search-dates-title" class="search-dates-title">Dates</p>
+                <div class="search-dates-choices" role="radiogroup" aria-labelledby="search-dates-title">
+                  <div class="search-dates-choice">
+                    <label><input id="search-dates-any" type="radio" name="search-dates-mode" value="any" />Any time</label>
+                  </div>
+                  <div class="search-dates-choice">
+                    <label><input id="search-dates-last" type="radio" name="search-dates-mode" value="last" />Last</label>
+                    <span class="search-dates-value">
+                      <button id="search-dates-k7" class="chip search-dates-k" type="button" data-days="7" aria-pressed="false" aria-label="Last 7 days">7</button>
+                      <button id="search-dates-k30" class="chip search-dates-k" type="button" data-days="30" aria-pressed="false" aria-label="Last 30 days">30</button>
+                      <button id="search-dates-k90" class="chip search-dates-k" type="button" data-days="90" aria-pressed="false" aria-label="Last 90 days">90</button>
+                      <label class="search-dates-days"><input id="search-dates-days" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" type="number" inputmode="numeric" min="0" max="99999" step="1" value="7" aria-label="Number of days" />days</label>
+                    </span>
+                  </div>
+                  <div class="search-dates-choice">
+                    <label for="search-dates-since"><input id="search-dates-since-mode" type="radio" name="search-dates-mode" value="since" aria-label="Since" />Since</label>
+                    <input id="search-dates-since" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" type="date" aria-label="Since date" />
+                  </div>
+                  <div class="search-dates-choice">
+                    <label for="search-dates-before"><input id="search-dates-before-mode" type="radio" name="search-dates-mode" value="before" aria-label="Before" />Before</label>
+                    <input id="search-dates-before" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" type="date" aria-label="Before date" />
+                  </div>
+                  <div class="search-dates-choice">
+                    <label for="search-dates-from"><input id="search-dates-between-mode" type="radio" name="search-dates-mode" value="between" aria-label="Between" />Between</label>
+                    <span class="search-dates-range">
+                      <input id="search-dates-from" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" type="date" aria-label="Between, first day" />
+                      <span aria-hidden="true">–</span>
+                      <input id="search-dates-to" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" type="date" aria-label="Between, last day" />
+                    </span>
+                  </div>
+                </div>
+                <p id="search-dates-preview" class="search-dates-preview" aria-live="polite"></p>
+                <p id="search-dates-error" class="search-dates-error" role="alert" hidden></p>
+                <div class="search-dates-actions">
+                  <button id="search-dates-clear" class="chip" type="button">Clear</button>
+                  <button id="search-dates-use" class="search-dates-use" type="button">Use dates</button>
+                </div>
+              </div>
             </div>
+            <!--
+              `#2425 vibe-talk-search-date-filter` (owner: "remind me the syntax"). One line under the
+              open bar over the channel: the date syntax with a real example, or the date standing in
+              the query. It floats over the list as the bucket chips do and its height is in the
+              head room the list keeps (--date-hint), so it never covers the first row and never
+              moves the row being read.
+            -->
+            <p id="search-date-hint" class="search-date-hint" hidden></p>
             <!--
               `#1797 vibe-talk-search-bucket-toggles` (owner 145/146, refining
               `#1786`), pinned by `#1899 vibe-talk-search-bucket-chips-pinned`.

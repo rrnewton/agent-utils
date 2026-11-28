@@ -921,7 +921,12 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         const rect = first.getBoundingClientRect();
         const panelBottom = panel.getBoundingClientRect().bottom;
         const key = `${deps.searchKey()}|${first.getAttribute("data-id") || ""}`;
-        if (rect.top < panelBottom - 1 && rect.bottom > panelBottom && key !== parkedFor) {
+        // `#2425`: the date hint stands over the chips, so the floating stack is taller and a short
+        // first row can stand WHOLLY under it. Covered is any part of the row on the list's screen
+        // above the panel's bottom; a row wholly above the screen (`#2258`) is still left alone.
+        const area = el("scroll-area") as HTMLElement | undefined;
+        const screenTop = Math.max(0, area && typeof area.getBoundingClientRect === "function" ? area.getBoundingClientRect().top : 0);
+        if (rect.top < panelBottom - 1 && rect.bottom > screenTop && key !== parkedFor) {
           parkedFor = key;
           deps.intoView(first, "start");
         }
