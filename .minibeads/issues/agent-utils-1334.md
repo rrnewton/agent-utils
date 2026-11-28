@@ -1,12 +1,13 @@
 ---
 title: 'chat-thread-bind: bind an existing chat thread to a sub-agent'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-11-11T17:55:23+00:00
-updated_at: 2026-11-11T17:57:31+00:00
+updated_at: 2026-11-28T14:20:10-05:00
+closed_at: 2026-11-28T14:20:10-05:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ updated_at: 2026-11-11T17:57:31+00:00
 # Notes
 
 Owner rush replies 392-395, relayed by coordb. Prior art: #917 chat-bang-commands (b6fb7609, 9e9b1bdb, 53bd4459) and ai_docs/transient/2026-11-06-chat-bang-commands-design.md. Cross-host bindings remain v2.
+
+## Resolution
+
+Landed on main as 785adf6c (2026-11-12, "agentctl: chat open-thread, the coordinator-side !@NAME"); this close records it. `agentctl chat open-thread` (`rs/agentctl/src/cli.rs`) runs through `chat_service.rs` into `BridgeState::open_bound_thread` in `rs/agentctl/src/chat_runtime.rs`, which posts the root message, creates the #917 binding exactly as `!@NAME` does, and admits the owner's text as the bound agent's first request. The plain-words path and the `!@NAME <text>` fallback are in the agentctl-chat and coordinator skills, and the `!help` text mentions plain-words asks. Test: `open_thread_binds_and_delivers_the_owners_words_to_the_agent` in `chat_runtime.rs`. Binding an existing thread (`!bind`), rebind-moves and one-thread-per-agent enforcement stay shelved, as the design says.
