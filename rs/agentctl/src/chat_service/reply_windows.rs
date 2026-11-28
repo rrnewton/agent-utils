@@ -246,6 +246,23 @@ impl ReplyWindowWatch {
             &mut notify,
             &mut |line| service_log(line),
         );
+        // A provider gap the bridge kept running through: one pane line, one owner notice
+        // (#2440 D5).
+        {
+            let has_alarm = alarm.is_some();
+            let mut post_owner = |notice: Notice| {
+                if let Some(alarm) = alarm.as_deref_mut() {
+                    post_alarm_notices(alarm, vec![notice], state, reborrow(&mut transport));
+                }
+            };
+            super::gap_reconcile::gap_reconcile_step(
+                state,
+                chat_runtime::unix_millis(),
+                &mut notify,
+                has_alarm.then_some(&mut post_owner as &mut dyn FnMut(Notice)),
+                &mut |line| service_log(line),
+            );
+        }
         if let Some(alarm) = alarm {
             capacity_alarm(
                 state,

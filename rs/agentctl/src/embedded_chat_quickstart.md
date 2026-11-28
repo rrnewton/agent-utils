@@ -150,9 +150,10 @@ Every `run` log line begins with the time, and the provider logs each
 subscription it opens and each reconnect it waits for.
 `agentctl chat userguide` documents plugin safety, the outbound NDJSON contract,
 exact local commit receipts, reply capture, explicit route closure and bounded
-retirement, fail-closed provider gaps, recovery, and service-manager limits. A
-status with `healthy: false` and an unresolved gap is not live success; protocol
-v1 intentionally refuses automatic reconnect.
+retirement, provider gaps (admitted at their far side and reconciled from
+history, with one alarm), recovery, and service-manager limits. A status with
+`healthy: false` and an unresolved gap mixed with other events is not live
+success; that one still refuses automatic reconnect.
 
 Only one bridge may serve a channel: a second `run` on a channel that already
 has a live bridge on this host exits at startup and names it. To point a running

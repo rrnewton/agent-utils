@@ -562,14 +562,37 @@ occurs every 300 seconds by default and can be changed with
 for prompts left waiting to be typed and tries them again while the agent is
 idle or done, as described under Prompt delivery below.
 
-A provider `Gap` is a terminal continuity warning in protocol v1. Its reason does not
-contain a recoverable range or completeness proof, so the host journals the
-incident, keeps the prior safe cursor, sends no commit, cancels that provider
-generation, and exits degraded. `chat status` reports `healthy: false` and the
-exact unresolved incident; `chat run` refuses automatic reconnect. One later
-message or checkpoint does not prove that a missing interval was recovered.
+A provider `Gap` never stops the bridge (#2440 chat-bridge-never-halt). A batch
+holding one gap event is admitted like a checkpoint: its cursor is the gap's far
+side, where the provider's stream goes on, and it is committed through the normal
+path, so `run` keeps running. The messages sent inside the gap come back from the
+provider's history: the Slack plugin's periodic rescan lists the last day of the
+channel and admits what the stream did not carry, and the request store's dedupe
+by message key drops any copy already admitted. The host records the gap in
+`gap.json` (phase `resolved` only, the record older hosts read) and in
+`gap-reconcile.json`: the reasons, the cursor before and after, and the window
+from the last commit before the gap to the gap. `run` puts ONE line in the
+agent's pane (message ID `chat-gap-reconciled-<observed ms>`) and posts ONE
+owner-alarm notice, each naming the window in ET and, when part of it is older
+than the rescan's 24 hours, saying those messages cannot be backfilled.
+`chat status` shows the record as `gap_reconcile` for 24 hours, with `finished`
+once the agent was told and the provider has stayed alive 5 minutes past the
+gap (several rescan passes); `chat health` reports an unfinished one as
+DEGRADED. An older host never reads `gap-reconcile.json`, so a rollback leaves
+an unfinished reconcile unfinished.
 
-An operator may approve a retry only when the saved boundary is exactly one
+Only a gap mixed with other events in one batch, which breaks the protocol, keeps
+the old halt: the host journals it `unresolved`, keeps the prior cursor, sends no
+commit and refuses automatic reconnect until an operator acts. A provider gap
+that arrives while an interrupted admission waits for its exact replay
+supersedes that admission (the provider will not replay it, and its messages
+are inside the gap's window).
+
+The retry approvals below are optional now. They apply to an `unresolved` gap an
+older host journaled for a provider gap, which this host no longer refuses to
+reconnect past: its next admitted batch resolves the gap and opens a reconcile
+for its window. An operator may still approve a retry of the kept cursor
+instead, but only when the saved boundary is exactly one
 committed `Checkpoint`, the gap proposes that same cursor, and independent
 provider evidence establishes that retrying that fixed cursor is safe. Stop the
 runner and review its backend's explicit retention-boundary recovery policy
@@ -596,8 +619,8 @@ messages excluded by a runtime prefix filter.
 
 Approval writes only a bounded audit under `gap-retries/`; it preserves the
 cursor, request bytes, UUIDs, and unresolved diagnostic. Status reports
-`gap_retry_approved: true` and `healthy: false`. The next generation may admit
-only the identical checkpoint at the kept cursor. A new exact provider commit
+`gap_retry_approved: true`. The identical checkpoint at the kept cursor takes the
+retry path below; any other batch resolves the gap as described above. A new exact provider commit
 resolves the gap and clears reconciliation; an interrupted resolution is
 repaired from that new committed receipt. A new gap revokes the approval before
 it is published. Audits retain original state and evidence without eviction,
@@ -3143,9 +3166,17 @@ resumes the tail with `--catchup=<n>` (or `--since=<seconds>`) and skips events 
 or before the saved sequence; a replayed event yields the identical batch. A new
 state directory first commits a checkpoint at the start instant (minus
 `initial_backfill_seconds`); older messages are never delivered. A tail `GAP`
-record, or a saved position the stream can no longer replay, is reported as a
-`Gap`, which stops `run` for operator review as described above. The tail
-exiting is a retryable failure, and the host reconnects from the saved cursor.
+record, a saved position the stream can no longer replay (an overflow on its
+standard error), or a saved cursor that is not a Slack cursor is reported as a
+`Gap` at its far side: a `slack1:since:` cursor taken when the gap was seen, so
+the host commits it, keeps running and resumes inside the stream's retention
+(#2440). The gap's reason says whether the rescan will backfill its window. The
+rescan ledger records that far side as `gap_cursor`: a subscription resuming
+from it admits messages back to the ledger's start rather than refusing those
+created before the time cursor, so the window is filled even across a restart.
+After an unknown saved cursor, what was delivered before is unknown, so nothing
+from before the gap is backfilled. The tail exiting is a retryable failure, and
+the host reconnects from the saved cursor.
 
 Quiet channels. The stream keeps events for about eight hours, and its sequence
 counts every event the client receives, while the client passes on only this
@@ -3166,8 +3197,8 @@ reopened tail goes a whole `cursor_refresh_seconds` without proving a position,
 the plugin stops reopening until it is restarted (reopening again would only
 restart catch-up from the same, older sequence). Should a channel event ever
 arrive at or before a proven position without having been delivered, the plugin
-reports a `Gap` instead of skipping it. The diagnostics log records each `cursor
-refresh` and each proven `position`.
+reports a `Gap` (at its far side, as above) instead of skipping it. The
+diagnostics log records each `cursor refresh` and each proven `position`.
 
 Reaction names. Slack names reactions by shortcode. The helper maps the
 bridge's default reactions through the Slack names defined with them, 👀 to
@@ -3540,11 +3571,12 @@ PID namespace the reader cannot see, as from a sandboxed shell with its own
 the lease without waiting and releases it at once, and a refused try reports
 the service as running with its process not visible), the request store is
 full and new messages are held (#2338), another bridge holds one of its channels, the event
-stream stopped on a gap or boundary mismatch, or the target agent is not
+stream stopped on a gap mixed with other events or a boundary mismatch, or the target agent is not
 registered, its pane is not alive, or Herdr detects no harness there. It is
 `DEGRADED` when the event stream has delivered nothing, not even a heartbeat,
 for `--stale-after` (default 5 minutes; the Slack provider sends a heartbeat
-every 30 seconds while idle), the subscription or send path is down, the owner
+every 30 seconds while idle), the subscription or send path is down, a provider
+gap's window is still being reconciled from history (#2440), the owner
 loop is failing, requests are stalled untyped or have uncertain delivery, a
 reply was retried 20 or more times or will never be sent, the request store
 is 90% full, the owner rescan has been held back by the host listing budget
@@ -3761,7 +3793,7 @@ logs one warning and one line when Git answers again. Git saying the file is
 not ignored still refuses at once. The earlier answer lives in the running
 process only: a new `chat run` checks afresh, three times, before it gives up.
 While the loop waits to start again, the provider's notices are still taken,
-so a provider that stops on an unrecoverable gap still ends `chat run`. A clean
+so a provider that stops on a protocol-breaking gap still ends `chat run`. A clean
 stop clears both records. `chat status` reports both
 under `service_health`: `owner_loop` while the loop has failed and not yet run
 for 60 seconds since it started again, and `profile_policy` while Git is not

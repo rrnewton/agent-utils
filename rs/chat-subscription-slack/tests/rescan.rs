@@ -2353,3 +2353,230 @@ fn an_unacknowledged_rescue_under_an_unrelated_cursor_is_offered_again_not_dropp
     assert_eq!(saved["pending"], Value::Null);
     assert!(!log(&directory).contains("recorded delivered and not offered again"));
 }
+
+clock!(gap_clock, GAP_NOW);
+
+#[test]
+fn a_provider_gap_never_halts_the_bridge_and_the_rescan_fills_its_window_across_a_restart() {
+    // #2440 D6: the tail reports lost events. The plugin offers one gap batch at the far side
+    // (a time cursor taken when the gap was seen), the bridge commits it and keeps running, and
+    // the message sent inside the gap, which the stream never carried, arrives once through the
+    // rescan, even after a restart that resumes from the far side (a time cursor otherwise
+    // refuses anything created before it).
+    let directory = scratch("gap");
+    let root = directory.join("bridge");
+    let state = host_state(&root, &directory);
+    let fake = FakeTransport::new();
+    let carried = ts(T0 + 5_000);
+    let in_gap = ts(T0 + 30_000);
+    let mut script = vec![stream_message(20, &carried, None, "before the gap")];
+    script.extend(heartbeats(2));
+    script.push(FakeStep::Line(
+        r#"{"type":"GAP","lost_from_iris_seq_id":21,"lost_to_iris_seq_id":40,"reason":"retention_overflow"}"#
+            .to_owned(),
+    ));
+    script.extend(heartbeats(3));
+    fake.push_script(script);
+    fake.push_history(listed(&carried, None, OWNER, "before the gap", &[]));
+    fake.push_history(listed(&in_gap, None, OWNER, "sent during the gap", &[]));
+    let mut backend = backend(&fake, gap_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &state.subscribe_request().unwrap()).unwrap();
+    let mut keys = drain(&mut subscription, &state, 2);
+    assert_eq!(keys.len(), 1, "the carried message");
+    // The gap is seen a minute in, after the message inside it was sent.
+    let seen = T0 + 60_000;
+    GAP_NOW.store(seen, Ordering::SeqCst);
+    keys.extend(drain(&mut subscription, &state, 3));
+    assert_eq!(keys.len(), 1, "the gap carries no message");
+    let far_side = format!("slack1:since:{seen}");
+    assert_eq!(state.cursor().unwrap().as_deref(), Some(far_side.as_str()));
+    let reconcile = state
+        .gap_reconcile()
+        .expect("the bridge opened a reconcile");
+    assert_eq!(reconcile.proposed_cursor, far_side);
+    assert!(
+        reconcile.reasons[0].contains("event stream lost events from sequence 21 to 40")
+            && reconcile.reasons[0].contains("the rescan admits the window's messages"),
+        "{:?}",
+        reconcile.reasons
+    );
+    let saved = ledger(&directory);
+    assert_eq!(saved["cursor"], far_side.as_str());
+    assert_eq!(saved["gap_cursor"], far_side.as_str());
+    subscription.close().unwrap();
+
+    // Restart from the far side: the rescan still reaches back for the gap's message.
+    let reopened = BridgeState::open(&root).unwrap();
+    fake.push_script(heartbeats(6));
+    GAP_NOW.store(T0 + 200_000, Ordering::SeqCst);
+    let request = reopened.subscribe_request().unwrap();
+    assert_eq!(
+        request.resume_from().map(ProviderCursor::as_str),
+        Some(far_side.as_str())
+    );
+    let mut subscription = ChatSubscription::open(&mut backend, &request).unwrap();
+    let rescued = drain(&mut subscription, &reopened, 4);
+    assert_eq!(rescued.len(), 1, "the message sent inside the gap, once");
+    keys.extend(rescued);
+    // Later passes offer it no more.
+    GAP_NOW.store(T0 + 400_000, Ordering::SeqCst);
+    assert!(drain(&mut subscription, &reopened, 4).is_empty());
+    subscription.close().unwrap();
+    let mut requests = reopened.request_keys().unwrap();
+    requests.sort();
+    keys.sort();
+    assert_eq!(requests, keys);
+    assert!(keys.iter().any(|key| {
+        fs::read_to_string(root.join("requests").join(format!("{key}.json")))
+            .unwrap()
+            .contains("sent during the gap")
+    }));
+    assert!(log(&directory).contains("resuming from the far side of a reported gap"));
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(gap_ack_clock, GAP_ACK_NOW);
+
+#[test]
+fn a_gap_committed_without_its_acknowledgement_still_resumes_as_known() {
+    // The bridge may commit the gap batch and lose the acknowledgement on the way back. The far
+    // side is the plugin's own cursor and nothing was offered after it, so a resume from it keeps
+    // the ledger's start, and the rescan can still reach back into the gap (#2440 D6).
+    let directory = scratch("gap-ack");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Line(
+        r#"{"type":"GAP","lost_from_iris_seq_id":21,"lost_to_iris_seq_id":40,"reason":"retention_overflow"}"#
+            .to_owned(),
+    )]);
+    let mut backend = backend(&fake, gap_ack_clock);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(&directory, Some("slack1:seq:20"), json!({})),
+    )
+    .unwrap();
+    let gap = next_batch_within(&mut subscription, 1).expect("the gap");
+    let tracking_since = ledger(&directory)["tracking_since_micros"].clone();
+    let far_side = format!("slack1:since:{T0}");
+    assert_eq!(gap.cursor().as_str(), far_side);
+    assert_eq!(ledger(&directory)["gap_cursor"], far_side.as_str());
+    // No acknowledgement: the subscription ends with the gap still pending.
+    drop(subscription);
+    GAP_ACK_NOW.store(T0 + 60_000, Ordering::SeqCst);
+    fake.push_script(heartbeats(2));
+    let subscription = ChatSubscription::open(
+        &mut backend,
+        &request(&directory, Some(&far_side), json!({})),
+    )
+    .unwrap();
+    assert_eq!(ledger(&directory)["tracking_since_micros"], tracking_since);
+    assert!(
+        !log(&directory).contains("not from the ledger's last acknowledged cursor"),
+        "{}",
+        log(&directory)
+    );
+    drop(subscription);
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+clock!(once_clock, ONCE_NOW);
+
+/// The request records whose saved text holds `needle`.
+fn requests_holding(root: &Path, state: &BridgeState, needle: &str) -> Vec<String> {
+    state
+        .request_keys()
+        .unwrap()
+        .into_iter()
+        .filter(|key| {
+            fs::read_to_string(root.join("requests").join(format!("{key}.json")))
+                .unwrap()
+                .contains(needle)
+        })
+        .collect()
+}
+
+#[test]
+fn an_owner_message_sent_inside_a_gap_is_delivered_exactly_once_across_restarts() {
+    // #2440 D5/D6 (lead-014's condition): an owner message posted inside a gap's window reaches
+    // the bridge EXACTLY ONCE after the reconcile: never lost, never twice, through a restart
+    // that resumes from the gap's far side, the stream carrying a late copy, and a second
+    // restart whose rescan lists the message again.
+    let directory = scratch("gap-once");
+    let root = directory.join("bridge");
+    let state = host_state(&root, &directory);
+    let fake = FakeTransport::new();
+    let before = ts(T0 + 5_000);
+    let inside = ts(T0 + 30_000);
+    let mut script = vec![stream_message(20, &before, None, "before the gap")];
+    script.extend(heartbeats(2));
+    script.push(FakeStep::Line(
+        r#"{"type":"GAP","lost_from_iris_seq_id":21,"lost_to_iris_seq_id":40,"reason":"retention_overflow"}"#
+            .to_owned(),
+    ));
+    script.extend(heartbeats(3));
+    fake.push_script(script);
+    fake.push_history(listed(&before, None, OWNER, "before the gap", &[]));
+    fake.push_history(listed(&inside, None, OWNER, "posted inside the gap", &[]));
+    let mut backend = backend(&fake, once_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &state.subscribe_request().unwrap()).unwrap();
+    drain(&mut subscription, &state, 2);
+    let seen = T0 + 60_000;
+    ONCE_NOW.store(seen, Ordering::SeqCst);
+    drain(&mut subscription, &state, 3);
+    let far_side = format!("slack1:since:{seen}");
+    assert_eq!(state.cursor().unwrap().as_deref(), Some(far_side.as_str()));
+    assert!(requests_holding(&root, &state, "posted inside the gap").is_empty());
+    subscription.close().unwrap();
+
+    // Restart 1, from the far side: the rescan delivers the message; then the stream carries a
+    // late copy of it, which is not a second request.
+    let first = BridgeState::open(&root).unwrap();
+    let mut script = heartbeats(3);
+    script.push(stream_message(41, &inside, None, "posted inside the gap"));
+    script.extend(heartbeats(4));
+    fake.push_script(script);
+    ONCE_NOW.store(T0 + 200_000, Ordering::SeqCst);
+    let request = first.subscribe_request().unwrap();
+    assert_eq!(
+        request.resume_from().map(ProviderCursor::as_str),
+        Some(far_side.as_str())
+    );
+    let mut subscription = ChatSubscription::open(&mut backend, &request).unwrap();
+    let new_keys = drain(&mut subscription, &first, 4);
+    let delivered = requests_holding(&root, &first, "posted inside the gap");
+    assert_eq!(delivered.len(), 1, "delivered, once");
+    assert_eq!(
+        new_keys, delivered,
+        "the only new request is the gap's message"
+    );
+    subscription.close().unwrap();
+
+    // Restart 2, from wherever the bridge now is: the rescan lists the message again and the
+    // stream replays nothing new; nothing is admitted twice.
+    let second = BridgeState::open(&root).unwrap();
+    fake.push_script(heartbeats(6));
+    ONCE_NOW.store(T0 + 500_000, Ordering::SeqCst);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &second.subscribe_request().unwrap()).unwrap();
+    assert!(drain(&mut subscription, &second, 4).is_empty());
+    subscription.close().unwrap();
+    assert_eq!(
+        requests_holding(&root, &second, "posted inside the gap"),
+        delivered,
+        "still one request, the same one"
+    );
+    assert_eq!(
+        second.request_keys().unwrap().len(),
+        2,
+        "before the gap, inside it"
+    );
+    // Exactly one prompt is owed for it: the request waits once for delivery to the agent.
+    let pending = second.pending_work_keys().unwrap();
+    assert_eq!(
+        pending.iter().filter(|key| delivered.contains(key)).count(),
+        1,
+        "{pending:?}"
+    );
+    fs::remove_dir_all(&directory).unwrap();
+}

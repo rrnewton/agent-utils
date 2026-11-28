@@ -24,6 +24,12 @@
 //! * `cursor`: the last cursor the bridge acknowledged. A subscription that resumes from any
 //!   other (an older plugin, or one without a ledger, moved the bridge on in between, so messages
 //!   it delivered were not recorded) restarts `tracking_since_micros` at its start.
+//! * `gap_cursor`: the far side of the last gap the plugin reported (#2440 D6), a time cursor
+//!   taken when the gap was seen. The bridge commits it and keeps running; the gap's messages,
+//!   created before it, come back through the rescan. A time cursor otherwise refuses anything
+//!   created before it, so a subscription resuming from this one admits messages back to
+//!   `tracking_since_micros` instead, and the window is filled even across a restart. Present
+//!   only after a gap; an older plugin ignores and drops it.
 //!
 //! The ledger is kept, and carried messages recorded, even while the rescan itself is off, so
 //! turning it on later never offers a message the stream already delivered.
@@ -242,6 +248,8 @@ pub struct Ledger {
     pub pending: Option<PendingRescue>,
     /// The last cursor the bridge acknowledged.
     pub cursor: Option<String>,
+    /// The far side of the last gap the plugin reported (see the module documentation).
+    pub gap_cursor: Option<String>,
 }
 
 impl Ledger {
@@ -264,6 +272,7 @@ impl Ledger {
             rescued: BTreeMap::new(),
             pending: None,
             cursor: None,
+            gap_cursor: None,
         };
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -303,6 +312,10 @@ impl Ledger {
                         pending => Some(PendingRescue::from_json(pending)?),
                     },
                     cursor: match value.get("cursor") {
+                        None | Some(Value::Null) => None,
+                        Some(cursor) => Some(cursor.as_str()?.to_owned()),
+                    },
+                    gap_cursor: match value.get("gap_cursor") {
                         None | Some(Value::Null) => None,
                         Some(cursor) => Some(cursor.as_str()?.to_owned()),
                     },
@@ -381,7 +394,7 @@ impl Ledger {
     ///
     /// Returns the I/O error; the caller logs it.
     pub fn save(&self) -> std::io::Result<()> {
-        let record = json!({
+        let mut record = json!({
             "schema": LEDGER_SCHEMA,
             "tracking_since_micros": u64::try_from(self.tracking_since_micros).unwrap_or(u64::MAX),
             "carried": self.carried.keys().collect::<Vec<_>>(),
@@ -389,6 +402,9 @@ impl Ledger {
             "pending": self.pending.as_ref().map(PendingRescue::to_json),
             "cursor": self.cursor,
         });
+        if let Some(gap_cursor) = &self.gap_cursor {
+            record["gap_cursor"] = json!(gap_cursor);
+        }
         let bytes = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
         // An unchanged ledger is not rewritten: batch acknowledgements save
         // after every batch, and most change nothing (#2098).

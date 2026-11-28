@@ -809,8 +809,10 @@ impl ChatSubscriptionBackend for SlackBackend {
                 None,
                 now,
                 Some(Initial::Gap(
-                    resume.clone().unwrap_or_default(),
-                    "the saved cursor is not a Slack provider cursor".to_owned(),
+                    "the saved cursor is not a Slack provider cursor, so the stream starts now; \
+                     which earlier messages were delivered is unknown, so messages from before \
+                     now are not backfilled"
+                        .to_owned(),
                 )),
             ),
         };
@@ -826,6 +828,26 @@ impl ChatSubscriptionBackend for SlackBackend {
             );
         }
         let rescan = open_rescan(&config, &diagnostics, resume.as_deref(), now);
+        // Resuming from the far side of a gap this plugin reported (#2440 D6): the gap's
+        // messages were created before that time cursor, so admit back to the ledger's start
+        // (the rescan's own floor) instead of refusing them as older than the lineage.
+        let created_floor_millis = match (&decoded, &rescan) {
+            (Some(Some(Cursor::Since(since))), Some(rescan))
+                if resume.is_some() && rescan.ledger.gap_cursor == resume =>
+            {
+                let tracking_since =
+                    u64::try_from(rescan.ledger.tracking_since_micros / 1_000).unwrap_or(u64::MAX);
+                if tracking_since < *since {
+                    diagnostics.log(&format!(
+                        "rescan: resuming from the far side of a reported gap; messages created \
+                         since {tracking_since} (the ledger's start) are admitted, so the gap's \
+                         window is filled"
+                    ));
+                }
+                created_floor_millis.min(tracking_since)
+            }
+            _ => created_floor_millis,
+        };
         // The client's path and arguments only: `cli_environment` values stay out of message
         // text, which the bridge stores and the agent sees.
         let download_command = config.cli.as_ref().map(|cli| {
@@ -920,11 +942,14 @@ fn open_rescan(
     }
     // A bridge moved on by something that kept no ledger may hold messages the ledger never
     // recorded carried; rescue nothing older than this subscription then.
+    // The far side of a gap this plugin reported is known too, even when the bridge committed
+    // it but its acknowledgement never came back: nothing else was offered after it (#2440 D6).
     let known_resume = resume == ledger.cursor.as_deref()
         || ledger
             .pending
             .as_ref()
-            .is_some_and(|pending| resume == Some(pending.cursor.as_str()));
+            .is_some_and(|pending| resume == Some(pending.cursor.as_str()))
+        || (resume.is_some() && resume == ledger.gap_cursor.as_deref());
     if !known_resume && ledger.tracking_since_micros < now_micros {
         diagnostics.log(&format!(
             "rescan: this subscription resumes from {}, not from the ledger's last acknowledged \
@@ -1270,7 +1295,8 @@ fn micros_ts(micros: u128) -> String {
 
 enum Initial {
     Checkpoint(String),
-    Gap(String, String),
+    /// A gap's reason; its far side is taken when it is offered.
+    Gap(String),
 }
 
 struct SlackDriver {
@@ -1455,9 +1481,34 @@ impl SlackDriver {
         Ok(SubscriptionItem::Batch(batch))
     }
 
-    fn gap(&mut self, cursor: String, reason: &str) -> Result<SubscriptionItem, BackendFailure> {
-        self.diagnostics.log(&format!("reporting gap: {reason}"));
-        let gap = ReconciliationGap::new(Some(crate::transport::bounded(reason)))
+    /// Report a gap at its far side (#2440 D6): a time cursor taken now, so the bridge commits
+    /// it, keeps running, and resumes inside the stream's retention, never into the same
+    /// overflow again. The gap's messages, created before it, come back through the rescan,
+    /// which the ledger keeps reaching back for after a restart (`gap_cursor`).
+    fn gap(&mut self, reason: &str) -> Result<SubscriptionItem, BackendFailure> {
+        let cursor = Cursor::Since((self.now_millis)()).encode();
+        let backfill = match self.rescan.as_ref() {
+            Some(rescan) if rescan.interval.is_some() => format!(
+                "; the rescan admits the window's messages from the channel's history (the \
+                 last {} h)",
+                rescan.window.as_secs() / 3_600
+            ),
+            _ => "; the rescan is off, so this gap's messages are NOT backfilled from history"
+                .to_owned(),
+        };
+        let reason = format!("{reason}{backfill}");
+        self.diagnostics.log(&format!(
+            "reporting gap: {reason}; the stream goes on from {cursor}"
+        ));
+        if let Some(rescan) = self.rescan.as_mut() {
+            rescan.ledger.gap_cursor = Some(cursor.clone());
+            if let Err(error) = rescan.ledger.save() {
+                self.diagnostics.log(&format!(
+                    "rescan: the ledger could not record the gap's far side: {error}"
+                ));
+            }
+        }
+        let gap = ReconciliationGap::new(Some(crate::transport::bounded(&reason)))
             .map_err(|error| failure("gap_invalid", error.detail().to_owned(), false))?;
         self.batch(cursor, CommittableEvent::Gap(gap))
     }
@@ -3020,7 +3071,7 @@ impl ChatSubscriptionDriver for SlackDriver {
             Some(Initial::Checkpoint(cursor)) => {
                 return self.batch(cursor, CommittableEvent::Checkpoint).map(Some);
             }
-            Some(Initial::Gap(cursor, reason)) => return self.gap(cursor, &reason).map(Some),
+            Some(Initial::Gap(reason)) => return self.gap(&reason).map(Some),
             None => {}
         }
         if let Some(item) = self.next_rescued()? {
@@ -3105,11 +3156,7 @@ impl ChatSubscriptionDriver for SlackDriver {
                     }
                 }
                 StreamWait::Record(StreamRecord::Gap(reason)) => {
-                    let cursor = self
-                        .last_cursor
-                        .clone()
-                        .unwrap_or_else(|| Cursor::Since(0).encode());
-                    return self.gap(cursor, &reason).map(Some);
+                    return self.gap(&reason).map(Some);
                 }
                 StreamWait::Record(StreamRecord::Event {
                     sequence,
@@ -3127,19 +3174,12 @@ impl ChatSubscriptionDriver for SlackDriver {
                             .filter(|&proven| sequence <= proven)
                             .filter(|_| previous.is_none_or(|last| sequence > last))
                         {
-                            let cursor = self
-                                .last_cursor
-                                .clone()
-                                .unwrap_or_else(|| Cursor::Sequence(proven).encode());
                             return self
-                                .gap(
-                                    cursor,
-                                    &format!(
-                                        "event {sequence} arrived at or before the proven stream \
+                                .gap(&format!(
+                                    "event {sequence} arrived at or before the proven stream \
                                          position {proven} without having been delivered; the \
                                          position proof was wrong and events may have been skipped"
-                                    ),
-                                )
+                                ))
                                 .map(Some);
                         }
                         continue;

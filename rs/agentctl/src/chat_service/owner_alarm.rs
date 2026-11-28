@@ -373,6 +373,19 @@ pub(crate) fn closure_notice(
     })
 }
 
+/// The one notice telling the owner the chat provider lost events in a gap that the bridge kept
+/// running through, and that the gap's messages are picked up from the channel's history
+/// (#2440 D5). One notice per gap.
+pub(crate) fn gap_reconcile_notice(
+    reconcile: &crate::chat_runtime::gap_reconcile::GapReconcile,
+    agent: &str,
+) -> Notice {
+    Notice {
+        text: format!("{WARNING}{}", reconcile.owner_notice(agent)),
+        place: Place::TopLevel,
+    }
+}
+
 impl OwnerAlarm {
     /// An alarm for requests held `after` or longer.
     #[cfg(test)]

@@ -41,6 +41,7 @@ use crate::stale_composer::{HerdrComposerPane, StaleComposer};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
 pub mod channel_lock;
+pub(crate) mod gap_reconcile;
 #[cfg(test)]
 mod grant_refresh_tests;
 mod headless_reminders;

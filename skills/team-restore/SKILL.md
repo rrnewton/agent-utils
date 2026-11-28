@@ -179,10 +179,16 @@ when no check failed; a held or skipped check is not a pass.
 
 - **Bridge restart-loops on `agent_not_found`:** its target agent isn't in Herdr. Restore that agent first;
   the bridge recovers on its next restart.
-- **Bridge stops on "unrecoverable stream gap" / retention overflow:** it was down longer than the event
-  stream keeps events. Stop the unit, move the state directory aside (`bridge.old-gap-<date>`), and
-  re-initialise with `agentctl chat init --config OLD/bridge.json --from OLD`. `--from` carries the event
-  sinks over. Then check the channel by hand for messages the gap swallowed.
+- **Alarm "the chat provider reported a gap":** nothing to repair. Since #2440 the bridge commits a
+  provider gap at its far side and keeps running; the rescan admits the gap's messages from the last 24 h
+  of history (`chat status` shows `gap_reconcile`). Check the channel by hand only for the part of the
+  window the alarm says cannot be backfilled.
+- **Bridge stops on "unrecoverable stream gap" / retention overflow** (a host from before #2440, or a gap
+  mixed with other events): it was down longer than the event stream keeps events. A current host
+  reconnects past an older host's provider gap by itself. Otherwise stop the unit, move the state
+  directory aside (`bridge.old-gap-<date>`), and re-initialise with
+  `agentctl chat init --config OLD/bridge.json --from OLD`. `--from` carries the event sinks over. Then
+  check the channel by hand for messages the gap swallowed.
 - **Revive refuses "death unverifiable" or "pane/cwd changed":** `agentctl stop NAME`, then
   `agentctl start NAME --profile P --resume SESSION`.
 - **Revive refuses "record has no native conversation ID" for Muse lanes:** the lane's session was

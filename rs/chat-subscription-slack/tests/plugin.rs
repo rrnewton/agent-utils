@@ -247,25 +247,66 @@ fn identical_replay_after_a_host_rollback() {
 }
 
 #[test]
-fn provider_gaps_and_unreadable_cursors_are_reported_as_gaps() {
-    let fake = FakeTransport::new();
-    fake.push_script(vec![FakeStep::Line(
-        r#"{"type":"GAP","lost_from_iris_seq_id":10,"lost_to_iris_seq_id":20,"reason":"retention_overflow"}"#
-            .to_owned(),
-    )]);
-    let mut backend = make_backend(&fake);
-    let mut subscription =
-        ChatSubscription::open(&mut backend, &request(Some("slack1:seq:9"), json!({}))).unwrap();
-    let gap = next_batch(&mut subscription);
-    assert!(gap.events()[0].requires_reconciliation());
-    assert_eq!(gap.cursor().as_str(), "slack1:seq:9");
+fn provider_gaps_and_unreadable_cursors_are_reported_at_their_far_side_and_the_stream_goes_on() {
+    // #2440 D6: a GAP record, a retention overflow on standard error and an unreadable saved
+    // cursor are each one gap batch whose cursor is the far side, a time cursor taken when the
+    // gap was seen (never the near side, which would resume into the same overflow, nor the
+    // beginning of time). Once the bridge commits it, the stream goes on: nothing halts.
+    let far_side = format!("slack1:since:{NOW_MILLIS}");
+    for (name, first) in [
+        (
+            "record",
+            FakeStep::Line(
+                r#"{"type":"GAP","lost_from_iris_seq_id":10,"lost_to_iris_seq_id":20,"reason":"retention_overflow"}"#
+                    .to_owned(),
+            ),
+        ),
+        (
+            "overflow",
+            FakeStep::Stderr("Error: position 9 is no longer queued (overflow)".to_owned()),
+        ),
+    ] {
+        let fake = FakeTransport::new();
+        fake.push_script(vec![
+            first,
+            owner_message(25, "1792000801.000100", None, "after the gap"),
+        ]);
+        let mut backend = make_backend(&fake);
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &request(Some("slack1:seq:9"), json!({})))
+                .unwrap();
+        let gap = commit_next(&mut subscription);
+        assert!(gap.events()[0].requires_reconciliation(), "{name}");
+        assert_eq!(gap.cursor().as_str(), far_side, "{name}");
+        let after = commit_next(&mut subscription);
+        assert_eq!(single_message(&after).text(), "after the gap", "{name}");
+        assert_eq!(after.cursor().as_str(), "slack1:seq:25", "{name}");
+    }
 
     let fake = FakeTransport::new();
+    fake.push_script(vec![owner_message(
+        30,
+        "1792000801.000100",
+        None,
+        "after the unknown cursor",
+    )]);
     let mut second = make_backend(&fake);
     let mut subscription =
         ChatSubscription::open(&mut second, &request(Some("18230"), json!({}))).unwrap();
-    let gap = next_batch(&mut subscription);
-    assert!(gap.events()[0].requires_reconciliation());
+    let gap = commit_next(&mut subscription);
+    assert_eq!(gap.cursor().as_str(), far_side);
+    match gap.events() {
+        [CommittableEvent::Gap(gap)] => {
+            let reason = gap.reason().unwrap();
+            assert!(reason.contains("not a Slack provider cursor"), "{reason}");
+            assert!(reason.contains("not backfilled"), "{reason}");
+        }
+        other => panic!("expected a gap, found {other:?}"),
+    }
+    assert_eq!(
+        single_message(&commit_next(&mut subscription)).text(),
+        "after the unknown cursor"
+    );
 }
 
 #[test]
@@ -1086,7 +1127,8 @@ fn an_event_behind_a_proven_position_is_a_gap_not_a_skip() {
         ChatSubscription::open(&mut backend, &request(Some("slack1:seq:100"), json!({}))).unwrap();
     checkpoint_at(&commit_next(&mut subscription), "slack1:seq:150");
     let gap = next_batch(&mut subscription);
-    assert_eq!(gap.cursor().as_str(), "slack1:seq:150");
+    // At its far side (#2440 D6): the bridge commits it and the stream goes on.
+    assert_eq!(gap.cursor().as_str(), format!("slack1:since:{NOW_MILLIS}"));
     match gap.events() {
         [CommittableEvent::Gap(gap)] => {
             assert!(gap.reason().unwrap().contains("event 120"), "{gap:?}");

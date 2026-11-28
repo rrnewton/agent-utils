@@ -150,7 +150,8 @@ proves:
 | Symptom | Fix |
 |---|---|
 | Bridge restart-loops on `agent_not_found` | Its target agent isn't in Herdr. Restore that agent. The bridge recovers on its next restart. |
-| Bridge stops on "unrecoverable stream gap" | It was down longer than the event stream keeps events. Stop the unit, move its state directory aside (`bridge.old-gap-<date>`), run `agentctl chat init --config OLD/bridge.json --from OLD`, then read the channel by hand for messages the gap swallowed. |
+| Pane and owner alarm "the chat provider reported a gap" | Nothing to repair: since #2440 the bridge commits a provider gap at its far side, keeps running, and the rescan admits the gap's messages from the last 24 h of history (`chat status` shows `gap_reconcile`). Read the channel by hand only for the part of the window the alarm says cannot be backfilled. |
+| Bridge stops on "unrecoverable stream gap" (a host from before #2440, or a gap mixed with other events) | It was down longer than the event stream keeps events. A current host reconnects past an older host's provider gap by itself. Otherwise stop the unit, move its state directory aside (`bridge.old-gap-<date>`), run `agentctl chat init --config OLD/bridge.json --from OLD`, then read the channel by hand for messages the gap swallowed. |
 | Revive refuses "record has no native conversation ID" | The session was never recorded. Before the next outage, run `agentctl --registry "$R" doctor --repair-native-sessions` while lanes are live. |
 | Revive refuses "death unverifiable" or "pane/cwd changed" | `agentctl stop NAME`, then `agentctl start NAME --profile P --resume SESSION`. |
 | A lane came back at a lower effort | `agentctl restart NAME --when-idle` relaunches it from its profile on the same session, at an idle turn boundary. |

@@ -35,6 +35,7 @@ use crate::agent::{self, DrainOptions, QueueMessageState};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
 pub(crate) mod bang;
+pub(crate) mod gap_reconcile;
 mod grants;
 mod held_replies;
 mod observe;
@@ -515,7 +516,9 @@ pub enum ChatRuntimeError {
     Invalid(String),
     /// The provider-neutral subscription generation failed.
     Subscription(SubscriptionError),
-    /// A provider declared an unrecoverable stream gap that must not be acknowledged.
+    /// A gap batch broke the protocol (a gap mixed with other events): it was journaled
+    /// unresolved and must not be acknowledged. A provider gap, one batch holding one gap event,
+    /// never raises this (#2440 D5): it is admitted at its far side.
     UnresolvedGap(String),
     /// A provider offered different content at the current inclusive cursor. The refusal is
     /// journaled in `boundary-mismatch.json`, and automatic reconnect is refused until an
@@ -1634,6 +1637,14 @@ struct GapDiagnostic {
 }
 
 impl GapDiagnostic {
+    /// Whether this gap stops the bridge until an operator acts: only a gap batch that broke the
+    /// protocol (a gap mixed with other events), which journals a second reason. A provider gap,
+    /// one batch holding one gap event, never does (#2440 D5): it is admitted like a checkpoint,
+    /// and an `unresolved` record an older bridge wrote for one is resolved by the next batch.
+    fn halts(&self) -> bool {
+        self.phase == GapPhase::Unresolved && self.reasons.len() != 1
+    }
+
     fn validate(&self) -> Result<()> {
         if self.version != STATE_VERSION
             || self.provider_sequence == 0
@@ -7662,7 +7673,7 @@ impl BridgeState {
         let _snapshot = self.lock_state_snapshot()?;
         let checkpoint = self.read_checkpoint()?;
         if let Some(gap) = self.gap_diagnostic()? {
-            if gap.phase == GapPhase::Unresolved
+            if gap.halts()
                 && self
                     .active_checkpoint_gap_retry(&gap, &checkpoint)?
                     .is_none()
@@ -8760,56 +8771,109 @@ impl BridgeState {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        // A provider gap, one batch holding one gap event, is admitted like a checkpoint: the
+        // cursor moves to the batch's, the gap's far side, and the window is reconciled from the
+        // provider's history (#2440 D5, see `gap_reconcile`). A gap mixed with other events
+        // breaks the protocol: it is journaled unresolved and halts until an operator acts.
+        let mut provider_gap = None;
         if !gap_reasons.is_empty() {
             if batch.events().len() != 1 || gap_reasons.len() != 1 {
                 gap_reasons.push(
                     "invalid mixed batch: a reconciliation gap must be the only child event"
                         .to_owned(),
                 );
+                let diagnostic = GapDiagnostic {
+                    version: STATE_VERSION,
+                    phase: GapPhase::Unresolved,
+                    provider_sequence: batch.sequence().get(),
+                    delivery_id: batch.delivery_id().as_str().to_owned(),
+                    proposed_cursor: batch.cursor().as_str().to_owned(),
+                    resume_cursor: checkpoint.cursor.clone(),
+                    reasons: gap_reasons,
+                    batch_fingerprint: batch_fingerprint.clone(),
+                    observed_at_millis: unix_millis(),
+                    resolved_at_millis: None,
+                    resolved_host_batch_sequence: None,
+                };
+                diagnostic.validate()?;
+                self.revoke_checkpoint_gap_retry_locked(&diagnostic)?;
+                write_document(&self.root.join("gap.json"), &diagnostic)?;
+                checkpoint.reconciliation_required = true;
+                checkpoint.updated_at_millis = unix_millis();
+                write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+                return Err(ChatRuntimeError::UnresolvedGap(format!(
+                    "sequence {} delivery {:?} was journaled without advancing cursor or acknowledging",
+                    batch.sequence().get(),
+                    batch.delivery_id().as_str()
+                )));
             }
-            let diagnostic = GapDiagnostic {
-                version: STATE_VERSION,
-                phase: GapPhase::Unresolved,
-                provider_sequence: batch.sequence().get(),
-                delivery_id: batch.delivery_id().as_str().to_owned(),
-                proposed_cursor: batch.cursor().as_str().to_owned(),
-                resume_cursor: checkpoint.cursor.clone(),
-                reasons: gap_reasons,
-                batch_fingerprint: batch_fingerprint.clone(),
-                observed_at_millis: unix_millis(),
-                resolved_at_millis: None,
-                resolved_host_batch_sequence: None,
-            };
-            diagnostic.validate()?;
-            self.revoke_checkpoint_gap_retry_locked(&diagnostic)?;
-            write_document(&self.root.join("gap.json"), &diagnostic)?;
-            checkpoint.reconciliation_required = true;
-            checkpoint.updated_at_millis = unix_millis();
-            write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
-            return Err(ChatRuntimeError::UnresolvedGap(format!(
-                "sequence {} delivery {:?} was journaled without advancing cursor or acknowledging",
-                batch.sequence().get(),
-                batch.delivery_id().as_str()
-            )));
+            // The same gap batch offered again at the boundary it already set was reconciled
+            // when it was first admitted.
+            let exact_boundary_replay = checkpoint.cursor.as_deref()
+                == Some(batch.cursor().as_str())
+                && checkpoint.boundary_batch_fingerprint.as_deref()
+                    == Some(batch_fingerprint.as_str());
+            if !exact_boundary_replay {
+                let diagnostic = GapDiagnostic {
+                    version: STATE_VERSION,
+                    phase: GapPhase::Unresolved,
+                    provider_sequence: batch.sequence().get(),
+                    delivery_id: batch.delivery_id().as_str().to_owned(),
+                    proposed_cursor: batch.cursor().as_str().to_owned(),
+                    resume_cursor: checkpoint.cursor.clone(),
+                    reasons: gap_reasons,
+                    batch_fingerprint: batch_fingerprint.clone(),
+                    observed_at_millis: unix_millis(),
+                    resolved_at_millis: None,
+                    resolved_host_batch_sequence: None,
+                };
+                diagnostic.validate()?;
+                provider_gap = Some(diagnostic);
+            }
         }
+        let fresh_provider_gap = provider_gap.is_some();
+        // The gap record this admission resolves: the provider gap above, or an unresolved one
+        // an older bridge wrote for a provider gap, which no longer stops the bridge. Only an
+        // operator-approved identical replay keeps the old retry path, and only a gap that broke
+        // the protocol still refuses everything else.
+        let mut resolving_gap = provider_gap;
         if let Some(gap) = self.gap_diagnostic()? {
             if gap.phase == GapPhase::Unresolved {
                 let approved = self.active_checkpoint_gap_retry(&gap, &checkpoint)?;
-                if approved.as_ref().is_none_or(|record| {
-                    record.boundary == GapRetryBoundary::CheckpointOnly
-                        && batch.events() != [CommittableEvent::Checkpoint]
-                }) || checkpoint.cursor.as_deref() != Some(batch.cursor().as_str())
-                    || checkpoint.boundary_batch_fingerprint.as_deref()
-                        != Some(batch_fingerprint.as_str())
-                    || usize::try_from(checkpoint.boundary_event_count).ok()
-                        != Some(batch.events().len())
-                {
-                    return Err(ChatRuntimeError::UnresolvedGap(
-                        "unresolved gap permits only its explicitly approved identical boundary replay".to_owned(),
-                    ));
+                let approved_replay = !fresh_provider_gap
+                    && !(approved.as_ref().is_none_or(|record| {
+                        record.boundary == GapRetryBoundary::CheckpointOnly
+                            && batch.events() != [CommittableEvent::Checkpoint]
+                    }) || checkpoint.cursor.as_deref() != Some(batch.cursor().as_str())
+                        || checkpoint.boundary_batch_fingerprint.as_deref()
+                            != Some(batch_fingerprint.as_str())
+                        || usize::try_from(checkpoint.boundary_event_count).ok()
+                            != Some(batch.events().len()));
+                if !approved_replay {
+                    if gap.halts() {
+                        return Err(ChatRuntimeError::UnresolvedGap(
+                            "unresolved gap permits only its explicitly approved identical boundary replay".to_owned(),
+                        ));
+                    }
+                    if resolving_gap.is_none() {
+                        resolving_gap = Some(gap);
+                    }
                 }
             }
         }
+        // The window a reconcile fills starts at the last commit before the gap.
+        let gap_window_from = if resolving_gap.is_some() {
+            self.current_commit_receipt(&checkpoint)
+                .ok()
+                .flatten()
+                .map(|receipt| {
+                    receipt
+                        .committed_at_millis
+                        .unwrap_or(receipt.prepared_at_millis)
+                })
+        } else {
+            None
+        };
         let mut restore_guard = None;
         match read_document::<AdmissionIntent>(&self.admission_path(), MAX_ADMISSION_INTENT_BYTES) {
             Ok(intent) => {
@@ -8852,6 +8916,11 @@ impl BridgeState {
                         && current_receipt_exact;
                     if exact_current_replay {
                         restore_guard = Some(intent.deferred_guard());
+                    } else if fresh_provider_gap && intent.rolled_back {
+                        // A provider gap supersedes an interrupted admission: the provider will
+                        // not offer that batch again, and its messages, inside the gap's window,
+                        // come back from the provider's history like the rest (#2440 D5). This
+                        // admission's own intent replaces the rolled-back one.
                     } else {
                         return Err(ChatRuntimeError::invalid(
                             "provider replay does not match the rolled-back admission transaction or current inclusive boundary",
@@ -8879,6 +8948,11 @@ impl BridgeState {
                         == checkpoint.boundary_batch_fingerprint.as_deref()
                     && self.active_boundary_acceptance(&checkpoint)?.is_some()
                 {
+                    accepted_boundary_replacement = true;
+                } else if fresh_provider_gap && restore_guard.is_none() {
+                    // A provider that reports a gap at the current cursor (an older plugin names
+                    // the gap's near side) carries no message: it replaces the boundary like a
+                    // checkpoint, and the cursor stays (#2440 D5).
                     accepted_boundary_replacement = true;
                 } else {
                     // The same offer recurs on every reconnect, so journal it and stop.
@@ -9303,8 +9377,9 @@ impl BridgeState {
                         sender_id,
                     ));
                 }
-                CommittableEvent::Checkpoint => {}
-                CommittableEvent::Gap(_) => unreachable!("gaps were rejected before admission"),
+                // Only a provider gap gets here (a mixed batch halted above): it carries no
+                // message, and its window is reconciled from the provider's history.
+                CommittableEvent::Checkpoint | CommittableEvent::Gap(_) => {}
             }
         }
 
@@ -9417,6 +9492,20 @@ impl BridgeState {
             self.save_rejection_reactions_locked(&rejection_candidates, &new_records);
         write_document(&self.admission_path(), &intent)?;
         self.admission_boundary()?;
+        if let Some(mut gap) = resolving_gap {
+            if fresh_provider_gap {
+                self.revoke_checkpoint_gap_retry_locked(&gap)?;
+            }
+            // Only ever `resolved` on disk: an older bridge refuses to reconnect on an
+            // `unresolved` gap and fails on a phase it does not know.
+            gap.phase = GapPhase::Resolved;
+            gap.resolved_at_millis = Some(unix_millis());
+            gap.resolved_host_batch_sequence = Some(host_batch_sequence);
+            gap.validate()?;
+            write_document(&self.root.join("gap.json"), &gap)?;
+            self.open_gap_reconcile_locked(&gap, gap_window_from, host_batch_sequence)?;
+            checkpoint.reconciliation_required = false;
+        }
         for record in &candidate_records {
             write_document(&self.request_path(&record.key), record)?;
             self.admission_boundary()?;
@@ -9593,6 +9682,8 @@ impl BridgeState {
         let unresolved_gap = gap
             .as_ref()
             .is_some_and(|diagnostic| diagnostic.phase == GapPhase::Unresolved);
+        // Only a gap that broke the protocol stops the bridge (#2440 D5).
+        let halting_gap = gap.as_ref().is_some_and(GapDiagnostic::halts);
         let gap_retry =
             if let Some(gap) = gap.as_ref().filter(|gap| gap.phase == GapPhase::Unresolved) {
                 self.active_checkpoint_gap_retry(gap, &checkpoint)?
@@ -9785,14 +9876,16 @@ impl BridgeState {
             "committed_batches": checkpoint.committed_batches,
             "runtime_evidence": {
                 "configuration_initialized": true,
-                "connected_now": if unresolved_gap || boundary_mismatch.is_some() { Value::Bool(false) } else { Value::Null },
-                "healthy": !unresolved_gap && boundary_mismatch.is_none(),
+                "connected_now": if halting_gap || boundary_mismatch.is_some() { Value::Bool(false) } else { Value::Null },
+                "healthy": !halting_gap && boundary_mismatch.is_none(),
                 "durable_batch_verified": latest_commit_confirmed && !unresolved_gap,
                 "latest_commit_receipt": commit_receipt,
                 "basis": if gap_retry.is_some() {
                     "operator approved an identical checkpoint retry; provider commit has not resolved the gap"
+                } else if halting_gap {
+                    "the provider sent a gap mixed with other events; no commit was sent and automatic reconnect is refused"
                 } else if unresolved_gap {
-                    "the provider declared a gap; no commit was sent and automatic reconnect is refused"
+                    "an older bridge recorded a provider gap; the next admitted batch resolves it and reconciles its window"
                 } else if boundary_mismatch.is_some() {
                     "the provider offered different content at the current cursor; no commit was sent and automatic reconnect is refused"
                 } else if boundary_acceptance.is_some() {
@@ -9859,6 +9952,8 @@ impl BridgeState {
         // Beside `phases`, outside the literal above, which is at the macro's recursion limit.
         status["stages"] = Value::Object(stages);
         status["relay_alarms"] = relay_alarms;
+        // The provider gap the bridge kept running through, for a day (#2440 D5).
+        status["gap_reconcile"] = self.gap_reconcile_status(now_millis);
         status["repoint"] = self.repoint_status_locked();
         // How the last prompt asked for replies (#896 chat-receipt-needs-evidence).
         status["reply_path"] = self.recorded_reply_path().unwrap_or(Value::Null);
@@ -24440,6 +24535,46 @@ pub(crate) mod tests {
         .expect("gap delivery")
     }
 
+    impl BridgeState {
+        /// Journal `batch`'s gap the way a bridge from before #2440 D5 did: an `unresolved`
+        /// gap.json, the cursor kept, `reconciliation_required` set, nothing acknowledged. The
+        /// operator retry path, and the resolution by the next admitted batch, start here.
+        fn journal_gap_like_older_build(&self, batch: &DeliveryBatch) -> Result<()> {
+            let mut checkpoint = self.read_checkpoint()?;
+            let reasons = batch
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    CommittableEvent::Gap(gap) => Some(
+                        gap.reason()
+                            .unwrap_or("provider reported an unspecified gap")
+                            .to_owned(),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let diagnostic = GapDiagnostic {
+                version: STATE_VERSION,
+                phase: GapPhase::Unresolved,
+                provider_sequence: batch.sequence().get(),
+                delivery_id: batch.delivery_id().as_str().to_owned(),
+                proposed_cursor: batch.cursor().as_str().to_owned(),
+                resume_cursor: checkpoint.cursor.clone(),
+                reasons,
+                batch_fingerprint: batch_fingerprint(batch)?,
+                observed_at_millis: unix_millis(),
+                resolved_at_millis: None,
+                resolved_host_batch_sequence: None,
+            };
+            diagnostic.validate()?;
+            self.revoke_checkpoint_gap_retry_locked(&diagnostic)?;
+            write_document(&self.root.join("gap.json"), &diagnostic)?;
+            checkpoint.reconciliation_required = true;
+            checkpoint.updated_at_millis = unix_millis();
+            write_document(&self.root.join("checkpoint.json"), &checkpoint)
+        }
+    }
+
     #[test]
     fn nonce_encoding_is_canonical_unpadded_base64url() {
         assert_eq!(base64url_nonce([0; 16]), "AAAAAAAAAAAAAAAAAAAAAA");
@@ -25746,7 +25881,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn interrupted_target_provider_gap_is_durable_and_stops_reconnect_before_guard_matching() {
+    fn interrupted_target_provider_gap_supersedes_the_rolled_back_admission_and_keeps_running() {
         let root = temporary("admission-gap-after-interruption");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let mut backend = Backend {
@@ -25801,25 +25936,38 @@ pub(crate) mod tests {
             &reopened.subscribe_request().expect("resume current cursor"),
         )
         .expect("gap subscription");
+        // A provider gap supersedes the interrupted admission (#2440 D5): the provider will not
+        // offer that batch again, so the gap is admitted at its far side and the bridge keeps
+        // running; the interrupted batch's messages come back from the provider's history.
         assert!(matches!(
             consume_one(&mut gap_subscription, &reopened),
-            Err(ChatRuntimeError::UnresolvedGap(_))
+            Ok(ConsumedItem::Batch(_))
         ));
         assert_eq!(next_calls.load(AtomicOrdering::SeqCst), 1);
-        assert!(acknowledged.lock().expect("ack lock").is_empty());
         assert_eq!(
-            reopened.cursor().expect("safe cursor").as_deref(),
-            Some("cursor-current")
+            &*acknowledged.lock().expect("ack lock"),
+            &["delivery-gap-after-interruption"]
         );
-        assert!(reopened.admission_path().exists());
+        assert_eq!(
+            reopened.cursor().expect("far side").as_deref(),
+            Some("cursor-gap")
+        );
+        assert!(!reopened.admission_path().exists());
         assert_eq!(
             reopened.status().expect("status")["unresolved_gap"]["phase"],
-            "unresolved"
+            "resolved"
         );
-        assert!(matches!(
-            reopened.subscribe_request(),
-            Err(ChatRuntimeError::UnresolvedGap(_))
-        ));
+        let reconcile = reopened.gap_reconcile().expect("reconcile opened");
+        assert_eq!(reconcile.prior_cursor.as_deref(), Some("cursor-current"));
+        assert_eq!(reconcile.proposed_cursor, "cursor-gap");
+        assert_eq!(
+            reopened
+                .subscribe_request()
+                .expect("the bridge keeps running")
+                .resume_from()
+                .map(ProviderCursor::as_str),
+            Some("cursor-gap")
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -26177,10 +26325,9 @@ pub(crate) mod tests {
         state
             .confirm_batch_commit(&admission)
             .expect("committed boundary");
-        assert!(matches!(
-            state.admit_batch(&gap_delivery(1, "cursor-safe", "gap-1")),
-            Err(ChatRuntimeError::UnresolvedGap(_))
-        ));
+        state
+            .journal_gap_like_older_build(&gap_delivery(1, "cursor-safe", "gap-1"))
+            .expect("an older bridge journals the gap unresolved");
         write_document(
             &root.join("operator-evidence.json"),
             &json!({"reviewed": "retained boundary"}),
@@ -26265,7 +26412,11 @@ pub(crate) mod tests {
         assert_eq!(fixture_files(&state.root), approved_files);
         let status = state.status().expect("approved status");
         assert_eq!(status["gap_retry_approved"], true);
-        assert_eq!(status["runtime_evidence"]["healthy"], false);
+        // An older bridge's provider gap no longer stops this one (#2440 D5): any other batch
+        // resolves it and reconciles its window (see
+        // `older_build_gap_is_resolved_by_the_next_batch_and_reconciled`); the approval keeps
+        // only the identical replay below on the retry path.
+        assert_eq!(status["runtime_evidence"]["healthy"], true);
         assert_eq!(
             state
                 .subscribe_request()
@@ -26274,18 +26425,6 @@ pub(crate) mod tests {
                 .map(ProviderCursor::as_str),
             Some("cursor-safe")
         );
-
-        for forbidden in [
-            checkpoint_delivery(4, "cursor-later"),
-            indexed_delivery_at(4, 10, "cursor-safe", "new message"),
-            boundary_delivery_at(4, 10, "cursor-safe", "mixed boundary"),
-        ] {
-            assert!(matches!(
-                state.admit_batch(&forbidden),
-                Err(ChatRuntimeError::UnresolvedGap(_))
-            ));
-            assert_eq!(fixture_files(&state.root), approved_files);
-        }
         let admission = state
             .admit_batch(&checkpoint_delivery(4, "cursor-safe"))
             .expect("exact replay");
@@ -26365,8 +26504,9 @@ pub(crate) mod tests {
             .expect("gap")
             .expect("incident")
             .observed_at_millis;
-        // A fresh gap is a live provider's problem: nothing is written, the operator
-        // path stays in charge, and the subscription still refuses.
+        // A fresh gap is a live provider's problem: nothing is written. An older bridge's
+        // provider gap no longer stops the subscription (#2440 D5); it resumes from the kept
+        // cursor and the next batch resolves the gap.
         let before = fixture_files(&state.root);
         assert_eq!(
             state
@@ -26375,10 +26515,14 @@ pub(crate) mod tests {
             None
         );
         assert_eq!(fixture_files(&state.root), before);
-        assert!(matches!(
-            state.subscribe_request(),
-            Err(ChatRuntimeError::UnresolvedGap(_))
-        ));
+        assert_eq!(
+            state
+                .subscribe_request()
+                .expect("an older gap never refuses reconnect")
+                .resume_from()
+                .map(ProviderCursor::as_str),
+            Some("cursor-safe")
+        );
         // An outage-aged gap approves its own retry with the evidence recorded in the
         // same audit an operator approval writes, keeping the cursor so the provider
         // replay backfills the down window.
@@ -26511,7 +26655,11 @@ pub(crate) mod tests {
         let current = BridgeState::inspect(&stale.root).expect("current configuration");
         approve_fixture_gap(&current, None).expect("approve current configuration");
         let approved = fixture_files(&stale.root);
-        assert!(stale.subscribe_request().is_err());
+        // An older bridge's provider gap no longer stops a subscription (#2440 D5): the stale
+        // configuration still never approves a retry (above), and subscribing writes nothing.
+        stale
+            .subscribe_request()
+            .expect("an older gap never refuses reconnect");
         assert_eq!(fixture_files(&stale.root), approved);
         current
             .subscribe_request()
@@ -26567,20 +26715,25 @@ pub(crate) mod tests {
             .read_checkpoint_gap_retry(&original)
             .expect("audit")
             .expect("record");
-        assert!(matches!(
-            state.admit_batch(&gap_delivery(2, "cursor-safe", "gap-again")),
-            Err(ChatRuntimeError::UnresolvedGap(_))
-        ));
+        // A fresh provider gap is admitted like a checkpoint (#2440 D5) and revokes the
+        // approval before its own record replaces the old one.
+        let admission = state
+            .admit_batch(&gap_delivery(2, "cursor-safe", "gap-again"))
+            .expect("a provider gap is admitted");
+        state
+            .confirm_batch_commit(&admission)
+            .expect("the gap batch commits");
         let revoked: CheckpointGapRetryRecord =
             read_document(&audit_path, MAX_GAP_RETRY_BYTES).expect("revoked audit");
         assert!(revoked.superseded_by.is_some());
         assert_eq!(revoked.gap_json, audit_before.gap_json);
         assert_eq!(revoked.evidence_json, audit_before.evidence_json);
-        assert!(state.subscribe_request().is_err());
+        state
+            .subscribe_request()
+            .expect("the bridge keeps running after a gap");
         assert_eq!(state.status().expect("status")["gap_retry_approved"], false);
         // Even an identical incident cannot regain authority from the old sidecar.
         write_document(&state.root.join("gap.json"), &original).expect("identical diagnostic");
-        assert!(state.subscribe_request().is_err());
         assert!(approve_fixture_gap(&state, None).is_err());
         fs::remove_dir_all(&state.root).expect("cleanup");
     }
@@ -26766,10 +26919,15 @@ pub(crate) mod tests {
 
     #[test]
     fn exact_boundary_gap_retry_rejects_changed_events_before_provider_acknowledgement() {
-        let state = exact_gap_fixture("exact-gap-event-refusal");
-        approve_exact_gap(&state).expect("approve");
-        let approved = fixture_files(&state.root);
-        for variant in ["text", "payload", "order", "count", "cursor", "checkpoint"] {
+        // A changed batch at the approved boundary's cursor is never the approved replay. Since
+        // #2440 D5 an older bridge's provider gap no longer refuses it as a gap: it meets the
+        // boundary check, which halts on different content at the current cursor, with nothing
+        // acknowledged and the gap left unresolved. (A batch at another cursor is simply the next
+        // batch and resolves the gap: see
+        // `older_build_gap_is_resolved_by_the_next_batch_and_reconciled`.)
+        for variant in ["text", "payload", "order", "count", "checkpoint"] {
+            let state = exact_gap_fixture(&format!("exact-gap-event-refusal-{variant}"));
+            approve_exact_gap(&state).expect("approve");
             let acknowledged = Arc::new(Mutex::new(Vec::new()));
             let mut backend = Backend {
                 items: Some(VecDeque::from([SubscriptionItem::Batch(
@@ -26784,13 +26942,18 @@ pub(crate) mod tests {
             let mut subscription = ChatSubscription::open(&mut backend, &request).expect("backend");
             let outcome = consume_one(&mut subscription, &state);
             assert!(
-                matches!(outcome, Err(ChatRuntimeError::UnresolvedGap(_))),
+                matches!(outcome, Err(ChatRuntimeError::BoundaryMismatch(_))),
                 "{variant}: {outcome:?}"
             );
             assert!(acknowledged.lock().unwrap().is_empty(), "{variant}");
-            assert_eq!(fixture_files(&state.root), approved, "{variant}");
+            assert_eq!(
+                state.gap_diagnostic().unwrap().unwrap().phase,
+                GapPhase::Unresolved,
+                "{variant}"
+            );
+            assert!(state.gap_reconcile().is_none(), "{variant}");
+            fs::remove_dir_all(&state.root).expect("cleanup");
         }
-        fs::remove_dir_all(&state.root).expect("cleanup");
     }
 
     #[test]
@@ -26872,17 +27035,20 @@ pub(crate) mod tests {
         approve_exact_gap(&state).expect("recover durable approval");
         let original = state.gap_diagnostic().unwrap().unwrap();
         let path = state.checkpoint_gap_retry_path(&original).unwrap();
-        assert!(matches!(
-            state.admit_batch(&gap_delivery(9, "cursor-safe", "fresh-gap")),
-            Err(ChatRuntimeError::UnresolvedGap(_))
-        ));
+        // A fresh provider gap is admitted like a checkpoint (#2440 D5) and revokes the
+        // approval first.
+        let admission = state
+            .admit_batch(&gap_delivery(9, "cursor-safe", "fresh-gap"))
+            .expect("a provider gap is admitted");
+        state.confirm_batch_commit(&admission).unwrap();
         let revoked: CheckpointGapRetryRecord = read_document(&path, MAX_GAP_RETRY_BYTES).unwrap();
         assert_eq!(revoked.boundary, GapRetryBoundary::ExactCommitted);
         assert!(revoked.superseded_by.is_some());
-        assert!(state.subscribe_request().is_err());
+        state
+            .subscribe_request()
+            .expect("the bridge keeps running after a gap");
         // An identical incident must not resurrect revoked authority.
         write_document(&state.root.join("gap.json"), &original).unwrap();
-        assert!(state.subscribe_request().is_err());
         assert!(approve_exact_gap(&state).is_err());
         fs::remove_dir_all(&state.root).unwrap();
     }
@@ -26895,7 +27061,11 @@ pub(crate) mod tests {
         checkpoint.boundary_messages[0].message_fingerprint = "a".repeat(64);
         write_document(&state.root.join("checkpoint.json"), &checkpoint).unwrap();
         let before = fixture_files(&state.root);
-        assert!(state.subscribe_request().is_err());
+        // An older bridge's provider gap no longer stops a subscription (#2440 D5), but the
+        // changed guard still refuses the replay, and nothing is resolved.
+        state
+            .subscribe_request()
+            .expect("an older gap never refuses reconnect");
         assert!(state
             .admit_batch(&exact_boundary_delivery(4, "exact"))
             .is_err());
@@ -27139,8 +27309,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unresolved_gap_is_journaled_before_refusal_and_never_acknowledged_or_reconnected() {
-        let root = temporary("gap-fail-closed");
+    fn provider_gap_is_admitted_like_a_checkpoint_and_the_bridge_keeps_running() {
+        // #2440 D5: a provider gap never halts the bridge. It is committed at its far side, the
+        // next batch is admitted, gap.json says only `resolved`, and the window is reconciled.
+        let root = temporary("gap-keeps-running");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let acknowledged = Arc::new(Mutex::new(Vec::new()));
         let next_calls = Arc::new(AtomicU64::new(0));
@@ -27160,8 +27332,13 @@ pub(crate) mod tests {
             ChatSubscription::open(&mut initial_backend, &request).expect("initial subscribe");
         consume_one(&mut initial, &state).expect("commit safe boundary");
         drop(initial);
+        let safe_committed_at = state
+            .current_commit_receipt(&state.read_checkpoint().unwrap())
+            .unwrap()
+            .unwrap()
+            .committed_at_millis;
 
-        let later = delivery(2, "cursor-later", "delivery-later");
+        let later = indexed_delivery_at(2, 20, "cursor-later", "sent after the gap");
         let mut gap_backend = Backend {
             items: Some(VecDeque::from([
                 SubscriptionItem::Batch(gap_delivery(1, "cursor-gap", "delivery-gap")),
@@ -27179,25 +27356,211 @@ pub(crate) mod tests {
         );
         let mut subscription =
             ChatSubscription::open(&mut gap_backend, &request).expect("gap subscribe");
-        let error = consume_one(&mut subscription, &state).expect_err("gap must fail closed");
-        assert!(matches!(error, ChatRuntimeError::UnresolvedGap(_)));
-        assert_eq!(next_calls.load(AtomicOrdering::SeqCst), 2);
-        assert_eq!(&*acknowledged.lock().expect("ack lock"), &["delivery-safe"]);
+        let ConsumedItem::Batch(gap_admission) =
+            consume_one(&mut subscription, &state).expect("the gap is admitted")
+        else {
+            panic!("the gap is a batch");
+        };
+        assert!(gap_admission.new_request_keys.is_empty());
+        assert!(!gap_admission.reconciliation_required);
+        assert_eq!(state.cursor().unwrap().as_deref(), Some("cursor-gap"));
+        let gap = state.gap_diagnostic().unwrap().expect("audit record");
+        assert_eq!(gap.phase, GapPhase::Resolved);
         assert_eq!(
-            state.cursor().expect("cursor").as_deref(),
-            Some("cursor-safe")
+            gap.resolved_host_batch_sequence,
+            Some(gap_admission.host_batch_sequence)
         );
-        let status = state.status().expect("degraded status");
-        assert_eq!(status["runtime_evidence"]["connected_now"], false);
-        assert_eq!(status["runtime_evidence"]["healthy"], false);
-        assert_eq!(status["runtime_evidence"]["durable_batch_verified"], false);
-        assert_eq!(status["unresolved_gap"]["phase"], "unresolved");
-        assert!(state.subscribe_request().is_err());
-        let reopened = BridgeState::open(&root).expect("inspect degraded state");
+        assert_eq!(gap.resume_cursor.as_deref(), Some("cursor-safe"));
+        assert_eq!(gap.proposed_cursor, "cursor-gap");
+        // gap.json keeps its shape: an older bridge reads it, and knows only these keys.
+        let raw: Value = read_document(&root.join("gap.json"), MAX_GAP_DIAGNOSTIC_BYTES).unwrap();
+        assert_eq!(raw["phase"], "resolved");
+        let keys = raw
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let known = [
+            "version",
+            "phase",
+            "provider_sequence",
+            "delivery_id",
+            "proposed_cursor",
+            "resume_cursor",
+            "reasons",
+            "batch_fingerprint",
+            "observed_at_millis",
+            "resolved_at_millis",
+            "resolved_host_batch_sequence",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+        assert!(keys.is_subset(&known), "{keys:?}");
+        let reconcile = state.gap_reconcile().expect("reconcile record");
+        assert_eq!(reconcile.reasons, ["fixture history was truncated"]);
+        assert_eq!(reconcile.prior_cursor.as_deref(), Some("cursor-safe"));
+        assert_eq!(reconcile.proposed_cursor, "cursor-gap");
+        assert_eq!(reconcile.window_from_millis, safe_committed_at);
+        assert_eq!(reconcile.observed_at_millis, gap.observed_at_millis);
+        assert!(!reconcile.agent_told && !reconcile.owner_told);
+        assert_eq!(
+            reconcile.notice_id(),
+            format!("chat-gap-reconciled-{}", gap.observed_at_millis)
+        );
+
+        let ConsumedItem::Batch(later) =
+            consume_one(&mut subscription, &state).expect("the next batch is admitted")
+        else {
+            panic!("the next item is a batch");
+        };
+        assert_eq!(later.new_request_keys.len(), 1);
+        assert_eq!(next_calls.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(
+            &*acknowledged.lock().expect("ack lock"),
+            &["delivery-safe", "delivery-gap", "delivery-2-20"]
+        );
+        let status = state.status().expect("status");
+        assert_eq!(status["runtime_evidence"]["healthy"], true);
+        assert_eq!(status["runtime_evidence"]["durable_batch_verified"], true);
+        assert_eq!(status["unresolved_gap"]["phase"], "resolved");
+        assert_eq!(status["gap_reconcile"]["proposed_cursor"], "cursor-gap");
+        assert_eq!(status["gap_reconcile"]["finished"], false);
+        let reopened = BridgeState::open(&root).expect("reopen");
+        assert_eq!(
+            reopened
+                .subscribe_request()
+                .expect("reconnect is never refused")
+                .resume_from()
+                .map(ProviderCursor::as_str),
+            Some("cursor-later")
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn gap_mixed_with_other_events_still_halts_until_an_operator_acts() {
+        // A gap with company breaks the protocol; that is not a provider gap, and it keeps the
+        // old halt (#2440 D5).
+        let root = temporary("gap-mixed-halts");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-safe", "delivery-safe"))
+            .expect("safe boundary");
+        state.confirm_batch_commit(&admission).expect("commit");
+        let mixed = DeliveryBatch::new(
+            EventSequence::new(2).expect("sequence"),
+            ProviderCursor::new("cursor-mixed").expect("cursor"),
+            DeliveryId::new("delivery-mixed").expect("delivery"),
+            vec![
+                CommittableEvent::Gap(
+                    ReconciliationGap::new(Some("lost".to_owned())).expect("gap"),
+                ),
+                CommittableEvent::Checkpoint,
+            ],
+        )
+        .expect("mixed batch");
         assert!(matches!(
-            reopened.subscribe_request(),
+            state.admit_batch(&mixed),
             Err(ChatRuntimeError::UnresolvedGap(_))
         ));
+        assert_eq!(state.cursor().unwrap().as_deref(), Some("cursor-safe"));
+        let gap = state.gap_diagnostic().unwrap().expect("journaled");
+        assert_eq!(gap.phase, GapPhase::Unresolved);
+        assert_eq!(gap.reasons.len(), 2);
+        assert!(state.gap_reconcile().is_none());
+        assert!(matches!(
+            state.subscribe_request(),
+            Err(ChatRuntimeError::UnresolvedGap(_))
+        ));
+        assert!(matches!(
+            state.admit_batch(&delivery(3, "cursor-later", "delivery-later")),
+            Err(ChatRuntimeError::UnresolvedGap(_))
+        ));
+        let status = state.status().expect("status");
+        assert_eq!(status["runtime_evidence"]["healthy"], false);
+        assert_eq!(status["runtime_evidence"]["connected_now"], false);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn older_build_gap_is_resolved_by_the_next_batch_and_reconciled() {
+        // An older bridge left an `unresolved` provider gap: it no longer stops reconnect, and
+        // the next batch resolves it and opens a reconcile for its window (#2440 D5).
+        let state = checkpoint_gap_fixture("gap-older-build");
+        let older = state.gap_diagnostic().unwrap().unwrap();
+        assert_eq!(older.phase, GapPhase::Unresolved);
+        assert!(state.read_checkpoint().unwrap().reconciliation_required);
+        assert_eq!(state.status().unwrap()["runtime_evidence"]["healthy"], true);
+        assert_eq!(
+            state
+                .subscribe_request()
+                .expect("an older gap never refuses reconnect")
+                .resume_from()
+                .map(ProviderCursor::as_str),
+            Some("cursor-safe")
+        );
+        let admission = state
+            .admit_batch(&indexed_delivery_at(4, 10, "cursor-later", "new message"))
+            .expect("the next batch is admitted");
+        state.confirm_batch_commit(&admission).expect("commit");
+        assert_eq!(admission.new_request_keys.len(), 1);
+        let checkpoint = state.read_checkpoint().unwrap();
+        assert_eq!(checkpoint.cursor.as_deref(), Some("cursor-later"));
+        assert!(!checkpoint.reconciliation_required);
+        let gap = state.gap_diagnostic().unwrap().unwrap();
+        assert_eq!(gap.phase, GapPhase::Resolved);
+        assert_eq!(
+            gap.resolved_host_batch_sequence,
+            Some(admission.host_batch_sequence)
+        );
+        let reconcile = state.gap_reconcile().expect("reconcile opened");
+        assert_eq!(reconcile.observed_at_millis, older.observed_at_millis);
+        assert_eq!(reconcile.prior_cursor.as_deref(), Some("cursor-safe"));
+        assert!(reconcile.window_from_millis.is_some());
+        fs::remove_dir_all(&state.root).expect("cleanup");
+    }
+
+    #[test]
+    fn near_side_gap_at_the_current_cursor_replaces_the_boundary_and_is_reconciled_once() {
+        // An older plugin names the gap's near side, the current cursor: the gap replaces the
+        // boundary like a checkpoint, the cursor stays, and the same gap offered again after a
+        // reconnect keeps its one reconcile record (so it is told about once).
+        let root = temporary("gap-near-side");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-safe", "delivery-safe"))
+            .expect("safe boundary");
+        state.confirm_batch_commit(&admission).expect("commit");
+        let first = state
+            .admit_batch(&gap_delivery(2, "cursor-safe", "gap-near-1"))
+            .expect("a near-side gap is admitted");
+        state.confirm_batch_commit(&first).expect("commit gap");
+        assert_eq!(state.cursor().unwrap().as_deref(), Some("cursor-safe"));
+        let record = state.gap_reconcile().expect("reconcile");
+        state
+            .mark_gap_reconcile_told(record.observed_at_millis, true, true)
+            .expect("told");
+        let again = state
+            .admit_batch(&gap_delivery(3, "cursor-safe", "gap-near-2"))
+            .expect("the same gap again");
+        state.confirm_batch_commit(&again).expect("commit again");
+        let kept = state.gap_reconcile().expect("reconcile kept");
+        assert_eq!(kept.observed_at_millis, record.observed_at_millis);
+        assert!(kept.agent_told && kept.owner_told);
+        // A message in the gap's window, rescued from history later, is admitted once; a copy
+        // is absorbed by the message key.
+        let rescued = indexed_delivery_at(4, 7, "cursor-rescue", "sent during the gap");
+        let admitted = state.admit_batch(&rescued).expect("rescued message");
+        state
+            .confirm_batch_commit(&admitted)
+            .expect("commit rescue");
+        assert_eq!(admitted.new_request_keys.len(), 1);
+        let copy = indexed_delivery_at(5, 7, "cursor-copy", "sent during the gap");
+        let duplicate = state.admit_batch(&copy).expect("a copy is absorbed");
+        state.confirm_batch_commit(&duplicate).expect("commit copy");
+        assert!(duplicate.new_request_keys.is_empty());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -46400,5 +46763,6 @@ them.\n❯\u{a0}\n"
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    mod gap_reconcile_tests;
     mod reply_window_tests;
 }

@@ -630,6 +630,33 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
             age_text(stale_millis)
         ));
     }
+    // #2440 D5: a provider gap the bridge kept running through, whose window is reconciled from
+    // the provider's history; shown for a day, degraded until it is finished.
+    let reconcile = &status["gap_reconcile"];
+    if reconcile["finished"] == Value::Bool(false) {
+        let mut line = format!(
+            "the chat provider lost events in a gap ({}); the bridge kept running and is \
+             admitting the window's messages ({}) from the channel's history",
+            reconcile["reasons"]
+                .as_array()
+                .map(|reasons| reasons
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; "))
+                .unwrap_or_default(),
+            reconcile["window"].as_str().unwrap_or("unknown window"),
+        );
+        if reconcile["window_exceeds_history"] == Value::Bool(true) {
+            line.push_str(
+                "; part of the window is older than that history and cannot be backfilled",
+            );
+        }
+        if reconcile["agent_told"] != Value::Bool(true) {
+            line.push_str("; the agent has not been given the alarm yet");
+        }
+        problems.degraded.push(line);
+    }
     for (field, label) in [
         ("subscription_down", "the chat subscription is down"),
         ("send_path_down", "the reply send path is down"),
@@ -1161,6 +1188,7 @@ fn assess(observed: Observed, options: HealthOptions) -> Health {
             "stale_after_seconds": options.stale_after.as_secs(),
             "cursor_present": status["cursor_present"],
             "runtime_evidence": status["runtime_evidence"],
+            "gap_reconcile": status["gap_reconcile"],
         },
         "target": target,
         "last_admitted_at_millis": last_admitted,
@@ -1390,6 +1418,56 @@ mod tests {
                 .contains("held back by the host listing budget for 43"),
             "{}",
             health.text
+        );
+    }
+
+    #[test]
+    fn an_unfinished_gap_reconcile_is_degraded_and_a_finished_one_only_shown() {
+        // #2440 D5: the bridge keeps running past a provider gap; health says so, degraded,
+        // until the window is reconciled, and the stream is never reported stopped for it.
+        let mut observed = healthy();
+        observed.status["gap_reconcile"] = json!({
+            "reasons": ["event stream lost events from sequence 10 to 20: retention"],
+            "window": "2026-11-27 23:10 ET to 2026-11-27 23:40 ET",
+            "window_exceeds_history": false,
+            "agent_told": false,
+            "finished": false,
+        });
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "degraded", "{}", health.text);
+        assert!(
+            health.text.contains(
+                "the chat provider lost events in a gap (event stream lost events from sequence \
+                 10 to 20: retention); the bridge kept running and is admitting the window's \
+                 messages (2026-11-27 23:10 ET to 2026-11-27 23:40 ET) from the channel's history"
+            ) && health
+                .text
+                .contains("the agent has not been given the alarm yet"),
+            "{}",
+            health.text
+        );
+        assert!(
+            !health.text.contains("the event stream stopped"),
+            "{}",
+            health.text
+        );
+        assert_eq!(
+            health.document["event_stream"]["gap_reconcile"]["finished"],
+            false
+        );
+        let mut observed = healthy();
+        observed.status["gap_reconcile"] = json!({
+            "reasons": ["lost"],
+            "window": "w",
+            "window_exceeds_history": true,
+            "agent_told": true,
+            "finished": true,
+        });
+        let health = assess(observed, options());
+        assert_eq!(health.verdict, "ok", "{}", health.text);
+        assert_eq!(
+            health.document["event_stream"]["gap_reconcile"]["finished"],
+            true
         );
     }
 
