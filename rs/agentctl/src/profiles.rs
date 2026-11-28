@@ -253,6 +253,13 @@ struct Document {
     required_env: Option<Value>,
     #[serde(default)]
     muse_hooks_trust: Option<Value>,
+    /// #2421 agentctl-asks-never-block registry defaults; see [`permission_policy`].
+    #[serde(default)]
+    permission_prompts: Option<Value>,
+    #[serde(default)]
+    permission_deny_after_s: Option<Value>,
+    #[serde(default)]
+    approval_timeout_s: Option<Value>,
     profiles: UniqueMap<RawProfile>,
     #[serde(flatten)]
     unknown: UnknownKeys,
@@ -389,6 +396,13 @@ struct RawProfile {
     coordinator_lean: Option<Value>,
     #[serde(default)]
     muse_hooks_trust: Option<Value>,
+    /// #2421 agentctl-asks-never-block, per profile; see [`permission_policy`].
+    #[serde(default)]
+    permission_prompts: Option<Value>,
+    #[serde(default)]
+    permission_deny_after_s: Option<Value>,
+    #[serde(default)]
+    approval_timeout_s: Option<Value>,
     /// The agent's role, one of [`ROLES`], and its protocol, one of [`PROTOCOLS`]: checked here,
     /// and read from the file by the chat bridge's latency stamps (#897).
     #[serde(default)]
@@ -1247,6 +1261,12 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
     let required_env = required_names(raw.required_env.as_ref(), &format!("profile {name:?}"))?;
     // Checked at load (#1932); launches resolve it via `hooks_trust_policy`.
     hooks_trust_setting(raw.muse_hooks_trust.as_ref(), &format!("profile {name:?}"))?;
+    // Checked at load (#2421); the watcher and the wrapper resolve them via
+    // `permission_policy`.
+    let label = format!("profile {name:?}");
+    permission_prompts_setting(raw.permission_prompts.as_ref(), &label)?;
+    deny_after_setting(raw.permission_deny_after_s.as_ref(), &label)?;
+    approval_timeout_setting(raw.approval_timeout_s.as_ref(), &label)?;
     // #1822: every interactive launch carries its harness's bypass flag.
     // Headless profiles are exempt at load: codex/agy headless argv is
     // empty by rule, and headless Claude is refused at start/run-headless
@@ -1424,6 +1444,12 @@ pub(crate) fn load_configuration(
     launch_env_value(document.launch_env.as_ref())?;
     registry_required_env(document.required_env.as_ref())?;
     hooks_trust_setting(document.muse_hooks_trust.as_ref(), "registry default")?;
+    permission_prompts_setting(document.permission_prompts.as_ref(), "registry default")?;
+    deny_after_setting(
+        document.permission_deny_after_s.as_ref(),
+        "registry default",
+    )?;
+    approval_timeout_setting(document.approval_timeout_s.as_ref(), "registry default")?;
     // Only a file that loads is warned about, so a refusal reads the same in both editions.
     if let Some(warning) = unknown_paths_warning(&path, unknown) {
         static WARNED: std::sync::Once = std::sync::Once::new();
@@ -1493,6 +1519,149 @@ pub(crate) fn hooks_trust_policy(
         }
     }
     Ok(("decline".to_owned(), "built-in default".to_owned()))
+}
+
+/// The built-in headless approval timeout (#2421 agentctl-asks-never-block):
+/// 0, deny at once. An agent never waits for a person to answer a
+/// permission prompt unless its profile or registry asks for that.
+pub const DEFAULT_APPROVAL_TIMEOUT_S: u64 = 0;
+/// The built-in time the same interactive permission prompt must show before
+/// the watcher refuses it (#2421).
+pub const DEFAULT_PERMISSION_DENY_AFTER_S: u64 = 60;
+/// The longest `permission_deny_after_s` accepted.
+pub const MAX_PERMISSION_DENY_AFTER_S: u64 = 3600;
+
+/// What happens when a managed agent's harness asks a person to approve a
+/// call (#2421 agentctl-asks-never-block), resolved per agent from
+/// profiles.json: each key from the agent's profile, then the file's
+/// top-level registry default, then the built-in default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionPolicy {
+    /// Interactive panes: the watcher refuses a recognised prompt (`deny`,
+    /// the default) or only reports it (`report`).
+    pub deny: bool,
+    /// Interactive panes: how long the same prompt must show first.
+    pub deny_after_s: u64,
+    /// Headless agents: seconds a prompt waits for the owner; 0 denies at
+    /// once (after the wrapper's short grace for the host's own hooks).
+    pub approval_timeout_s: u64,
+    /// Where each value came from, as `key=source` words, for reports.
+    pub source: String,
+}
+
+impl Default for PermissionPolicy {
+    fn default() -> Self {
+        Self {
+            deny: true,
+            deny_after_s: DEFAULT_PERMISSION_DENY_AFTER_S,
+            approval_timeout_s: DEFAULT_APPROVAL_TIMEOUT_S,
+            source: "built-in default".to_owned(),
+        }
+    }
+}
+
+/// Validate `permission_prompts` (#2421): `"deny"` or `"report"`; fail closed.
+fn permission_prompts_setting(
+    value: Option<&Value>,
+    label: &str,
+) -> Result<Option<bool>, AgentError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(setting)) if setting == "deny" => Ok(Some(true)),
+        Some(Value::String(setting)) if setting == "report" => Ok(Some(false)),
+        Some(other) => Err(fail(format!(
+            "{label} permission_prompts must be \"deny\" or \"report\", not {other}"
+        ))),
+    }
+}
+
+/// Validate `approval_timeout_s` (#2421): 0 (deny at once) or 10 to 86400.
+fn approval_timeout_setting(value: Option<&Value>, label: &str) -> Result<Option<u64>, AgentError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number))
+            if number
+                .as_u64()
+                .is_some_and(|seconds| seconds == 0 || (10..=86_400).contains(&seconds)) =>
+        {
+            Ok(number.as_u64())
+        }
+        Some(other) => Err(fail(format!(
+            "{label} approval_timeout_s must be 0 (deny at once) or a whole number of seconds from 10 to 86400, not {other}"
+        ))),
+    }
+}
+
+/// Validate `permission_deny_after_s` (#2421): 0 to 3600.
+fn deny_after_setting(value: Option<&Value>, label: &str) -> Result<Option<u64>, AgentError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number))
+            if number
+                .as_u64()
+                .is_some_and(|seconds| seconds <= MAX_PERMISSION_DENY_AFTER_S) =>
+        {
+            Ok(number.as_u64())
+        }
+        Some(other) => Err(fail(format!(
+            "{label} permission_deny_after_s must be a whole number of seconds from 0 to {MAX_PERMISSION_DENY_AFTER_S}, not {other}"
+        ))),
+    }
+}
+
+/// The permission policy for one agent (#2421 agentctl-asks-never-block):
+/// for each of `permission_prompts`, `permission_deny_after_s` and
+/// `approval_timeout_s`, the agent's profile in profiles.json wins, then the
+/// file's top-level registry default, then the built-in default (deny,
+/// 60 s, 0 = deny at once). An invalid value refuses here.
+pub(crate) fn permission_policy(
+    cwd: &Path,
+    registry: &Path,
+    profile_name: Option<&str>,
+) -> Result<PermissionPolicy, AgentError> {
+    let root = configuration_root(cwd, registry, true)?;
+    let raw = registry_policy(&root.join(".agentctl"))?;
+    let mut policy = PermissionPolicy::default();
+    let Some(object) = raw else {
+        return Ok(policy);
+    };
+    let profile = profile_name.and_then(|name| {
+        object
+            .get("profiles")
+            .and_then(Value::as_object)
+            .and_then(|profiles| profiles.get(name))
+            .and_then(Value::as_object)
+            .map(|profile| (name, profile))
+    });
+    let mut sources = Vec::new();
+    let pick = |key: &str| -> (Option<&Value>, String) {
+        if let Some((name, profile)) = profile {
+            if let Some(value) = profile.get(key).filter(|value| !value.is_null()) {
+                return (Some(value), format!("profile '{name}'"));
+            }
+        }
+        match object.get(key).filter(|value| !value.is_null()) {
+            Some(value) => (Some(value), "registry default".to_owned()),
+            None => (None, "built-in default".to_owned()),
+        }
+    };
+    let (value, from) = pick("permission_prompts");
+    if let Some(deny) = permission_prompts_setting(value, &from)? {
+        policy.deny = deny;
+    }
+    sources.push(format!("permission_prompts={from}"));
+    let (value, from) = pick("permission_deny_after_s");
+    if let Some(seconds) = deny_after_setting(value, &from)? {
+        policy.deny_after_s = seconds;
+    }
+    sources.push(format!("permission_deny_after_s={from}"));
+    let (value, from) = pick("approval_timeout_s");
+    if let Some(seconds) = approval_timeout_setting(value, &from)? {
+        policy.approval_timeout_s = seconds;
+    }
+    sources.push(format!("approval_timeout_s={from}"));
+    policy.source = sources.join(" ");
+    Ok(policy)
 }
 
 pub(crate) fn load_profiles(
@@ -2432,6 +2601,101 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("muse_hooks_trust must be"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn permission_policy_precedence_defaults_and_fail_closed() {
+        // #2421: each key from the profile, then the registry default, then
+        // the built-in (deny, 60 s, 0 = deny at once); invalid refuses.
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-permission-policy-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let registry = root.join("registry");
+        assert_eq!(
+            permission_policy(&root, &registry, None).unwrap(),
+            PermissionPolicy::default()
+        );
+        assert_eq!(PermissionPolicy::default().approval_timeout_s, 0);
+        assert_eq!(PermissionPolicy::default().deny_after_s, 60);
+        assert!(PermissionPolicy::default().deny);
+        assert!(Command::new(SYSTEM_GIT)
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join(".gitignore"), ".agentctl/\n").unwrap();
+        let directory = root.join(".agentctl");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("profiles.json");
+        let write = |text: &str| {
+            fs::write(&path, text).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(
+            r#"{"schema":"agentctl-profiles/v1","approval_timeout_s":600,"permission_deny_after_s":120,"profiles":{"plain":{"harness":"claude","mode":"interactive","argv":["--dangerously-skip-permissions"]},"own":{"harness":"claude","mode":"interactive","argv":["--dangerously-skip-permissions"],"permission_prompts":"report","approval_timeout_s":0}}}"#,
+        );
+        let plain = permission_policy(&root, &registry, Some("plain")).unwrap();
+        assert!(plain.deny);
+        assert_eq!(plain.deny_after_s, 120);
+        assert_eq!(plain.approval_timeout_s, 600);
+        assert!(
+            plain.source.contains("approval_timeout_s=registry default"),
+            "{}",
+            plain.source
+        );
+        assert!(
+            plain.source.contains("permission_prompts=built-in default"),
+            "{}",
+            plain.source
+        );
+        let own = permission_policy(&root, &registry, Some("own")).unwrap();
+        assert!(!own.deny);
+        assert_eq!(own.deny_after_s, 120);
+        assert_eq!(own.approval_timeout_s, 0);
+        assert!(
+            own.source.contains("permission_prompts=profile 'own'"),
+            "{}",
+            own.source
+        );
+        // The keys are known fields: the file loads with them.
+        let (_, profiles) = load_profiles(&root, false).unwrap();
+        assert!(profiles.contains_key("own"));
+        for (text, needle) in [
+            (
+                r#"{"schema":"agentctl-profiles/v1","approval_timeout_s":5,"profiles":{}}"#,
+                "approval_timeout_s must be 0",
+            ),
+            (
+                r#"{"schema":"agentctl-profiles/v1","permission_deny_after_s":7200,"profiles":{}}"#,
+                "permission_deny_after_s must be",
+            ),
+            (
+                r#"{"schema":"agentctl-profiles/v1","profiles":{"own":{"harness":"claude","mode":"interactive","argv":["--dangerously-skip-permissions"],"permission_prompts":"approve"}}}"#,
+                "permission_prompts must be",
+            ),
+        ] {
+            write(text);
+            assert!(
+                load_configuration(&root, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(needle),
+                "{text}"
+            );
+            assert!(
+                permission_policy(&root, &registry, Some("own"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains(needle),
+                "{text}"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

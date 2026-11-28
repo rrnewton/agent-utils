@@ -585,3 +585,413 @@ fn matching_wrapped_draft_is_confirmed_without_retyping() {
     assert!(terminal.keys.borrow().is_empty());
     assert!(terminal.text.borrow().is_empty());
 }
+
+// #2421 agentctl-asks-never-block: refusing permission prompts. A menu
+// fake moves its cursor between drawn option rows like the harnesses do
+// and records which option the submit key chose, so every test can check
+// that nothing but a refusal is ever submitted.
+
+const CLAUDE_PERMISSION: &str = include_str!("fixtures/tui/claude-permission-proceed.txt");
+const CLAUDE_HOOK: &str = "──────\nHook PreToolUse:Bash requires confirmation\nRunning this command may delete files: rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend\n";
+const CLAUDE_DANGEROUS: &str = "────────────────────────────────────────\n Bash command\n rm -rf \"$OUT/\"*\n Dangerous rm operation on possibly-empty variable path\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again for rm commands in /work/project\n   3. No, and tell Claude what to do differently (esc)\n";
+const CLAUDE_TRUST: &str = "────────────────────────────────────────\n Do you trust the files in this folder?\n /work/project\n ❯ 1. Yes, proceed\n   2. No, exit\n Enter to confirm · Esc to exit\n";
+const CLAUDE_QUESTION: &str = "────────────────────────────────────────\n Which branch should I use?\n ❯ 1. main\n   2. No preference\n Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n";
+const MUSE_APPROVAL: &str = include_str!("../testdata/muse-busy/muse-approval.txt");
+const MUSE_PEER: &str = include_str!("../testdata/muse-busy/muse-peer-approval.txt");
+const MUSE_PEER_FOCUSED: &str =
+    include_str!("../testdata/muse-busy/muse-peer-approval-focused.txt");
+const MUSE_IDLE: &str = include_str!("../testdata/muse-busy/muse-idle.txt");
+const CLAUDE_IDLE: &str =
+    "────────────────────────────────────────\n❯\n────────────────────────────────────────\n";
+
+/// How the menu fake misbehaves.
+#[derive(Clone, Copy, PartialEq)]
+enum Fault {
+    None,
+    /// Arrow keys do nothing.
+    StuckCursor,
+    /// The first arrow key replaces the prompt with a different one.
+    PromptChanges,
+    /// The submit key is swallowed: the prompt stays up.
+    SubmitIgnored,
+}
+
+struct Menu {
+    screen: RefCell<String>,
+    marker: char,
+    idle: String,
+    fault: Fault,
+    keys: RefCell<Vec<String>>,
+    submitted: RefCell<Vec<String>>,
+}
+
+impl Menu {
+    fn new(screen: &str, harness: &str, fault: Fault) -> Self {
+        let (marker, idle) = if harness == "muse" {
+            ('⟩', MUSE_IDLE.to_owned())
+        } else {
+            ('❯', CLAUDE_IDLE.to_owned())
+        };
+        Self {
+            screen: RefCell::new(screen.to_owned()),
+            marker,
+            idle,
+            fault,
+            keys: RefCell::new(vec![]),
+            submitted: RefCell::new(vec![]),
+        }
+    }
+
+    /// Indices of the trailing run of option rows (`N. label`, cursor or
+    /// not): the dialog's menu, not a numbered list above it.
+    fn option_rows(&self, rows: &[String]) -> Vec<usize> {
+        let found: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                let body = row.trim().trim_start_matches(self.marker).trim_start();
+                body.split_once(". ")
+                    .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let Some(mut start) = found.len().checked_sub(1) else {
+            return found;
+        };
+        while start > 0 && found[start - 1] + 1 == found[start] {
+            start -= 1;
+        }
+        found[start..].to_vec()
+    }
+
+    fn selected(&self, rows: &[String], options: &[usize]) -> Option<usize> {
+        options
+            .iter()
+            .position(|&index| rows[index].trim_start().starts_with(self.marker))
+    }
+
+    fn draw(&self, rows: &mut [String], options: &[usize], cursor: usize) {
+        for (position, &index) in options.iter().enumerate() {
+            let body = rows[index]
+                .trim()
+                .trim_start_matches(self.marker)
+                .trim_start()
+                .to_owned();
+            rows[index] = if position == cursor {
+                format!(" {} {body}", self.marker)
+            } else {
+                format!("   {body}")
+            };
+        }
+    }
+
+    fn start_at(&self, cursor: usize) {
+        let mut rows: Vec<String> = self.screen.borrow().lines().map(str::to_owned).collect();
+        let options = self.option_rows(&rows);
+        self.draw(&mut rows, &options, cursor);
+        *self.screen.borrow_mut() = rows.join("\n") + "\n";
+    }
+}
+
+impl GuardedInput for Menu {
+    fn read_screen(&self, _pane: &str) -> agentctl::error::Result<String> {
+        Ok(self.screen.borrow().clone())
+    }
+    fn send_keys(&self, _pane: &str, key: &str) -> agentctl::error::Result<()> {
+        self.keys.borrow_mut().push(key.to_owned());
+        let mut rows: Vec<String> = self.screen.borrow().lines().map(str::to_owned).collect();
+        let options = self.option_rows(&rows);
+        match key {
+            "Down" | "Up" => {
+                if self.fault == Fault::PromptChanges {
+                    *self.screen.borrow_mut() =
+                        CLAUDE_HOOK.replace("rm -rf build", "git push --force");
+                    return Ok(());
+                }
+                if self.fault == Fault::StuckCursor {
+                    return Ok(());
+                }
+                let cursor = match self.selected(&rows, &options) {
+                    // An unfocused menu takes focus on its first option.
+                    None => 0,
+                    Some(at) if key == "Down" => (at + 1).min(options.len() - 1),
+                    Some(at) => at.saturating_sub(1),
+                };
+                self.draw(&mut rows, &options, cursor);
+                *self.screen.borrow_mut() = rows.join("\n") + "\n";
+            }
+            "Enter" => {
+                let chosen = self.selected(&rows, &options).map(|at| {
+                    let body = rows[options[at]]
+                        .trim()
+                        .trim_start_matches(self.marker)
+                        .trim_start()
+                        .to_owned();
+                    body.split_once(". ")
+                        .map_or(body.clone(), |(_, label)| label.to_owned())
+                });
+                self.submitted
+                    .borrow_mut()
+                    .push(chosen.unwrap_or_else(|| "<no cursor>".to_owned()));
+                if self.fault != Fault::SubmitIgnored {
+                    *self.screen.borrow_mut() = self.idle.clone();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn send_text(&self, _pane: &str, text: &str) -> agentctl::error::Result<()> {
+        panic!("a refusal never types text, got {text:?}");
+    }
+    fn native_prompt(&self, _pane: &str, text: &str) -> agentctl::error::Result<()> {
+        panic!("a refusal never submits a prompt, got {text:?}");
+    }
+}
+
+fn deny_on(menu: &Menu, harness: &str) -> agentctl::agent::AgentResult<Option<serde_json::Value>> {
+    agentctl::tui_prompts::deny(
+        menu,
+        "pane",
+        harness,
+        None,
+        &|_| Ok(()),
+        &Runtime::default(),
+    )
+}
+
+/// Every recognised prompt: harness, screen, kind and the refusing option's label.
+fn recognised() -> Vec<(&'static str, String, &'static str, &'static str)> {
+    vec![
+        ("claude", CLAUDE_PERMISSION.to_owned(), "permission", "No"),
+        ("claude", CLAUDE_HOOK.to_owned(), "hook-confirmation", "No"),
+        (
+            "claude",
+            CLAUDE_DANGEROUS.to_owned(),
+            "permission",
+            "No, and tell Claude what to do differently (esc)",
+        ),
+        (
+            "muse",
+            MUSE_APPROVAL.to_owned(),
+            "command-approval",
+            "Abort the entire command (esc)",
+        ),
+        ("muse", MUSE_PEER.to_owned(), "peer-approval", "Reject once"),
+        (
+            "muse",
+            MUSE_PEER_FOCUSED.to_owned(),
+            "peer-approval",
+            "Reject once",
+        ),
+    ]
+}
+
+#[test]
+fn deny_labels_refuse_and_approving_labels_never_pass() {
+    use agentctl::harness_tui::deny_label;
+    for label in [
+        "No",
+        "no",
+        "No, and tell Claude what to do differently (esc)",
+        "Reject once",
+        "Abort the entire command (esc)",
+    ] {
+        assert!(deny_label(label), "{label}");
+    }
+    for label in [
+        "Yes",
+        "Yes, proceed",
+        "Yes, and don't ask again for rm commands in /work/project",
+        "Allow once",
+        "Allow for this session",
+        "Allow this stage once (y)",
+        "Trust all and continue",
+        "Continue without trusting",
+        "Block",
+        "None of the above",
+        "Not now",
+        "main",
+        "",
+    ] {
+        assert!(!deny_label(label), "{label}");
+    }
+}
+
+#[test]
+fn each_recognised_prompt_names_its_refusal_and_what_it_asked() {
+    use agentctl::harness_tui::permission_denial;
+    for (harness, screen, kind, label) in recognised() {
+        let denial = permission_denial(Some(harness), &screen)
+            .unwrap_or_else(|| panic!("{kind} on {harness} not recognised"));
+        assert_eq!(denial.kind, kind);
+        let chosen = denial
+            .options
+            .iter()
+            .find(|option| option.number == denial.deny)
+            .unwrap();
+        assert_eq!(chosen.text, label, "{kind}");
+    }
+    let permission = permission_denial(Some("claude"), CLAUDE_PERMISSION).unwrap();
+    assert!(
+        permission.prompt.contains("rm -rf /work/project/victim"),
+        "{}",
+        permission.prompt
+    );
+    assert!(
+        permission.prompt.contains("requires confirmation"),
+        "{}",
+        permission.prompt
+    );
+    let hook = permission_denial(Some("claude"), CLAUDE_HOOK).unwrap();
+    assert!(
+        hook.prompt
+            .contains("Hook PreToolUse:Bash requires confirmation"),
+        "{}",
+        hook.prompt
+    );
+    let command = permission_denial(Some("muse"), MUSE_APPROVAL).unwrap();
+    assert!(
+        command.prompt.contains("$ date > stamp.txt"),
+        "{}",
+        command.prompt
+    );
+    let peer = permission_denial(Some("muse"), MUSE_PEER).unwrap();
+    assert_eq!(peer.selected, None);
+    assert_eq!(peer.focus_keys, ["Down"]);
+    assert!(
+        peer.prompt.contains("Message from coordinator"),
+        "{}",
+        peer.prompt
+    );
+}
+
+#[test]
+fn prompts_that_are_not_permission_asks_are_never_recognised() {
+    use agentctl::harness_tui::permission_denial;
+    // A folder trust dialog ("No, exit" would quit the harness), an
+    // ordinary question, idle composers, a harness with no recogniser, and
+    // the wrong harness for a screen are all left to the report path.
+    assert!(permission_denial(Some("claude"), CLAUDE_TRUST).is_none());
+    assert!(permission_denial(Some("claude"), CLAUDE_QUESTION).is_none());
+    assert!(permission_denial(Some("claude"), CLAUDE_IDLE).is_none());
+    assert!(permission_denial(Some("muse"), MUSE_IDLE).is_none());
+    assert!(permission_denial(Some("codex"), CLAUDE_PERMISSION).is_none());
+    assert!(permission_denial(None, CLAUDE_PERMISSION).is_none());
+    assert!(permission_denial(Some("muse"), CLAUDE_PERMISSION).is_none());
+    assert!(permission_denial(Some("claude"), MUSE_APPROVAL).is_none());
+    // A form with no refusal, or two refusals of which none is plain, is ambiguous.
+    let no_refusal = CLAUDE_HOOK.replace("  2. No", "  2. Yes, always");
+    assert!(permission_denial(Some("claude"), &no_refusal).is_none());
+    let two = CLAUDE_DANGEROUS.replace(
+        "   2. Yes, and don't ask again for rm commands in /work/project",
+        "   2. No, exit",
+    );
+    assert!(permission_denial(Some("claude"), &two).is_none());
+    // Without the proceed line it is not the exact form.
+    let no_proceed = CLAUDE_HOOK.replace("Do you want to proceed?\n", "");
+    assert!(permission_denial(Some("claude"), &no_proceed).is_none());
+}
+
+#[test]
+fn a_refusal_submits_only_the_refusing_option_from_every_cursor_position() {
+    // The property #2421 promises: whatever option the cursor starts on,
+    // the submit key is sent once, and only with a refusal selected.
+    use agentctl::harness_tui::{deny_label, permission_denial};
+    for (harness, screen, kind, label) in recognised() {
+        let denial = permission_denial(Some(harness), &screen).unwrap();
+        for start in 0..denial.options.len() {
+            let menu = Menu::new(&screen, harness, Fault::None);
+            if denial.selected.is_some() {
+                menu.start_at(start);
+            }
+            let result = deny_on(&menu, harness).unwrap().unwrap();
+            assert_eq!(result["denied"], true);
+            assert_eq!(result["kind"], kind);
+            assert_eq!(result["option"], label);
+            let submitted = menu.submitted.borrow();
+            assert_eq!(submitted.len(), 1, "{kind} from {start}: {submitted:?}");
+            assert!(
+                deny_label(&submitted[0]),
+                "{kind} from {start}: {submitted:?}"
+            );
+            assert_eq!(submitted[0], label);
+            let keys = menu.keys.borrow();
+            assert_eq!(keys.last().map(String::as_str), Some("Enter"));
+            assert_eq!(keys.iter().filter(|key| *key == "Enter").count(), 1);
+        }
+    }
+}
+
+#[test]
+fn a_refusal_moves_up_or_down_and_focuses_an_unfocused_menu_first() {
+    let menu = Menu::new(CLAUDE_PERMISSION, "claude", Fault::None);
+    deny_on(&menu, "claude").unwrap().unwrap();
+    assert_eq!(*menu.keys.borrow(), ["Down", "Enter"]);
+    let menu = Menu::new(CLAUDE_DANGEROUS, "claude", Fault::None);
+    menu.start_at(2);
+    deny_on(&menu, "claude").unwrap().unwrap();
+    assert_eq!(*menu.keys.borrow(), ["Enter"]);
+    let menu = Menu::new(CLAUDE_PERMISSION, "claude", Fault::None);
+    menu.start_at(1);
+    deny_on(&menu, "claude").unwrap().unwrap();
+    assert_eq!(*menu.keys.borrow(), ["Enter"]);
+    let menu = Menu::new(MUSE_PEER_FOCUSED, "muse", Fault::None);
+    menu.start_at(3);
+    deny_on(&menu, "muse").unwrap().unwrap();
+    assert_eq!(*menu.keys.borrow(), ["Up", "Up", "Enter"]);
+    let menu = Menu::new(MUSE_PEER, "muse", Fault::None);
+    deny_on(&menu, "muse").unwrap().unwrap();
+    assert_eq!(*menu.keys.borrow(), ["Down", "Down", "Enter"]);
+    assert_eq!(*menu.submitted.borrow(), ["Reject once"]);
+}
+
+#[test]
+fn an_unrecognised_prompt_or_a_different_prompt_gets_no_key() {
+    for (harness, screen) in [
+        ("claude", CLAUDE_TRUST),
+        ("claude", CLAUDE_QUESTION),
+        ("codex", CLAUDE_PERMISSION),
+        ("muse", MUSE_IDLE),
+    ] {
+        let menu = Menu::new(screen, harness, Fault::None);
+        assert!(deny_on(&menu, harness).unwrap().is_none());
+        assert!(menu.keys.borrow().is_empty(), "{harness}");
+    }
+    // The caller timed one prompt; another one on screen now is left alone.
+    let expected = agentctl::harness_tui::permission_denial(Some("claude"), CLAUDE_HOOK).unwrap();
+    let menu = Menu::new(CLAUDE_PERMISSION, "claude", Fault::None);
+    let result = agentctl::tui_prompts::deny(
+        &menu,
+        "pane",
+        "claude",
+        Some(&expected),
+        &|_| Ok(()),
+        &Runtime::default(),
+    );
+    assert!(result.unwrap().is_none());
+    assert!(menu.keys.borrow().is_empty());
+}
+
+#[test]
+fn a_cursor_that_does_not_land_or_a_prompt_that_changes_stops_before_the_submit_key() {
+    for fault in [Fault::StuckCursor, Fault::PromptChanges] {
+        let menu = Menu::new(CLAUDE_PERMISSION, "claude", fault);
+        let error = deny_on(&menu, "claude").unwrap_err();
+        assert!(error.to_string().contains("no submit key sent"), "{error}");
+        assert!(!menu.keys.borrow().contains(&"Enter".to_owned()));
+        assert!(menu.submitted.borrow().is_empty());
+    }
+}
+
+#[test]
+fn a_refusal_whose_prompt_stays_up_is_reported_possibly_submitted_not_retried() {
+    let menu = Menu::new(CLAUDE_PERMISSION, "claude", Fault::SubmitIgnored);
+    let error = deny_on(&menu, "claude").unwrap_err();
+    assert_eq!(error.exit_code(), 76, "{error}");
+    assert!(
+        error.to_string().contains("do not retry automatically"),
+        "{error}"
+    );
+    assert_eq!(*menu.submitted.borrow(), ["No"]);
+}

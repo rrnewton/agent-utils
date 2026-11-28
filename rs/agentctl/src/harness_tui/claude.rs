@@ -10,112 +10,12 @@ impl HarnessTui for ClaudeTui {
     }
     fn classify(&self, screen: &str) -> View {
         let clean = plain(screen);
-        // A Claude hook confirmation (`Hook PreToolUse:Bash requires
-        // confirmation … Do you want to proceed? 1. Yes 2. No`) is an
-        // owner-only decision (#1784): recognize it as a blocking question
-        // naming the hook and the first line of its reason, so the watcher
-        // can page a person instead of reporting unrecognizable text.
-        // `answer_plan` refuses it: nothing answers it automatically.
-        {
-            let rows: Vec<_> = clean.lines().collect();
-            let hook = rows.iter().position(|row| {
-                let lower = row.to_lowercase();
-                lower.contains("hook") && lower.contains("requires confirmation")
-            });
-            if let Some(hook) = hook {
-                let mut options = vec![];
-                let mut selected = None;
-                for row in &rows {
-                    if let Some((option, is_selected)) = option_row(row, '❯') {
-                        if is_selected {
-                            selected = Some(option.number);
-                        }
-                        options.push(option);
-                    }
-                }
-                let proceeds = rows
-                    .iter()
-                    .any(|row| row.to_lowercase().contains("do you want to proceed"));
-                if proceeds && options.len() >= 2 && selected.is_some() {
-                    let reason = rows[hook + 1..]
-                        .iter()
-                        .map(|row| row.trim())
-                        .find(|row| {
-                            !row.is_empty()
-                                && !row.to_lowercase().contains("do you want to proceed")
-                                && option_row(row, '❯').is_none()
-                        })
-                        .unwrap_or_default();
-                    let heading = rows[hook].trim();
-                    let text = if reason.is_empty() {
-                        heading.to_owned()
-                    } else {
-                        format!("{heading}: {reason}")
-                    };
-                    return View::question(Question {
-                        text,
-                        options,
-                        selected,
-                        total: 1,
-                        collapsed: false,
-                        notes: false,
-                        draft: String::new(),
-                    });
-                }
-            }
+        let rows: Vec<_> = clean.lines().collect();
+        if let Some(question) = hook_confirmation(&rows) {
+            return View::question(question);
         }
-        // A permission prompt (`Do you want to proceed? ❯ 1. Yes  2. No`,
-        // under a `Bash command` form or a dangerous-operation warning) is
-        // an answerable question, not a menu: until this recogniser it
-        // classified as a menu, so `agentctl answer` refused it while
-        // `agentctl prompts` showed it (#2011
-        // agentctl-claude-permission-answer). Only the exact form counts:
-        // the proceed line, then numbered Yes/No options with one selected.
-        {
-            let rows: Vec<_> = clean.lines().collect();
-            if let Some(proceed) = rows
-                .iter()
-                .position(|row| row.to_lowercase().contains("do you want to proceed"))
-            {
-                let mut options = vec![];
-                let mut selected = None;
-                for row in &rows[proceed + 1..] {
-                    if let Some((option, is_selected)) = option_row(row, '❯') {
-                        if is_selected {
-                            selected = Some(option.number);
-                        }
-                        options.push(option);
-                    }
-                }
-                let yes_no = options
-                    .iter()
-                    .any(|option| option.text.to_lowercase().starts_with("yes"))
-                    && options
-                        .iter()
-                        .any(|option| option.text.to_lowercase().starts_with("no"));
-                // A permission context must head the form: a bare proceed
-                // selection (the shared corpus's menu row) stays a menu.
-                let context = rows[..proceed].iter().rev().find(|row| {
-                    let lower = row.to_lowercase();
-                    lower.contains("dangerous")
-                        || lower.contains("requires confirmation")
-                        || lower.contains("bash command")
-                });
-                if let (true, Some(context)) =
-                    (options.len() >= 2 && selected.is_some() && yes_no, context)
-                {
-                    let text = context.trim().to_owned();
-                    return View::question(Question {
-                        text,
-                        options,
-                        selected,
-                        total: 1,
-                        collapsed: false,
-                        notes: false,
-                        draft: String::new(),
-                    });
-                }
-            }
+        if let Some(question) = permission_prompt(&rows) {
+            return View::question(question);
         }
         let all_rows: Vec<_> = clean.lines().collect();
         let border = all_rows.iter().rposition(|r| {
@@ -191,8 +91,9 @@ impl HarnessTui for ClaudeTui {
         option: Option<usize>,
         text: Option<&str>,
     ) -> Result<AnswerPlan, String> {
-        // A hook confirmation is owner-only (#1784): never answered through
-        // agentctl, automatically or otherwise; a person answers at the pane.
+        // A hook confirmation is never approved through agentctl (#1784):
+        // `agentctl answer` refuses it outright; only the watcher's deny
+        // sweep may answer it, and only with its refusal (#2421).
         if q.text.to_lowercase().contains("hook")
             && q.text.to_lowercase().contains("requires confirmation")
         {
@@ -221,4 +122,172 @@ impl HarnessTui for ClaudeTui {
             selected: Some(number),
         })
     }
+}
+
+/// Whether `row` is a horizontal rule a Claude form draws above itself.
+fn rule_row(row: &str) -> bool {
+    let trimmed = row.trim();
+    trimmed.chars().count() >= 3 && trimmed.chars().all(|c| matches!(c, '─' | '━' | '═'))
+}
+
+/// A Claude hook confirmation (`Hook PreToolUse:Bash requires confirmation
+/// … Do you want to proceed? 1. Yes 2. No`), as a blocking question naming
+/// the hook and the first line of its reason (#1784), so the watcher can
+/// say what it is instead of reporting unrecognizable text. `answer_plan`
+/// refuses it; only the deny path of #2421 may ever answer it, and only
+/// with its refusal. The options are read below the hook heading.
+fn hook_confirmation(rows: &[&str]) -> Option<Question> {
+    let hook = rows.iter().rposition(|row| {
+        let lower = row.to_lowercase();
+        lower.contains("hook") && lower.contains("requires confirmation")
+    })?;
+    let mut options = vec![];
+    let mut selected = None;
+    for row in &rows[hook + 1..] {
+        if let Some((option, is_selected)) = option_row(row, '❯') {
+            if is_selected {
+                selected = Some(option.number);
+            }
+            options.push(option);
+        }
+    }
+    let proceeds = rows[hook + 1..]
+        .iter()
+        .any(|row| row.to_lowercase().contains("do you want to proceed"));
+    if !(proceeds && options.len() >= 2 && selected.is_some()) {
+        return None;
+    }
+    let reason = rows[hook + 1..]
+        .iter()
+        .map(|row| row.trim())
+        .find(|row| {
+            !row.is_empty()
+                && !row.to_lowercase().contains("do you want to proceed")
+                && option_row(row, '❯').is_none()
+        })
+        .unwrap_or_default();
+    let heading = rows[hook].trim();
+    let text = if reason.is_empty() {
+        heading.to_owned()
+    } else {
+        format!("{heading}: {reason}")
+    };
+    Some(Question {
+        text,
+        options,
+        selected,
+        total: 1,
+        collapsed: false,
+        notes: false,
+        draft: String::new(),
+    })
+}
+
+/// A permission prompt (`Do you want to proceed? ❯ 1. Yes  2. No`, under a
+/// `Bash command` form, a permission-rule confirmation or a
+/// dangerous-operation warning): an answerable question, not a menu
+/// (#2011 agentctl-claude-permission-answer). Only the exact form counts:
+/// the proceed line, then numbered Yes/No options with one selected, with
+/// a permission context heading the form.
+fn permission_prompt(rows: &[&str]) -> Option<Question> {
+    let proceed = rows
+        .iter()
+        .rposition(|row| row.to_lowercase().contains("do you want to proceed"))?;
+    let mut options = vec![];
+    let mut selected = None;
+    for row in &rows[proceed + 1..] {
+        if let Some((option, is_selected)) = option_row(row, '❯') {
+            if is_selected {
+                selected = Some(option.number);
+            }
+            options.push(option);
+        }
+    }
+    let yes_no = options
+        .iter()
+        .any(|option| option.text.to_lowercase().starts_with("yes"))
+        && options
+            .iter()
+            .any(|option| option.text.to_lowercase().starts_with("no"));
+    // A permission context must head the form: a bare proceed selection
+    // (the shared corpus's menu row) stays a menu.
+    let context = rows[..proceed].iter().rev().find(|row| {
+        let lower = row.to_lowercase();
+        lower.contains("dangerous")
+            || lower.contains("requires confirmation")
+            || lower.contains("bash command")
+    })?;
+    (options.len() >= 2 && selected.is_some() && yes_no).then(|| Question {
+        text: context.trim().to_owned(),
+        options,
+        selected,
+        total: 1,
+        collapsed: false,
+        notes: false,
+        draft: String::new(),
+    })
+}
+
+/// Claude Code's hook, safety-check or permission-rule confirmation, when
+/// recognised well enough to refuse (#2421 agentctl-asks-never-block): the
+/// exact forms above, one fully visible question with a `Yes` option and
+/// exactly one refusing option (`No`), and nothing typed. The prompt text
+/// is the form's own rows from the rule above it to the proceed line, so
+/// the agent and its manager read what was refused.
+pub(crate) fn permission_denial(screen: &str) -> Option<super::Denial> {
+    let clean = plain(screen);
+    let rows: Vec<&str> = clean.lines().collect();
+    let (kind, question) = if let Some(question) = hook_confirmation(&rows) {
+        ("hook-confirmation", question)
+    } else {
+        ("permission", permission_prompt(&rows)?)
+    };
+    if question.total != 1 || question.collapsed || question.notes || !question.draft.is_empty() {
+        return None;
+    }
+    if !question
+        .options
+        .iter()
+        .any(|option| option.text.to_lowercase().starts_with("yes"))
+    {
+        return None;
+    }
+    let deny = super::sole_deny_option(&question.options)?;
+    let proceed = rows
+        .iter()
+        .rposition(|row| row.to_lowercase().contains("do you want to proceed"))?;
+    let start = rows[..proceed]
+        .iter()
+        .rposition(|row| rule_row(row))
+        .filter(|rule| proceed - rule <= 16)
+        .map_or_else(
+            || {
+                rows[..proceed]
+                    .iter()
+                    .rposition(|row| row.trim() == question.text.trim())
+                    .unwrap_or(proceed)
+            },
+            |rule| rule + 1,
+        );
+    let mut form: Vec<&str> = rows[start..proceed]
+        .iter()
+        .map(|row| row.trim())
+        .filter(|row| !row.is_empty() && !row.chars().all(|c| matches!(c, '╌' | '─' | '┄')))
+        .collect();
+    if form.is_empty() {
+        form.push(question.text.trim());
+    }
+    let prompt: String = form
+        .join(" · ")
+        .chars()
+        .take(super::DENIAL_PROMPT_CHARS)
+        .collect();
+    Some(super::Denial {
+        kind,
+        prompt,
+        options: question.options,
+        selected: question.selected,
+        deny,
+        focus_keys: &[],
+    })
 }

@@ -343,7 +343,7 @@ enum Commands {
     Approve(ApprovalAnswer),
     /// Deny a headless agent's held permission prompt as the owner at a terminal: the model reads the denial, with --reason, as the tool's error
     #[command(
-        after_help = "Examples:\n  agentctl deny coordinator a4182 --reason 'push to the fork instead'\n  agentctl deny coordinator\n\nWithout ID it answers the only pending prompt (refused when several are pending). In the chat channel the owner\nanswers with `deny ID [reason]`. A prompt nobody answers is denied when its timeout ends (run-headless\n--approval-timeout). Same terminal and agent checks as approve. Prints {name, approval}."
+        after_help = "Examples:\n  agentctl deny coordinator a4182 --reason 'push to the fork instead'\n  agentctl deny coordinator\n\nWithout ID it answers the only pending prompt (refused when several are pending). In the chat channel the owner\nanswers with `deny ID [reason]`. A prompt nobody answers is denied when its timeout ends (run-headless\n--approval-timeout, or the agent's approval_timeout_s; 0, the default, denies at once). Same terminal and agent checks as approve. Prints {name, approval}."
     )]
     Deny(ApprovalAnswer),
     /// Move a headless agent's session to an interactive Claude Code in a new Herdr tab: wait for the running turn to end (or interrupt it), stop the wrapper, and run `claude --resume SESSION` there
@@ -1447,15 +1447,27 @@ struct RunHeadless {
     /// Lines of each tool result kept, credential-shaped words masked, as the `preview` of its tool.completed event, at most 8; 0 keeps no output in the log (default: 8)
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(0..=8))]
     tool_preview_lines: Option<u64>,
-    /// Seconds a permission prompt waits for the owner's answer before it is denied, from 10 to 86400 (default: 600)
-    #[arg(long, default_value = "600", value_parser = clap::value_parser!(u64).range(10..=86400), value_name = "SECONDS")]
-    approval_timeout: u64,
+    /// Seconds a permission prompt waits for the owner's answer before it is denied: 0 denies at once (after a 3 s grace for the host's own permission hooks), or 10 to 86400 to ask the owner (default: the agent's profile approval_timeout_s, then the registry default in profiles.json, then 0)
+    #[arg(long, value_parser = approval_timeout_seconds, value_name = "SECONDS")]
+    approval_timeout: Option<u64>,
     /// Deny permission prompts at once instead of asking the owner (runs Claude Code with --permission-prompts none)
     #[arg(long)]
     no_approvals: bool,
     /// Accept answers from processes in the harness's own control group (by default refused, so a tool call that left the harness's process tree still cannot answer); for a wrapper that is not run as its own systemd unit
     #[arg(long)]
     approval_shared_cgroup: bool,
+}
+
+/// `run-headless --approval-timeout` (#2421): 0 (deny at once) or 10 to 86400 seconds.
+fn approval_timeout_seconds(text: &str) -> std::result::Result<u64, String> {
+    let seconds: u64 = text
+        .parse()
+        .map_err(|_| format!("{text:?} is not a whole number of seconds"))?;
+    if seconds == 0 || (10..=86_400).contains(&seconds) {
+        Ok(seconds)
+    } else {
+        Err("must be 0 (deny at once) or from 10 to 86400".to_owned())
+    }
 }
 
 /// `agentctl tabs` (#1793 agentctl-workspace-cultivation).
@@ -7057,7 +7069,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 value.tool_preview_lines.map(|lines| lines as usize),
                 Some(crate::subagents::HeadlessApprovals {
                     enabled: !value.no_approvals,
-                    timeout: Duration::from_secs(value.approval_timeout),
+                    timeout: value.approval_timeout.map(Duration::from_secs),
                     cgroup_check: !value.approval_shared_cgroup,
                 }),
                 terminate,

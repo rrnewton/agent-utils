@@ -1789,6 +1789,29 @@ coordinator when a condition holds past its threshold:
 | `looping` | `--loop-minutes` (default 10) | the same command `--loop-repeats` times in a row, the same error in that many attempts, or a retry banner |
 | `background-wait` | `--idle-minutes` if gone, `--stall-minutes` if idle | idle while the screen counts background shells that no longer run, or that use no CPU and move no bytes |
 
+**Permission prompts are refused, never approved** (#2421
+agentctl-asks-never-block; Rust edition). An agent waiting at a permission or
+approval prompt is stuck until a person acts, so the watcher answers the prompts
+it can recognise exactly: Claude Code's hook confirmations, built-in safety
+checks and permission-rule confirmations (`Do you want to proceed?`, Yes/No), and
+Muse's command approval form and peer-approval dialog. Once the same prompt has
+shown for the agent's `permission_deny_after_s` (default 60; set it on the
+profile or at the top of `.agentctl/profiles.json`), the full pass or the quick
+check after it selects the prompt's one refusing option (`No`, `Abort the entire
+command`, `Reject once`), re-reading the pane before every key, sending Enter
+only while a refusal is selected, and checking that the prompt left. The agent
+is then queued a note saying what was refused, that nothing ran, and to carry on
+another way or end with `BLOCKED:`; its manager (else the coordinator) gets one
+`FYI` line; nobody is asked anything, and the owner alarm for hook
+confirmations and the coordinator's blocked page wait while a refusal is
+pending. A prompt no recogniser accepts (a folder trust dialog, a question, a
+Codex screen, an unknown harness) is never answered: the `approval-prompt`
+notice reports it as before. Two failed refusals of the same prompt hand it back
+to that notice. `permission_prompts: "report"` on a profile or at the top level
+keeps the old report-only behaviour. The pass report lists every prompt seen
+under `permission_denials` with its action (`waiting`, `denied`, `failed`,
+`gave-up`, `reported`, `due` under `--check-only`).
+
 A verdict is a prose line of the agent's last reply that starts with a
 `--done-marker` once its indentation and any reply bullet are stripped; the
 markers are `DONE:` and `BLOCKED:` unless `--done-marker` is given, which
@@ -3672,9 +3695,16 @@ interactive session, and withdraws it from the wrapper when one does (the event
 log then shows it `cancelled` by the harness). Otherwise the wrapper logs
 `approval.requested` with an ID such as `a4182`, the whole call as the owner should
 judge it (`detail`: the shell command, or the input as JSON, credential-shaped words
-masked, up to 3000 bytes; `complete` is false when it had to be cut or masked), and
-holds the call until the owner answers or `run-headless --approval-timeout SECONDS`
-(default 600) passes, which denies it. A `chat run` bridge serving the agent follows
+masked, up to 3000 bytes; `complete` is false when it had to be cut or masked).
+**By default nobody is asked** (#2421 agentctl-asks-never-block): the agent's
+approval timeout is 0, so after a 3 s grace for the host's own hooks the wrapper
+denies the call by policy (`approval.decided` with `by: policy`), and the model
+reads that nothing ran, why the harness asked, and to do it a way that needs no
+approval or say what it needs; a bridge posts nothing for it. To ask the owner
+instead, set `approval_timeout_s` (10 to 86400) on the agent's profile or at the top
+of `.agentctl/profiles.json`, or pass `run-headless --approval-timeout SECONDS`,
+which wins; the wrapper then holds the call until the owner answers or the timeout
+passes, which denies it. A `chat run` bridge serving the agent follows
 the event log and, once a prompt has waited 5 s, posts `AGENT wants to run: TOOL
 (reason: ...) - reply approve ID or deny ID` with the call in a code block to its
 channel, then the outcome. A reason the harness made up from the model's own

@@ -59,7 +59,12 @@ pub fn capabilities() -> serde_json::Value {
         "commands": ["start --mode headless", "run-headless", "tail", "interrupt", "compact",
                      "send", "drain", "status", "stop", "install-units --headless", "takeover", "handback", "turnover",
                      "approvals", "approve", "deny"],
-        "approvals": {"default_timeout_s": approval::DEFAULT_TIMEOUT.as_secs(),
+        // #2421: the built-in policy denies at once (0); a profile or registry
+        // `approval_timeout_s` from 10 s asks the owner, `owner_timeout_s` being
+        // the wrapper's own default when it asks and names none.
+        "approvals": {"default_timeout_s": crate::profiles::DEFAULT_APPROVAL_TIMEOUT_S,
+                      "deny_at_once_grace_s": approval::POLICY_GRACE.as_secs(),
+                      "owner_timeout_s": approval::DEFAULT_TIMEOUT.as_secs(),
                       "answers": ["chat: approve|deny ID", "console: agentctl approve|deny NAME ID"]},
         // #2214: this build's headless start path ensures the agent's
         // console viewer tab (#1973). Restore probes a wrapper snapshot's

@@ -66,6 +66,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Busy / idle detection | supported | supported | supported | partial | supported (event log) |
 | Interrupt a running turn | supported | supported | supported | partial | supported (Claude and Muse) |
 | Approvals relay to chat | none | none | none | none | supported (Claude and Muse) |
+| Permission prompts refused, never approved (#2421) | supported | none (report only) | supported | none | supported (Claude) |
 | Forms / questions (`prompts`, `answer`) | supported | supported | none (detect only) | none | n/a |
 | Trust dialogs | supported | supported | partial | none | n/a |
 | Headless mode itself | supported | none | supported | none | — |
@@ -413,17 +414,71 @@ cancelled it) produces no `tail` line. It sits in the queue's
 - **Claude Code, Codex, Muse, Unknown (interactive)**: none. agentctl
   detects that a pane waits at an approval, permission, or trust prompt
   and reports it — the watcher as a blocked episode, `agentctl status`
-  as blocked — but the answer is given in the pane by a person. No TUI
-  approval is posted to chat and none is answered from chat. Muse's
-  peer-approval dialog is detection only, by design (#974
-  muse-peer-approval-prompt).
-- **Headless (Claude Code)**: supported. The wrapper holds the prompt,
-  logs `approval.requested`, a bridge serving the agent posts it to the
-  chat channel, and the owner answers `approve ID` / `deny ID` there or
-  `agentctl approve|deny` at a terminal (#671
-  headless-approval-surface; `rs/agentctl/src/headless/approval.rs`,
+  as blocked. No TUI approval is posted to chat and none is answered
+  from chat. Since #2421 the watcher refuses the prompts it recognises
+  (next row), so nobody needs to answer them; an approval is still only
+  ever given in the pane by a person.
+- **Headless (Claude Code)**: supported, when asked for. By default
+  (#2421) nobody is asked: the agent's approval timeout is 0 and the
+  prompt is denied by policy after a 3 s grace (see the next row), so
+  the bridge posts nothing. With `approval_timeout_s` (10 to 86400) on
+  the profile or registry, or `run-headless --approval-timeout`, the
+  wrapper holds the prompt, logs `approval.requested`, a bridge serving
+  the agent posts it to the chat channel, and the owner answers
+  `approve ID` / `deny ID` there or `agentctl approve|deny` at a
+  terminal (#671 headless-approval-surface;
+  `rs/agentctl/src/headless/approval.rs`,
   `rs/agentctl/src/chat_service.rs`). An unanswered prompt is denied
   when its timeout ends.
+
+### Permission prompts refused, never approved (#2421)
+
+An agent at a permission or approval prompt waits until a person acts
+(owner, 2026-11-27: "just deny is better than freeze forever"). agentctl
+refuses the prompts it can recognise exactly and never selects an
+approving option (#2421 agentctl-asks-never-block). Interactive panes go
+through `watch-agents`: the full pass and the quick check run
+`sweep_permission_denials` (`rs/agentctl/src/agent_watch.rs`) on each
+screen; a harness recogniser (`permission_denial` in
+`rs/agentctl/src/harness_tui/`) must accept the prompt; once the same
+prompt has shown for `permission_deny_after_s` (profile, then registry,
+default 60), `tui_prompts::deny` moves the cursor one verified step at a
+time onto the one option `deny_label` reads as a refusal, sends Enter only
+then, and checks the prompt left. The agent is queued a note (what was
+refused, nothing ran, carry on or end with `BLOCKED:`) and its manager one
+FYI line. `permission_prompts: "report"` (profile or registry) keeps
+report-only. Two failed refusals hand the prompt back to the
+`approval-prompt` notice and, for a hook confirmation, the owner alarm.
+
+- **Claude Code**: supported — hook confirmations (`Hook ... requires
+  confirmation`), built-in safety checks (a dangerous-operation warning)
+  and permission-rule or `Bash command` confirmations, each with `Do you
+  want to proceed?`, a `Yes` option and exactly one refusal (`No`, or
+  only `No, and tell Claude what to do differently` when that is the one
+  refusal besides a plain `No`). The folder trust dialog (`No, exit`
+  would quit the harness) and question forms are not recognised.
+- **Codex**: none (report only) — Codex lanes run with approvals off
+  (`--dangerously-bypass-approvals-and-sandbox`) and no Codex approval
+  screen is recorded here, so none is answered; the watcher reports one
+  if it ever shows.
+- **Muse**: supported — the command approval form (`Would you like to
+  run the following command?`; refusal `Abort the entire command`) and
+  the peer-approval dialog (`Message from PEER`; refusal `Reject once`,
+  never `Block`), the dialog's unfocused menu focused with one Down key
+  first. This supersedes #974's detection-only rule for the refusal
+  only. The plugin-hooks trust dialog keeps its own policy (Trust
+  dialogs row).
+- **Unknown TUI**: none — no recogniser, so nothing is answered.
+- **Headless (Claude Code)**: supported — `approval_timeout_s` 0, the
+  built-in default (profile, then registry; `run-headless
+  --approval-timeout` wins), denies every prompt by policy after
+  `POLICY_GRACE` (3 s, for the host's own permission hooks), logging
+  `approval.requested` and `approval.decided` with `by: policy`; the
+  model reads `policy_denial_message` (nothing ran, why it asked, what to
+  do instead) (`rs/agentctl/src/headless/wrapper.rs`,
+  `rs/agentctl/src/headless/approval.rs`,
+  `rs/agentctl/src/subagents/headless.rs`). Headless Muse never asks: its
+  bypass becomes `allowAll` on the wire (Permission bypass at launch).
 
 ### Forms / questions (`prompts`, `answer`)
 
@@ -1038,10 +1093,12 @@ The two smallest divergences, kept as rows so they cannot hide:
 1. **The stuck-paste backstop is not harness-agnostic yet.** It grew up
    Claude-first; Muse got it in #1546; an unrecognised TUI gets a
    report, not a rescue. #1560 is making it general now.
-2. **No TUI approval reaches chat.** Only a headless Claude agent's
-   approvals are posted to chat and answered there. A Claude, Codex, or
-   Muse pane waiting at an approval is reported, and a person answers
-   in the pane.
+2. **No TUI approval reaches chat, and by default no approval reaches
+   anyone.** Since #2421 a recognised Claude or Muse permission prompt is
+   refused by the watcher after 60 s and a headless prompt is denied by
+   policy after 3 s; only a profile or registry that sets
+   `permission_prompts: "report"` or `approval_timeout_s` keeps a person
+   in the loop. A Codex or unknown-harness prompt is still only reported.
 3. **`agentctl answer` does not answer Muse.** Muse forms are detected
    so status can say blocked; answering them is refused by design.
 4. **Headless means Claude or Muse.** In the Rust edition that the
@@ -1090,6 +1147,10 @@ differential lockstep for the interactive core, but it is not identical:
   from `managed_by` in `rs/agentctl/src/subagents/control.rs`) is Rust-only,
   like the `manage` and `tree` commands it builds on, which this edition
   refuses; its plain `send` keeps the unmarked header.
+- The #2421 permission keys (`permission_prompts`,
+  `permission_deny_after_s`, `approval_timeout_s`) are validated at load in
+  both editions, but only the Rust edition acts on them: this edition has
+  no `watch-agents` sweep and no headless Claude.
 - Its headless workers are a different mechanism — resumable Codex, AGY,
   and Muse structured turns driven per turn (`py/agentctl/foreign/`),
   not the Rust wrapper's persistent Claude process. The user guide's

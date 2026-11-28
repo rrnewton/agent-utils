@@ -45,8 +45,32 @@ use serde_json::Value;
 
 use super::events::excerpt;
 
-/// How long a prompt waits for the owner before it is denied, by default.
+/// How long a prompt waits for the owner before it is denied, when a wrapper is configured to
+/// ask the owner at all and names no timeout of its own. An agent's built-in policy is not to
+/// ask: [`crate::profiles::DEFAULT_APPROVAL_TIMEOUT_S`] is 0, deny at once (#2421).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Under a zero timeout, how long a prompt waits before the policy denies it: only long enough
+/// for the host's own permission hooks, which Claude Code consults alongside the wrapper and
+/// which typically settle a prompt within a second, to allow or refuse it first (#2421).
+pub const POLICY_GRACE: Duration = Duration::from_secs(3);
+
+/// What the model reads when the policy denied a prompt nobody was asked about (#2421
+/// agentctl-asks-never-block): that nothing ran, why the harness asked, and what to do instead.
+#[must_use]
+pub fn policy_denial_message(id: &str, reason: &str) -> String {
+    let reason = reason.trim();
+    let why = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " The harness asked because: {}.",
+            excerpt(reason, CHAT_REASON_BYTES).trim_end_matches('.')
+        )
+    };
+    format!(
+        "Denied automatically (approval {id}): this agent never waits for a person to approve a call, so nothing ran.{why} Do not retry the same call. Do it a way that needs no approval (for rm, literal absolute paths, or ${{VAR:?}} on every variable), or leave it out and say in your reply exactly what you need and why."
+    )
+}
 /// Longest reason quoted in a chat post, in bytes.
 pub const CHAT_REASON_BYTES: usize = 600;
 /// Longest chat message read as an answer, in bytes.

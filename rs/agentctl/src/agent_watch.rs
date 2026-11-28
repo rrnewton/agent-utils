@@ -518,8 +518,9 @@ const PEER_APPROVAL_CHOICES: [&str; 4] = [
 
 /// The Muse peer-approval dialog at the bottom of `screen` (#974
 /// muse-peer-approval-prompt): a `Message from <peer>` heading with its choices
-/// (`Allow once / Reject once / Allow for this session / Block`). A peer asking
-/// is a human decision, so this only ever names the dialog; nothing answers it.
+/// (`Allow once / Reject once / Allow for this session / Block`). Allowing a peer
+/// is a human decision, so this only names the dialog; the deny sweep may refuse
+/// it once (#2421), and nothing ever allows it.
 /// Both the heading and at least two choices must show in the prompt window, so
 /// a screen merely quoting a peer message does not count. The returned line
 /// names the dialog and the choices it offers, focused or not (before a Down
@@ -938,6 +939,27 @@ fn batch_id(keys: &[String], recipient: Option<&str>, generation: u32) -> String
     format!("agent-watch-{:016x}", stable_hash(&text))
 }
 
+/// One agent's permission prompt under the deny sweep (#2421).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DenialEntry {
+    /// Fingerprint of the prompt: kind, text and options.
+    prompt: String,
+    /// When the sweep first saw this prompt.
+    since: f64,
+    /// Refusals tried for it.
+    #[serde(default)]
+    attempts: u32,
+    /// When the last refusal was tried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_attempt: Option<f64>,
+}
+
+/// Refusals tried for one prompt before the sweep leaves it to the
+/// blocked-prompt notice (#2421).
+const MAX_DENY_ATTEMPTS: u32 = 2;
+/// Seconds between two refusals of the same prompt (#2421).
+const DENY_RETRY_SECONDS: f64 = 30.0;
+
 /// The persisted watcher state.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct WatchState {
@@ -999,6 +1021,13 @@ struct WatchState {
     /// blocked report survive watcher restarts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     general_backstop: BTreeMap<String, BackstopEntry>,
+    /// Permission prompts under the deny sweep (#2421
+    /// agentctl-asks-never-block), by agent: which prompt, since when, and
+    /// the refusals tried, persisted so the bound and the attempt cap
+    /// survive watcher restarts. An older build ignores the field and, if it
+    /// writes the state back, drops it, which only restarts the bound.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    permission_denials: BTreeMap<String, DenialEntry>,
     /// Recovery-ladder episodes (phase 2), by agent: persisted so the
     /// bounded escalation survives watcher restarts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1367,6 +1396,12 @@ pub trait Probe {
     fn agent_pane(&self, _agent: &str) -> Option<String> {
         None
     }
+    /// One agent's permission policy (#2421 agentctl-asks-never-block):
+    /// whether a recognised prompt is refused and after how long. The
+    /// default is the built-in policy: refuse after 60 s.
+    fn permission_policy(&self, _agent: &str) -> crate::profiles::PermissionPolicy {
+        crate::profiles::PermissionPolicy::default()
+    }
     /// The harness one agent runs, for parsing its editor screen.
     fn agent_harness(&self, _agent: &str) -> Option<String> {
         None
@@ -1531,6 +1566,19 @@ pub trait Notifier {
     fn answer_hooks_trust(&mut self, agent: &str) -> Result<Option<String>> {
         let _ = agent;
         Err(fail("this watcher cannot answer hooks dialogs"))
+    }
+    /// Refuse the permission prompt `agent`'s pane shows (#2421
+    /// agentctl-asks-never-block), only if it is still `expected`: the
+    /// manager re-reads the pane and re-recognises the prompt before every
+    /// key and only ever selects its refusing option. `Ok(None)` is nothing
+    /// to refuse any more, and silent. The default cannot act, only report.
+    fn deny_permission_prompt(
+        &mut self,
+        agent: &str,
+        expected: &crate::harness_tui::Denial,
+    ) -> Result<Option<String>> {
+        let _ = (agent, expected);
+        Err(fail("this watcher cannot answer permission prompts"))
     }
     /// Recovery ladder step 1: submit a stranded draft of ours (bare Enter).
     fn ladder_sweep(&mut self, agent: &str) -> Result<String> {
@@ -3630,6 +3678,29 @@ fn report_coordinator_blocked(
         return None;
     };
     let since = *state.coordinator_blocked_since.get_or_insert(now);
+    // #2421: the coordinator's own permission prompt goes through the deny
+    // sweep here (it has no observation, so neither the full pass's sweep
+    // nor the quick check's sees it), and is not paged while the sweep will
+    // refuse it: nobody is asked to answer what agentctl refuses itself.
+    if will_deny(probe, state, &coordinator, harness.as_deref(), &screen) {
+        let screens = [(
+            coordinator.clone(),
+            screen.clone(),
+            harness.clone().unwrap_or_default(),
+        )];
+        let denials = sweep_permission_denials(probe, notifier, state, &screens, now, options);
+        if denials.iter().all(|row| row["action"] != "gave-up") {
+            return Some(json!({
+                "agent": coordinator,
+                "blocked": true,
+                "kind": kind.as_str(),
+                "detail": detail,
+                "since": since,
+                "will_deny": true,
+                "permission_denials": denials,
+            }));
+        }
+    }
     let window = options.min_notice_interval.as_secs_f64().max(60.0);
     let due = state
         .coordinator_blocked_noticed_at
@@ -3692,6 +3763,212 @@ fn report_coordinator_blocked(
     Some(row)
 }
 
+/// Whether the deny sweep will refuse the prompt `screen` shows for `agent`
+/// (#2421): recognised, the agent's policy denies, and the sweep has not
+/// given up on it.
+fn will_deny(
+    probe: &dyn Probe,
+    state: &WatchState,
+    agent: &str,
+    harness: Option<&str>,
+    screen: &str,
+) -> bool {
+    crate::harness_tui::permission_denial(harness, screen).is_some()
+        && probe.permission_policy(agent).deny
+        && state
+            .permission_denials
+            .get(agent)
+            .is_none_or(|entry| entry.attempts < MAX_DENY_ATTEMPTS)
+}
+
+/// The fingerprint of a recognised permission prompt: its kind, text and
+/// options, so a different prompt restarts the bound.
+fn denial_fingerprint(denial: &crate::harness_tui::Denial) -> String {
+    let options: Vec<String> = denial
+        .options
+        .iter()
+        .map(|option| format!("{}. {}", option.number, option.text))
+        .collect();
+    format!(
+        "{:016x}",
+        stable_hash(&format!(
+            "{}\n{}\n{}",
+            denial.kind,
+            denial.prompt,
+            options.join("\n")
+        ))
+    )
+}
+
+/// What the refused agent reads next (#2421): what was refused, that
+/// nothing ran (or nothing was let in), and to carry on another way.
+fn denial_note(agent: &str, denial: &crate::harness_tui::Denial, waited: f64) -> String {
+    let waited = crate::turn_state::format_age(waited.max(0.0));
+    if denial.kind == "peer-approval" {
+        return format!(
+            "[agentctl watch-agents] {agent}: a peer asked to message you and nobody answers approval \
+             dialogs for managed agents, so agentctl chose \"Reject once\" after {waited} (policy: \
+             never wait on an approval prompt; never approve one): {}. If you need what that peer \
+             wanted, ask your manager through agentctl. Carry on with your task.",
+            denial.prompt
+        );
+    }
+    format!(
+        "[agentctl watch-agents] {agent}: your harness asked a person to approve a call and nobody \
+         answers approval prompts for managed agents, so agentctl refused it after {waited} \
+         (policy: never wait on an approval prompt; never approve one). Refused: {}. Nothing ran. \
+         Do not retry the same call. Carry on another way that needs no approval (for rm: literal \
+         absolute paths, or ${{VAR:?}} on every variable); if you cannot, end your turn with \
+         BLOCKED: and exactly what you need.",
+        denial.prompt
+    )
+}
+
+/// The deny sweep (#2421 agentctl-asks-never-block), on the full pass and
+/// the quick check: for each agent screen showing a permission prompt its
+/// harness recogniser can refuse ([`crate::harness_tui::permission_denial`]),
+/// once the same prompt has shown for the agent's `permission_deny_after_s`,
+/// ask the manager to refuse it ([`Notifier::deny_permission_prompt`]; it
+/// re-reads and re-recognises before every key and never selects an
+/// approving option). A refused agent is queued a note saying what was
+/// refused and to carry on, and its manager gets one FYI line. A prompt no
+/// recogniser accepts is not touched here: the blocked-prompt notice
+/// reports it as before. An agent whose policy is `report` is only listed.
+fn sweep_permission_denials(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    screens: &[(String, String, String)],
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for (agent, screen, harness) in screens {
+        let Some(denial) = crate::harness_tui::permission_denial(Some(harness.as_str()), screen)
+        else {
+            state.permission_denials.remove(agent);
+            continue;
+        };
+        let fingerprint = denial_fingerprint(&denial);
+        let entry = state
+            .permission_denials
+            .entry(agent.clone())
+            .or_insert_with(|| DenialEntry {
+                prompt: fingerprint.clone(),
+                since: now,
+                attempts: 0,
+                last_attempt: None,
+            });
+        if entry.prompt != fingerprint {
+            *entry = DenialEntry {
+                prompt: fingerprint.clone(),
+                since: now,
+                attempts: 0,
+                last_attempt: None,
+            };
+        }
+        let since = entry.since;
+        let policy = probe.permission_policy(agent);
+        let mut row = json!({
+            "agent": agent,
+            "kind": denial.kind,
+            "prompt": denial.prompt,
+            "seen_for_s": (now - since).max(0.0),
+            "deny_after_s": policy.deny_after_s,
+        });
+        if !policy.deny {
+            row["action"] = json!("reported");
+            row["policy"] = json!(policy.source);
+            rows.push(row);
+            continue;
+        }
+        let due_at = since + policy.deny_after_s as f64;
+        if now < due_at {
+            row["action"] = json!("waiting");
+            row["due_in_s"] = json!(due_at - now);
+            rows.push(row);
+            continue;
+        }
+        if entry.attempts >= MAX_DENY_ATTEMPTS {
+            row["action"] = json!("gave-up");
+            row["attempts"] = json!(entry.attempts);
+            rows.push(row);
+            continue;
+        }
+        if entry
+            .last_attempt
+            .is_some_and(|at| now - at < DENY_RETRY_SECONDS)
+        {
+            row["action"] = json!("retry-wait");
+            rows.push(row);
+            continue;
+        }
+        if options.check_only {
+            row["action"] = json!("due");
+            rows.push(row);
+            continue;
+        }
+        entry.attempts += 1;
+        entry.last_attempt = Some(now);
+        let attempt = entry.attempts;
+        match notifier.deny_permission_prompt(agent, &denial) {
+            Ok(Some(outcome)) => {
+                state.permission_denials.remove(agent);
+                row["action"] = json!("denied");
+                row["outcome"] = json!(outcome);
+                log(format_args!(
+                    "agent {agent}: refused a {} after {:.0} s (never approved): {}",
+                    denial.kind,
+                    now - since,
+                    denial.prompt
+                ));
+                let note_id = format!("agent-watch-deny-{agent}-{fingerprint}-{since:.0}");
+                row["note"] = match notifier.notify(
+                    agent,
+                    &denial_note(agent, &denial, now - since),
+                    &note_id,
+                ) {
+                    Ok(outcome) => json!(outcome),
+                    Err(error) => json!({"error": error.to_string()}),
+                };
+                let manager = state
+                    .agents
+                    .get(agent)
+                    .and_then(|memory| memory.route.clone())
+                    .unwrap_or_else(|| options.coordinator.clone());
+                if manager != *agent && !manager.is_empty() {
+                    let line = format!(
+                        "[agentctl watch-agents] FYI {agent}: refused a {} after {} (never approved; nothing ran): {}",
+                        denial.kind,
+                        crate::turn_state::format_age((now - since).max(0.0)),
+                        denial.prompt.chars().take(200).collect::<String>()
+                    );
+                    let fyi_id = format!("agent-watch-deny-fyi-{agent}-{fingerprint}-{since:.0}");
+                    row["fyi"] = match notifier.notify(&manager, &line, &fyi_id) {
+                        Ok(outcome) => json!({"to": manager, "outcome": outcome}),
+                        Err(error) => json!({"to": manager, "error": error.to_string()}),
+                    };
+                }
+            }
+            Ok(None) => {
+                state.permission_denials.remove(agent);
+                row["action"] = json!("gone");
+            }
+            Err(error) => {
+                row["action"] = json!("failed");
+                row["attempts"] = json!(attempt);
+                row["error"] = json!(error.to_string());
+                log(format_args!(
+                    "agent {agent}: could not refuse a {} (attempt {attempt}): {error}",
+                    denial.kind
+                ));
+            }
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 /// Page the owner in chat about every agent waiting at an owner-only hook
 /// confirmation (#1784 agentctl-watch-recognise-hook-confirmation): the
 /// coordinator cannot answer one, so the ordinary blocked notice is not
@@ -3724,6 +4001,15 @@ fn report_hook_confirmations(
             continue;
         }
         let agent = observation.name.clone();
+        // #2421: the deny sweep refuses it within its bound, so the owner
+        // is not asked to answer it; only a prompt the sweep cannot refuse
+        // (or a profile that only reports) still alarms.
+        if will_deny(probe, state, &agent, observation.harness.as_deref(), screen) {
+            rows.push(
+                json!({"agent": agent, "blocked": true, "detail": detail, "will_deny": true}),
+            );
+            continue;
+        }
         let pane = probe
             .agent_pane(&agent)
             .unwrap_or_else(|| "unknown pane".to_owned());
@@ -3965,6 +4251,24 @@ fn watch_agents_once(
             }
         }
     }
+    // Permission prompts are refused, never approved, once they have shown
+    // for the agent's bound (#2421 agentctl-asks-never-block). Like the
+    // hooks-trust sweep, only this registry's own observations are read.
+    let permission_denials = if probe_error.is_null() {
+        let screens: Vec<(String, String, String)> = observations
+            .iter()
+            .filter_map(|observation| {
+                Some((
+                    observation.name.clone(),
+                    observation.screen.clone()?,
+                    observation.harness.clone()?,
+                ))
+            })
+            .collect();
+        sweep_permission_denials(probe, notifier, state, &screens, now, options)
+    } else {
+        Vec::new()
+    };
     // Whom to tell is decided again each pass from the latest observation, so a notice still
     // waiting does not go to a manager that has since stopped, paused, lost the agent, or
     // stopped taking notices.
@@ -4186,6 +4490,7 @@ fn watch_agents_once(
         "team_pump": team_pump,
         "auto_interrupts": auto_interrupts,
         "hooks_trust": hooks_trust,
+        "permission_denials": permission_denials,
         "activity": observations
             .iter()
             .map(|row| {
@@ -4295,6 +4600,14 @@ fn check_blocked(
             )
         })
         .collect();
+    // The deny sweep runs on the quick check too (#2421), so a prompt is
+    // refused within one quick-check interval of its bound.
+    let swept: Vec<(String, String, String)> = editor_screens
+        .iter()
+        .filter(|(name, ..)| *name != options.coordinator)
+        .cloned()
+        .collect();
+    let permission_denials = sweep_permission_denials(probe, notifier, state, &swept, now, options);
     let draft_sweeps =
         sweep_editor_drafts(probe, notifier, state, editor_screens.clone(), now, options);
     // The general backstop runs on the quick check too (#1560), on the
@@ -4322,12 +4635,16 @@ fn check_blocked(
         && paste_backstop.is_empty()
         && !retry_due
         && coordinator_blocked.is_none()
+        && permission_denials
+            .iter()
+            .all(|row| row["action"] == "waiting")
     {
         return None;
     }
     let notice = flush_notices(state, notifier, now, options);
     Some(json!({"checked_at": now, "found": found, "notice": notice,
                 "coordinator_blocked": coordinator_blocked,
+                "permission_denials": permission_denials,
                 "paste_backstop": paste_backstop,
                 "draft_sweeps": draft_sweeps}))
 }
@@ -6815,6 +7132,16 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
             .ok()
     }
 
+    fn permission_policy(&self, agent: &str) -> crate::profiles::PermissionPolicy {
+        // An unreadable record or profile file leaves the built-in policy
+        // (refuse after 60 s): a broken configuration never leaves an agent
+        // waiting at a prompt.
+        ManagedAgents::new(self.client, &self.registry)
+            .ok()
+            .and_then(|manager| manager.permission_policy_for(agent).ok())
+            .unwrap_or_default()
+    }
+
     fn team_undeliverable_notices(&mut self) -> Vec<(PathBuf, Value)> {
         crate::subagents::team_undeliverable_notices(&self.registry, &self.teams_state)
     }
@@ -7287,6 +7614,22 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
 
     fn answer_hooks_trust(&mut self, agent: &str) -> Result<Option<String>> {
         ManagedAgents::new(self.client, &self.registry)?.answer_hooks_trust_if_dialog(agent)
+    }
+    fn deny_permission_prompt(
+        &mut self,
+        agent: &str,
+        expected: &crate::harness_tui::Denial,
+    ) -> Result<Option<String>> {
+        let outcome = ManagedAgents::new(self.client, &self.registry)?
+            .deny_permission_prompt(agent, Some(expected))?;
+        Ok(outcome.map(|report| {
+            format!(
+                "{agent}: chose {:?} on a {} in pane {}",
+                report["option"].as_str().unwrap_or_default(),
+                report["kind"].as_str().unwrap_or_default(),
+                report["pane_id"].as_str().unwrap_or_default()
+            )
+        }))
     }
 
     fn ladder_redraw(&mut self, agent: &str) -> Result<String> {
@@ -8927,6 +9270,11 @@ mod tests {
         presses: Vec<String>,
         /// Agents whose hooks dialog the watcher answered (#1932).
         hooks_answers: Vec<String>,
+        /// Agents whose permission prompt a refusal was asked for (#2421).
+        denials: Vec<String>,
+        /// Whether a refusal succeeds; by default this notifier cannot
+        /// refuse, as the trait's default (#2421).
+        deny_ok: bool,
         /// The answered agent's record vanished mid-pass (#2222).
         hooks_vanish: bool,
         /// Whether every backstop press fails (#1560).
@@ -8965,6 +9313,30 @@ mod tests {
     }
 
     impl Notifier for RecordingNotifier {
+        fn deny_permission_prompt(
+            &mut self,
+            agent: &str,
+            expected: &crate::harness_tui::Denial,
+        ) -> Result<Option<String>> {
+            self.denials.push(agent.to_owned());
+            if !self.deny_ok {
+                return Err(fail("this watcher cannot answer permission prompts"));
+            }
+            let chosen = expected
+                .options
+                .iter()
+                .find(|option| option.number == expected.deny)
+                .map(|option| option.text.clone())
+                .unwrap_or_default();
+            assert!(
+                crate::harness_tui::deny_label(&chosen),
+                "the sweep asked to refuse with a non-refusal {chosen:?}"
+            );
+            Ok(Some(format!(
+                "{agent}: chose {chosen:?} on a {}",
+                expected.kind
+            )))
+        }
         fn withdraw(&mut self, recipient: &str, message_id: &str) -> Result<String> {
             let outcome = self
                 .withdraw_outcome
@@ -9189,10 +9561,15 @@ mod tests {
             row.harness = Some("claude".to_owned());
             row
         };
-        let mut probe = ScriptedProbe(vec![
-            vec![hook_observation(HOOK_SCREEN)],
-            vec![hook_observation(HOOK_SCREEN)],
-        ]);
+        // Since #2421 only an agent whose policy reports (never refuses) a
+        // prompt pages the owner; the default policy refuses it instead.
+        let mut probe = PolicyProbe::new(
+            vec![
+                vec![hook_observation(HOOK_SCREEN)],
+                vec![hook_observation(HOOK_SCREEN)],
+            ],
+            report_policy(),
+        );
         let mut notifier = RecordingNotifier::default();
         let mut state = WatchState::default();
         let options = options();
@@ -9222,6 +9599,329 @@ mod tests {
             1,
             "the same prompt is rate-limited per prompt: {report}"
         );
+    }
+
+    /// A scripted probe whose agents all carry one permission policy, with
+    /// visible screens for the quick check (#2421).
+    struct PolicyProbe {
+        inner: ScriptedProbe,
+        policy: crate::profiles::PermissionPolicy,
+        screens: Vec<(String, String)>,
+        harness: Option<String>,
+    }
+
+    impl PolicyProbe {
+        fn new(passes: Vec<Vec<Observation>>, policy: crate::profiles::PermissionPolicy) -> Self {
+            Self {
+                inner: ScriptedProbe(passes),
+                policy,
+                screens: Vec::new(),
+                harness: Some("claude".to_owned()),
+            }
+        }
+    }
+
+    impl Probe for PolicyProbe {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            self.inner.observe()
+        }
+        fn permission_policy(&self, _agent: &str) -> crate::profiles::PermissionPolicy {
+            self.policy.clone()
+        }
+        fn visible_screens(&mut self) -> Vec<(String, String)> {
+            self.screens.clone()
+        }
+        fn agent_harness(&self, _agent: &str) -> Option<String> {
+            self.harness.clone()
+        }
+    }
+
+    fn report_policy() -> crate::profiles::PermissionPolicy {
+        crate::profiles::PermissionPolicy {
+            deny: false,
+            ..crate::profiles::PermissionPolicy::default()
+        }
+    }
+
+    fn claude_at(name: &str, screen: &str) -> Observation {
+        let mut row = observation(name, "blocked", Some(screen));
+        row.harness = Some("claude".to_owned());
+        row
+    }
+
+    const PERMISSION_SCREEN: &str = "────────────────────────────────────────\n Bash command\n rm -rf /work/project/victim\n Permission rule Bash requires confirmation for this command.\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend\n";
+
+    #[test]
+    fn a_permission_prompt_is_refused_once_the_bound_passes_never_before() {
+        // #2421: the same prompt shown for the agent's bound (default 60 s)
+        // is refused with its refusing option; the agent is queued a note
+        // and its manager one FYI line; nothing happens before the bound.
+        let passes = (0..4)
+            .map(|_| vec![claude_at("lane", HOOK_SCREEN)])
+            .collect();
+        let mut probe = PolicyProbe::new(passes, crate::profiles::PermissionPolicy::default());
+        let mut notifier = RecordingNotifier {
+            deny_ok: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let options = options();
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "waiting",
+            "{report}"
+        );
+        assert_eq!(report["permission_denials"][0]["kind"], "hook-confirmation");
+        assert!(notifier.denials.is_empty());
+        assert!(
+            notifier.alarms.is_empty(),
+            "nobody is asked: {:?}",
+            notifier.alarms
+        );
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_059.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "waiting",
+            "{report}"
+        );
+        assert!(notifier.denials.is_empty(), "not before the bound");
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_060.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "denied",
+            "{report}"
+        );
+        assert_eq!(notifier.denials, ["lane"]);
+        assert!(state.permission_denials.is_empty());
+        let note = notifier
+            .sent
+            .iter()
+            .find(|(to, _, id)| to == "lane" && id.starts_with("agent-watch-deny-lane-"))
+            .expect("a note to the refused agent");
+        assert!(note.1.contains("Nothing ran"), "{}", note.1);
+        assert!(
+            note.1
+                .contains("Hook PreToolUse:Bash requires confirmation"),
+            "{}",
+            note.1
+        );
+        let fyi = notifier
+            .sent
+            .iter()
+            .find(|(to, _, id)| to == "coordinator" && id.starts_with("agent-watch-deny-fyi-lane-"))
+            .expect("one FYI line to the manager");
+        assert!(
+            fyi.1
+                .starts_with("[agentctl watch-agents] FYI lane: refused a hook-confirmation"),
+            "{}",
+            fyi.1
+        );
+        assert!(!fyi.1.contains('\n'), "one line: {}", fyi.1);
+        assert!(
+            notifier.alarms.is_empty(),
+            "never a question: {:?}",
+            notifier.alarms
+        );
+    }
+
+    #[test]
+    fn the_bound_comes_from_the_policy_and_a_different_prompt_restarts_it() {
+        let policy = crate::profiles::PermissionPolicy {
+            deny_after_s: 300,
+            ..crate::profiles::PermissionPolicy::default()
+        };
+        let passes = vec![
+            vec![claude_at("lane", HOOK_SCREEN)],
+            vec![claude_at("lane", PERMISSION_SCREEN)],
+            vec![claude_at("lane", PERMISSION_SCREEN)],
+            vec![claude_at("lane", PERMISSION_SCREEN)],
+        ];
+        let mut probe = PolicyProbe::new(passes, policy);
+        let mut notifier = RecordingNotifier {
+            deny_ok: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let options = options();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        // A different prompt at 1 200 s starts its own clock.
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_200.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["kind"], "permission",
+            "{report}"
+        );
+        assert_eq!(
+            report["permission_denials"][0]["action"], "waiting",
+            "{report}"
+        );
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_400.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "waiting",
+            "{report}"
+        );
+        assert!(notifier.denials.is_empty());
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_500.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "denied",
+            "{report}"
+        );
+        assert_eq!(notifier.denials, ["lane"]);
+    }
+
+    #[test]
+    fn a_report_policy_or_check_only_refuses_nothing() {
+        let passes = (0..2)
+            .map(|_| vec![claude_at("lane", HOOK_SCREEN)])
+            .collect();
+        let mut probe = PolicyProbe::new(passes, report_policy());
+        let mut notifier = RecordingNotifier {
+            deny_ok: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let options = options();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 2_000.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "reported",
+            "{report}"
+        );
+        assert!(notifier.denials.is_empty());
+        let passes = (0..2)
+            .map(|_| vec![claude_at("lane", HOOK_SCREEN)])
+            .collect();
+        let mut probe = PolicyProbe::new(passes, crate::profiles::PermissionPolicy::default());
+        let mut notifier = RecordingNotifier {
+            deny_ok: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let check_only = WatchAgentsOptions {
+            check_only: true,
+            ..options
+        };
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &check_only);
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 2_000.0, &check_only);
+        assert_eq!(report["permission_denials"][0]["action"], "due", "{report}");
+        assert!(notifier.denials.is_empty());
+    }
+
+    #[test]
+    fn an_unrecognised_prompt_is_reported_and_never_refused() {
+        // A folder trust dialog and a bare approval line block, so the
+        // blocked-prompt notice reports them, but no recogniser accepts
+        // them, so nothing is refused; a Codex screen likewise.
+        let trust = "────────────────────────────────────────\n Do you trust the files in this folder?\n ❯ 1. Yes, proceed\n   2. No, exit\n Enter to confirm · Esc to exit\n";
+        let mut codex = claude_at("cx", HOOK_SCREEN);
+        codex.harness = Some("codex".to_owned());
+        let passes = (0..2)
+            .map(|_| {
+                vec![
+                    claude_at("lane", trust),
+                    codex.clone(),
+                    claude_at("bare", "Do you want to proceed?\n"),
+                ]
+            })
+            .collect();
+        let mut probe = PolicyProbe::new(passes, crate::profiles::PermissionPolicy::default());
+        let mut notifier = RecordingNotifier {
+            deny_ok: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let options = options();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 5_000.0, &options);
+        assert!(notifier.denials.is_empty(), "{report}");
+        assert_eq!(
+            report["permission_denials"].as_array().map(Vec::len),
+            Some(0),
+            "{report}"
+        );
+        assert!(state.permission_denials.is_empty());
+    }
+
+    #[test]
+    fn a_refusal_that_fails_is_retried_once_then_left_to_the_notice_and_the_owner() {
+        let passes = (0..5)
+            .map(|_| vec![claude_at("lane", HOOK_SCREEN)])
+            .collect();
+        let mut probe = PolicyProbe::new(passes, crate::profiles::PermissionPolicy::default());
+        let mut notifier = RecordingNotifier::default(); // cannot refuse
+        let mut state = WatchState::default();
+        let options = options();
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_060.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "failed",
+            "{report}"
+        );
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_070.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "retry-wait",
+            "{report}"
+        );
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_090.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "failed",
+            "{report}"
+        );
+        assert_eq!(notifier.denials, ["lane", "lane"]);
+        // Out of attempts: the hook confirmation pages the owner as before
+        // #2421, in the same pass, since nothing else will end it; later
+        // passes give up refusing and the alarm keeps its rate limit.
+        assert_eq!(notifier.alarms.len(), 1, "{report}");
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_120.0, &options);
+        assert_eq!(
+            report["permission_denials"][0]["action"], "gave-up",
+            "{report}"
+        );
+        assert_eq!(notifier.denials.len(), 2);
+        assert_eq!(notifier.alarms.len(), 1, "{report}");
+    }
+
+    #[test]
+    fn the_quick_check_refuses_a_due_prompt_between_passes() {
+        let mut probe = PolicyProbe::new(Vec::new(), crate::profiles::PermissionPolicy::default());
+        probe.screens = vec![("lane".to_owned(), PERMISSION_SCREEN.to_owned())];
+        let mut notifier = RecordingNotifier {
+            deny_ok: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let options = options();
+        let first = check_blocked(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        assert!(notifier.denials.is_empty(), "{first:?}");
+        let row = check_blocked(&mut probe, &mut notifier, &mut state, 1_061.0, &options)
+            .expect("a report row");
+        assert_eq!(row["permission_denials"][0]["action"], "denied", "{row}");
+        assert_eq!(notifier.denials, ["lane"]);
+    }
+
+    #[test]
+    fn a_coordinator_at_a_refusable_prompt_is_refused_not_paged() {
+        let mut probe = CoordScreenProbe(vec![
+            Some(PERMISSION_SCREEN.to_owned()),
+            Some(PERMISSION_SCREEN.to_owned()),
+        ]);
+        let mut notifier = RecordingNotifier {
+            deny_ok: true,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        let options = options();
+        let row =
+            report_coordinator_blocked(&mut probe, &mut notifier, &mut state, 1_000.0, &options)
+                .expect("a blocked row");
+        assert_eq!(row["will_deny"], true, "{row}");
+        assert!(
+            notifier.sent.is_empty(),
+            "nobody paged: {:?}",
+            notifier.sent
+        );
+        let row =
+            report_coordinator_blocked(&mut probe, &mut notifier, &mut state, 1_060.0, &options)
+                .expect("a blocked row");
+        assert_eq!(row["permission_denials"][0]["action"], "denied", "{row}");
+        assert_eq!(notifier.denials, ["coordinator"]);
     }
 
     #[test]

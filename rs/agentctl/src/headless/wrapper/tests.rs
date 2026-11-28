@@ -1361,6 +1361,64 @@ fn an_unanswered_prompt_is_denied_at_the_timeout() {
 }
 
 #[test]
+fn a_zero_timeout_denies_by_policy_after_the_grace_with_the_reason() {
+    // #2421 agentctl-asks-never-block: a zero timeout asks nobody. The
+    // prompt is still logged, waits only the grace for the host's own
+    // hooks, and is denied by `policy` with a message that names why the
+    // harness asked and what to do instead; no owner answer is involved.
+    let mut fixture = Fixture::new("policy", "normal");
+    fixture.config.approval_timeout = Duration::ZERO;
+    let handle = fixture.start();
+    fixture.enqueue("m1", "ASK to push", json!({"from": "owner"}));
+    let id = fixture.approval_id();
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    let requested = fixture.event_data("approval.requested");
+    assert_eq!(requested["timeout_s"], 0, "{requested}");
+    let decided = fixture.event_data("approval.decided");
+    assert_eq!(decided["decision"], "denied", "{decided}");
+    assert_eq!(decided["by"], "policy", "{decided}");
+    let waited = decided["waited_ms"].as_u64().unwrap();
+    assert!(
+        waited >= crate::headless::approval::POLICY_GRACE.as_millis() as u64,
+        "{decided}"
+    );
+    let completed = fixture.event_data("tool.completed");
+    let reason = completed["denied"]["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with(&format!("Denied automatically (approval {id})")),
+        "{reason}"
+    );
+    assert!(reason.contains("nothing ran"), "{reason}");
+    assert!(reason.contains("Do not retry the same call"), "{reason}");
+    // Nothing is left for an owner to answer.
+    let late =
+        fixture.answer(json!({"op": "approval", "id": id, "decision": "approve", "by": "chat:U1"}));
+    assert_eq!(late["class"], "not_pending", "{late}");
+    fixture.stop(handle);
+}
+
+#[test]
+fn the_policy_message_names_the_reason_and_never_invites_approval() {
+    let message = crate::headless::approval::policy_denial_message(
+        "a7",
+        "Dangerous rm operation on possibly-empty variable path.",
+    );
+    assert!(message.contains("(approval a7)"), "{message}");
+    assert!(
+        message.contains(
+            "The harness asked because: Dangerous rm operation on possibly-empty variable path."
+        ),
+        "{message}"
+    );
+    assert!(message.contains("${VAR:?}"), "{message}");
+    assert!(!message.to_lowercase().contains("approve a7"), "{message}");
+    let bare = crate::headless::approval::policy_denial_message("a8", "  ");
+    assert!(!bare.contains("asked because"), "{bare}");
+}
+
+#[test]
 fn the_agent_cannot_answer_its_own_prompt_and_bad_answers_are_refused() {
     let fixture = Fixture::new("selfapprove", "normal");
     let handle = fixture.start();

@@ -106,6 +106,89 @@ pub trait HarnessTui {
     ) -> Result<AnswerPlan, String>;
 }
 
+/// A permission or approval prompt recognised well enough to refuse
+/// (#2421 agentctl-asks-never-block): the harness waits for a person to
+/// allow or refuse a call or a message, and agentctl may only ever choose
+/// the refusal. Built by a harness's own strict recogniser from the
+/// visible rows; anything less certain stays unrecognised and is
+/// reported, never answered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Denial {
+    /// Which prompt: `hook-confirmation`, `permission`, `peer-approval` or
+    /// `command-approval`.
+    pub kind: &'static str,
+    /// The prompt as drawn: its heading and first reason line, bounded.
+    pub prompt: String,
+    /// Every visible option, numbered as drawn.
+    pub options: Vec<OptionItem>,
+    /// The option the cursor is on, when a cursor is drawn.
+    pub selected: Option<usize>,
+    /// The one option that refuses; its label passes [`deny_label`].
+    pub deny: usize,
+    /// Keys that put a cursor on an unfocused menu (Muse draws its peer
+    /// dialog with no cursor until a Down key focuses it).
+    pub focus_keys: &'static [&'static str],
+}
+
+/// Longest prompt text a [`Denial`] keeps, in characters.
+pub const DENIAL_PROMPT_CHARS: usize = 300;
+
+/// Whether an option label refuses: `No` (alone, or followed by a comma,
+/// space or bracket, as in `No, and tell Claude what to do differently`),
+/// `Reject once`, or `Abort the entire command`. An approving label (`Yes`,
+/// `Allow ...`, `Trust ...`) never passes, nor does `Block`, which refuses
+/// a peer for good rather than once.
+#[must_use]
+pub fn deny_label(text: &str) -> bool {
+    let lower = text.trim().to_lowercase();
+    let no = lower
+        .strip_prefix("no")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([',', ' ', '(']));
+    no || lower == "reject once"
+        || lower.starts_with("reject once ")
+        || lower.starts_with("abort the entire command")
+}
+
+/// The option of `options` that refuses, when exactly one does and some
+/// other option is there to refuse instead of.
+pub(crate) fn sole_deny_option(options: &[OptionItem]) -> Option<usize> {
+    let mut refusing = options.iter().filter(|option| deny_label(&option.text));
+    let deny = refusing.next()?;
+    let refusing_more = refusing.next().is_some();
+    // "No" and "No, and tell Claude what to do differently" both refuse;
+    // the plain one is chosen. Any other pair is ambiguous.
+    if refusing_more {
+        let plain: Vec<_> = options
+            .iter()
+            .filter(|option| option.text.trim().eq_ignore_ascii_case("no"))
+            .collect();
+        return (plain.len() == 1).then(|| plain[0].number);
+    }
+    (options.len() >= 2).then_some(deny.number)
+}
+
+/// The permission or approval prompt `screen` shows for `harness`, when
+/// one is recognised well enough to refuse (#2421): Claude Code's hook,
+/// safety-check and permission-rule confirmations, and Muse's peer and
+/// command approvals. Codex runs with approvals off and no approval
+/// screen of it is recorded, so it has none; an unknown harness has none.
+#[must_use]
+pub fn permission_denial(harness: Option<&str>, screen: &str) -> Option<Denial> {
+    let denial = match harness {
+        Some("claude") => claude::permission_denial(screen),
+        Some("muse") => muse::permission_denial(screen),
+        _ => None,
+    }?;
+    // Defence in depth: whatever a recogniser built, the option chosen
+    // must be drawn, be the only refusal, and read as one.
+    let chosen = denial
+        .options
+        .iter()
+        .find(|option| option.number == denial.deny)?;
+    (deny_label(&chosen.text) && sole_deny_option(&denial.options) == Some(denial.deny))
+        .then_some(denial)
+}
+
 /// Supported adapters; unknown harnesses remain unsupported.
 pub fn harness_tui(harness: Option<&str>) -> Option<&'static dyn HarnessTui> {
     match harness {

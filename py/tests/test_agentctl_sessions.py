@@ -392,6 +392,36 @@ def test_hooks_trust_policy_precedence_and_fail_closed(tmp_path: Path) -> None:
         hooks_trust_policy(tmp_path, registry, "own")
 
 
+def test_permission_policy_keys_are_known_and_fail_closed(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # #2421: both editions know the keys (no unknown-key warning) and refuse
+    # a bad value at either level; only the Rust edition acts on them.
+    _write_profiles(tmp_path, {
+        "own": {"harness": "claude", "mode": "interactive", "argv": ["--dangerously-skip-permissions"],
+                "permission_prompts": "report", "permission_deny_after_s": 120, "approval_timeout_s": 0},
+    })
+    path = tmp_path / ".agentctl/profiles.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["approval_timeout_s"] = 600
+    document["permission_prompts"] = "deny"
+    document["permission_deny_after_s"] = 60
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    assert "own" in load_profiles(tmp_path)[1]
+    assert "does not know" not in capsys.readouterr().err
+    for level, key, value, needle in [
+        ("top", "approval_timeout_s", 5, "approval_timeout_s must be 0"),
+        ("top", "permission_deny_after_s", 7200, "permission_deny_after_s must be"),
+        ("profile", "permission_prompts", "approve", "permission_prompts must be"),
+        ("profile", "approval_timeout_s", True, "approval_timeout_s must be 0"),
+    ]:
+        broken = json.loads(json.dumps(document))
+        (broken if level == "top" else broken["profiles"]["own"])[key] = value
+        path.write_text(json.dumps(broken), encoding="utf-8")
+        path.chmod(0o600)
+        with pytest.raises(AgentDeliveryError, match=needle):
+            load_configuration(tmp_path)
+
+
 def test_project_configuration_ignores_unknown_top_level_keys_with_one_warning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -103,7 +103,9 @@ pub struct WrapperConfig {
     /// Hold the harness's permission prompts for the owner's answer ([`super::approval`]);
     /// false runs it with `--permission-prompts none`, which denies them at once.
     pub approvals: bool,
-    /// How long a permission prompt waits for the owner before it is denied.
+    /// How long a permission prompt waits for the owner before it is denied;
+    /// zero denies it at once by policy, after [`approval::POLICY_GRACE`]
+    /// (#2421 agentctl-asks-never-block).
     pub approval_timeout: Duration,
     /// Refuse an answer from a process in the harness's control group, not only from its
     /// process tree ([`approval::peer_refusal`]). Off only where everything shares one group,
@@ -1846,6 +1848,13 @@ impl Wrapper {
             }),
         )?;
         let now = Instant::now();
+        // #2421: a zero timeout denies at once, after only the short grace
+        // in which the host's own permission hooks may still settle it.
+        let wait = if timeout.is_zero() {
+            approval::POLICY_GRACE
+        } else {
+            timeout
+        };
         self.approvals.push(PendingApproval {
             id,
             request_id: request.request_id,
@@ -1861,7 +1870,7 @@ impl Wrapper {
             requirement: request.requirement,
             choices: request.choices,
             asked_at: now,
-            deadline: now + timeout,
+            deadline: now + wait,
             causation,
         });
         Ok(())
@@ -1879,6 +1888,7 @@ impl Wrapper {
         let pending = self.approvals.remove(index);
         let timeout = self.config.approval_timeout.as_secs();
         let message = match (decision, by) {
+            ("denied", "policy") => approval::policy_denial_message(&pending.id, &pending.reason),
             ("denied", "timeout") => format!(
                 "Denied: this call needed the owner's approval (approval {}), and no answer came within {timeout} s. Ask the owner in chat if it is still needed.",
                 pending.id
@@ -2179,7 +2189,14 @@ impl Wrapper {
             .iter()
             .position(|pending| now >= pending.deadline)
         {
-            self.settle_approval(index, "denied", "timeout", None)?;
+            // #2421: under a zero timeout nobody was ever asked; the
+            // policy denied it, and the event says so.
+            let by = if self.config.approval_timeout.is_zero() {
+                "policy"
+            } else {
+                "timeout"
+            };
+            self.settle_approval(index, "denied", by, None)?;
         }
         Ok(())
     }

@@ -73,8 +73,11 @@ const CHAT_WAKE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct HeadlessApprovals {
     /// Hold them for the owner's answer; false denies them at once.
     pub enabled: bool,
-    /// How long one waits for the owner before it is denied.
-    pub timeout: Duration,
+    /// How long one waits for the owner before it is denied, when the
+    /// command line says (`run-headless --approval-timeout`); `None` takes
+    /// the agent's permission policy (#2421: profile, then registry
+    /// default, then 0 = deny at once).
+    pub timeout: Option<Duration>,
     /// Refuse answers from the harness's control group ([`wrapper::WrapperConfig`]).
     pub cgroup_check: bool,
 }
@@ -931,9 +934,29 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if let Some(lines) = tool_preview_lines {
             config.tool_preview_lines = lines;
         }
+        // #2421 agentctl-asks-never-block: how long a permission prompt
+        // waits for a person comes from the agent's permission policy
+        // (profile, then registry default, then 0 = deny at once) unless
+        // the command line names one. A profile file that cannot be read
+        // leaves the built-in default: an agent is never left waiting
+        // because its configuration is broken.
+        let policy = crate::profiles::permission_policy(
+            Path::new(&record.cwd),
+            &self.registry,
+            record.profile.as_deref(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "agentctl: agent {agent_name:?}: permission policy unreadable ({error}); prompts are denied at once"
+            );
+            crate::profiles::PermissionPolicy::default()
+        });
+        config.approval_timeout = Duration::from_secs(policy.approval_timeout_s);
         if let Some(approvals) = approvals {
             config.approvals = approvals.enabled;
-            config.approval_timeout = approvals.timeout;
+            if let Some(timeout) = approvals.timeout {
+                config.approval_timeout = timeout;
+            }
             config.approval_cgroup_check = approvals.cgroup_check;
         }
         let hooks = RecordIdentity {

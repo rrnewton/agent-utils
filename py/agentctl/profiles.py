@@ -702,6 +702,8 @@ def _profile(name: str, raw: object) -> LaunchProfile:
     ):
         raise AgentDeliveryError(f"profile {name!r} unset_env must be an array of environment variable names")
     hooks_trust = _hooks_trust_setting(raw.get("muse_hooks_trust"), f"profile {name!r}")
+    # #2421: checked at load in both editions; only the Rust edition acts on them.
+    _permission_settings(raw, f"profile {name!r}")
     # #1822: every interactive launch carries its harness's bypass flag.
     # Headless profiles are exempt at load: codex/agy headless argv is
     # empty by rule, and this edition runs no headless Claude.
@@ -880,6 +882,33 @@ def _hooks_trust_setting(value: object, label: str) -> str | None:
     return value
 
 
+def _permission_settings(raw: dict[str, object], label: str) -> None:
+    """Validate the #2421 agentctl-asks-never-block keys of one object (a
+    profile or the top level), failing closed as the Rust edition does:
+    `permission_prompts` "deny" or "report", `approval_timeout_s` 0 or 10 to
+    86400, `permission_deny_after_s` 0 to 3600. The Python edition runs no
+    watcher sweep and no headless Claude, so it only checks them."""
+    prompts = raw.get("permission_prompts")
+    if prompts is not None and prompts not in ("deny", "report"):
+        raise AgentDeliveryError(
+            f'{label} permission_prompts must be "deny" or "report", not {json.dumps(prompts)}'
+        )
+    timeout = raw.get("approval_timeout_s")
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, int) or not (timeout == 0 or 10 <= timeout <= 86400)
+    ):
+        raise AgentDeliveryError(
+            f"{label} approval_timeout_s must be 0 (deny at once) or a whole number of seconds "
+            f"from 10 to 86400, not {json.dumps(timeout)}"
+        )
+    after = raw.get("permission_deny_after_s")
+    if after is not None and (isinstance(after, bool) or not isinstance(after, int) or not 0 <= after <= 3600):
+        raise AgentDeliveryError(
+            f"{label} permission_deny_after_s must be a whole number of seconds from 0 to 3600, "
+            f"not {json.dumps(after)}"
+        )
+
+
 def hooks_trust_policy(
     cwd: str | Path, registry: str | Path, profile_name: str | None = None,
 ) -> tuple[str, str]:
@@ -912,11 +941,15 @@ def hooks_trust_policy(
 
 # Unknown top-level keys are warned about once and ignored rather than refused, so a key a newer
 # agentctl adds never breaks an older one reading the same file. Keys inside a profile stay strict.
-_KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env", "required_env", "muse_hooks_trust"})
+_KNOWN_TOP_LEVEL_KEYS = frozenset({
+    "schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env", "required_env", "muse_hooks_trust",
+    "permission_prompts", "permission_deny_after_s", "approval_timeout_s",
+})
 _PROFILE_FIELDS = frozenset({
     "harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud", "record_edges",
     "role", "protocol", "required_env", "muse_hooks_trust", "masked_paths", "unset_env",
     "no_mcp_servers", "coordinator_lean",
+    "permission_prompts", "permission_deny_after_s", "approval_timeout_s",
 })
 _ROLES = ("coordinator", "liaison", "coordinator-hands", "worker")
 _PROTOCOLS = ("self-tooling", "hands-delegating")
@@ -995,6 +1028,7 @@ def load_configuration(
     _term_backend(raw.get("term_backend"))
     _launch_env(raw.get("launch_env"))
     _hooks_trust_setting(raw.get("muse_hooks_trust"), "registry default")
+    _permission_settings(raw, "registry default")
     workspace = _workspace(raw.get("workspace"))
     # Only a file that loads is warned about, so a refusal reads the same in both editions.
     warning = unknown_keys_warning(path, _unknown_key_paths(raw))

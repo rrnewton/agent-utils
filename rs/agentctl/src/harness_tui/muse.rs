@@ -6,9 +6,11 @@
 //! editor, and Esc interrupts the turn. agentctl therefore steers with Enter, which also
 //! submits an ordinary prompt if the turn ended in between (#505 agentctl-muse-followup).
 //!
-//! Muse forms (approvals, panels, questions) are never answered here, so this adapter is offered
-//! only by [`super::followup_tui`] and not by [`super::harness_tui`], which `agentctl prompts`
-//! and `agentctl answer` use.
+//! Muse forms (approvals, panels, questions) are never answered through `agentctl answer`, so
+//! this adapter is offered only by [`super::followup_tui`] and not by [`super::harness_tui`],
+//! which `agentctl prompts` and `agentctl answer` use. The one exception is a refusal: the
+//! watcher may refuse a command approval or a peer approval through [`permission_denial`]
+//! (#2421 agentctl-asks-never-block), and never approves either.
 use super::{plain, AnswerPlan, HarnessTui, Question, State, View};
 use crate::client::{
     muse_ansi_composer_is_empty, muse_divider_width, muse_editor_rows_empty_w,
@@ -49,8 +51,8 @@ impl MuseTui {
     }
 
     /// Whether Muse's peer-approval dialog stands where the editor would be (#974
-    /// muse-peer-approval-prompt), so the pane waits for a person. Detection only: whether
-    /// a peer may talk to this session is a human decision, and nothing here answers it.
+    /// muse-peer-approval-prompt), so the pane waits for a person. Allowing a peer is a human
+    /// decision: nothing here approves it; the watcher may only refuse it once (#2421).
     pub(crate) fn peer_approval_form(screen: &str) -> bool {
         crate::agent_watch::peer_approval_prompt_line(screen).is_some()
     }
@@ -72,6 +74,83 @@ impl MuseTui {
             .to_lowercase();
         APPROVAL_MARKERS.iter().any(|marker| tail.contains(marker))
     }
+}
+
+/// Muse's command approval or peer-approval prompt, when recognised well
+/// enough to refuse (#2421 agentctl-asks-never-block): the command form's
+/// `Abort the entire command` or the peer dialog's `Reject once`. The
+/// options are read only from the rows below the form's own heading in
+/// the bottom window, with Muse's `⟩` cursor; a peer dialog drawn before
+/// its menu has focus carries no cursor and gets a Down key first, after
+/// which the answering flow re-reads where the cursor landed.
+pub(crate) fn permission_denial(screen: &str) -> Option<super::Denial> {
+    let clean = plain(screen);
+    let rows: Vec<&str> = clean.lines().collect();
+    let last = rows.iter().rposition(|row| !row.trim().is_empty())?;
+    let window = &rows[(last + 1).saturating_sub(FORM_ROWS)..=last];
+    let (kind, heading) = if MuseTui::approval_form(screen) {
+        let heading = window.iter().rposition(|row| {
+            row.to_lowercase()
+                .contains("would you like to run the following command?")
+        })?;
+        ("command-approval", heading)
+    } else if MuseTui::peer_approval_form(screen) {
+        let heading = window
+            .iter()
+            .rposition(|row| row.to_lowercase().contains("message from "))?;
+        ("peer-approval", heading)
+    } else {
+        return None;
+    };
+    let mut options = Vec::new();
+    let mut selected = None;
+    let mut detail = None;
+    for row in &window[heading + 1..] {
+        if let Some((option, is_selected)) = super::option_row(row, '⟩') {
+            if is_selected {
+                selected = Some(option.number);
+            }
+            options.push(option);
+        } else if detail.is_none() && options.is_empty() {
+            let text = row.trim();
+            let quoted = text.starts_with('"') || text.starts_with('$');
+            if quoted {
+                detail = Some(text.to_owned());
+            }
+        }
+    }
+    let numbers: Vec<usize> = options.iter().map(|option| option.number).collect();
+    if numbers != (1..=numbers.len()).collect::<Vec<_>>() {
+        return None;
+    }
+    let deny = super::sole_deny_option(&options)?;
+    let wanted = if kind == "command-approval" {
+        "abort the entire command"
+    } else {
+        "reject once"
+    };
+    if !options
+        .iter()
+        .any(|option| option.number == deny && option.text.to_lowercase().starts_with(wanted))
+    {
+        return None;
+    }
+    let mut prompt = window[heading].trim().to_owned();
+    if let Some(detail) = detail {
+        prompt = format!("{prompt} {detail}");
+    }
+    Some(super::Denial {
+        kind,
+        prompt: prompt.chars().take(super::DENIAL_PROMPT_CHARS).collect(),
+        options,
+        selected,
+        deny,
+        focus_keys: if selected.is_none() && kind == "peer-approval" {
+            &["Down"]
+        } else {
+            &[]
+        },
+    })
 }
 
 impl HarnessTui for MuseTui {

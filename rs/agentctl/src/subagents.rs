@@ -16105,6 +16105,79 @@ its drain would also type, so it was not queued",
         }
     }
 
+    /// The permission policy for `agent_name` (#2421): its profile, then
+    /// the registry default in profiles.json, then the built-in default.
+    pub fn permission_policy_for(
+        &self,
+        agent_name: &str,
+    ) -> Result<crate::profiles::PermissionPolicy> {
+        let record = self.load(agent_name)?;
+        crate::profiles::permission_policy(
+            std::path::Path::new(&record.cwd),
+            &self.registry,
+            record.profile.as_deref(),
+        )
+    }
+
+    /// Refuse the permission or approval prompt `agent_name`'s pane shows
+    /// (#2421 agentctl-asks-never-block), through the same pinned-recipient
+    /// guards as [`Self::prompts`] and the verified deny flow of
+    /// [`crate::tui_prompts::deny`], which never selects an approving
+    /// option. `expected` is the prompt the watcher timed; a different one
+    /// is left alone. `Ok(None)`: nothing to refuse (no record, an adopted
+    /// foreign pane, no pane, or no recognised prompt), and nothing typed.
+    pub fn deny_permission_prompt(
+        &self,
+        agent_name: &str,
+        expected: Option<&crate::harness_tui::Denial>,
+    ) -> Result<Option<Value>> {
+        match agent_queue::registry::record_directories(&self.registry, agent_name) {
+            Ok(directories) if directories.is_empty() => return Ok(None),
+            Ok(_) => {}
+            Err(error) => return Err(fail(error.to_string())),
+        }
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        // Adopted foreign panes are someone else's agent: never typed into.
+        if record.is_foreign() || record.pane_id.is_none() {
+            return Ok(None);
+        }
+        self.checked_policy(&record, false)?;
+        record.input_allowed()?;
+        let workspace = WorkspaceClient {
+            client: self.client,
+            record: &record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: None,
+            registry: None,
+            check_prompt: false,
+            expected_workspace: self.project_workspace()?,
+            readback: None,
+        };
+        let pane = record
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| fail("interactive pane required"))?;
+        // A pane scrolled back shows old rows, perhaps an old prompt, and a
+        // key would land on whatever is live: someone is reading it, so the
+        // refusal waits until it is at the bottom again.
+        if !self.client.pane_at_bottom(pane) {
+            return Ok(None);
+        }
+        let runtime = agent::SystemRuntime::default();
+        let (_pane_lock, _info) = agent::lock_resolved_target(&workspace, &self.target(&record)?)?;
+        let terminal = workspace.guarded(&runtime)?;
+        crate::tui_prompts::deny(
+            &terminal,
+            pane,
+            &record.harness,
+            expected,
+            &|pane| workspace.verify_recipient(pane, true),
+            &runtime,
+        )
+    }
+
     /// Read what a chat bridge scans for replies and persist it as the latest bounded snapshot:
     /// see [`agent::read_capture`].
     pub(crate) fn read_capture(&self, agent_name: &str, lines: usize) -> Result<String> {

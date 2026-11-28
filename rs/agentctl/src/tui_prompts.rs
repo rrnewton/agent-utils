@@ -228,3 +228,171 @@ pub fn inspect_question(
         }
     })
 }
+
+/// Refuse a recognised permission or approval prompt (#2421
+/// agentctl-asks-never-block): the only answer agentctl gives on its own,
+/// and never an approval. The pane is re-read and the prompt re-recognised
+/// ([`crate::harness_tui::permission_denial`]) before every key; the cursor
+/// is moved one step at a time onto the one refusing option and each move
+/// is seen to land; the submit key is sent only while the selected option
+/// reads as a refusal ([`crate::harness_tui::deny_label`]); and the prompt
+/// must then be seen to leave. A prompt that changes, or a cursor that
+/// moves anywhere else, stops the attempt with no submit key.
+///
+/// `expected` is the prompt the caller saw and timed; a different prompt
+/// on screen now is left alone. `Ok(None)` means no recognised prompt is
+/// showing (it left, or was never one agentctl may refuse) and nothing was
+/// typed.
+pub fn deny(
+    terminal: &dyn GuardedInput,
+    pane: &str,
+    harness: &str,
+    expected: Option<&crate::harness_tui::Denial>,
+    verify: &dyn Fn(&str) -> crate::error::Result<()>,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<Option<Value>> {
+    let _admission =
+        crate::pane_admission::PaneAdmission::acquire(pane).map_err(|e| fail(e.to_string()))?;
+    let mut denying = Denying {
+        terminal,
+        pane,
+        harness,
+        verify,
+        runtime,
+        attempted: false,
+    };
+    denying.run(expected).map_err(|error| {
+        if denying.attempted {
+            AgentError::PossiblySubmitted(UndeliveredMessage {
+                message: error.to_string(),
+                message_id: "tui-deny".to_owned(),
+                artifact: PathBuf::from("visible pane; inspect with agentctl prompts NAME"),
+            })
+        } else {
+            error
+        }
+    })
+}
+
+struct Denying<'a> {
+    terminal: &'a dyn GuardedInput,
+    pane: &'a str,
+    harness: &'a str,
+    verify: &'a dyn Fn(&str) -> crate::error::Result<()>,
+    runtime: &'a dyn AgentRuntime,
+    attempted: bool,
+}
+
+/// Whether two recognised prompts are the same prompt: same kind, text and
+/// options (the cursor may differ).
+fn same_prompt(a: &crate::harness_tui::Denial, b: &crate::harness_tui::Denial) -> bool {
+    a.kind == b.kind && a.prompt == b.prompt && a.options == b.options && a.deny == b.deny
+}
+
+impl Denying<'_> {
+    fn observe(&self) -> AgentResult<Option<crate::harness_tui::Denial>> {
+        (self.verify)(self.pane)?;
+        let screen = self.terminal.read_screen(self.pane)?;
+        (self.verify)(self.pane)?;
+        Ok(crate::harness_tui::permission_denial(
+            Some(self.harness),
+            &screen,
+        ))
+    }
+
+    fn key(&mut self, key: &str) -> AgentResult<()> {
+        self.attempted = true;
+        self.terminal.send_keys(self.pane, key)?;
+        Ok(())
+    }
+
+    /// Wait for the same prompt with the cursor on `want` (any cursor when
+    /// `None` would do is not allowed: a cursor must be drawn).
+    fn landed(
+        &self,
+        prompt: &crate::harness_tui::Denial,
+        want: Option<usize>,
+    ) -> AgentResult<crate::harness_tui::Denial> {
+        let deadline = self.runtime.monotonic() + Duration::from_secs(2);
+        loop {
+            match self.observe()? {
+                Some(now) if same_prompt(&now, prompt) => {
+                    if now.selected.is_some() && (want.is_none() || now.selected == want) {
+                        return Ok(now);
+                    }
+                }
+                _ => {
+                    return Err(fail(
+                        "the permission prompt changed or left while it was being refused; no submit key sent",
+                    ))
+                }
+            }
+            if self.runtime.monotonic() >= deadline {
+                return Err(fail(
+                    "the cursor did not land where expected on the permission prompt; no submit key sent",
+                ));
+            }
+            self.runtime.sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn run(&mut self, expected: Option<&crate::harness_tui::Denial>) -> AgentResult<Option<Value>> {
+        let Some(mut prompt) = self.observe()? else {
+            return Ok(None);
+        };
+        if expected.is_some_and(|expected| !same_prompt(expected, &prompt)) {
+            return Ok(None);
+        }
+        if prompt.selected.is_none() {
+            for key in prompt.focus_keys {
+                self.key(key)?;
+            }
+            prompt = self.landed(&prompt, None)?;
+        }
+        let deny = prompt.deny;
+        loop {
+            let selected = prompt.selected.ok_or_else(|| {
+                fail("no cursor is drawn on the permission prompt; no submit key sent")
+            })?;
+            if selected == deny {
+                break;
+            }
+            let (key, next) = if deny > selected {
+                ("Down", selected + 1)
+            } else {
+                ("Up", selected - 1)
+            };
+            self.key(key)?;
+            prompt = self.landed(&prompt, Some(next))?;
+        }
+        // The last look before the submit key: still this prompt, the cursor
+        // on its refusing option, and that option reads as a refusal.
+        let last = self.landed(&prompt, Some(deny))?;
+        let chosen = last
+            .options
+            .iter()
+            .find(|option| option.number == deny && Some(option.number) == last.selected)
+            .filter(|option| crate::harness_tui::deny_label(&option.text))
+            .ok_or_else(|| fail("the selected option is not a refusal; no submit key sent"))?
+            .clone();
+        self.key("Enter")?;
+        let deadline = self.runtime.monotonic() + Duration::from_secs(3);
+        loop {
+            if self.observe()?.is_none_or(|now| !same_prompt(&now, &last)) {
+                return Ok(Some(json!({
+                    "denied": true,
+                    "pane_id": self.pane,
+                    "kind": last.kind,
+                    "prompt": last.prompt,
+                    "option": chosen.text,
+                })));
+            }
+            if self.runtime.monotonic() >= deadline {
+                return Err(fail(
+                    "the permission prompt is still showing after its refusal was submitted; do not retry automatically",
+                ));
+            }
+            self.runtime.sleep(Duration::from_millis(100));
+        }
+    }
+}
