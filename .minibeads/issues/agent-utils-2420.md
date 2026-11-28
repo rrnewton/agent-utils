@@ -99,3 +99,40 @@ So no check in the relay or the chat bridges may lose or delay a message unless 
   - `664f5f90b6053631` (partner team): quarantined 2026-11-27T22:26:01Z; delivered copy `accepted` at 2026-11-27T22:25:24Z
   - `16f92d87abb43a0b` (partner team): quarantined 2026-11-27T23:45:12Z; delivered copy `accepted` at 2026-11-27T23:44:39Z; past the 16-position restore cap
   - `64c698a73c172f6d` (partner team): quarantined 2026-11-28T00:01:09Z; delivered copy `accepted` at 2026-11-28T00:00:24Z
+- 2026-11-27 (cl-bridgeretire), step (c) c-relay gate 1 (R3, R4, R4b, R5, R6, R7,
+  R13), stacked on step (b). Land note:
+  - Late, superseded and unverified warnings ride on line 1 as a `warning:` field of
+    the team tag, not as a separate line, because agentctl's drainer, stale-draft
+    attribution, paste backstop and failed digest read line 1 as the sender header.
+    lead-014 confirmed this. Under-tag `[relay warning: ...]` lines are one short line
+    each.
+  - R4: past not_after means delivered late, `late: its not_after T passed 3h ago;
+    reconfirm before acting`. Past the ledger's 30-day horizon (coordb's ruling) it
+    is delivered as `UNVERIFIED: more than 30 days late; a replay cannot be ruled
+    out; reconfirm before acting`, with its proof replaced by `sender UNVERIFIED (a
+    replay cannot be ruled out)` and one replay-unproven-notice per post. The entry
+    is kept 30 days from arrival.
+  - R4b (found during (c), outside the audit table): items accepted in time were
+    dropped at type time once not_after passed. The hook drain now prints them late,
+    and team queue items carry no not_after. Known limit, a follow-up coordb is
+    numbering: a team message that goes late or is superseded while it waits in an
+    agentctl queue is typed without the warning field; its meta line still shows
+    `expires T`.
+  - R3: over max_bytes means delivered with a warning. Over 16 KiB as well, the body
+    goes to teams.d/<team>/bodies/<id>.txt: written once, 0444, read back and hashed
+    against the signed hash before its path is delivered, one file per delivery
+    (lead-014). The coordinator gets the path, sha256, verdict and first 20 lines.
+  - R5: TTL over max is delivered and logged.
+  - R6: over the rate means delivered with a warning. At 10x the rate it is paced
+    (answered deferred, nothing recorded, the sender retries), with one
+    rate-paced-notice per sender per day.
+  - R7: superseded means delivered with `superseded by <id>: reconfirm before
+    acting` first. No tombstone; the entry records `superseded_by`.
+  - R13: the sender keeps retrying past not_after, with one overdue-notice a day
+    past it. agentctl watch-agents words these three notices as alarms ("nothing was
+    dropped"), not refusals.
+  - New persisted items, all optional, ignored by older readers: ledger
+    `delivery_warnings` and `superseded_by`; outbox `overdue_notice_at`;
+    teams.d/<team>/bodies/; the notice events replay-unproven-notice,
+    rate-paced-notice and overdue-notice.
+  - The chunking wire change (R12) is gate 2, behind lead-014's five points.
