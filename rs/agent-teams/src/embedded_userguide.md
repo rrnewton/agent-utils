@@ -536,10 +536,15 @@ stays `in-custody` because its receipt was refused. Posts for other fleets from 
 are still dropped silently (above); only strangers and malformed posts
 are loud. A malformed post from a CONFIRMED sender (a split or truncated
 relay post is the usual cause; a sender listed in a declaration's
-`relay_channels[].peers` counts as confirmed) is not a stranger: it
-raises a relay alarm of its own kind naming every quarantined post from
-that sender, and is dismissed with `relay quarantine dismiss <id>`,
-which also closes the alarm. An unparseable post never draws a reply
+`relay_channels[].peers` counts as confirmed) is delivered as received to
+the team the route serves, with a `[relay warning: ...]` line, once
+(`relay/unparseable-delivered.json` keeps its hash so a rescan never
+delivers it twice; #2420). A split or truncated copy whose tag line names
+a message already delivered is a known duplicate. Only when that
+hand-over fails is the post quarantined: it is not a stranger, it raises a
+relay alarm of its own kind naming every quarantined post from that
+sender, and it is dismissed with `relay quarantine dismiss <id>`, which
+also closes the alarm. An unparseable post never draws a reply
 (its plain-text receipt would itself be unparseable), and a given post
 is recorded at most once however often a rescan re-offers it.
 

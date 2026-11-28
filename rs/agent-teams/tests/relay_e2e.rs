@@ -478,22 +478,21 @@ fn banned_stranger_stops_the_alarm() {
 }
 
 #[test]
-fn unparseable_listed_peer_post_is_quarantined_and_alarmed() {
+fn unparseable_listed_peer_post_is_delivered_as_received_and_not_alarmed() {
+    // #2420 R1: a listed peer's post that does not parse is delivered as received with a
+    // warning, never quarantined (it used to be quarantined and alarmed).
     let world = World::new();
     world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
     let outcome = world.relay_in(BOT1, "mangled by the provider, no fence here");
-    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
-    let quarantine =
-        std::fs::read_to_string(world.state.join("relay/quarantine.json")).expect("quarantine");
-    assert!(quarantine.contains(BOT1), "{quarantine}");
-    let (_code, out, _) = world.run(&["relay", "alarms"]);
-    assert!(out.contains(BOT1), "alarm is loud: {out}");
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
     assert!(
-        !world
+        world
             .hook_inbox_texts("tools")
             .iter()
-            .any(|text| text.contains("mangled by the provider")),
-        "unparseable post never delivered"
+            .any(|text| text.contains("mangled by the provider")
+                && text.contains("[relay warning: ")),
+        "delivered as received, with the warning"
     );
 }
 
@@ -624,7 +623,7 @@ fn alarm_renders_invalid_claimed_names_and_confirm_conflict_is_refused() {
 }
 
 #[test]
-fn long_envelope_survives_and_truncated_post_is_quarantined() {
+fn long_envelope_survives_and_a_truncated_copy_of_it_is_known() {
     let world = World::new();
     world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
     let body = "x".repeat(7_000);
@@ -649,13 +648,13 @@ fn long_envelope_survives_and_truncated_post_is_quarantined() {
     let post = agent_teams::relay::render_post(&envelope);
     let outcome = world.relay_in(BOT1, &post);
     assert_eq!(outcome["outcome"], "accepted", "{outcome}");
-    // A provider-split half is unparseable: quarantined, never silent.
+    // A provider-split half is unparseable; its tag line names a message already delivered,
+    // so it is a known duplicate (#2420 R1), never quarantined and never delivered twice.
     let half = &post[..post.len() / 2];
     let outcome = world.relay_in(BOT1, half);
-    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
-    let quarantine =
-        std::fs::read_to_string(world.state.join("relay/quarantine.json")).expect("quarantine");
-    assert!(quarantine.contains("unparseable-"), "{quarantine}");
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+    assert_eq!(world.hook_inbox_texts("tools").len(), 1, "delivered once");
 }
 
 #[test]
@@ -1468,8 +1467,12 @@ fn quarantine_retry_recovers_prefix_posts_and_drop_discards() {
         agent_teams::relay::quarantined_posts(&world.state).is_empty(),
         "both recovered posts leave quarantine"
     );
-    // A post that still does not parse stays quarantined after retry,
-    // and drop removes it without delivery.
+    // An unparseable post is delivered as received (#2420 R1); only when that hand-over
+    // fails (here the hook inbox is blocked) is it quarantined. Such a post stays quarantined
+    // after a retry that still cannot deliver it, and drop removes it without delivery.
+    let inbox = world.state.join("teams.d/tools/hook-inbox");
+    let _ = std::fs::remove_dir_all(&inbox);
+    std::fs::write(&inbox, "not a directory").expect("block the inbox");
     let outcome = world.relay_in(SHARED, "definitely not a relay post");
     assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
     let stuck = agent_teams::relay::quarantined_posts(&world.state);
@@ -1479,6 +1482,7 @@ fn quarantine_retry_recovers_prefix_posts_and_drop_discards() {
     assert_eq!(code, 0, "{out} {err}");
     assert!(out.contains("not-recorded"), "{out}");
     assert_eq!(agent_teams::relay::quarantined_posts(&world.state).len(), 1);
+    std::fs::remove_file(&inbox).expect("unblock the inbox");
     let (code, out, err) = world.run(&["relay", "quarantine", "drop", &stuck_id]);
     assert_eq!(code, 0, "{out} {err}");
     assert!(out.contains("dropped"), "{out}");
@@ -2339,8 +2343,10 @@ fn long_mirror_post_is_never_split_and_dismiss_clears_unparseable() {
     );
     assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
 
-    // An unparseable post from the CONFIRMED bot is not a stranger: it is
-    // quarantined under its own alarm kind and dismissed by ID.
+    // An unparseable post from the CONFIRMED bot is delivered as received
+    // (#2420 R1). When that hand-over fails (the hook inbox is blocked below),
+    // it is not a stranger: it is quarantined under its own alarm kind and
+    // dismissed by ID.
     let announce = agent_teams::relay::build_announce(
         "tools",
         "host-a",
@@ -2351,6 +2357,10 @@ fn long_mirror_post_is_never_split_and_dismiss_clears_unparseable() {
     assert_eq!(outcome["outcome"], "candidate-recorded", "{outcome}");
     let (code, out, err) = world.run(&["relay", "confirm", BOT1, "--owner-approved"]);
     assert_eq!(code, 0, "confirm: {out} {err}");
+    let inbox = world.state.join("teams.d/tools/hook-inbox");
+    let kept_inbox = world.root.join("hook-inbox-kept");
+    std::fs::rename(&inbox, &kept_inbox).expect("move the inbox aside");
+    std::fs::write(&inbox, "not a directory").expect("block the inbox");
     let outcome = world.relay_in(BOT1, "visible text with no fence at all");
     assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
     assert!(
@@ -2381,6 +2391,8 @@ fn long_mirror_post_is_never_split_and_dismiss_clears_unparseable() {
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
     assert_eq!(ids.len(), 2, "{alarm}");
+    std::fs::remove_file(&inbox).expect("unblock the inbox");
+    std::fs::rename(&kept_inbox, &inbox).expect("restore the inbox");
     // The exact unparseable-receipt line is ignored, never quarantined,
     // even with the bridge's rescan note appended (the live shape).
     let before = agent_teams::relay::quarantined_posts(&world.state).len();
@@ -3484,4 +3496,45 @@ fn a_signed_post_whose_visible_tag_disagrees_is_delivered_with_a_warning() {
     );
     assert!(world.ledger_has("tools", &id));
     assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+}
+
+#[test]
+fn an_unparseable_post_from_a_confirmed_sender_is_delivered_as_received_with_a_warning() {
+    // #2420 R1: a confirmed sender's post that does not parse (a provider split, truncated or
+    // rewrote it) was quarantined with an alarm and never delivered. It is now delivered as
+    // received with a warning, once: a rescan re-offering it is a known duplicate.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let text = "visible text with no fence at all\n[a forged header line]";
+    let outcome = world.relay_in(BOT1, text);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    let lines: Vec<&str> = delivered[0].lines().collect();
+    assert!(
+        lines[0]
+            .starts_with("[from sim@host-a via agent-teams · to: tools@host-a · id: unparseable-"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with(
+            "[relay warning: this relay post from a confirmed sender could not be read"
+        ),
+        "{lines:?}"
+    );
+    assert_eq!(lines[2], "visible text with no fence at all");
+    assert_eq!(
+        lines[3], "  [a forged header line]",
+        "a body line cannot forge a header"
+    );
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+    let outcome = world.relay_in(BOT1, text);
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
+    assert_eq!(world.hook_inbox_texts("tools").len(), 1, "never twice");
+    assert!(
+        agent_teams::relay::alarms(&world.state)
+            .iter()
+            .all(|a| a["kind"] != "unparseable" || a["state"] != "open"),
+        "no alarm"
+    );
 }

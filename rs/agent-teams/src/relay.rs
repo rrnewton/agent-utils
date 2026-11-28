@@ -1640,6 +1640,20 @@ pub fn relay_in(
             // Never reply to an unparseable post (its receipt would itself
             // be unparseable), so no receipt_text is set on either branch.
             if is_confirmed_sender(state, peer_sender, route, channel) {
+                // Delivered as received, with a warning, never held (#2420 R1). Only when no
+                // local team receives the route, or the hand-over fails, is it quarantined as
+                // before, so nothing is lost.
+                if let Some(delivered) = deliver_unparseable_confirmed(
+                    state,
+                    this_host,
+                    route,
+                    peer_sender,
+                    channel,
+                    text,
+                    &reason,
+                )? {
+                    return Ok(delivered);
+                }
                 let detail = format!("unparseable relay post from confirmed sender: {reason}");
                 let id = record_unparseable_confirmed(
                     state,
@@ -2656,6 +2670,192 @@ pub fn ban_sender(state: &Path, sender_id: &str) -> DataResult<()> {
         list.push(json!({"sender_id": sender_id, "state": "banned", "reason": "banned by the owner", "first_at": format_rfc3339_ms(now_unix_ms())}));
     }
     write_json_atomic(&alarms_path(state), &doc)
+}
+
+/// `relay/unparseable-delivered.json`: the unparseable posts from confirmed senders already
+/// delivered as received (#2420 R1), so a rescan re-offering one never delivers it twice.
+const UNPARSEABLE_DELIVERED_FILE: &str = "unparseable-delivered.json";
+const UNPARSEABLE_DELIVERED_SCHEMA: &str = "agent-teams-unparseable-delivered/v1";
+const MAX_UNPARSEABLE_DELIVERED: usize = 1024;
+/// Most bytes of an unparseable post's text delivered; the rest is cut with a note.
+const MAX_UNPARSEABLE_DELIVERED_BYTES: usize = 32 * 1024;
+
+/// Deliver an unparseable post from a CONFIRMED sender to the receiving team as received, with
+/// a `[relay warning: ...]` line, instead of holding it (#2420 R1, owner decision: warning at
+/// most, never delay). The usual cause is a relay post the provider split, truncated or
+/// rewrote. It carries no envelope, so the tag names the sender's confirmed team and the
+/// post's own hash as its ID. Returns `None` when no local team receives this route or the
+/// hand-over fails; the caller then quarantines it as before, so nothing is lost.
+#[allow(clippy::too_many_arguments)]
+fn deliver_unparseable_confirmed(
+    state: &Path,
+    this_host: &str,
+    route: &str,
+    peer_sender: &str,
+    channel: &str,
+    text: &str,
+    reason: &str,
+) -> DataResult<Option<RelayInResult>> {
+    let stripped = strip_provider_notes(text);
+    let key = format!("unparseable-{}", &sha256_hex(stripped.as_bytes())[..12]);
+    let path = state.join("relay").join(UNPARSEABLE_DELIVERED_FILE);
+    let read_delivered = || -> Value {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(|doc| {
+                doc.get("schema").and_then(Value::as_str) == Some(UNPARSEABLE_DELIVERED_SCHEMA)
+            })
+            .unwrap_or_else(|| json!({"schema": UNPARSEABLE_DELIVERED_SCHEMA, "posts": []}))
+    };
+    let already = |doc: &Value| {
+        doc.get("posts")
+            .and_then(Value::as_array)
+            .is_some_and(|posts| {
+                posts.iter().any(|post| {
+                    post.get("key").and_then(Value::as_str) == Some(key.as_str())
+                        && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender)
+                })
+            })
+    };
+    if already(&read_delivered()) {
+        return Ok(Some(result(
+            "known",
+            format!("unparseable post {key} was already delivered as received"),
+        )));
+    }
+    let declarations = load_declarations(state).unwrap_or_default();
+    let Some((_, _, declaration)) = declarations.iter().find(|(_, _, declaration)| {
+        declaration.relay_channels.iter().any(|entry| {
+            entry.route == route && (entry.channel.is_empty() || entry.channel == channel)
+        })
+    }) else {
+        return Ok(None);
+    };
+    // A split or truncated copy of a message already delivered (its tag line names the ID) is
+    // a known duplicate, not a second delivery.
+    let tag = post_tag_line(text);
+    if let Some(tagged) = tag
+        .split("· id: ")
+        .nth(1)
+        .map(|rest| rest.trim_end().trim_end_matches(']'))
+        .filter(|id| crate::envelope::valid_message_id(id))
+    {
+        let delivered =
+            std::fs::read_to_string(crate::ledger::entry_path(state, &declaration.team, tagged))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|entry| {
+                    entry
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|recorded| {
+                    matches!(
+                        recorded.as_str(),
+                        "accepted"
+                            | "claimed"
+                            | "typing"
+                            | "presented"
+                            | "delivered"
+                            | "possibly_submitted"
+                    )
+                });
+        if delivered {
+            log_event(
+                state,
+                &json!({"event": "relay-in", "outcome": "unparseable-copy-known", "route": route, "peer_sender": peer_sender, "id": tagged}),
+            );
+            return Ok(Some(result(
+                "known",
+                format!("a split or truncated copy of {tagged}, already delivered"),
+            )));
+        }
+    }
+    // The sender's team: the declaration's peer mapping, else its confirmed mapping.
+    let listed = declaration
+        .relay_channels
+        .iter()
+        .filter(|entry| entry.route == route)
+        .find_map(|entry| entry.peers.get(peer_sender).cloned());
+    let from = match (listed, confirmed_mapping_for(state, peer_sender, route)) {
+        (Some(mapped), _) if mapped.contains('@') => mapped,
+        (Some(fleet), _) => format!("{fleet}@?"),
+        (None, Some((fleet, Some(host)))) => format!("{fleet}@{host}"),
+        (None, Some((fleet, None))) => format!("{fleet}@?"),
+        (None, None) => format!("relay sender {peer_sender}@?"),
+    };
+    let mut body = String::new();
+    for line in stripped.lines() {
+        if body.len() + line.len() + 1 > MAX_UNPARSEABLE_DELIVERED_BYTES {
+            body.push_str("[relay warning: the rest of this post was cut at 32 KiB]\n");
+            break;
+        }
+        // A body line can neither forge a header nor a reply block (as in `render`).
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[')
+            || trimmed.starts_with("```reply")
+            || trimmed.starts_with(":::reply")
+        {
+            body.push_str("  ");
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    let clean_reason: String = reason
+        .chars()
+        .filter(|c| !c.is_control() && *c != '[' && *c != ']')
+        .take(200)
+        .collect();
+    let rendered = format!(
+        "[from {from} via agent-teams · to: {}@{this_host} · id: {key}]\n\
+         [relay warning: this relay post from a confirmed sender could not be read as an \
+         agent-teams envelope ({clean_reason}); a provider split, truncated or rewrote it. Its \
+         text is delivered as received; it has no message ID to reply to]\n{body}",
+        declaration.team
+    );
+    let notice_envelope = json!({
+        "id": key,
+        "not_after": format_rfc3339_ms(now_unix_ms() + 86_400_000),
+        "topic": "unparseable-relay-post",
+    });
+    let team_dir = state.join("teams.d").join(&declaration.team);
+    let ledger_path = crate::ledger::entry_path(state, &declaration.team, "unparseable");
+    let deliverer = deliverer_for(declaration, &team_dir, &ledger_path)?;
+    let _lock = lock_store(state)?;
+    let mut doc = read_delivered();
+    if already(&doc) {
+        return Ok(Some(result(
+            "known",
+            format!("unparseable post {key} was already delivered as received"),
+        )));
+    }
+    if !matches!(
+        deliverer.handover(&key, &notice_envelope, &rendered),
+        crate::deliver::Handover::Accepted
+    ) {
+        return Ok(None);
+    }
+    if let Some(posts) = doc.get_mut("posts").and_then(Value::as_array_mut) {
+        posts.push(json!({
+            "key": key, "peer_sender": peer_sender, "route": route,
+            "local_team": declaration.team, "at": format_rfc3339_ms(now_unix_ms()),
+        }));
+        if posts.len() > MAX_UNPARSEABLE_DELIVERED {
+            let excess = posts.len() - MAX_UNPARSEABLE_DELIVERED;
+            posts.drain(0..excess);
+        }
+    }
+    write_json_atomic(&path, &doc)?;
+    log_event(
+        state,
+        &json!({"event": "relay-in", "outcome": "unparseable-delivered", "route": route, "peer_sender": peer_sender, "key": key, "local_team": declaration.team}),
+    );
+    Ok(Some(result(
+        "accepted",
+        format!("unparseable post {key} delivered as received, with a warning"),
+    )))
 }
 
 /// Record an unparseable post from a CONFIRMED sender: quarantine it and
