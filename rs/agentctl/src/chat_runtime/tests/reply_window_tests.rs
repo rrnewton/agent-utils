@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::chat_runtime::reply_windows::{
-    listed_keys, ClosureCause, ReplyWindowSettings, WindowSweep,
+    listed_keys, ClosedRequest, ClosureCause, ReplyWindowSettings, WindowSweep,
 };
 use crate::chat_service::owner_alarm::{Notice, OwnerAlarm, DEFAULT_AFTER};
 use crate::chat_service::reply_windows::{capacity_alarm, sweep, tell_closures};
@@ -923,4 +923,53 @@ fn a_request_the_sweep_retires_is_never_reminded_afterwards() {
     assert!(found.candidates.is_empty(), "{:?}", found.candidates);
     assert!(eligible(&found).is_empty());
     fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn the_closure_outbox_merges_batches_past_its_bound_and_never_drops_one() {
+    // #2430 C1: past 64 untold batches the oldest was dropped and only counted, so its closed
+    // requests were never told to the agent or the owner. The two oldest are now merged, under
+    // a new ID, and every closed request is still listed.
+    let (state, _key, _root) = delivered_request("window-outbox-bound");
+    let request = |n: u64| ClosedRequest {
+        key: format!("bound-key-{n}"),
+        reply_id: format!("{n}"),
+        message_number: None,
+        first_line: format!("request {n}"),
+        sender_id: "U0OWNER0001".to_owned(),
+        from_owner: true,
+        admitted_at_millis: n,
+        unknown: crate::forward_compat::KeptKeys::default(),
+    };
+    let mut first_ids = Vec::new();
+    for n in 0..70_u64 {
+        state
+            .append_closure_batch_locked(ClosureCause::Age, 1_000 + n, 0, vec![request(n)])
+            .expect("append");
+        if n < 2 {
+            first_ids.push(
+                state.closure_batches().expect("outbox").0[n as usize]
+                    .id
+                    .clone(),
+            );
+        }
+    }
+    let (batches, dropped) = state.closure_batches().expect("outbox");
+    assert_eq!(dropped, 0, "nothing dropped");
+    assert!(batches.len() <= 64, "{}", batches.len());
+    assert_eq!(
+        listed_keys(&batches).len(),
+        70,
+        "every closed request is still listed"
+    );
+    let oldest = &batches[0];
+    assert_eq!(
+        oldest.requests[0].key, "bound-key-0",
+        "oldest requests first"
+    );
+    assert!(
+        !first_ids.contains(&oldest.id),
+        "a merged batch has a new ID"
+    );
+    assert!(!oldest.agent_notified && !oldest.owner_notified && !oldest.logged);
 }

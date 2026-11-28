@@ -63,7 +63,7 @@ const MAX_WINDOW_SECONDS: u64 = 366 * 24 * 60 * 60;
 /// The list of unanswered requests closed by a window, waiting for the service to tell about them.
 pub(crate) const CLOSURE_OUTBOX_FILE: &str = "reply-window-closures.json";
 const CLOSURE_OUTBOX_SCHEMA: &str = "agentctl-chat-reply-window-closures/v1";
-/// Most batches the outbox keeps; the oldest beyond it is dropped and counted.
+/// Most batches the outbox keeps; past it the two oldest are merged into one (#2430 C1).
 const MAX_CLOSURE_BATCHES: usize = 64;
 const MAX_CLOSURE_OUTBOX_BYTES: usize = 8 * 1024 * 1024;
 /// Characters of a closed request's first line the outbox keeps.
@@ -578,7 +578,7 @@ impl BridgeState {
         write_document(&self.closure_outbox_path(), outbox)
     }
 
-    fn append_closure_batch_locked(
+    pub(super) fn append_closure_batch_locked(
         &self,
         cause: ClosureCause,
         now_millis: u64,
@@ -621,9 +621,24 @@ impl BridgeState {
             owner_notified: !owners,
             unknown: KeptKeys::default(),
         });
+        // Past the bound the two oldest batches are merged, never dropped (#2430 C1): dropping
+        // one left its closed requests untold. A step either had not done is redone for both,
+        // so a request may be told twice but never not at all; the merged batch takes a new ID,
+        // so its agent notice is not mistaken for one already queued.
         while outbox.batches.len() > MAX_CLOSURE_BATCHES {
-            outbox.batches.remove(0);
-            outbox.dropped_batches = outbox.dropped_batches.saturating_add(1);
+            let older = outbox.batches.remove(0);
+            let newer = &mut outbox.batches[0];
+            let mut digest = Sha256::new();
+            digest.update(format!("merge:{}:{}", older.id, newer.id));
+            newer.id = format!("{:x}", digest.finalize())[..32].to_owned();
+            newer.closed_at_millis = newer.closed_at_millis.min(older.closed_at_millis);
+            newer.answered_closed = newer.answered_closed.saturating_add(older.answered_closed);
+            let mut requests = older.requests;
+            requests.append(&mut newer.requests);
+            newer.requests = requests;
+            newer.logged &= older.logged;
+            newer.agent_notified &= older.agent_notified;
+            newer.owner_notified &= older.owner_notified;
         }
         self.write_closure_outbox(&outbox)
     }
