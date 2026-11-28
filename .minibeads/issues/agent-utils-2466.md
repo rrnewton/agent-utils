@@ -8,7 +8,7 @@ labels:
 - wrkslots
 - liveness
 created_at: 2026-11-28T09:36:00-05:00
-updated_at: 2026-11-28T09:36:00-05:00
+updated_at: 2026-11-28T11:00:00-05:00
 ---
 
 # Description
@@ -37,3 +37,14 @@ Open questions:
 # Notes
 
 Report evidence at filing time; this lane has not inspected the reporting host and will not (reproduction on a scratch project only). Number pre-assigned by the coordinator (2026-11-28).
+
+## Analysis (cl-wrkdoctor, 2026-11-28)
+
+- Python: `_status_record` takes the owner verdict from `_process_state_with_evidence` and `_process_state_legacy` over `ProcessIdentity` (host PID, start ticks, boot id, host id; cgroup and namespace fields are evidence only). A changed boot reads dead; a PID that names no live process reads dead; the same PID with other start ticks reads "reused" and dead; a zombie reads dead. Live only when /proc/PID now carries the recorded start ticks in the recorded boot. Rust: `status_state::process_state`, the same comparison.
+- PID reuse is defended: a reused PID would need the same start tick in the same boot. Heartbeat age is not an input: `_heartbeat_diagnosis` feeds only `heartbeat_expired` and `heartbeat_age_seconds`, which the status row prints beside `owner=`.
+- Scratch reproduction (worktree representation): an owner process the creator spawned and left running, an agent name no registry knows, a 60 s time-to-live: status reads owner=live ("PID N generation is live", pidfd evidence), liveness unverifiable, heartbeat expired. So the reported row most likely names a recorded owner process that is still running: a leftover of the old lane, or a long-lived process passed as the owner.
+- Direction of risk: a live owner can only block a reclaim (removal needs a dead owner generation unless an owner release applies; an attested stop also needs the owner generation proven dead). "Live" never authorizes a removal, and a false "dead" needs other start ticks or a new boot. No wrong-reclaim path found.
+
+## Fix (display only, the consumer lead's choice)
+
+Status rows name the live process (`owner_process`: pid, start instant, command name, truncated command line, cgroup) when the owner is live and the heartbeat expired; doctor reports `owner-live-heartbeat-expired`, keyed by the slot, only past TTL + max(TTL, 1 hour) since the recorded heartbeat, so one long turn reports nothing. Both editions; consumers that alert on new finding kinds get one stable key per stuck slot.
