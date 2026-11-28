@@ -1,6 +1,6 @@
 ---
 title: 'search-date-hint-beside-empty-pins: the date syntax hint stands under the search bar beside "No pinned messages", reading like a date filter hiding pins'
-status: open
+status: in_progress
 priority: 3
 issue_type: bug
 assignee: cl-datehint
@@ -9,7 +9,7 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-28T13:38:00-05:00
-updated_at: 2026-11-28T13:38:00-05:00
+updated_at: 2026-11-28T14:05:00-05:00
 ---
 
 # Description
@@ -29,3 +29,8 @@ Found by the advisory design review of `#2483` labels-redraw-drops-focus (its af
 # Notes
 
 - Filed at the coordinator's request (number assigned by the coordinator) from the `#2483` design review; assigned to cl-datehint. Related: `#2425` (the date hint), `#2489` (the Labels pill in the same stills). The stills: the `#2483` evidence (after/*-4d-dropdown-keyboard-enter.png).
+- Settled through the coordinator (2026-11-28, cl-datehint plan approved, from the liaison's fix note):
+  - The hint reads as a hint, never a chip: muted italic text starting "Try:", one example per form ("Try: after:7d · before:<today>"), with no pill edge, shadow or chip shape (R4, R5, R15). The title still holds the line whole (R6).
+  - It shows only while the search field has the focus AND is empty AND no other filter is in force: Labels (Pinned or a label), Links, Whose. A tap on it still opens the Dates panel (the tap must not blur the field first).
+  - Phone: `#2425`'s step-aside while the keyboard is up stays. The matrix shows the phone with the keyboard up and with it dismissed.
+- Where it lives: `searchdates.ts` `sync()` writes the text and the only switch (`data-typed`, set once text is typed); nothing reads focus or the other filters. `09-to-do-view.css` gives it the bucket chips' pill (panel fill, edge, shadow, centred, where the chips float). `controlbar.ts` hides it with the calendar.
