@@ -745,6 +745,7 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     if (!block && footDock && replyState.list && replyState.target) {
       keepAnsweredRowClear(replyState.list, String(replyState.target.id), footDock.mount, replyPane());
     }
+    if (replyState.docked && replyState.list && replyState.target) gatherAfterOpen(replyState.list, String(replyState.target.id));
     if (!focus) return;
     // The box came up to be written in: it takes the focus, the caret under a quote or after a draft.
     // Without moving either list, which has rules of its own about where the reader is.
@@ -1114,8 +1115,12 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     const top = from && from.parentNode && deps.shownNode(from) ? from.getBoundingClientRect().top : NaN;
     replyState.list = list;
     replyState.docked = true;
-    replyState.gathered = gatherForReply(list);
-    // The message where it was, whatever the gathering moved round it.
+    // `#2428 vibe-talk-reply-open-local-instant`: the box first, its replies gathered after. The
+    // gathering redraws the whole list (`renderChannelRows`, every row's arrows measured): on a long
+    // channel that took 0.6 s before the box could show. So the box opens under its row in this
+    // pass, and the gathering follows once that frame is painted (`gatherAfterOpen`).
+    replyState.gathered = false;
+    // The message where it was.
     holdRowAt(listPane(list as HTMLElement) as { scroller(): HTMLElement }, list as HTMLElement, id, top);
     const mount = replyMountFor(list);
     (list.parentNode as HTMLElement).append(mount);
@@ -1140,19 +1145,59 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     // the list's frame, and at the list's end the browser's clamp put every row that much lower;
     // the room the reply's box keeps under its row is what lets this hold put it back.
     holdRowAt(listPane(list as HTMLElement) as { scroller(): HTMLElement }, list as HTMLElement, id, top);
-    // `#2063 vibe-talk-quote-reply-view-stability`. The post being answered stays pixel-still:
-    // opening the box never scrolls the list. Where the box drawn under its row would sit below
-    // the foot of the column, it is docked to that foot instead (an overlay at the foot, the
-    // rows exactly where they were) until the reader scrolls, which hands the box back to its
-    // row. Only for a box drawn under its row: one at the list's foot needs no dock.
-    if (!anchorsSupported() || replyState.anchor === null) return;
+    dockAtFootIfBelow(list as HTMLElement, id);
+  }
+
+  /**
+   * `#2063 vibe-talk-quote-reply-view-stability`. The post being answered stays pixel-still:
+   * opening the box never scrolls the list. Where the box drawn under its row would sit below
+   * the foot of the column, it is docked to that foot instead (an overlay at the foot, the
+   * rows exactly where they were) until the reader scrolls, which hands the box back to its
+   * row. Only for a box drawn under its row: one at the list's foot needs no dock. Asked again
+   * once the replies are gathered (`#2428`), which move the box down by their height.
+   */
+  function dockAtFootIfBelow(list: HTMLElement, id: string): void {
+    if (!anchorsSupported() || replyState.anchor === null || footDock) return;
+    const mount = replyMountFor(list);
     const pane = replyPane();
     if (mount.getBoundingClientRect().bottom > pane.foot()) {
       // `#2395`: the gap the box keeps under its row in the stream, measured before it is docked.
-      const row = deps.rowIn(list as HTMLElement, id);
+      const row = deps.rowIn(list, id);
       answeredGap = row && deps.shownNode(row) ? Math.max(0, mount.getBoundingClientRect().top - row.getBoundingClientRect().bottom) : 0;
       dockReplyAtFoot(mount, pane);
     }
+  }
+
+  /**
+   * `#2428 vibe-talk-reply-open-local-instant`. The owner, 2026-11-27: "Pressing reply and popping
+   * open the reply window should be 100% LOCAL AND INSTANT." The message's replies are gathered under
+   * it (`gatherForReply`) only after the frame that shows the box: two animation frames, so the box
+   * is painted first. The row answered stays where it is (held again), and the box moves under the
+   * gathered replies (`placeInlineReply`). Nothing is done if the reply was put down or moved to
+   * another message in between. A host with no frames (the page's unit tests) gathers at once.
+   */
+  function gatherAfterOpen(list: HTMLElement, id: string): void {
+    const gather = (): void => {
+      if (!replyState.docked || replyState.list !== list || String(replyState.target?.id) !== id) return;
+      const row = deps.rowIn(list, id);
+      const top = row && deps.shownNode(row) ? row.getBoundingClientRect().top : NaN;
+      if (!gatherForReply(list)) return;
+      replyState.gathered = true;
+      holdRowAt(listPane(list) as { scroller(): HTMLElement }, list, id, top);
+      renderReplyingMarks();
+      deps.markCardBesideReply();
+      placeInlineReply();
+      // The box now stands under the gathered replies: docked at the foot where that put it below
+      // it, and the row kept clear of it (`#2395`), as the open does for a box drawn under its row.
+      holdRowAt(listPane(list) as { scroller(): HTMLElement }, list, id, top);
+      dockAtFootIfBelow(list, id);
+      if (!replyState.quote && footDock) keepAnsweredRowClear(list, id, footDock.mount, replyPane());
+    };
+    if (typeof requestAnimationFrame !== "function") {
+      gather();
+      return;
+    }
+    requestAnimationFrame(() => requestAnimationFrame(gather));
   }
 
   /**

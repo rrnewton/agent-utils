@@ -1,0 +1,21 @@
+steps:
+  # `#2428 vibe-talk-reply-open-local-instant`: Reply opens its box in the frame of the tap. About 1,200
+  # rows (over 100k px, windowed off), every fiftieth message answered three times. Counted per tap,
+  # never timed: no request before the box's first frame, the box on screen at it, the tap redrawing no
+  # rows and reading a handful of boxes; then the replies gathered and the box over neither the message
+  # nor them. Desk and phone. The tap's time is printed as a report only.
+  - group: check
+    job: reply-open-instant-browser
+    desc: Reply shows its box at the first frame after the tap with no request and no whole-list redraw first, its replies gathered after that frame and the box over neither them nor the message, over 100k px of rows, in current Chromium at 1280x800 and 412x915 by touch (#2428)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/reply_open_instant_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 600
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1610612736
