@@ -423,6 +423,12 @@
     display: none;
   }
 
+  /* `#2425 vibe-talk-search-date-filter`: the search's date hint steps aside while the keyboard is
+     up (it floats and takes no room; the calendar stays on the bar). */
+  :root[data-keyboard="open"][data-pane="discord"] #search-date-hint {
+    display: none !important;
+  }
+
   :root[data-keyboard="open"][data-pane="discord"] #control-pane {
     grid-template-rows: 2.75rem;
     padding-top: 0.35rem;

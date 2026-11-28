@@ -232,22 +232,22 @@ export function createSearchDates(deps: SearchDatesDependencies): SearchDates {
     const full = datesWords(standing, today, true);
     const button = el("search-dates");
     const name = `Dates: ${full ?? "any time"}`;
-    if (button.getAttribute("aria-label") !== name) {
-      button.setAttribute("aria-label", name);
-      button.setAttribute("title", name);
-    }
+    if (button.getAttribute("aria-label") !== name) button.setAttribute("aria-label", name);
     if (button.getAttribute("aria-pressed") !== String(words !== null)) button.setAttribute("aria-pressed", String(words !== null));
     // The hint: the syntax with a real example, or the date standing (Q4: it stays while the bar is
     // open). A typed relative day says that it moves with today.
-    // A typed relative day moves with today; the short standing says it only in its title (R5).
+    // The hint: the syntax with a real example, while nothing is typed; at the first key it steps
+    // aside (`data-typed`, on the hint alone: it floats and takes no room, so nothing moves) and the
+    // calendar names the dates standing. A typed relative day says that it moves with today there.
     const hint = el("search-date-hint");
-    const text = words === null
-      ? `after:${dayText(daysBefore(today, 7))} · after:7d · before:${dayText(today)}`
-      : words.charAt(0).toUpperCase() + words.slice(1);
-    const moving = standing.after !== null && !standing.before && relative(standing.afterValue);
+    const text = `after:${dayText(daysBefore(today, 7))} · after:7d · before:${dayText(today)}`;
     if (hint.textContent !== text) hint.textContent = text;
-    const title = words === null ? `Dates: ${text}` : `Dates: ${full}${moving ? ", moving with today" : ""}`;
-    if (hint.getAttribute("title") !== title) hint.setAttribute("title", title);
+    if (hint.getAttribute("title") !== `Dates: ${text}`) hint.setAttribute("title", `Dates: ${text}`);
+    const typed = deps.query().trim() !== "";
+    if (hint.hasAttribute("data-typed") !== typed) hint.toggleAttribute("data-typed", typed);
+    const moving = standing.after !== null && !standing.before && relative(standing.afterValue);
+    const named = `${name}${moving ? ", moving with today" : ""}`;
+    if (button.getAttribute("title") !== named) button.setAttribute("title", named);
   }
 
   function mode(): Mode {

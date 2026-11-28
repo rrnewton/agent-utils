@@ -5104,43 +5104,6 @@ test("`#2259` thread-view parking, forced order: an answer that leaves the first
   assert.deepStrictEqual(parked, ["201 start", "201 start", "201 start"], "a reopened search did not park its covered first result");
 });
 
-test("`#2425` thread-view parking: a first result WHOLLY under the taller floating stack (the date hint over the chips) is parked; one wholly above the list's screen is not", () => {
-  const { createSearchRows } = CHANNEL_VIEW;
-  const box = (top, bottom) => ({ top, bottom, left: 0, right: 400, width: 400, height: bottom - top });
-  const row = (id, top, bottom) => ({
-    id, top, bottom, hidden: false, className: "",
-    getAttribute: (name) => (name === "data-search" ? "" : name === "data-id" ? id : null),
-    getBoundingClientRect() { return box(this.top, this.bottom); },
-  });
-  // The thread's list starts at 85 on the screen; the hint and the chips float to 226 over it.
-  const panel = { hidden: false, getBoundingClientRect() { return box(172, 226); } };
-  const area = { getBoundingClientRect() { return box(85, 750); } };
-  const log = { children: [] };
-  const nodes = { "search-bucket-row": panel, "discord-log": log, "scroll-area": area };
-  const parked = [];
-  let key = "lantern";
-  const nothing = () => {};
-  const given = {
-    byId: (id) => nodes[id], leftById: (id) => nodes[id],
-    searchField: { open: () => true, markSoon: nothing, markNow: nothing, query: () => key, links: () => false },
-    language: { parsedQueries: new Map(), searchQueryTree: () => null, searchFold: (text) => text },
-    threadListOnScreen: () => false, selectionView: () => "thread", searchKey: () => key,
-    intoView: (element, block) => parked.push(`${element.id} ${block}`),
-    mainColumnRecord: () => ({ searched: null }),
-  };
-  const deps = new Proxy(given, { get: (target, name) => (name in target ? target[name] : nothing) });
-  const rows = createSearchRows(deps);
-  // Above the list's screen (it scrolled off the top): left alone, as `#2258` asks.
-  log.children = [row("151", 10, 80), row("201", 240, 300)];
-  rows.renderSearchCount(true, false);
-  assert.deepStrictEqual(parked, [], "a first result above the list's screen was parked");
-  // Wholly under the floating stack (142 to 208, the stack's foot at 226): parked, once.
-  log.children = [row("201", 142, 208), row("204", 216, 282)];
-  rows.renderSearchCount(true, false);
-  rows.renderSearchCount(true, false);
-  assert.deepStrictEqual(parked, ["201 start"], "a first result wholly under the stack was not parked exactly once");
-});
-
 test("`#2346 vibe-talk-search-landed-reader-follows-foot`: a search that leaves the list too short to scroll to the reader's place holds the nearest hit there with room, not a clamped nudge", () => {
   const { createFilterPlace, freshFilterState } = CHANNEL_VIEW;
   // The reader mid-list reads row 12; the key's search hides it and keeps row 14, 58 px below it.

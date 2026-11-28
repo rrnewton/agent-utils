@@ -1634,27 +1634,22 @@ li[data-labels-below] > .meta > .label-chips {
   }
 }
 
-/* `#2425 vibe-talk-search-date-filter`. The date hint's line stands under the bar whenever the
-   bar is open over the channel (`data-date-hint`), above the bucket chips; its height is folded
-   into `--bucket-head`, which every head-room rule already carries, so the first row is never
-   under it and opening it is the only time it changes the head (typing never does, R12). */
-#screen-main {
-  --date-hint: 0px;
+/* `#2425 vibe-talk-search-date-filter`. The date hint: the syntax reminder, floating where the
+   bucket chips float, while the bar stands open with NOTHING typed. It takes no room at the head
+   of the list and moves nothing: it appears with the bar and steps aside at the first key
+   (`data-typed`, on the hint alone), so every typed state lays out exactly as without it — the
+   head room, the chips' foot, the thread view's parking (#2200, #2258) and every landing. The
+   calendar names the dates standing once a search is typed. */
+#search-date-hint[data-typed] {
+  display: none !important;
 }
 
-#screen-main[data-searching][data-date-hint] {
-  /* The pill's 1.6rem and the bar's own 4px row gap under it, so the chips stand just below. */
-  --date-hint: calc(1.6rem + 4px);
-  --bucket-head: var(--date-hint);
-}
-
-#screen-main[data-searching][data-bucket-head][data-date-hint] {
-  --bucket-head: calc(3.7rem + var(--date-hint));
-}
-
-@media (max-width: 480px) {
-  #screen-main[data-searching][data-bucket-head][data-date-hint] {
-    --bucket-head: calc(3.7rem + 2.9rem + var(--date-hint));
+/* On a short screen it steps aside too: there the few lines of list it would cover are worth more
+   (the calendar stays on the bar). While an on-screen keyboard is up it does the same; that rule
+   lives with the page's other keyboard rules (19-control-pane.css). */
+@media (max-height: 560px) {
+  #search-date-hint {
+    display: none !important;
   }
 }
 
@@ -1667,8 +1662,7 @@ li[data-labels-below] > .meta > .label-chips {
   right: calc(var(--float-edge) + env(safe-area-inset-right));
   box-sizing: border-box;
   height: 1.6rem;
-  /* Up to 400px the author disc hangs under the bar's left end: the hint stands under it. */
-  margin: var(--hint-drop, 0px) 0 0;
+  margin: 0;
   padding: 0 0.75rem;
   overflow: hidden;
   background: var(--panel);
@@ -1684,10 +1678,6 @@ li[data-labels-below] > .meta > .label-chips {
   z-index: var(--z-chips);
   /* A tap on it opens the Dates panel (the detail one tap away, R5). */
   cursor: pointer;
-}
-
-#screen-main[data-date-hint] #search-bucket-row:not([hidden]) {
-  margin-top: calc(var(--date-hint) + var(--hint-drop, 0px));
 }
 
 /* While a panel hangs under the bar it covers the hint but for a sliver: the hint steps aside
@@ -1971,11 +1961,10 @@ li[data-labels-below] > .meta > .label-chips {
    up as well it hangs under their row, so the two never meet. Wider, it stays on the line, left of
    Links. */
 @media (max-width: 400px) {
-  /* `#2425 vibe-talk-search-date-filter`: the date hint and the chips stand below the hung disc
-     too (`--hint-drop` on the hint's margin and the chips'), never over it, so it stays a whole
-     target; the list already starts below it (`--hang-foot`). */
-  #screen-main[data-searching][data-date-hint] {
-    --hint-drop: calc(var(--kinds-gap) + var(--toggle-hit));
+  /* `#2425 vibe-talk-search-date-filter`: the date hint stands below the hung disc too, never over
+     it, so the disc stays a whole target; the list already starts below it (`--hang-foot`). */
+  #screen-main[data-searching] #search-date-hint:not([hidden]) {
+    margin-top: calc(var(--kinds-gap) + var(--toggle-hit));
   }
 
   #screen-main[data-searching] #author-filter {

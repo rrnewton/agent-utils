@@ -10,7 +10,8 @@ One channel of 60 messages, two a day for thirty days, read on Friday 27 Novembe
 York (the browser's clock is fixed). The page loads the newest 30; "kestrel" stands in two older
 messages only the server holds, two loaded ones older than a week, and three loaded ones inside the
 week. At a desk (1280x800) and on a phone (412x915, by touch), in light and dark, with the keyboard
-closed and open, plus the narrow phone (360x800, light) where the author filter hangs under the bar (a shrunken `visualViewport`, as tests/server_hits_browser.py plays it):
+closed and open (on the phone the hint steps aside while the keyboard is up), plus the narrow
+phone (360x800, light) where the author filter hangs under the bar (a shrunken `visualViewport`, as tests/server_hits_browser.py plays it):
 
   open the bar -> the calendar stands on it, and the hint line under it shows the date syntax with a
   real example ("after:2026-11-20 · after:7d · before:2026-11-27"); the hint lies inside the bar's
@@ -20,13 +21,14 @@ closed and open, plus the narrow phone (360x800, light) where the author filter 
   "Searches after:2026-11-20" before writing it; Use dates -> the field reads
   "kestrel after:2026-11-20", the server is asked with that date inside q and the reader's zone, and
   every row the list shows (loaded or a server card) was written on or after Nov 20; the calendar is
-  pressed and named "Dates: since Nov 20, 2026", the hint says "Since Nov 20";
-  typed "kestrel after:7d" -> the same rows, and the hint says "Last 7 days" (its title: moving
-  with today);
+  pressed and named "Dates: since Nov 20, 2026", and the hint has stepped aside (it shows only while
+  nothing is typed, floating with no room of its own);
+  typed "kestrel after:7d" -> the same rows, and the calendar names "last 7 days" (its title:
+  moving with today);
   the panel's Clear -> "kestrel" again, the old results back; the hint opens the panel; Between
-  Nov 10 - Nov 15 -> "after:2026-11-10 before:2026-11-16", one hit, the hint "Nov 10 – Nov 15";
+  Nov 10 - Nov 15 -> "after:2026-11-10 before:2026-11-16", one hit, the calendar named "Nov 10 – Nov 15, 2026";
   reopened, pre-filled; a range the wrong way round refused in the panel; 3 days said as
-  "after:2026-11-24" before it is written.
+  "after:2026-11-24" before it is written. The hint takes no room, so it moves nothing.
 
 What the server reads is not this walk's to prove: tests/message_cache_serve.rs
 (`a_dated_search_reads_only_its_window_and_counts_only_what_it_read`) asserts, through the real
@@ -309,6 +311,8 @@ def inside(box: object, width: object, height: object) -> bool:
 
 def walk_through(walk: Walk, keyboard: bool) -> None:
     page, api = walk.page, walk.api
+    # The hint steps aside on a phone while its on-screen keyboard is up (the calendar stays).
+    hint_up = not (walk.touch and keyboard)
     if keyboard:
         page.evaluate(f"() => window.__iosKeyboard(window.innerHeight - {KEYBOARD_PX})")
         walk.settled()
@@ -334,15 +338,19 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
     walk.shot("1-bar-hint")
     boxes = walk.boxes()
     walk.check(boxes["dates"] is not None, "no calendar on the open bar")
-    walk.check(boxes["hint"] is not None, "no hint line under the open bar")
     walk.check(boxes["hintText"] == "after:2026-11-20 · after:7d · before:2026-11-27",
                f"the hint does not show the date syntax with a real example: {boxes['hintText']!r}")
     bar, hint, first = boxes["bar"], boxes["hint"], boxes["firstRow"]
-    assert isinstance(bar, dict) and isinstance(hint, dict)
-    walk.check(hint["top"] >= bar["bottom"] - 0.5, f"the hint stands over the bar: hint {hint}, bar {bar}")
-    walk.check(inside(hint, boxes["width"], boxes["height"]), f"the hint leaves the viewport: {hint}")
-    walk.check(isinstance(first, dict) and first["top"] >= hint["bottom"] - 0.5,
-               f"the first row starts under the hint: row {first}, hint {hint}")
+    assert isinstance(bar, dict)
+    if hint_up:
+        # It floats where the chips float and takes no room: below the bar, inside the viewport.
+        walk.check(isinstance(hint, dict), "no hint line under the open bar")
+        assert isinstance(hint, dict)
+        walk.check(hint["top"] >= bar["bottom"] - 0.5, f"the hint stands over the bar: hint {hint}, bar {bar}")
+        walk.check(inside(hint, boxes["width"], boxes["height"]), f"the hint leaves the viewport: {hint}")
+    else:
+        # A phone with the keyboard up: the hint steps aside.
+        walk.check(hint is None, f"the hint stands while the phone's keyboard is up: {hint}")
     # Every toggle on the bar stays a whole target: a tap at its centre lands on it, never on the hint
     # (up to 400px the author filter hangs under the bar, where the hint would otherwise stand).
     covered = page.evaluate("""() => ['search-dates', 'search-entire-threads', 'author-filter', 'links-filter',
@@ -399,7 +407,7 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
     boxes = walk.boxes()
     walk.check(boxes["datesPressed"] == "true" and boxes["datesName"] == "Dates: since Nov 20, 2026",
                f"the calendar does not say the date standing: {boxes['datesName']!r} pressed={boxes['datesPressed']}")
-    walk.check(boxes["hintText"] == "Since Nov 20", f"the hint does not name the standing date: {boxes['hintText']!r}")
+    walk.check(boxes["hint"] is None, f"the hint stands over a typed search: {boxes['hint']}")
     walk.shot("5-date-standing")
 
     # 4. Typed, the moving spelling: the same rows, and the hint says it moves.
@@ -408,9 +416,9 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
     walk.until(f"() => ({SHOWN_JS})().length === {len(RECENT)}", "a typed after:7d did not leave only the week's hits")
     walk.settled()
     walk.check({str(row["id"]) for row in walk.shown()} == ids(RECENT), "a typed after:7d shows other than the week's hits")
-    walk.until("() => document.getElementById('search-date-hint').textContent === 'Last 7 days' && "
-               "document.getElementById('search-date-hint').title === 'Dates: last 7 days, moving with today'",
-               "the hint does not name the typed relative day, or its title does not say it moves with today")
+    walk.until("() => document.getElementById('search-dates').getAttribute('aria-label') === 'Dates: last 7 days' && "
+               "document.getElementById('search-dates').title === 'Dates: last 7 days, moving with today'",
+               "the calendar does not name the typed relative day, or its title does not say it moves with today")
     walk.shot("6-typed-relative")
 
     # 5. Clear: the old results again.
@@ -428,7 +436,10 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
     # 6. Between, either end: the panel says both tokens, Use writes them, the hint names the range;
     # reopened over a standing date it is pre-filled; a range the wrong way round is refused there;
     # a custom number of days is said before it is written. Opened by the hint this time.
-    walk.press("#search-date-hint")
+    # The hint gives its line to the bucket chips while they stand; then the calendar opens it.
+    hint_shown = bool(page.evaluate("() => { const h = document.getElementById('search-date-hint');"
+                                    " return !!h && h.getClientRects().length > 0; }"))
+    walk.press("#search-date-hint" if hint_up and hint_shown else "#search-dates")
     walk.until("() => !document.getElementById('search-dates-panel').hidden", "a tap on the hint did not open the panel")
     page.fill("#search-dates-from", "2026-11-10")
     page.fill("#search-dates-to", "2026-11-15")
@@ -443,8 +454,7 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
     walk.until(f"() => ({SHOWN_JS})().length === 1", "the range did not leave its one hit")
     walk.check({str(row["id"]) for row in walk.shown()} == ids((35,)), f"the range shows other rows: {walk.shown()}")
     boxes = walk.boxes()
-    walk.check(boxes["hintText"] == "Nov 10 – Nov 15" and boxes["datesName"] == "Dates: Nov 10 – Nov 15, 2026",
-               f"the range is not named: hint {boxes['hintText']!r}, button {boxes['datesName']!r}")
+    walk.check(boxes["datesName"] == "Dates: Nov 10 – Nov 15, 2026", f"the range is not named: {boxes['datesName']!r}")
     walk.shot("9-between-standing")
     walk.press("#search-dates")
     walk.until("() => !document.getElementById('search-dates-panel').hidden && "
