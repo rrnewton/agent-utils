@@ -21,8 +21,9 @@ phone (360x800, light) where the author filter hangs under the bar (a shrunken `
   "Searches after:2026-11-20" before writing it; Use dates -> the field reads
   "kestrel after:2026-11-20", the server is asked with that date inside q and the reader's zone, and
   every row the list shows (loaded or a server card) was written on or after Nov 20; the calendar is
-  pressed and named "Dates: since Nov 20, 2026", and the hint has stepped aside (it shows only while
-  nothing is typed, floating with no room of its own);
+  pressed and named "Dates: since Nov 20, 2026", the hint has stepped aside (it shows only while
+  nothing is typed, floating with no room of its own), and the step back offers no search before
+  the loaded floor ("Before ...: outside your dates", disabled);
   typed "kestrel after:7d" -> the same rows, and the calendar names "last 7 days" (its title:
   moving with today);
   the panel's Clear -> "kestrel" again, the old results back; the hint opens the panel; Between
@@ -443,6 +444,11 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
     walk.check(boxes["datesPressed"] == "true" and boxes["datesName"] == "Dates: since Nov 20, 2026",
                f"the calendar does not say the date standing: {boxes['datesName']!r} pressed={boxes['datesPressed']}")
     walk.check(boxes["hint"] is None, f"the hint stands over a typed search: {boxes['hint']}")
+    # The step back offers no search before the loaded floor, which lies outside the dates.
+    older = page.evaluate("() => { const b = document.getElementById('load-older');"
+                          " return b && !b.hidden ? [b.textContent, b.disabled] : null; }")
+    walk.check(older is None or (str(older[0]).endswith(": outside your dates") and older[1] is True),
+               f"the step back still offers a search outside the dates: {older}")
     walk.shot("5-date-standing")
 
     # 4. Typed, the moving spelling: the same rows, and the hint says it moves.

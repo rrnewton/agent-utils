@@ -78,6 +78,12 @@ export interface OlderWalksDependencies {
   guardQuietly(fn: (...args: never[]) => unknown): (...args: never[]) => unknown;
   renderJumpNewest(): void;
   applySearch(): void;
+  /**
+   * `#2425`: where the search's own date window starts (its latest top-level after: day, at the
+   * start of that day in the reader's zone), in milliseconds, or null with no such date. Absent:
+   * no window.
+   */
+  searchWindowFromMs?(): number | null;
   /** `#2200`: redraw "X of Y loaded" from the fold after the chips move. Optional for doubles. */
   refreshSearchCount?(): void;
   preservingScroll(mutate: () => void, cause?: ScrollCause): void;
@@ -336,7 +342,20 @@ const searchKey = () => JSON.stringify([filterKey(), searchField.open() ? search
 
 function searchOffered() {
   return readRunsSuspended() && screens.view() === "discord" && selection().view !== "threads" && !pinsView().only &&
-    olderPages().moreAbove === true && !(readModes.hiding() && !providerFacts.threading()) && (!columnWork.side() || sideShowing());
+    olderPages().moreAbove === true && !(readModes.hiding() && !providerFacts.threading()) && (!columnWork.side() || sideShowing()) &&
+    !olderOutsideDates();
+}
+
+/**
+ * `#2425` follow-up (liaison): whether everything older than the column's oldest loaded message
+ * lies before the search's own date window, so a search further back could only answer empty.
+ * Then nothing is offered to search there; the control says why instead.
+ */
+function olderOutsideDates(): boolean {
+  const from = deps.searchWindowFromMs?.() ?? null;
+  if (from === null || !searchField.open()) return false;
+  const sent = oldestLoadedMs();
+  return sent !== null && from >= sent;
 }
 
 /** The view a column shows, as a sentence names it. */
@@ -1953,8 +1972,18 @@ function renderOlderControl() {
   } else if (!older.inFlight && older.cursor !== null && older.failedAt === older.cursor) {
     label = `Couldn't fetch older messages from ${serviceWords()}. Tap to try again`;
   }
+  // `#2425` follow-up: with a date window standing wholly above what is loaded, the step back would
+  // search outside the reader's dates: it says so, and offers nothing.
+  const outside = !walk && !walking && olderOutsideDates();
+  if (outside) {
+    const sent = oldestLoadedMs();
+    label = `Before ${sent === null ? "these" : searchMomentWords(sent)}: outside your dates`;
+    if (!button.disabled) button.disabled = true;
+  }
   if (walk) {
     label = walk.stopping ? "Stopping…" : searchWalkProgress(walk);
+  } else if (outside) {
+    // Said above: nothing inside the dates lies further back.
   } else if (offered) {
     // `#578 search-status-clarity`. To the minute, so that every press that brings anything older moves it.
     const sent = oldestLoadedMs();

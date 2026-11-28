@@ -3837,3 +3837,31 @@ test("`#2425`: typed after:7d and before:7d filter the loaded rows by the reader
   assert.deepStrictEqual(matchedIds(page), []);
   assert.equal(page.el("search-dates").getAttribute("aria-label"), "Dates: any time");
 });
+
+test("`#2425` follow-up: with a date window wholly above what is loaded, the step back offers no search before it and says those messages are outside the dates", async () => {
+  // The liaison, on the #2425 evidence: with after:2026-11-20 standing, the list still offered
+  // "Search before Nov 13, 12:00 AM", which lies outside the date window and can only answer empty.
+  const { page, all } = await searchPage({ content: (i) => `message ${i}` });
+  const chip = page.el("load-older");
+  const day = searchMoment(page, all[20].timestamp);
+  // A window reaching below the loaded floor keeps its search further back.
+  await search(page, "message after:2026-08-10");
+  await page.settle();
+  assert.equal(chip.textContent, `Search before ${day}`, "a window reaching below the loaded floor lost its search further back");
+  assert.equal(chip.disabled, false);
+  // One wholly above it offers nothing, and says why.
+  await search(page, "message after:2026-08-20");
+  await page.settle();
+  assert.equal(chip.textContent, `Before ${day}: outside your dates`);
+  assert.equal(chip.disabled, true, "a search outside the dates can still be pressed");
+  assert.equal(chip.getAttribute("aria-label"), null);
+  const reads = searchReads(page).length;
+  await page.el("search-field").dispatch("keydown", { key: "Enter", preventDefault: () => {} });
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, reads, "Enter searched further back, outside the dates");
+  // The date gone, the search further back is offered again.
+  await search(page, "message");
+  await page.settle();
+  assert.equal(chip.textContent, `Search before ${day}`);
+  assert.equal(chip.disabled, false);
+});

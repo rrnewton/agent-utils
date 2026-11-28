@@ -12,6 +12,7 @@ import {createGathering,
   createServerSearch,
   searchDateValue,
   searchFold,
+  searchQueryDateBounds,
   searchQueryExpandLabels,
   searchQueryMatches,
   searchQueryTree,
@@ -7997,6 +7998,11 @@ const settleAfterRead = clientDebug.spanned("read-settle", settleAfterReadPass);
  * @type {import("../view/channel/index.ts").OlderWalks}
  */
 const olderWalks = mountOlderWalks({
+  // `#2425` follow-up: the search's date window, so the step back never offers to search before it.
+  searchWindowFromMs: () => {
+    const { after } = searchQueryDateBounds(/** @type {any} */ (searchParsed(searchField.query()).node));
+    return after ? new Date(after.year, after.month - 1, after.day).getTime() : null;
+  },
   el, leftEl, selection, selectedChannelId, channelContextKey, viewKey, olderPages,
   channelStore, providerFacts, readModes, searchField, searchIdentity, searchTyped,
   filterKey, linkKindsHidden: () => linkKinds.hidden(), authorChoosing,
