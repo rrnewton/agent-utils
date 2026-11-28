@@ -8,7 +8,7 @@ labels:
 - agentctl
 - testing
 created_at: 2026-11-21T12:45:00-05:00
-updated_at: 2026-11-27T18:50:00-05:00
+updated_at: 2026-11-28T07:14:00-05:00
 ---
 
 # Description
@@ -114,6 +114,8 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
   - Both editions count a live process using the slot as a running agent, so the faster Rust census seeing one is the #2418 cause, not an edition bug.
   - The two tests are `ordinary_environment` with that reason. Their 15 sibling audit differentials already pass on the host shards.
 - **Test fix, not a mark.** `test_eden_restart.py::test_hung_daemon_times_out_and_the_other_slot_still_restarts` patched both eden timeouts to 0.5 s, so the healthy slot's start was refused inside a gate's host shard. Both timeouts are now 10 s: the hung fake sleeps 30 s and still times out by name. Alone 5 of 5 at load1 215-261.
+- **Landed (2026-11-28).** Step A', its follow-ups and option B' as f58a74e0 (8d6c7421..f58a74e0, seven commits). The gate on the source head 54b0854a (1795865238081247654-6865f313) had all 30 wrkslots and lifecycle steps green. 28 sessions reported 94,442 git calls in their own namespace, none fell back. Four off-path reds were waived (liaison 1171): `rust.agentctl.test` (#2381, console refused under the lane's harness), `rust.merge-queue.test` (CPU cap), `vibe-talk.check.discuss-browser` (#2175 known-red) and `vibe-talk.check.thread-reader-resume-browser`.
+  - Still open against the acceptance criteria: the 281 host-identity cases read the live host process table in the host shards, and the load quarantines above remain until hermetic versions exist (the fixture proc root of #2434, a controlled inventory for the census cases). The product side of the helper race is #2418.
 - **Coverage.** Removal-path coverage for the quarantined set now rests on #2392's new tests and on this on-demand set. The 9 `test_remove_write_rust.py` Rust/Python remove differentials are back in the namespaced shards with the git stand-in (next note); #2418 stays the product fix.
 - **Git stand-in, option B' (2026-11-28, coordinator's approval).** The wrkslots tests put a git stand-in first on PATH for the session (`py/wrkslots/tests/git_stand_in.c` and `git_stand_in.py`, wired in the conftest).
   - The stand-in runs the real git in its own unprivileged user and PID namespace under a small init. When git exits, the kernel kills whatever git left behind (the host wrapper's helper) before the call returns. No privilege beyond unprivileged user namespaces; plain git where they are refused, counted in the session summary.
