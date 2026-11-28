@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-owner-live-stale: a slot row reads owner=live 44 hours after its heartbeat expired, with no registered agent of that name'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: cl-wrkdoctor
@@ -8,7 +8,8 @@ labels:
 - wrkslots
 - liveness
 created_at: 2026-11-28T09:36:00-05:00
-updated_at: 2026-11-28T11:00:00-05:00
+updated_at: 2026-11-28T15:12:00-05:00
+closed_at: 2026-11-28T15:12:00-05:00
 ---
 
 # Description
@@ -48,3 +49,7 @@ Report evidence at filing time; this lane has not inspected the reporting host a
 ## Fix (display only, the consumer lead's choice)
 
 Status rows name the live process (`owner_process`: pid, start instant, command name, truncated command line, cgroup) when the owner is live and the heartbeat expired; doctor reports `owner-live-heartbeat-expired`, keyed by the slot, only past TTL + max(TTL, 1 hour) since the recorded heartbeat, so one long turn reports nothing. The finding's detail names the process by PID, command name, start and cgroup but never its command line (the consumer relays finding details into posts, which keep command lines out); the row's `owner_process` keeps the truncated argv. Both editions; consumers that alert on new finding kinds get one stable key per stuck slot.
+
+## Resolution
+
+Landed on main as 6c72d429 (d064d85f Python, 6d04af3c Rust, 18d81ad5 notes, 6c72d429 detail without a command line). Status rows carry `owner_process` {pid, started_at, comm, argv, cgroup} only when the owner is live and the heartbeat expired, with an "owner process:" line in human status; doctor (full and --quick, both editions) reports `owner-live-heartbeat-expired`, keyed by the slot, only past TTL + max(TTL, 3600 s) since the recorded heartbeat, and its detail names the process by PID, command name, start and cgroup, never by its command line (at the consumer lead's request: their pager relays details into posts). No verdict or persisted field changed. Gate on 1def9e67 (full): every wrkslots step green; four off-path reds waived by the liaison (#2474 image-status digits, fixed on main; #2493 private-tmp race; herdr-run differential at the old CPU budget; screenshots-desks known-red); landed on the combined tree with the approved components.json overlap. The consumer team was told before its pin moves.
