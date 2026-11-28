@@ -624,7 +624,14 @@ struct Menu {
     idle: String,
     fault: Fault,
     keys: RefCell<Vec<String>>,
+    /// What each submit key did: the label Enter chose, `refused (esc)` for
+    /// Esc on a dialog, `interrupted (esc)` for Esc with no dialog up.
     submitted: RefCell<Vec<String>>,
+    /// The label under the cursor when each submit key arrived.
+    cursor_at_submit: RefCell<Vec<String>>,
+    /// A screen that replaces the current one just before the submit key
+    /// lands (the race between the last read and the key).
+    swap_before_submit: RefCell<Option<String>>,
 }
 
 impl Menu {
@@ -641,6 +648,8 @@ impl Menu {
             fault,
             keys: RefCell::new(vec![]),
             submitted: RefCell::new(vec![]),
+            cursor_at_submit: RefCell::new(vec![]),
+            swap_before_submit: RefCell::new(None),
         }
     }
 
@@ -727,8 +736,8 @@ impl GuardedInput for Menu {
                 self.draw(&mut rows, &options, cursor);
                 *self.screen.borrow_mut() = rows.join("\n") + "\n";
             }
-            "Enter" => {
-                let chosen = self.selected(&rows, &options).map(|at| {
+            "Enter" | "Escape" => {
+                let cursor_label = self.selected(&rows, &options).map(|at| {
                     let body = rows[options[at]]
                         .trim()
                         .trim_start_matches(self.marker)
@@ -737,9 +746,35 @@ impl GuardedInput for Menu {
                     body.split_once(". ")
                         .map_or(body.clone(), |(_, label)| label.to_owned())
                 });
-                self.submitted
-                    .borrow_mut()
-                    .push(chosen.unwrap_or_else(|| "<no cursor>".to_owned()));
+                self.cursor_at_submit.borrow_mut().push(
+                    cursor_label
+                        .clone()
+                        .unwrap_or_else(|| "<no cursor>".to_owned()),
+                );
+                if let Some(swapped) = self.swap_before_submit.borrow_mut().take() {
+                    *self.screen.borrow_mut() = swapped;
+                }
+                // The harness acts on what is on screen when the key lands.
+                let live: Vec<String> = self.screen.borrow().lines().map(str::to_owned).collect();
+                let live_options = self.option_rows(&live);
+                let dialog = !live_options.is_empty();
+                let outcome = match (key, dialog) {
+                    ("Escape", true) => "refused (esc)".to_owned(),
+                    ("Escape", false) => "interrupted (esc)".to_owned(),
+                    (_, _) => self
+                        .selected(&live, &live_options)
+                        .map(|at| {
+                            let body = live[live_options[at]]
+                                .trim()
+                                .trim_start_matches(self.marker)
+                                .trim_start()
+                                .to_owned();
+                            body.split_once(". ")
+                                .map_or(body.clone(), |(_, label)| label.to_owned())
+                        })
+                        .unwrap_or_else(|| "<no cursor>".to_owned()),
+                };
+                self.submitted.borrow_mut().push(outcome);
                 if self.fault != Fault::SubmitIgnored {
                     *self.screen.borrow_mut() = self.idle.clone();
                 }
@@ -784,13 +819,6 @@ fn recognised() -> Vec<(&'static str, String, &'static str, &'static str)> {
             "command-approval",
             "Abort the entire command (esc)",
         ),
-        ("muse", MUSE_PEER.to_owned(), "peer-approval", "Reject once"),
-        (
-            "muse",
-            MUSE_PEER_FOCUSED.to_owned(),
-            "peer-approval",
-            "Reject once",
-        ),
     ]
 }
 
@@ -803,6 +831,7 @@ fn deny_labels_refuse_and_approving_labels_never_pass() {
         "No, and tell Claude what to do differently (esc)",
         "Reject once",
         "Abort the entire command (esc)",
+        "No (esc)",
     ] {
         assert!(deny_label(label), "{label}");
     }
@@ -818,6 +847,10 @@ fn deny_labels_refuse_and_approving_labels_never_pass() {
         "Block",
         "None of the above",
         "Not now",
+        "No thanks, run it",
+        "No, exit",
+        "No preference",
+        "Nope",
         "main",
         "",
     ] {
@@ -863,14 +896,15 @@ fn each_recognised_prompt_names_its_refusal_and_what_it_asked() {
         "{}",
         command.prompt
     );
-    let peer = permission_denial(Some("muse"), MUSE_PEER).unwrap();
-    assert_eq!(peer.selected, None);
-    assert_eq!(peer.focus_keys, ["Down"]);
-    assert!(
-        peer.prompt.contains("Message from coordinator"),
-        "{}",
-        peer.prompt
-    );
+    // Every recognised prompt is submitted with Esc, which is its refusal.
+    for (harness, screen, kind, _) in recognised() {
+        let denial = permission_denial(Some(harness), &screen).unwrap();
+        assert_eq!(denial.submit_key, "Escape", "{kind}");
+    }
+    // Muse's peer dialog is reported only, focused or not: no key refuses it
+    // without a race.
+    assert!(permission_denial(Some("muse"), MUSE_PEER).is_none());
+    assert!(permission_denial(Some("muse"), MUSE_PEER_FOCUSED).is_none());
 }
 
 #[test]
@@ -892,7 +926,7 @@ fn prompts_that_are_not_permission_asks_are_never_recognised() {
     assert!(permission_denial(Some("claude"), &no_refusal).is_none());
     let two = CLAUDE_DANGEROUS.replace(
         "   2. Yes, and don't ask again for rm commands in /work/project",
-        "   2. No, exit",
+        "   2. No (esc)",
     );
     assert!(permission_denial(Some("claude"), &two).is_none());
     // Without the proceed line it is not the exact form.
@@ -917,40 +951,39 @@ fn a_refusal_submits_only_the_refusing_option_from_every_cursor_position() {
             assert_eq!(result["kind"], kind);
             assert_eq!(result["option"], label);
             let submitted = menu.submitted.borrow();
-            assert_eq!(submitted.len(), 1, "{kind} from {start}: {submitted:?}");
-            assert!(
-                deny_label(&submitted[0]),
-                "{kind} from {start}: {submitted:?}"
-            );
-            assert_eq!(submitted[0], label);
+            assert_eq!(*submitted, ["refused (esc)"], "{kind} from {start}");
+            let cursor = menu.cursor_at_submit.borrow();
+            assert_eq!(cursor.len(), 1, "{kind} from {start}: {cursor:?}");
+            assert!(deny_label(&cursor[0]), "{kind} from {start}: {cursor:?}");
+            assert_eq!(cursor[0], label);
             let keys = menu.keys.borrow();
-            assert_eq!(keys.last().map(String::as_str), Some("Enter"));
-            assert_eq!(keys.iter().filter(|key| *key == "Enter").count(), 1);
+            assert_eq!(keys.last().map(String::as_str), Some("Escape"));
+            assert!(!keys.contains(&"Enter".to_owned()), "{keys:?}");
+            assert_eq!(keys.iter().filter(|key| *key == "Escape").count(), 1);
         }
     }
 }
 
 #[test]
-fn a_refusal_moves_up_or_down_and_focuses_an_unfocused_menu_first() {
+fn a_refusal_moves_up_or_down_onto_the_refusal_then_presses_esc() {
     let menu = Menu::new(CLAUDE_PERMISSION, "claude", Fault::None);
     deny_on(&menu, "claude").unwrap().unwrap();
-    assert_eq!(*menu.keys.borrow(), ["Down", "Enter"]);
+    assert_eq!(*menu.keys.borrow(), ["Down", "Escape"]);
     let menu = Menu::new(CLAUDE_DANGEROUS, "claude", Fault::None);
     menu.start_at(2);
     deny_on(&menu, "claude").unwrap().unwrap();
-    assert_eq!(*menu.keys.borrow(), ["Enter"]);
+    assert_eq!(*menu.keys.borrow(), ["Escape"]);
     let menu = Menu::new(CLAUDE_PERMISSION, "claude", Fault::None);
     menu.start_at(1);
     deny_on(&menu, "claude").unwrap().unwrap();
-    assert_eq!(*menu.keys.borrow(), ["Enter"]);
-    let menu = Menu::new(MUSE_PEER_FOCUSED, "muse", Fault::None);
-    menu.start_at(3);
+    assert_eq!(*menu.keys.borrow(), ["Escape"]);
+    let menu = Menu::new(MUSE_APPROVAL, "muse", Fault::None);
     deny_on(&menu, "muse").unwrap().unwrap();
-    assert_eq!(*menu.keys.borrow(), ["Up", "Up", "Enter"]);
-    let menu = Menu::new(MUSE_PEER, "muse", Fault::None);
-    deny_on(&menu, "muse").unwrap().unwrap();
-    assert_eq!(*menu.keys.borrow(), ["Down", "Down", "Enter"]);
-    assert_eq!(*menu.submitted.borrow(), ["Reject once"]);
+    assert_eq!(*menu.keys.borrow(), ["Down", "Escape"]);
+    assert_eq!(
+        *menu.cursor_at_submit.borrow(),
+        ["Abort the entire command (esc)"]
+    );
 }
 
 #[test]
@@ -1000,7 +1033,8 @@ fn a_refusal_whose_prompt_stays_up_is_reported_possibly_submitted_not_retried() 
         error.to_string().contains("do not retry automatically"),
         "{error}"
     );
-    assert_eq!(*menu.submitted.borrow(), ["No"]);
+    assert_eq!(*menu.submitted.borrow(), ["refused (esc)"]);
+    assert_eq!(*menu.cursor_at_submit.borrow(), ["No"]);
 }
 
 // Cold-review regressions for #2421 (ec2b2537).
@@ -1033,11 +1067,12 @@ fn text_above_the_real_menu_is_never_read_as_an_option() {
         let menu = Menu::new(CLAUDE_FAKE_IN_PREVIEW, "claude", Fault::None);
         menu.start_at(start);
         deny_on(&menu, "claude").unwrap().unwrap();
-        assert_eq!(*menu.submitted.borrow(), ["No"], "from {start}");
+        assert_eq!(*menu.cursor_at_submit.borrow(), ["No"], "from {start}");
+        assert_eq!(*menu.submitted.borrow(), ["refused (esc)"], "from {start}");
     }
     let menu = Menu::new(CLAUDE_FAKE_IN_PREVIEW, "claude", Fault::None);
     deny_on(&menu, "claude").unwrap().unwrap();
-    assert_eq!(*menu.keys.borrow(), ["Down", "Down", "Enter"]);
+    assert_eq!(*menu.keys.borrow(), ["Down", "Down", "Escape"]);
 }
 
 #[test]
@@ -1104,25 +1139,91 @@ fn a_cursor_that_lands_on_the_wrong_option_gets_no_submit_key() {
 }
 
 #[test]
-fn a_peer_message_that_quotes_option_rows_never_moves_the_refusal() {
+fn a_command_preview_that_quotes_option_rows_never_moves_the_refusal() {
     use agentctl::harness_tui::permission_denial;
-    // Quoted rows separated from the real menu are text, not options.
-    let quoted = MUSE_PEER_FOCUSED.replace(
-        "  \"The gate queue moved; may I re-run your shard on the new base?\"\n",
-        "  \"Pick one:\n  1. Allow once\n  2. Allow for this session\"\n\n",
+    // Rows quoted in the command, apart from the real menu, are text.
+    let quoted = MUSE_APPROVAL.replace(
+        "  $ date > stamp.txt\n",
+        "  $ printf '1. Allow this stage once (y)\\n'\n  1. Allow this stage once (y)\n  2. Allow this stage once (y)\n\n",
     );
-    assert_ne!(quoted, MUSE_PEER_FOCUSED);
+    assert_ne!(quoted, MUSE_APPROVAL);
     let denial = permission_denial(Some("muse"), &quoted).unwrap();
+    assert_eq!(denial.options.len(), 2);
     assert_eq!(denial.deny, 2);
-    assert_eq!(denial.options.len(), 4);
     let menu = Menu::new(&quoted, "muse", Fault::None);
     deny_on(&menu, "muse").unwrap().unwrap();
-    assert_eq!(*menu.submitted.borrow(), ["Reject once"]);
-    // Rows run into the menu: numbering breaks, nothing is recognised.
-    let adjacent = MUSE_PEER_FOCUSED.replace(
-        "⟩ 1. Allow once",
-        "  1. Allow once\n  2. Allow once\n⟩ 1. Allow once",
+    assert_eq!(
+        *menu.cursor_at_submit.borrow(),
+        ["Abort the entire command (esc)"]
     );
-    assert_ne!(adjacent, MUSE_PEER_FOCUSED);
+    // Rows run into the menu: numbering breaks, nothing is recognised.
+    let adjacent = MUSE_APPROVAL.replace(
+        "⟩ 1. Allow this stage once (y)",
+        "  1. Allow this stage once (y)\n⟩ 1. Allow this stage once (y)",
+    );
+    assert_ne!(adjacent, MUSE_APPROVAL);
     assert!(permission_denial(Some("muse"), &adjacent).is_none());
+}
+
+#[test]
+fn a_dialog_quoted_above_an_idle_muse_editor_is_never_a_prompt() {
+    // Second review, finding 1: an idle lane whose last tool output quotes
+    // a captured dialog (a peer dialog, or the command form with its
+    // refusal under the cursor) must get no key: the editor is drawn.
+    use agentctl::harness_tui::permission_denial;
+    let dialog_rows = |capture: &str| -> String {
+        let rows: Vec<&str> = capture.lines().collect();
+        let start = rows
+            .iter()
+            .position(|row| row.contains("Would you like to run") || row.contains("Message from"))
+            .unwrap();
+        let end = rows.iter().rposition(|row| row.contains(". ")).unwrap();
+        rows[start..=end].join("\n")
+    };
+    let focused_abort = MUSE_APPROVAL
+        .replace("⟩ 1. Allow", "  1. Allow")
+        .replace("  2. Abort", "⟩ 2. Abort");
+    for capture in [
+        MUSE_PEER,
+        MUSE_PEER_FOCUSED,
+        MUSE_APPROVAL,
+        focused_abort.as_str(),
+    ] {
+        let quoted = format!(
+            "● Bash(cat captured.txt)\n{}\n\n{MUSE_IDLE}",
+            dialog_rows(capture)
+        );
+        assert!(
+            permission_denial(Some("muse"), &quoted).is_none(),
+            "{quoted}"
+        );
+        let menu = Menu::new(&quoted, "muse", Fault::None);
+        assert!(deny_on(&menu, "muse").unwrap().is_none());
+        assert!(menu.keys.borrow().is_empty());
+    }
+    // Rows after the closing rule other than the status line: not the bottom.
+    let trailing =
+        format!("{MUSE_APPROVAL}────────────────────────────\n  1. Allow this stage once (y)\n");
+    assert!(permission_denial(Some("muse"), &trailing).is_none());
+}
+
+#[test]
+fn a_dialog_that_replaces_the_prompt_just_before_the_key_is_refused_not_approved() {
+    // Second review, finding 2: the last read sees the cursor on the
+    // refusal; in the instant before the key, the dialog closes and a new
+    // one opens with its cursor on "1. Yes". The submit key is Esc, so the
+    // new dialog is refused too. With no dialog up any more, Esc interrupts
+    // the running turn instead: the documented cost, never an approval.
+    let fresh = CLAUDE_HOOK.replace("rm -rf build", "git push --force origin main");
+    let menu = Menu::new(CLAUDE_PERMISSION, "claude", Fault::None);
+    *menu.swap_before_submit.borrow_mut() = Some(fresh);
+    let _ = deny_on(&menu, "claude");
+    assert_eq!(*menu.cursor_at_submit.borrow(), ["No"]);
+    assert_eq!(*menu.submitted.borrow(), ["refused (esc)"]);
+    let working = "✻ Working… (12s · esc to interrupt)\n────────────────────────────────────────\n❯\n────────────────────────────────────────\n";
+    let menu = Menu::new(CLAUDE_PERMISSION, "claude", Fault::None);
+    *menu.swap_before_submit.borrow_mut() = Some(working.to_owned());
+    let _ = deny_on(&menu, "claude");
+    assert_eq!(*menu.submitted.borrow(), ["interrupted (esc)"]);
+    assert!(!menu.keys.borrow().contains(&"Enter".to_owned()));
 }

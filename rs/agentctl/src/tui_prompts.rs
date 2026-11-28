@@ -234,9 +234,10 @@ pub fn inspect_question(
 /// and never an approval. The pane is re-read and the prompt re-recognised
 /// ([`crate::harness_tui::permission_denial`]) before every key; the cursor
 /// is moved one step at a time onto the one refusing option and each move
-/// is seen to land; the submit key is sent only while the selected option
-/// reads as a refusal ([`crate::harness_tui::deny_label`]); and the prompt
-/// must then be seen to leave. A prompt that changes, or a cursor that
+/// is seen to land; the submit key is sent only while the row under the
+/// cursor reads as that refusal ([`crate::harness_tui::deny_label`]), and
+/// it is `Escape` wherever Esc is itself the refusal; and the prompt must
+/// then be seen to leave. A prompt that changes, or a cursor that
 /// moves anywhere else, stops the attempt with no submit key.
 ///
 /// `expected` is the prompt the caller saw and timed; a different prompt
@@ -306,18 +307,17 @@ impl Denying<'_> {
         Ok(())
     }
 
-    /// Wait for the same prompt with the cursor on `want` (any cursor when
-    /// `None` would do is not allowed: a cursor must be drawn).
+    /// Wait for the same prompt with its cursor drawn on `want`.
     fn landed(
         &self,
         prompt: &crate::harness_tui::Denial,
-        want: Option<usize>,
+        want: usize,
     ) -> AgentResult<crate::harness_tui::Denial> {
         let deadline = self.runtime.monotonic() + Duration::from_secs(2);
         loop {
             match self.observe()? {
                 Some(now) if same_prompt(&now, prompt) => {
-                    if now.selected.is_some() && (want.is_none() || now.selected == want) {
+                    if now.selected == Some(want) {
                         return Ok(now);
                     }
                 }
@@ -343,12 +343,6 @@ impl Denying<'_> {
         if expected.is_some_and(|expected| !same_prompt(expected, &prompt)) {
             return Ok(None);
         }
-        if prompt.selected.is_none() {
-            for key in prompt.focus_keys {
-                self.key(key)?;
-            }
-            prompt = self.landed(&prompt, None)?;
-        }
         let deny = prompt.deny;
         loop {
             let selected = prompt.selected.ok_or_else(|| {
@@ -363,12 +357,12 @@ impl Denying<'_> {
                 ("Up", selected - 1)
             };
             self.key(key)?;
-            prompt = self.landed(&prompt, Some(next))?;
+            prompt = self.landed(&prompt, next)?;
         }
         // The last look before the submit key: still this prompt, the cursor
         // on its refusing option, and the label read from the very row the
         // cursor is drawn on is that refusal.
-        let last = self.landed(&prompt, Some(deny))?;
+        let last = self.landed(&prompt, deny)?;
         let refusal = last
             .options
             .iter()
@@ -385,7 +379,10 @@ impl Denying<'_> {
             .ok_or_else(|| {
                 fail("the row under the cursor is not the refusal; no submit key sent")
             })?;
-        self.key("Enter")?;
+        // `Escape` where Esc is itself the refusal (see `Denial::submit_key`):
+        // a dialog that replaced this one since the last read is refused,
+        // not approved; with no dialog up it would interrupt a running turn.
+        self.key(last.submit_key)?;
         let deadline = self.runtime.monotonic() + Duration::from_secs(3);
         loop {
             if self.observe()?.is_none_or(|now| !same_prompt(&now, &last)) {

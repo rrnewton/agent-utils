@@ -2149,6 +2149,18 @@ impl Wrapper {
             };
             return refuse(self, "not_pending", error);
         };
+        // #2421: under deny-at-once nobody is asked, so nobody may approve,
+        // even in the short grace before the policy denies the call.
+        if decision == Decision::Approve && self.config.approval_timeout.is_zero() {
+            let pending_id = self.approvals[index].id.clone();
+            return refuse(
+                self,
+                "policy",
+                format!(
+                    "approval {pending_id} is denied by policy (approval_timeout_s 0, deny at once); approvals are not taken"
+                ),
+            );
+        }
         if chat && decision == Decision::Approve && !self.approvals[index].complete {
             let pending_id = self.approvals[index].id.clone();
             return refuse(

@@ -1622,8 +1622,20 @@ pub(crate) fn permission_policy(
     let root = configuration_root(cwd, registry, true)?;
     let raw = registry_policy(&root.join(".agentctl"))?;
     let mut policy = PermissionPolicy::default();
+    // A record naming a profile the file no longer has (or no file at all)
+    // cannot tell what its owner chose for interactive prompts: report only,
+    // so a `report` that was removed with the profile is never overridden
+    // by a refusal. The headless timeout keeps the defaults (deny at once).
+    let missing = |mut policy: PermissionPolicy, name: &str| {
+        policy.deny = false;
+        policy.source = format!("profile '{name}' not in profiles.json: report only");
+        policy
+    };
     let Some(object) = raw else {
-        return Ok(policy);
+        return Ok(match profile_name {
+            Some(name) => missing(policy, name),
+            None => policy,
+        });
     };
     let profile = profile_name.and_then(|name| {
         object
@@ -1633,6 +1645,7 @@ pub(crate) fn permission_policy(
             .and_then(Value::as_object)
             .map(|profile| (name, profile))
     });
+    let profile_missing = profile_name.filter(|_| profile.is_none());
     let mut sources = Vec::new();
     let pick = |key: &str| -> (Option<&Value>, String) {
         if let Some((name, profile)) = profile {
@@ -1661,7 +1674,10 @@ pub(crate) fn permission_policy(
     }
     sources.push(format!("approval_timeout_s={from}"));
     policy.source = sources.join(" ");
-    Ok(policy)
+    Ok(match profile_missing {
+        Some(name) => missing(policy, name),
+        None => policy,
+    })
 }
 
 pub(crate) fn load_profiles(
@@ -2619,6 +2635,8 @@ mod tests {
             permission_policy(&root, &registry, None).unwrap(),
             PermissionPolicy::default()
         );
+        // No file at all, yet the record names a profile: report only.
+        assert!(!permission_policy(&root, &registry, Some("p")).unwrap().deny);
         assert_eq!(PermissionPolicy::default().approval_timeout_s, 0);
         assert_eq!(PermissionPolicy::default().deny_after_s, 60);
         assert!(PermissionPolicy::default().deny);
@@ -2662,6 +2680,21 @@ mod tests {
             own.source.contains("permission_prompts=profile 'own'"),
             "{}",
             own.source
+        );
+        // A record naming a profile the file no longer has: report only
+        // (second review, finding 5), headless default unchanged.
+        let missing = permission_policy(&root, &registry, Some("gone")).unwrap();
+        assert!(!missing.deny, "{missing:?}");
+        assert_eq!(
+            missing.approval_timeout_s, 600,
+            "registry default still applies"
+        );
+        assert!(
+            missing
+                .source
+                .contains("profile 'gone' not in profiles.json"),
+            "{}",
+            missing.source
         );
         // The keys are known fields: the file loads with them.
         let (_, profiles) = load_profiles(&root, false).unwrap();

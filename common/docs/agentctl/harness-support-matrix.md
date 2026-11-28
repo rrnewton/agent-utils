@@ -66,7 +66,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Busy / idle detection | supported | supported | supported | partial | supported (event log) |
 | Interrupt a running turn | supported | supported | supported | partial | supported (Claude and Muse) |
 | Approvals relay to chat | none | none | none | none | supported (Claude and Muse) |
-| Permission prompts refused, never approved (#2421) | supported | none (report only) | supported | none | supported (Claude) |
+| Permission prompts refused, never approved (#2421) | supported | none (report only) | partial (command approvals; peer dialog reported) | none | supported (Claude) |
 | Forms / questions (`prompts`, `answer`) | supported | supported | none (detect only) | none | n/a |
 | Trust dialogs | supported | supported | partial | none | n/a |
 | Headless mode itself | supported | none | supported | none | — |
@@ -443,8 +443,12 @@ screen; a harness recogniser (`permission_denial` in
 `rs/agentctl/src/harness_tui/`) must accept the prompt; once the same
 prompt has shown for `permission_deny_after_s` (profile, then registry,
 default 60), `tui_prompts::deny` moves the cursor one verified step at a
-time onto the one option `deny_label` reads as a refusal, sends Enter only
-while the label read from the row under the cursor is that refusal, and
+time onto the one option `deny_label` reads as a refusal (an exact list of
+known refusal labels), and only while the label read from the row under the
+cursor is that refusal sends the submit key, which is Esc: Esc is itself the
+refusal on every recognised dialog, so a dialog that replaced this one in
+the instant before the key is refused too, never approved (with no dialog
+up any more, Esc interrupts a running turn: the accepted cost). It then
 checks the prompt left. Before every key it re-proves the recipient and
 that the pane is at its bottom (a pane scrolled back, or one whose scroll
 position is unknown, gets no key). The agent is queued a note (what was
@@ -452,10 +456,12 @@ refused, nothing ran, carry on or end with `BLOCKED:`) and its manager one
 FYI line. `permission_prompts: "report"` (profile or registry) keeps
 report-only, and so does a policy that cannot be read and an adopted
 foreign pane or a record with no pane (agentctl never types into those):
-such a prompt is paged at once, as before. A refusal that could not act
-(scrolled pane, changed prompt, keys failed) counts as failed; two failed
-refusals hand the prompt back to the `approval-prompt` notice, the
-coordinator page and, for a hook confirmation, the owner alarm.
+such a prompt is paged at once, as before; a record naming a profile that
+profiles.json no longer has is report-only too. A refusal that could not act
+(scrolled pane, changed prompt, keys failed), or whose own read found no
+prompt while the watcher still sees it, counts as an attempt; two attempts
+hand the prompt back to the `approval-prompt` notice, the coordinator page
+and, for a hook confirmation, the owner alarm.
 
 - **Claude Code**: supported — hook confirmations (`Hook ... requires
   confirmation`), built-in safety checks (a dangerous-operation warning)
@@ -475,23 +481,25 @@ coordinator page and, for a hook confirmation, the owner alarm.
   (`--dangerously-bypass-approvals-and-sandbox`) and no Codex approval
   screen is recorded here, so none is answered; the watcher reports one
   if it ever shows.
-- **Muse**: supported — the command approval form (`Would you like to
-  run the following command?`; refusal `Abort the entire command`) and
-  the peer-approval dialog (`Message from PEER`; refusal `Reject once`,
-  never `Block`), the dialog's unfocused menu focused with one Down key
-  first. The menu is the last contiguous run of option rows under the
-  heading, numbered 1..n, followed only by Muse's hints up to its rule, so
-  rows quoted in a peer message or a command are never options. This supersedes #974's detection-only rule for the refusal
-  only. The plugin-hooks trust dialog keeps its own policy (Trust
-  dialogs row).
+- **Muse**: partial — the command approval form (`Would you like to
+  run the following command?`; refusal `Abort the entire command (esc)`,
+  submitted with Esc) is refused. Its menu is the last contiguous run of
+  option rows under the heading, numbered 1..n with one cursor, followed
+  only by Muse's hints, its closing rule and its status line, and the
+  editor must be absent, so rows quoted in a command or in an idle lane's
+  transcript are never a prompt. The peer-approval dialog (#974) stays
+  reported only: no key is known that refuses it without a race (its Esc
+  meaning is unverified, and Enter on a dialog that replaced it in the
+  instant before the key could allow a peer). The plugin-hooks trust
+  dialog keeps its own policy (Trust dialogs row).
 - **Unknown TUI**: none — no recogniser, so nothing is answered.
 - **Headless (Claude Code)**: supported — `approval_timeout_s` 0, the
   built-in default (profile, then registry; `run-headless
   --approval-timeout` wins), denies every prompt by policy after
   `POLICY_GRACE` (3 s, for the host's own permission hooks), logging
   `approval.requested` (marked `policy: deny-at-once`, which no bridge
-  posts and `tail` shows as asking nobody) and `approval.decided` with
-  `by: policy`; the
+  posts and `tail` shows as asking nobody; an `approve` sent in the grace
+  is refused) and `approval.decided` with `by: policy`; the
   model reads `policy_denial_message` (nothing ran, why it asked, what to
   do instead) (`rs/agentctl/src/headless/wrapper.rs`,
   `rs/agentctl/src/headless/approval.rs`,
@@ -1112,11 +1120,12 @@ The two smallest divergences, kept as rows so they cannot hide:
    Claude-first; Muse got it in #1546; an unrecognised TUI gets a
    report, not a rescue. #1560 is making it general now.
 2. **No TUI approval reaches chat, and by default no approval reaches
-   anyone.** Since #2421 a recognised Claude or Muse permission prompt is
-   refused by the watcher after 60 s and a headless prompt is denied by
-   policy after 3 s; only a profile or registry that sets
-   `permission_prompts: "report"` or `approval_timeout_s` keeps a person
-   in the loop. A Codex or unknown-harness prompt is still only reported.
+   anyone.** Since #2421 a recognised Claude permission prompt or Muse
+   command approval is refused by the watcher after 60 s and a headless
+   prompt is denied by policy after 3 s; only a profile or registry that
+   sets `permission_prompts: "report"` or `approval_timeout_s` keeps a
+   person in the loop. A Muse peer dialog, a Codex or an unknown-harness
+   prompt is still only reported.
 3. **`agentctl answer` does not answer Muse.** Muse forms are detected
    so status can say blocked; answering them is refused by design.
 4. **Headless means Claude or Muse.** In the Rust edition that the

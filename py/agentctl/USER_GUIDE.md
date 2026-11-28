@@ -1794,24 +1794,25 @@ agentctl-asks-never-block; Rust edition). An agent waiting at a permission or
 approval prompt is stuck until a person acts, so the watcher answers the prompts
 it can recognise exactly: Claude Code's hook confirmations, built-in safety
 checks and permission-rule confirmations (`Do you want to proceed?`, Yes/No), and
-Muse's command approval form and peer-approval dialog. Once the same prompt has
-shown for the agent's `permission_deny_after_s` (default 60; set it on the
-profile or at the top of `.agentctl/profiles.json`), the full pass or the quick
-check after it selects the prompt's one refusing option (`No`, `Abort the entire
-command`, `Reject once`), re-reading the pane before every key, sending Enter
-only while the row under the cursor reads as that refusal, and checking that the
-prompt left; a pane scrolled back gets no key. The agent
+Muse's command approval form. Once the same prompt has shown for the agent's
+`permission_deny_after_s` (default 60; set it on the profile or at the top of
+`.agentctl/profiles.json`), the full pass or the quick check after it moves the
+cursor onto the prompt's one refusing option (`No`, `Abort the entire command`),
+re-reading the pane before every key, and only while the row under the cursor
+reads as that refusal presses Esc, which is itself the refusal on these dialogs
+(if the dialog closed in that instant, Esc interrupts a running turn instead);
+then it checks that the prompt left. A pane scrolled back gets no key. The agent
 is then queued a note saying what was refused, that nothing ran, and to carry on
 another way or end with `BLOCKED:`; its manager (else the coordinator) gets one
 `FYI` line; nobody is asked anything, and the owner alarm for hook
 confirmations and the coordinator's blocked page wait while a refusal is
 pending. A prompt no recogniser accepts (a folder trust dialog, a question, a
-Codex screen, an unknown harness) is never answered: the `approval-prompt`
+Muse peer dialog, a Codex screen, an unknown harness) is never answered: the `approval-prompt`
 notice reports it as before. Two failed refusals of the same prompt hand it back
 to that notice. `permission_prompts: "report"` on a profile or at the top level
-keeps the old report-only behaviour, as does a policy that cannot be read and an
-adopted foreign pane, which agentctl never types into: those prompts are paged at
-once. The pass report lists every prompt seen
+keeps the old report-only behaviour, as does a policy that cannot be read, a
+record naming a profile that profiles.json no longer has, and an adopted foreign
+pane, which agentctl never types into: those prompts are paged at once. The pass report lists every prompt seen
 under `permission_denials` with its action (`waiting`, `denied`, `failed`,
 `gave-up`, `reported`, `due` under `--check-only`).
 
@@ -3702,7 +3703,8 @@ masked, up to 3000 bytes; `complete` is false when it had to be cut or masked).
 **By default nobody is asked** (#2421 agentctl-asks-never-block): the agent's
 approval timeout is 0, so after a 3 s grace for the host's own hooks the wrapper
 denies the call by policy (`approval.requested` is marked `policy: deny-at-once`
-and posted by no bridge; `approval.decided` says `by: policy`), and the model
+and posted by no bridge, and an `approve` sent in the grace is refused;
+`approval.decided` says `by: policy`), and the model
 reads that nothing ran, why the harness asked, and to do it a way that needs no
 approval or say what it needs; a bridge posts nothing for it. To ask the owner
 instead, set `approval_timeout_s` (10 to 86400) on the agent's profile or at the top

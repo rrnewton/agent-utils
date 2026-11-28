@@ -114,8 +114,8 @@ pub trait HarnessTui {
 /// reported, never answered.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Denial {
-    /// Which prompt: `hook-confirmation`, `permission`, `peer-approval` or
-    /// `command-approval`.
+    /// Which prompt: `hook-confirmation`, `permission` (Claude Code) or
+    /// `command-approval` (Muse).
     pub kind: &'static str,
     /// The prompt as drawn: its heading and first reason line, bounded.
     pub prompt: String,
@@ -128,28 +128,40 @@ pub struct Denial {
     pub selected_text: Option<String>,
     /// The one option that refuses; its label passes [`deny_label`].
     pub deny: usize,
-    /// Keys that put a cursor on an unfocused menu (Muse draws its peer
-    /// dialog with no cursor until a Down key focuses it).
-    pub focus_keys: &'static [&'static str],
+    /// The key that submits the refusal once the cursor is verified on it:
+    /// `Escape` where Esc is itself the refusal (every Claude permission
+    /// dialog, and Muse's command approval, whose refusal reads `(esc)`), so
+    /// a dialog that replaced this one in the instant before the key is
+    /// refused too, never approved; `Enter` only where Esc means nothing
+    /// known (Muse's peer dialog). If no dialog is up any more, Esc
+    /// interrupts a running turn: a cost accepted over any approval.
+    pub submit_key: &'static str,
 }
 
 /// Longest prompt text a [`Denial`] keeps, in characters.
 pub const DENIAL_PROMPT_CHARS: usize = 300;
 
-/// Whether an option label refuses: `No` (alone, or followed by a comma,
-/// space or bracket, as in `No, and tell Claude what to do differently`),
-/// `Reject once`, or `Abort the entire command`. An approving label (`Yes`,
-/// `Allow ...`, `Trust ...`) never passes, nor does `Block`, which refuses
-/// a peer for good rather than once.
+/// The refusal labels agentctl knows, lowercased, exactly as the harnesses
+/// draw them (#2421).
+pub const REFUSAL_LABELS: [&str; 7] = [
+    "no",
+    "no (esc)",
+    "no, and tell claude what to do differently",
+    "no, and tell claude what to do differently (esc)",
+    "reject once",
+    "abort the entire command",
+    "abort the entire command (esc)",
+];
+
+/// Whether an option label is one of the known refusals
+/// ([`REFUSAL_LABELS`]), compared whole, case aside. Anything else, an
+/// approving label (`Yes`, `Allow ...`, `Trust ...`) or an unknown one that
+/// merely starts with `No` (`No thanks, run it`), never passes; nor does
+/// `Block`, which refuses a peer for good rather than once.
 #[must_use]
 pub fn deny_label(text: &str) -> bool {
     let lower = text.trim().to_lowercase();
-    let no = lower
-        .strip_prefix("no")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with([',', ' ', '(']));
-    no || lower == "reject once"
-        || lower.starts_with("reject once ")
-        || lower.starts_with("abort the entire command")
+    REFUSAL_LABELS.contains(&lower.as_str())
 }
 
 /// The option of `options` that refuses, when exactly one does and some
@@ -172,9 +184,9 @@ pub(crate) fn sole_deny_option(options: &[OptionItem]) -> Option<usize> {
 
 /// The permission or approval prompt `screen` shows for `harness`, when
 /// one is recognised well enough to refuse (#2421): Claude Code's hook,
-/// safety-check and permission-rule confirmations, and Muse's peer and
-/// command approvals. Codex runs with approvals off and no approval
-/// screen of it is recorded, so it has none; an unknown harness has none.
+/// safety-check and permission-rule confirmations, and Muse's command
+/// approval. Muse's peer-approval dialog, Codex (approvals off, no recorded
+/// approval screen) and an unknown harness have none: reported only.
 #[must_use]
 pub fn permission_denial(harness: Option<&str>, screen: &str) -> Option<Denial> {
     let denial = match harness {
@@ -195,7 +207,6 @@ pub fn permission_denial(harness: Option<&str>, screen: &str) -> Option<Denial> 
         .iter()
         .find(|option| option.number == denial.deny)?;
     let cursor_consistent = match (denial.selected, denial.selected_text.as_deref()) {
-        (None, None) => true,
         (Some(selected), Some(text)) => denial
             .options
             .get(selected.wrapping_sub(1))
@@ -204,6 +215,7 @@ pub fn permission_denial(harness: Option<&str>, screen: &str) -> Option<Denial> 
     };
     (numbered
         && cursor_consistent
+        && matches!(denial.submit_key, "Enter" | "Escape")
         && deny_label(&chosen.text)
         && sole_deny_option(&denial.options) == Some(denial.deny))
     .then_some(denial)

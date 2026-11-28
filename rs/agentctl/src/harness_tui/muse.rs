@@ -9,8 +9,8 @@
 //! Muse forms (approvals, panels, questions) are never answered through `agentctl answer`, so
 //! this adapter is offered only by [`super::followup_tui`] and not by [`super::harness_tui`],
 //! which `agentctl prompts` and `agentctl answer` use. The one exception is a refusal: the
-//! watcher may refuse a command approval or a peer approval through [`permission_denial`]
-//! (#2421 agentctl-asks-never-block), and never approves either.
+//! watcher may refuse a command approval through [`permission_denial`] (#2421
+//! agentctl-asks-never-block), and never approves one.
 use super::{plain, AnswerPlan, HarnessTui, Question, State, View};
 use crate::client::{
     muse_ansi_composer_is_empty, muse_divider_width, muse_editor_rows_empty_w,
@@ -52,7 +52,7 @@ impl MuseTui {
 
     /// Whether Muse's peer-approval dialog stands where the editor would be (#974
     /// muse-peer-approval-prompt), so the pane waits for a person. Allowing a peer is a human
-    /// decision: nothing here approves it; the watcher may only refuse it once (#2421).
+    /// decision: nothing here answers it, and the #2421 deny sweep reports it only.
     pub(crate) fn peer_approval_form(screen: &str) -> bool {
         crate::agent_watch::peer_approval_prompt_line(screen).is_some()
     }
@@ -76,32 +76,33 @@ impl MuseTui {
     }
 }
 
-/// Muse's command approval or peer-approval prompt, when recognised well
-/// enough to refuse (#2421 agentctl-asks-never-block): the command form's
-/// `Abort the entire command` or the peer dialog's `Reject once`. The
-/// options are read only from the rows below the form's own heading in
-/// the bottom window, with Muse's `⟩` cursor; a peer dialog drawn before
-/// its menu has focus carries no cursor and gets a Down key first, after
-/// which the answering flow re-reads where the cursor landed.
+/// Muse's command approval form, when recognised well enough to refuse
+/// (#2421 agentctl-asks-never-block): its `Abort the entire command (esc)`,
+/// submitted with Esc, which is that refusal itself. The options are read
+/// only from the rows below the form's own heading in the bottom window,
+/// with Muse's `⟩` cursor. The peer-approval dialog is not refused here:
+/// it has no known key that refuses without a race (its Esc meaning is
+/// unverified, and Enter on a dialog that replaced it in the instant before
+/// the key could allow a peer), so it stays reported only (#974).
 pub(crate) fn permission_denial(screen: &str) -> Option<super::Denial> {
     let clean = plain(screen);
     let rows: Vec<&str> = clean.lines().collect();
     let last = rows.iter().rposition(|row| !row.trim().is_empty())?;
     let window = &rows[(last + 1).saturating_sub(FORM_ROWS)..=last];
-    let (kind, heading) = if MuseTui::approval_form(screen) {
-        let heading = window.iter().rposition(|row| {
-            row.to_lowercase()
-                .contains("would you like to run the following command?")
-        })?;
-        ("command-approval", heading)
-    } else if MuseTui::peer_approval_form(screen) {
-        let heading = window
-            .iter()
-            .rposition(|row| row.to_lowercase().contains("message from "))?;
-        ("peer-approval", heading)
-    } else {
+    // The live dialog stands where the editor would be: with the editor
+    // drawn, any dialog rows are transcript text (a quoted capture), never
+    // a prompt (review finding: a quoted peer dialog above an idle editor).
+    if muse_verified_process_editor_rows(&clean).is_some() {
         return None;
-    };
+    }
+    if !MuseTui::approval_form(screen) || MuseTui::peer_approval_form(screen) {
+        return None;
+    }
+    let kind = "command-approval";
+    let heading = window.iter().rposition(|row| {
+        row.to_lowercase()
+            .contains("would you like to run the following command?")
+    })?;
     // The menu is the LAST contiguous run of option rows under the heading;
     // below it, up to the next rule, only blank rows and Muse's own hints;
     // text above it (a quoted peer message, a command) is never an option.
@@ -120,14 +121,28 @@ pub(crate) fn permission_denial(screen: &str) -> Option<super::Denial> {
             || lower.contains("to navigate")
             || lower.contains("enter to select")
     };
-    for row in &body[end + 1..] {
+    // Below the menu: Muse's hints, then its closing rule, then only its
+    // status line (at most two rows of `a · b · c`, none an option or a
+    // rule), so the dialog is the live bottom of the screen.
+    let is_rule = |row: &str| {
         let trimmed = row.trim();
-        if trimmed.chars().count() >= 3 && trimmed.chars().all(|c| c == '─') {
-            break;
-        }
-        if !hint(row) {
-            return None;
-        }
+        trimmed.chars().count() >= 3 && trimmed.chars().all(|c| c == '─')
+    };
+    let after = &body[end + 1..];
+    let closing = after.iter().position(|row| is_rule(row))?;
+    if !after[..closing].iter().all(|row| hint(row)) {
+        return None;
+    }
+    let status: Vec<&&str> = after[closing + 1..]
+        .iter()
+        .filter(|row| !row.trim().is_empty())
+        .collect();
+    if status.len() > 2
+        || status.iter().any(|row| {
+            is_rule(row) || !row.contains(" · ") || super::option_row(row, '⟩').is_some()
+        })
+    {
+        return None;
     }
     let mut options = Vec::new();
     let mut selected = None;
@@ -153,17 +168,17 @@ pub(crate) fn permission_denial(screen: &str) -> Option<super::Denial> {
         return None;
     }
     let deny = super::sole_deny_option(&options)?;
-    let wanted = if kind == "command-approval" {
-        "abort the entire command"
-    } else {
-        "reject once"
-    };
-    if !options
-        .iter()
-        .any(|option| option.number == deny && option.text.to_lowercase().starts_with(wanted))
-    {
+    if !options.iter().any(|option| {
+        option.number == deny
+            && option
+                .text
+                .to_lowercase()
+                .starts_with("abort the entire command")
+    }) {
         return None;
     }
+    // A cursor must be drawn: the flow moves it and verifies every step.
+    selected?;
     let mut prompt = window[heading].trim().to_owned();
     if let Some(detail) = detail {
         prompt = format!("{prompt} {detail}");
@@ -175,11 +190,8 @@ pub(crate) fn permission_denial(screen: &str) -> Option<super::Denial> {
         selected,
         selected_text,
         deny,
-        focus_keys: if selected.is_none() && kind == "peer-approval" {
-            &["Down"]
-        } else {
-            &[]
-        },
+        // The command form's refusal reads "(esc)": Esc is the refusal itself.
+        submit_key: "Escape",
     })
 }
 

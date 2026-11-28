@@ -357,6 +357,9 @@ pub(crate) fn permission_denial(screen: &str) -> Option<super::Denial> {
         selected: Some(selected),
         selected_text,
         deny,
-        focus_keys: &[],
+        // Esc cancels every Claude permission dialog ("Esc to cancel"),
+        // which refuses the call: it is the submit key, so a dialog that
+        // replaced this one just before the key is refused too.
+        submit_key: "Escape",
     })
 }

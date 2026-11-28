@@ -1402,6 +1402,27 @@ fn a_zero_timeout_denies_by_policy_after_the_grace_with_the_reason() {
 }
 
 #[test]
+fn under_deny_at_once_an_approval_in_the_grace_is_refused() {
+    // Second review, finding 4: nobody is asked, so nobody may approve,
+    // not even in the 3 s grace; the call is still denied by policy.
+    let mut fixture = Fixture::new("policygrace", "normal");
+    fixture.config.approval_timeout = Duration::ZERO;
+    let handle = fixture.start();
+    fixture.enqueue("m1", "ASK to push", json!({"from": "owner"}));
+    let id = fixture.approval_id();
+    let answer = fixture
+        .answer(json!({"op": "approval", "id": id, "decision": "approve", "by": "console:owner"}));
+    assert_eq!(answer["class"], "policy", "{answer}");
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |_| true)
+    });
+    let decided = fixture.event_data("approval.decided");
+    assert_eq!(decided["decision"], "denied", "{decided}");
+    assert_eq!(decided["by"], "policy", "{decided}");
+    fixture.stop(handle);
+}
+
+#[test]
 fn the_policy_message_names_the_reason_and_never_invites_approval() {
     let message = crate::headless::approval::policy_denial_message(
         "a7",
