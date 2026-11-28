@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-asks-never-block: a permission or guardrail ask in any managed agent becomes a fast, logged denial instead of a wait for a person'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-27T19:20:00-05:00
-updated_at: 2026-11-27T19:20:00-05:00
+updated_at: 2026-11-27T23:08:07-05:00
+closed_at: 2026-11-27T23:08:07-05:00
 ---
 
 # Description
@@ -91,3 +92,31 @@ Filed by the lane before coding. The coordinator's own headless
 approvals are already denied at once by a harness relay outside this
 repository; this issue makes that the tool's behaviour for every
 agent.
+
+## Resolution
+
+[opus 5.5] Landed on github/main as e7c23b8d (replay of gated ecf2fab5:
+four commits, the feature and the fixes from two cold reviews).
+Headless: `approval_timeout_s` (profile, then registry default, then
+0) denies at once by policy after a 3 s grace; the request is marked
+`policy: deny-at-once`, no bridge posts it, an approval sent in the
+grace is refused, and the model reads that nothing ran, why the
+harness asked and what to do instead. Interactive: watch-agents
+refuses Claude Code hook, safety-check and permission-rule
+confirmations and the Muse command approval form after
+`permission_deny_after_s` (default 60), with a strict per-harness
+recogniser, the cursor moved one verified step at a time onto the
+one known refusal label, and Esc as the submit key (the refusal
+itself, so a dialog that replaced the prompt in the instant before
+the key is refused too). Every key first proves the recipient and
+that the pane is at its bottom. The agent gets a note and its
+manager one FYI line. Report only: `permission_prompts: "report"`, an
+unreadable policy, a record naming a missing profile, adopted foreign
+panes, the Muse peer-approval dialog (no race-free refusal key known),
+Codex and unknown harnesses. A refusal that cannot act counts as an
+attempt; two attempts hand the prompt back to the notice and the
+owner alarm. Gate on ecf2fab5: 3 failed steps outside the change;
+python.wrkslots.shard-0 and shard-6 known-red in untouched components,
+python-lifecycle.namespace.shard-1 under a recorded step waiver
+granted by the liaison. Follow-up: #2436 (the peer detector still
+reports a non-Muse pane quoting the dialog; reporting only).
