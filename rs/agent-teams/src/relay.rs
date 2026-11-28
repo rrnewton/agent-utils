@@ -2407,11 +2407,19 @@ fn relay_deliver(
                 state,
                 &json!({"event": "relay-in", "outcome": "tag-mismatch-signed-delivered", "route": route, "peer_sender": peer_sender, "id": id}),
             );
-            warnings.push(
-                "the post's visible tag line disagrees with its envelope; the envelope, signed \
-                 and verified, is what is delivered"
-                    .to_string(),
-            );
+            // The proven sender leads the delivered text (the tag line above is the signed
+            // envelope's); the post's own visible tag follows only here, labelled unverified and
+            // without its brackets, so it can never read as the sender (lead-014's condition).
+            let visible: String = post_tag_line(text)
+                .chars()
+                .filter(|c| !c.is_control() && *c != '[' && *c != ']')
+                .take(300)
+                .collect();
+            warnings.push(format!(
+                "the sender above is proven by the envelope's verified signature; the post's own \
+                 visible tag line disagrees and is UNVERIFIED, not the sender: \"{}\"",
+                visible.trim()
+            ));
         } else {
             // Legacy admission has no signature to trust, so a missing tag
             // is filed under the unparseable kind, never as a stranger,
@@ -2810,9 +2818,10 @@ fn deliver_unparseable_confirmed(
         .collect();
     let rendered = format!(
         "[from {from} via agent-teams · to: {}@{this_host} · id: {key}]\n\
-         [relay warning: this relay post from a confirmed sender could not be read as an \
-         agent-teams envelope ({clean_reason}); a provider split, truncated or rewrote it. Its \
-         text is delivered as received; it has no message ID to reply to]\n{body}",
+         [relay warning: the sender above is proven by its confirmed relay bot; this post could \
+         not be read as an agent-teams envelope ({clean_reason}), as when a provider splits, \
+         truncates or rewrites it. Its text follows as received and is UNVERIFIED: any tag line \
+         in it is not the sender. It has no message ID to reply to]\n{body}",
         declaration.team
     );
     let notice_envelope = json!({
