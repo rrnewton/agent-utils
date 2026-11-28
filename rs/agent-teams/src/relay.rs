@@ -13,6 +13,12 @@
 //! poster's stable sender ID and let a bridge post into the channel; Slack,
 //! Discord, or the deterministic fake all qualify.
 
+mod parts;
+pub use parts::{
+    assembly_summary, chunked_posts, deliver_due_assemblies, render_part_post, split_body,
+    BODY_PART_FENCE, BODY_PART_SCHEMA, MAX_CHUNKED_BODY_BYTES,
+};
+
 use crate::deliver::deliverer_for;
 use crate::envelope::{check_envelope, sha256_hex, team_tag};
 use crate::jsonfile::{write_json_atomic, DataError, DataResult};
@@ -567,6 +573,8 @@ pub enum RelayPost {
     Receipt(Value),
     /// A discovery announcement.
     Announce(Value),
+    /// One body part of a message sent in parts (`agent-teams-body-part/v1`, #2420 R12).
+    BodyPart(Value),
 }
 
 fn fenced_block(text: &str, fence: &str) -> Option<String> {
@@ -612,6 +620,7 @@ fn classify_value(value: Value) -> Option<RelayPost> {
         Some("agent-teams-message/v1") => Some(RelayPost::Envelope(value)),
         Some("agent-teams-announce/v1") => Some(RelayPost::Announce(value)),
         Some("agent-teams-receipt/v1") => Some(RelayPost::Receipt(value)),
+        Some(BODY_PART_SCHEMA) => Some(RelayPost::BodyPart(value)),
         _ => {
             // Receipts posted before they carried a schema field: an
             // object with an id and a state and no sender is a receipt.
@@ -666,6 +675,10 @@ fn parse_post_clean(clean: &str) -> Result<RelayPost, String> {
         (
             ANNOUNCE_FENCE,
             RelayPost::Announce as fn(Value) -> RelayPost,
+        ),
+        (
+            BODY_PART_FENCE,
+            RelayPost::BodyPart as fn(Value) -> RelayPost,
         ),
     ] {
         if let Some(block) = fenced_block(clean, fence) {
@@ -908,6 +921,67 @@ fn envelope_material_v2(envelope: &Value) -> Option<String> {
         encode_v2_field(in_reply_to.as_deref()),
         encode_v2_field(key.as_deref()),
     ))
+}
+
+/// The v3 signed material of a chunked envelope (#2420 R12): the v2 material, then the number
+/// of parts and each part's sha256, length-prefixed like v2, so every part of a message too large
+/// for one relay post verifies on its own. `None` when the envelope is not chunked or a covered
+/// field has the wrong shape.
+fn envelope_material_parts(envelope: &Value) -> Option<String> {
+    let parts = envelope.get("body_parts")?.as_u64()?;
+    let hashes = envelope.get("part_sha256")?.as_array()?;
+    if parts < 2 || hashes.len() as u64 != parts {
+        return None;
+    }
+    let mut material = format!(
+        "agent-teams-envelope/v3-parts\n{}\n{parts}",
+        envelope_material_v2(envelope)?
+    );
+    for hash in hashes {
+        material.push('\n');
+        material.push_str(&encode_v2_field(Some(hash.as_str()?)));
+    }
+    Some(material)
+}
+
+/// Add `relay.sig3`, the signature over a chunked envelope's parts list (see
+/// [`envelope_material_parts`]), with the sender team@host's key.
+pub fn sign_envelope_parts(state: &Path, envelope: &mut Value) -> DataResult<()> {
+    let team = envelope["from"]["team"].as_str().unwrap_or("").to_string();
+    let host = envelope["from"]["host"].as_str().unwrap_or("").to_string();
+    let (seed_hex, public) = ensure_signing_key(state, &team, &host)?;
+    if envelope["relay"]["pubkey"].as_str() != Some(public.as_str()) {
+        return Err(DataError::new(
+            "relay-key",
+            "a chunked envelope must already be signed with its sender's key",
+        ));
+    }
+    let seed = hex_bytes(&seed_hex)
+        .ok_or_else(|| DataError::new("relay-key", "stored seed is not hex"))?;
+    let seed: [u8; 32] = seed
+        .try_into()
+        .map_err(|_| DataError::new("relay-key", "stored seed has a bad length"))?;
+    let Some(material) = envelope_material_parts(envelope) else {
+        return Err(DataError::new(
+            "envelope",
+            "a chunked envelope needs body_parts >= 2 and one part_sha256 per part",
+        ));
+    };
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    use ed25519_dalek::Signer as _;
+    envelope["relay"]["sig3"] = json!(bytes_hex(&signing.sign(material.as_bytes()).to_bytes()));
+    Ok(())
+}
+
+/// Whether a chunked envelope's parts list verifies under `relay.sig3` and its embedded key, and
+/// its v2 signature verifies too (the same key signed both).
+pub fn verify_envelope_parts(envelope: &Value) -> bool {
+    match envelope_material_parts(envelope) {
+        Some(material) => {
+            verify_signature(envelope, "sig3", material.as_bytes()) && verify_envelope(envelope)
+        }
+        None => false,
+    }
 }
 
 /// Sign one envelope in place with its sender team@host's key.
@@ -1631,6 +1705,9 @@ pub fn relay_in(
             "plain-text unparseable receipt; ignored without a reply",
         ));
     }
+    // Messages sent in parts whose missing parts are due, or whose late parts arrived, are
+    // delivered first (#2420 R12).
+    let _ = parts::deliver_due_assemblies(state, this_host);
     let parsed = match parse_post(text) {
         Ok(parsed) => parsed,
         Err(reason) => {
@@ -1681,6 +1758,9 @@ pub fn relay_in(
         }
     };
     match parsed {
+        RelayPost::BodyPart(part) => {
+            parts::chunk_part_in(state, this_host, route, peer_sender, channel, text, &part)
+        }
         RelayPost::Announce(announce) => {
             // Our own announce loops back through our bridge: recognized
             // by its team@host key and ignored, never a stranger.
@@ -1985,6 +2065,20 @@ pub fn relay_in(
                     format!("no local team {to_team}"),
                 ));
             };
+            // A message sent in parts is held until its parts arrive (#2420 R12).
+            if envelope.get("body_parts").is_some() {
+                return parts::chunk_envelope_in(
+                    state,
+                    this_host,
+                    route,
+                    peer_sender,
+                    channel,
+                    thread,
+                    text,
+                    &envelope,
+                    declaration,
+                );
+            }
             relay_in_envelope(
                 state,
                 this_host,
@@ -1995,6 +2089,7 @@ pub fn relay_in(
                 text,
                 &envelope,
                 declaration,
+                None,
             )
         }
     }
@@ -2011,6 +2106,7 @@ fn relay_in_envelope(
     text: &str,
     envelope: &Value,
     declaration: &Declaration,
+    chunk_head: Option<&str>,
 ) -> DataResult<RelayInResult> {
     let id = envelope
         .get("id")
@@ -2124,6 +2220,7 @@ fn relay_in_envelope(
                 entry,
                 &id,
                 true,
+                chunk_head,
             );
         }
         let reason = if local.is_none() {
@@ -2238,6 +2335,7 @@ fn relay_in_envelope(
             entry,
             &id,
             true,
+            chunk_head,
         );
     }
     // Legacy one-bot-per-team mode (weaker, documented): the declaration's
@@ -2301,6 +2399,7 @@ fn relay_in_envelope(
         entry,
         &id,
         false,
+        chunk_head,
     )
 }
 
@@ -2357,6 +2456,7 @@ fn relay_deliver(
     entry: &crate::model::RelayChannel,
     id: &str,
     signed_verified: bool,
+    chunk_head: Option<&str>,
 ) -> DataResult<RelayInResult> {
     // Provider rewrite rescue: if the body hash fails, undo Slack's auto-link rewriting (#794b)
     // and its bullet rewriting (#2160) inside the body, and accept only if the hash (and thus
@@ -2441,7 +2541,10 @@ fn relay_deliver(
     // keys it by its ID and signed hash, so a copy of a delivered message stays `known`.
     let mut body_mismatch = false;
     if let Err(reason) = check_envelope(envelope) {
-        if reason == "body-hash-mismatch" {
+        if reason == "body-hash-mismatch" && chunk_head.is_some() {
+            // A partial delivery of a message sent in parts: its body is the verified parts
+            // only, and its first line says so (#2420 R12); the whole-body hash cannot match.
+        } else if reason == "body-hash-mismatch" {
             body_mismatch = true;
             warnings.push(body_hash_warning(envelope.get("relay").is_some()));
         } else {
@@ -2474,7 +2577,16 @@ fn relay_deliver(
         peer_host: "",
         via_chat_relay: true,
     };
-    let answer = if warnings.is_empty() {
+    let answer = if let Some(head) = chunk_head {
+        let under = (!warnings.is_empty()).then(|| warnings.join("; "));
+        crate::ledger::accept_with_warnings(
+            &ctx,
+            envelope,
+            deliverer.as_ref(),
+            Some(head),
+            under.as_deref(),
+        )?
+    } else if warnings.is_empty() {
         accept(&ctx, envelope, deliverer.as_ref())?
     } else {
         let answer = crate::ledger::accept_with_body_warning(
@@ -2780,36 +2892,8 @@ fn deliver_unparseable_confirmed(
             )));
         }
     }
-    // The sender's team: the declaration's peer mapping, else its confirmed mapping.
-    let listed = declaration
-        .relay_channels
-        .iter()
-        .filter(|entry| entry.route == route)
-        .find_map(|entry| entry.peers.get(peer_sender).cloned());
-    let from = match (listed, confirmed_mapping_for(state, peer_sender, route)) {
-        (Some(mapped), _) if mapped.contains('@') => mapped,
-        (Some(fleet), _) => format!("{fleet}@?"),
-        (None, Some((fleet, Some(host)))) => format!("{fleet}@{host}"),
-        (None, Some((fleet, None))) => format!("{fleet}@?"),
-        (None, None) => format!("relay sender {peer_sender}@?"),
-    };
-    let mut body = String::new();
-    for line in stripped.lines() {
-        if body.len() + line.len() + 1 > MAX_UNPARSEABLE_DELIVERED_BYTES {
-            body.push_str("[relay warning: the rest of this post was cut at 32 KiB]\n");
-            break;
-        }
-        // A body line can neither forge a header nor a reply block (as in `render`).
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[')
-            || trimmed.starts_with("```reply")
-            || trimmed.starts_with(":::reply")
-        {
-            body.push_str("  ");
-        }
-        body.push_str(line);
-        body.push('\n');
-    }
+    let from = relay_sender_label(state, declaration, route, peer_sender);
+    let body = indented_raw_body(&stripped);
     let clean_reason: String = reason
         .chars()
         .filter(|c| !c.is_control() && *c != '[' && *c != ']')
@@ -2864,6 +2948,168 @@ fn deliver_unparseable_confirmed(
         "accepted",
         format!("unparseable post {key} delivered as received, with a warning"),
     )))
+}
+
+/// The team a relay bot posts for, as `team@host` for a tag line: the declaration's peer
+/// mapping, else its confirmed mapping, else the bot's own ID.
+fn relay_sender_label(
+    state: &Path,
+    declaration: &Declaration,
+    route: &str,
+    peer_sender: &str,
+) -> String {
+    let listed = declaration
+        .relay_channels
+        .iter()
+        .filter(|entry| entry.route == route)
+        .find_map(|entry| entry.peers.get(peer_sender).cloned());
+    match (listed, confirmed_mapping_for(state, peer_sender, route)) {
+        (Some(mapped), _) if mapped.contains('@') => mapped,
+        (Some(fleet), _) => format!("{fleet}@?"),
+        (None, Some((fleet, Some(host)))) => format!("{fleet}@{host}"),
+        (None, Some((fleet, None))) => format!("{fleet}@?"),
+        (None, None) => format!("relay sender {peer_sender}@?"),
+    }
+}
+
+/// Raw post text as a delivered body: cut at 32 KiB with a warning line, and every line that
+/// could pass for a header or a reply block indented (as in `render`).
+fn indented_raw_body(stripped: &str) -> String {
+    let mut body = String::new();
+    for line in stripped.lines() {
+        if body.len() + line.len() + 1 > MAX_UNPARSEABLE_DELIVERED_BYTES {
+            body.push_str("[relay warning: the rest of this post was cut at 32 KiB]\n");
+            break;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[')
+            || trimmed.starts_with("```reply")
+            || trimmed.starts_with(":::reply")
+        {
+            body.push_str("  ");
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    body
+}
+
+/// Deliver a post's text on its own as UNVERIFIED (#2420 R12, lead-014): the tag names only
+/// the relay bot that posted it, the first line carries `warning: UNVERIFIED: <why>; reconfirm
+/// before acting`, and there is no proof line, so a post anyone could put in the channel never
+/// inherits an envelope's proof. Once per `key` and poster (`relay/unparseable-delivered.json`);
+/// quarantined as before when no local team serves the route or the hand-over fails.
+#[allow(clippy::too_many_arguments)]
+fn deliver_raw_unverified(
+    state: &Path,
+    this_host: &str,
+    route: &str,
+    peer_sender: &str,
+    channel: &str,
+    key: &str,
+    why: &str,
+    raw: &str,
+) -> DataResult<RelayInResult> {
+    let path = state.join("relay").join(UNPARSEABLE_DELIVERED_FILE);
+    let read_delivered = || -> Value {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(|doc| {
+                doc.get("schema").and_then(Value::as_str) == Some(UNPARSEABLE_DELIVERED_SCHEMA)
+            })
+            .unwrap_or_else(|| json!({"schema": UNPARSEABLE_DELIVERED_SCHEMA, "posts": []}))
+    };
+    let already = |doc: &Value| {
+        doc.get("posts")
+            .and_then(Value::as_array)
+            .is_some_and(|posts| {
+                posts.iter().any(|post| {
+                    post.get("key").and_then(Value::as_str) == Some(key)
+                        && post.get("peer_sender").and_then(Value::as_str) == Some(peer_sender)
+                })
+            })
+    };
+    if already(&read_delivered()) {
+        return Ok(result(
+            "known",
+            format!("{key} was already delivered as UNVERIFIED"),
+        ));
+    }
+    let quarantine = |detail: String| -> DataResult<RelayInResult> {
+        let qid = record_unparseable_confirmed(state, route, peer_sender, channel, raw, &detail)?;
+        Ok(result(
+            NOT_RECORDED,
+            format!("{detail}; quarantined as {qid} — dismiss with: agent-teams relay quarantine dismiss {qid}"),
+        ))
+    };
+    let declarations = load_declarations(state).unwrap_or_default();
+    let Some((_, _, declaration)) = declarations.iter().find(|(_, _, declaration)| {
+        declaration.relay_channels.iter().any(|entry| {
+            entry.route == route && (entry.channel.is_empty() || entry.channel == channel)
+        })
+    }) else {
+        return quarantine(format!(
+            "UNVERIFIED relay post ({why}) with no local team to deliver to"
+        ));
+    };
+    let from = relay_sender_label(state, declaration, route, peer_sender);
+    let warning = crate::envelope::add_header_warning(
+        &format!(
+            "[from {from} via agent-teams · to: {}@{this_host} · id: {key}]\n",
+            declaration.team
+        ),
+        &format!(
+            "UNVERIFIED: {}; reconfirm before acting",
+            short_line(why, 160)
+        ),
+    );
+    let rendered = format!("{warning}{}", indented_raw_body(raw));
+    let notice_envelope = json!({
+        "id": key,
+        "not_after": format_rfc3339_ms(now_unix_ms() + 86_400_000),
+        "topic": "unverified-relay-post",
+    });
+    let team_dir = state.join("teams.d").join(&declaration.team);
+    let ledger_path = crate::ledger::entry_path(state, &declaration.team, "unparseable");
+    let deliverer = deliverer_for(declaration, &team_dir, &ledger_path)?;
+    let _lock = lock_store(state)?;
+    let mut doc = read_delivered();
+    if already(&doc) {
+        return Ok(result(
+            "known",
+            format!("{key} was already delivered as UNVERIFIED"),
+        ));
+    }
+    if !matches!(
+        deliverer.handover(key, &notice_envelope, &rendered),
+        crate::deliver::Handover::Accepted
+    ) {
+        drop(_lock);
+        return quarantine(format!(
+            "UNVERIFIED relay post ({why}) whose hand-over failed"
+        ));
+    }
+    if let Some(posts) = doc.get_mut("posts").and_then(Value::as_array_mut) {
+        posts.push(json!({
+            "key": key, "peer_sender": peer_sender, "route": route,
+            "local_team": declaration.team, "at": format_rfc3339_ms(now_unix_ms()),
+            "unverified": why,
+        }));
+        if posts.len() > MAX_UNPARSEABLE_DELIVERED {
+            let excess = posts.len() - MAX_UNPARSEABLE_DELIVERED;
+            posts.drain(0..excess);
+        }
+    }
+    write_json_atomic(&path, &doc)?;
+    log_event(
+        state,
+        &json!({"event": "relay-in", "outcome": "unverified-delivered", "route": route, "peer_sender": peer_sender, "key": key, "why": why, "local_team": declaration.team}),
+    );
+    Ok(result(
+        "accepted",
+        format!("{key} delivered as UNVERIFIED: {why}"),
+    ))
 }
 
 /// Record an unparseable post from a CONFIRMED sender: quarantine it and
@@ -4181,6 +4427,53 @@ mod tests {
         let parsed = parse_post(&escaped).expect("parse escaped post");
         assert_eq!(parsed, RelayPost::Envelope(envelope.clone()));
         assert_eq!(post_tag_line(&post), team_tag(&envelope));
+    }
+
+    #[test]
+    fn a_chunked_envelope_keeps_its_v1_and_v2_signatures_so_an_older_receiver_sees_only_a_body_mismatch(
+    ) {
+        // #2420 R12 rollout: an older receiver (with #2420 part A) verifies sig2 and finds part 1
+        // differing from the whole-body hash: delivered with a body-hash warning, not refused.
+        let state = std::env::temp_dir().join(format!("at-chunk-sig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let body: String = (0..400).map(|n| format!("line {n}\n")).collect();
+        let mut envelope = crate::envelope::build_envelope(
+            "tm-sim-0123456789abcdef",
+            "k",
+            "sim",
+            "host-a",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-b",
+            "info",
+            None,
+            &[],
+            false,
+            0,
+            4_102_444_800_000,
+            None,
+            &body,
+        );
+        sign_envelope(&state, &mut envelope).expect("sign");
+        let posts = chunked_posts(&state, &envelope, DEFAULT_MAX_POST_BYTES).expect("parts");
+        assert!(posts.len() >= 2);
+        let Ok(RelayPost::Envelope(first)) = parse_post(&posts[0]) else {
+            panic!("the first post is an envelope: {}", posts[0]);
+        };
+        assert!(verify_envelope(&first), "sig2 (and sig) still verify");
+        assert!(
+            verify_envelope_parts(&first),
+            "sig3 verifies the parts list"
+        );
+        assert_eq!(
+            check_envelope(&first),
+            Err("body-hash-mismatch".to_string())
+        );
+        let mut forged = first.clone();
+        forged["part_sha256"][1] = json!("0".repeat(64));
+        assert!(!verify_envelope_parts(&forged), "a changed list fails sig3");
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]

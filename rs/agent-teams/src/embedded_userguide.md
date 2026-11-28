@@ -337,7 +337,10 @@ the sender asks for a receipt; it never resends blind.
   `limits.per_hour` (default 6), `visible_to_owner: true`, and `mirror`
   (default false; see "Mirror copies" in the Chat relay section), and
   `post_timeout_seconds` (default 10; raise it when the helper waits out
-  rate limits — a timed-out post kills the helper's whole process group).
+  rate limits — a timed-out post kills the helper's whole process group),
+  and `chunk_posts` (default false; true sends an envelope too large for
+  one post in parts, see "Messages sent in parts" below; leave it off until
+  every receiving host runs a build that assembles parts).
   It posts the
   envelope as one chat post and never reposts: ambiguity is settled by the
   receipt in the post's thread, delivered back through the sender's bridge
@@ -419,8 +422,8 @@ post stays ~1x the body, not ~2x), while the envelope always carries the
 full body. An envelope whose fenced block alone exceeds the
 cap skips the route instead: a fallback stays deferred (its outbox
 entry names the reason as `too large for relay route ...`) and a mirror
-records `mirror-skipped`. `check` warns when `max_envelope_bytes` exceeds
-`max_post_bytes`. Inside the fence the envelope JSON escapes the
+records `mirror-skipped`, unless the route sets `chunk_posts` (below).
+`check` warns when `max_envelope_bytes` exceeds `max_post_bytes`. Inside the fence the envelope JSON escapes the
 characters Slack auto-links (`.`, `:`, `@`, `<`, `>`, `&`), so a body
 naming a file like `cli.rs`, a URL or an email survives Slack intact;
 it escapes the bullet glyphs `•` `‣` `⁃` `▪` `●` `◦` too, because Slack
@@ -465,6 +468,55 @@ it, a relay post after a quiet bridge restart can wait out the stream's
 settle (up to about 10 minutes) plus up to an interval; with it, the
 bound is one poll. Receipts ride the envelope post's thread, which the
 poll lists whenever it gains replies.
+
+**Messages sent in parts** (#2420, route `chunk_posts: true`; off by
+default). Sending in parts needs a signed sender (a team with a relay key);
+an unsigned envelope too large for one post stays deferred, and the pump
+keeps retrying it.
+- The sender posts the usual envelope first, with its body cut to part 1
+  and two new fields: `body_parts: N` and `part_sha256` (one sha256 per
+  part). `body_sha256` stays the whole body's hash. A new signature,
+  `relay.sig3`, signs the parts list; `sig` and `sig2` stay.
+- Parts 2..N follow as their own posts: a fenced `agent-teams-body-part`
+  block holding `{schema: agent-teams-body-part/v1, id, index, of, text}`.
+- Each post fits `max_post_bytes`. A message sent in parts may carry 256 KiB
+  in at most 128 parts. The route's `limits.per_hour` must leave room for
+  every post.
+
+The receiver keeps the parts in `relay/body-parts/<id>.json` (only for an
+ID that passes the message-ID check). It checks each part against the
+signed list, joins them, checks the whole-body hash, and delivers once
+through the ledger as usual.
+- **A part still missing 10 minutes after the first post:** the verified
+  parts are delivered, with a placeholder line for each missing one. The
+  first line carries `· warning: parts 1-2 of 4 verified; 3-4 missing;
+  reconfirm before acting`. Parts that arrive later are a second delivery,
+  under the key `<id>-rest-<k>`: `· warning: late parts 3-4 of 4 of <id>;
+  all 4 parts now verified; the whole body matches its signed hash;
+  reconfirm before acting`.
+- **Delivered on its own as UNVERIFIED**, never dropped, with no proof line
+  and the tag naming only the relay bot that posted it:
+  - a part that does not match its signed hash;
+  - a second, different text for a part;
+  - a part whose index or count does not fit the signed list;
+  - a parts list its key did not sign;
+  - an orphan part with no envelope after 24 hours.
+  The first line carries `· warning: UNVERIFIED: <why>; reconfirm before
+  acting`.
+- **Bounds:** assembly state is bounded at 16 assemblies per posting bot and
+  8 MiB in total. A bot that reaches a bound has ITS OWN oldest assembly
+  delivered at once as a partial, its first line naming the bound. Another
+  bot's assembly never makes way. Records are dropped a day after their last
+  activity. `relay status` shows `body_part_assemblies` and
+  `body_part_assembly_bytes`.
+- **Older receivers:** a receiver built before this change, but with the
+  body-hash warning (#2420 part A), verifies `sig2`, finds part 1 differing
+  from the whole-body hash, and delivers part 1 with a body-hash warning. A
+  part post does not parse there: with #2420 R1 it is delivered as an
+  unparseable post with a warning; without R1 it is quarantined with an
+  alarm (kept, not delivered). A receiver older than part A quarantines the
+  first post as well. Hence `chunk_posts` stays off until every receiving
+  host assembles parts.
 
 **Mirror copies.** A relay route definition may carry `"mirror": true`.
 Then, whenever a message is *delivered over a direct route*, the sender

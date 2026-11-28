@@ -3551,3 +3551,401 @@ fn an_unparseable_post_from_a_confirmed_sender_is_delivered_as_received_with_a_w
         "no alarm"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #2420 R12: messages too large for one relay post, sent in parts.
+
+impl World {
+    /// The relay route with sending in parts switched on (`chunk_posts: true`).
+    fn write_chunked_route(&self) {
+        let post = self.root.join("bin/post.sh");
+        let list = self.root.join("bin/list.sh");
+        let routes = format!(
+            r#"{{"schema": "agent-teams-routes/v1", "routes": {{"relay-coord": {{"driver": "command", "mode": "relay", "channel": "{CHAN}", "sender_id": "UBOTTOOLS", "chunk_posts": true, "post_argv": ["{}", "post", "--channel", "{{channel}}", "--text-file", "{{text_file}}"], "list_argv": ["{}", "list", "--channel", "{{channel}}"], "max_envelope_bytes": 10000, "limits": {{"per_hour": 1000}}}}}}}}"#,
+            post.display(),
+            list.display()
+        );
+        std::fs::write(self.config.join("agent-teams/routes.d/relay.json"), routes)
+            .expect("routes rewrite");
+    }
+
+    /// Send `text` from sim in parts; returns the ID and the posts it made (envelope first).
+    fn send_in_parts(&self, text: &str, key: &str) -> (String, Vec<String>) {
+        let before = self.channel_posts().len();
+        let (code, out, err) = self.run(&[
+            "send",
+            "tools@host-a",
+            "--from-team",
+            "sim",
+            "--text",
+            text,
+            "--key",
+            key,
+            "--json",
+        ]);
+        assert_eq!(code, 75, "{out} {err}");
+        let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+        assert_eq!(value["state"], "in-custody", "{out}");
+        let posts = self.channel_posts()[before..].to_vec();
+        (value["id"].as_str().expect("id").to_string(), posts)
+    }
+
+    fn assembly_path(&self, id: &str) -> PathBuf {
+        self.state.join(format!("relay/body-parts/{id}.json"))
+    }
+
+    /// Move an assembly's clock back by `ms`, as if its posts arrived that long ago.
+    fn age_assembly(&self, id: &str, ms: i64) {
+        let path = self.assembly_path(id);
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("assembly"))
+                .expect("assembly json");
+        for field in ["first_at", "last_at"] {
+            doc[field] = serde_json::json!(doc[field].as_i64().expect("time") - ms);
+        }
+        std::fs::write(&path, doc.to_string()).expect("age assembly");
+    }
+}
+
+/// A body of numbered lines, `bytes` long or a little over.
+fn numbered_body(bytes: usize) -> String {
+    let mut body = String::new();
+    let mut n = 0;
+    while body.len() < bytes {
+        body.push_str(&format!("line {n:05} of a long report for the lead\n"));
+        n += 1;
+    }
+    body
+}
+
+#[test]
+fn a_message_too_large_for_one_post_is_sent_in_parts_and_delivered_once() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.write_chunked_route();
+    let body = numbered_body(7_000);
+    let (id, posts) = world.send_in_parts(&body, "parts-1");
+    assert!(posts.len() >= 3, "{} posts", posts.len());
+    assert!(posts[0].contains("```agent-teams-envelope"), "{}", posts[0]);
+    assert!(posts[0].contains("\"body_parts\""), "{}", posts[0]);
+    for post in &posts {
+        assert!(
+            agent_teams::relay::measured_post_bytes(post)
+                <= agent_teams::relay::DEFAULT_MAX_POST_BYTES,
+            "every post fits one relay post"
+        );
+    }
+    for post in &posts[1..] {
+        assert!(post.contains("```agent-teams-body-part"), "{post}");
+    }
+    // Parts first (they wait as orphans), the envelope last: delivered once, whole.
+    for post in posts[1..].iter().rev() {
+        let outcome = world.relay_in(BOT1, post);
+        assert_eq!(outcome["outcome"], "part-held", "{outcome}");
+    }
+    assert!(world.hook_inbox_texts("tools").is_empty());
+    let outcome = world.relay_in(BOT1, &posts[0]);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert!(
+        delivered[0].contains("line 00000 of a long report"),
+        "first part"
+    );
+    let last_line = body.lines().last().expect("last line");
+    assert!(delivered[0].contains(last_line), "last part: {last_line}");
+    assert!(
+        !delivered[0]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains("warning:"),
+        "a whole, verified message carries no warning: {}",
+        delivered[0].lines().next().unwrap_or_default()
+    );
+    assert!(world.ledger_has("tools", &id));
+    // Every post again (a rescan): known or a held duplicate, never a second copy.
+    for post in &posts {
+        let outcome = world.relay_in(BOT1, post);
+        assert!(
+            ["known", "part-held"].contains(&outcome["outcome"].as_str().unwrap_or("")),
+            "{outcome}"
+        );
+    }
+    assert_eq!(world.hook_inbox_texts("tools").len(), 1, "exactly once");
+}
+
+#[test]
+fn a_missing_part_delivers_the_verified_parts_after_ten_minutes_and_the_rest_when_it_comes() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.write_chunked_route();
+    let body = numbered_body(5_000);
+    let (id, posts) = world.send_in_parts(&body, "parts-2");
+    let parts = posts.len();
+    assert!(parts >= 2);
+    for post in &posts[..parts - 1] {
+        world.relay_in(BOT1, post);
+    }
+    assert!(
+        world.hook_inbox_texts("tools").is_empty(),
+        "held while parts are missing"
+    );
+    world.age_assembly(&id, 11 * 60_000);
+    let (code, out, err) = world.run(&["pump"]);
+    assert!(code == 0 || code == 75 || code == 76, "{out} {err}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    let first = delivered[0].lines().next().expect("first line");
+    let verified = if parts == 2 {
+        "1".to_string()
+    } else {
+        format!("1-{}", parts - 1)
+    };
+    assert!(
+        first.ends_with(&format!(
+            " · warning: parts {verified} of {parts} verified; {parts} missing; reconfirm before acting]"
+        )),
+        "{first}"
+    );
+    assert!(
+        delivered[0].contains(&format!("[part {parts} of {parts} missing]")),
+        "{}",
+        delivered[0]
+    );
+    // The missing part arrives: a SECOND delivery with the late part and the verdict.
+    let outcome = world.relay_in(BOT1, &posts[parts - 1]);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 2, "{delivered:?}");
+    let rest = delivered
+        .iter()
+        .find(|text| text.contains("late parts"))
+        .expect("the late-parts delivery");
+    assert!(
+        rest.lines().next().unwrap_or_default().contains(&format!(
+            " · warning: late parts {parts} of {parts} of {id}; all {parts} parts now verified; the whole body matches its signed hash; reconfirm before acting]"
+        )),
+        "{rest}"
+    );
+    assert!(
+        rest.contains(body.lines().last().expect("last line")),
+        "{rest}"
+    );
+}
+
+#[test]
+fn a_forged_part_is_delivered_unverified_without_proof_and_the_real_part_still_completes() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.write_chunked_route();
+    let body = numbered_body(5_000);
+    let (id, posts) = world.send_in_parts(&body, "parts-3");
+    assert!(posts.len() >= 2);
+    world.relay_in(BOT1, &posts[0]);
+    let forged = posts[1].replacen("line 0", "LINE 9", 1);
+    assert_ne!(forged, posts[1]);
+    let outcome = world.relay_in(BOT1, &forged);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    let first = delivered[0].lines().next().unwrap_or_default();
+    assert!(
+        first.contains(&format!(
+            " · warning: UNVERIFIED: part 2 of {id} does not match its signed hash; reconfirm before acting]"
+        )),
+        "{first}"
+    );
+    assert!(
+        !delivered[0].contains("[team message:"),
+        "no proof line: {}",
+        delivered[0]
+    );
+    for post in &posts[1..] {
+        world.relay_in(BOT1, post);
+    }
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 2, "{delivered:?}");
+    assert!(world.ledger_has("tools", &id));
+    // A different text for a part already held is never taken as that part.
+    let second = posts[1].replacen("line 0", "LINE 8", 1);
+    let outcome = world.relay_in(BOT1, &second);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 3, "{delivered:?}");
+    assert!(
+        delivered.iter().any(|text| text.lines().next().unwrap_or_default().contains(&format!(
+            "warning: UNVERIFIED: a second, different text for part 2 of {id}; reconfirm before acting"
+        ))),
+        "{delivered:?}"
+    );
+}
+
+#[test]
+fn an_orphan_part_with_no_envelope_for_a_day_is_delivered_unverified() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.write_chunked_route();
+    let (id, posts) = world.send_in_parts(&numbered_body(5_000), "parts-orphan");
+    let outcome = world.relay_in(BOT1, &posts[1]);
+    assert_eq!(outcome["outcome"], "part-held", "{outcome}");
+    world.age_assembly(&id, 25 * 3_600_000);
+    let (code, out, err) = world.run(&["pump"]);
+    assert!(code == 0 || code == 75 || code == 76, "{out} {err}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1, "never dropped: {delivered:?}");
+    assert!(
+        delivered[0].lines().next().unwrap_or_default().contains(&format!(
+            "warning: UNVERIFIED: orphan body part 2 of {id}, no signed envelope arrived within 24 hours; reconfirm before acting"
+        )),
+        "{}",
+        delivered[0]
+    );
+    assert!(!delivered[0].contains("[team message:"), "no proof line");
+    assert!(!world.assembly_path(&id).exists());
+}
+
+#[test]
+fn a_part_whose_count_does_not_fit_the_signed_list_is_delivered_unverified() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.write_chunked_route();
+    let (id, posts) = world.send_in_parts(&numbered_body(5_000), "parts-count");
+    let parts = posts.len();
+    world.relay_in(BOT1, &posts[0]);
+    let wrong = posts[1].replacen(
+        &format!("\"of\":{parts}"),
+        &format!("\"of\":{}", parts + 1),
+        1,
+    );
+    assert_ne!(wrong, posts[1]);
+    let outcome = world.relay_in(BOT1, &wrong);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert!(
+        delivered[0].lines().next().unwrap_or_default().contains(&format!(
+            "warning: UNVERIFIED: body part 2 of {} does not fit the signed list of {parts} parts for {id}",
+            parts + 1
+        )),
+        "{}",
+        delivered[0]
+    );
+}
+
+#[test]
+fn a_parts_list_the_key_did_not_sign_is_delivered_unverified() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.write_chunked_route();
+    let (id, posts) = world.send_in_parts(&numbered_body(5_000), "parts-4");
+    // Any change to a listed hash breaks sig3.
+    let start = posts[0].find("\"part_sha256\":[\"").expect("parts list") + 16;
+    let mut tampered = posts[0].clone();
+    let original = &posts[0][start..start + 1];
+    tampered.replace_range(start..start + 1, if original == "0" { "1" } else { "0" });
+    let outcome = world.relay_in(BOT1, &tampered);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1);
+    assert!(
+        delivered[0].lines().next().unwrap_or_default().contains(
+            "warning: UNVERIFIED: a message sent in parts whose parts list is not signed by its key"
+        ),
+        "{}",
+        delivered[0]
+    );
+    assert!(!world.ledger_has("tools", &id));
+}
+
+#[test]
+fn a_poster_over_the_assembly_bound_has_its_own_oldest_delivered_early_never_another_posters() {
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.write_chunked_route();
+    // Another poster's assembly, held in the store.
+    let other_id = "tm-other-0123456789abcdef";
+    std::fs::create_dir_all(world.state.join("relay/body-parts")).expect("dir");
+    let now = agent_teams::timeutil::now_unix_ms();
+    let other = serde_json::json!({
+        "schema": "agent-teams-body-parts/v1", "id": other_id, "route": "relay-coord",
+        "peer_sender": "UOTHERBOT", "channel": CHAN, "thread": "", "to_team": null,
+        "post_text": "", "first_at": now - 1_000, "last_at": now - 1_000, "envelope": null,
+        "parts": {}, "orphans": [{"index": 2, "of": 3, "text": "held", "at": now - 1_000}],
+        "state": "assembling", "delivered_parts": [],
+    });
+    std::fs::write(world.assembly_path(other_id), other.to_string()).expect("other assembly");
+    let mut first_id = String::new();
+    for n in 0..17 {
+        let (id, posts) = world.send_in_parts(&numbered_body(5_000), &format!("bound-{n}"));
+        if n == 0 {
+            first_id = id;
+        }
+        world.relay_in(BOT1, &posts[0]);
+    }
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(
+        delivered.len(),
+        1,
+        "only this poster's oldest: {delivered:?}"
+    );
+    let head = delivered[0].lines().next().unwrap_or_default();
+    assert!(head.contains(&format!("id: {first_id}")), "{head}");
+    assert!(
+        head.contains("· warning: delivered early, its poster reached the bound of 16 assemblies per poster; parts 1 of "),
+        "{head}"
+    );
+    assert!(
+        world.assembly_path(other_id).exists(),
+        "another poster's assembly stays"
+    );
+}
+
+#[test]
+fn the_total_assembly_bound_delivers_the_arriving_posters_own_message_early_never_another_posters()
+{
+    // lead-014: one poster filling the 8 MiB total must never push ANOTHER poster's assembly out.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.write_chunked_route();
+    let other_id = "tm-other-fedcba9876543210";
+    std::fs::create_dir_all(world.state.join("relay/body-parts")).expect("dir");
+    let now = agent_teams::timeutil::now_unix_ms();
+    let other = serde_json::json!({
+        "schema": "agent-teams-body-parts/v1", "id": other_id, "route": "relay-coord",
+        "peer_sender": "UOTHERBOT", "channel": CHAN, "thread": "", "to_team": null,
+        "post_text": "", "first_at": now - 1_000, "last_at": now - 1_000, "envelope": null,
+        "parts": {}, "orphans": [{"index": 2, "of": 3, "text": "x".repeat(8 * 1024 * 1024), "at": now - 1_000}],
+        "state": "assembling", "delivered_parts": [],
+    });
+    std::fs::write(world.assembly_path(other_id), other.to_string()).expect("other assembly");
+    let (id, posts) = world.send_in_parts(&numbered_body(5_000), "total-bound");
+    world.relay_in(BOT1, &posts[0]);
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    let head = delivered[0].lines().next().unwrap_or_default();
+    assert!(head.contains(&format!("id: {id}")), "{head}");
+    assert!(
+        head.contains("· warning: delivered early, its poster reached the bound of 8 MiB of assemblies; parts 1 of "),
+        "{head}"
+    );
+    assert!(
+        world.assembly_path(other_id).exists(),
+        "another poster's assembly stays"
+    );
+    // The rest still arrives, as the second delivery.
+    for post in &posts[1..] {
+        world.relay_in(BOT1, post);
+    }
+    assert!(world
+        .hook_inbox_texts("tools")
+        .iter()
+        .any(|text| text.contains("late parts")));
+}

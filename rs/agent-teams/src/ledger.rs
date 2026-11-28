@@ -391,11 +391,36 @@ pub fn accept_with_body_warning(
     accept_checked(ctx, envelope, deliverer, Some(warning))
 }
 
+/// [`accept`] for a partial delivery of a message sent in parts (#2420 R12): `head` rides on the
+/// first line (which parts were verified and which are missing), `under` is the warning line
+/// under the tag, and the body may differ from the whole-body hash. The ledger keys and dedupes
+/// it by its ID and signed hash as [`accept`] does.
+pub fn accept_with_warnings(
+    ctx: &AcceptContext<'_>,
+    envelope: &Value,
+    deliverer: &dyn Deliverer,
+    head: Option<&str>,
+    under: Option<&str>,
+) -> DataResult<AcceptAnswer> {
+    accept_checked_with(ctx, envelope, deliverer, under, head, true)
+}
+
 fn accept_checked(
     ctx: &AcceptContext<'_>,
     envelope: &Value,
     deliverer: &dyn Deliverer,
     body_warning: Option<&str>,
+) -> DataResult<AcceptAnswer> {
+    accept_checked_with(ctx, envelope, deliverer, body_warning, None, false)
+}
+
+fn accept_checked_with(
+    ctx: &AcceptContext<'_>,
+    envelope: &Value,
+    deliverer: &dyn Deliverer,
+    body_warning: Option<&str>,
+    head: Option<&str>,
+    body_may_differ: bool,
 ) -> DataResult<AcceptAnswer> {
     // Opportunistic retention pruning (its own ledger lock, taken and
     // released before accept's): entries past their horizon are exactly
@@ -405,7 +430,7 @@ fn accept_checked(
     let team = &ctx.declaration.team;
     // Route refusals first: no ledger entry, nothing fenced (section 9.4).
     if let Err(reason) = check_envelope(envelope) {
-        if !(reason == "body-hash-mismatch" && body_warning.is_some()) {
+        if !(reason == "body-hash-mismatch" && (body_warning.is_some() || body_may_differ)) {
             return Ok(AcceptAnswer::route_refused(format!(
                 "envelope refused: {reason}"
             )));
@@ -491,6 +516,7 @@ fn accept_checked(
             // delivered (#2420 R4): it is recovered late, with the late warning first. Its
             // ledger entry exists, so a replay is ruled out whatever the age.
             let mut warnings = DeliveryWarnings::from_body_warning(body_warning);
+            warnings.head.extend(head.map(str::to_string));
             check_size(ctx, envelope, &id, &mut warnings);
             let not_after_ms = existing
                 .get("not_after")
@@ -604,6 +630,7 @@ fn accept_checked(
     // relay-never-lossy, owner decision 2026-11-27: a warning at most, never a lossy
     // transport); each failed check is one short warning on the delivered text.
     let mut warnings = DeliveryWarnings::from_body_warning(body_warning);
+    warnings.head.extend(head.map(str::to_string));
     check_size(ctx, envelope, &id, &mut warnings);
     // A message past its not_after was a terminal `expired` (#2420 R4): it is delivered late,
     // the warning on its first line naming the not_after, so it never reads as a fresh

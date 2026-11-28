@@ -538,6 +538,11 @@ pub struct ChatRelayRoute {
     /// Seconds a post command may run (`post_timeout_seconds`,
     /// default 10; raise it when the helper waits out rate limits).
     pub post_timeout_seconds: u64,
+    /// Send an envelope too large for one post in parts (`"chunk_posts": true` in the route
+    /// definition; default off until every receiver is proven to assemble them, #2420 R12).
+    pub chunk_posts: bool,
+    /// The state directory holding the sender's signing key, for the parts list's signature.
+    pub state_dir: PathBuf,
     /// Mirror posts an hour (`limits.mirror_per_hour`, default 60),
     /// counted in `mirror_rate_file` only: a mirror never spends the
     /// delivery allowance a fallback needs.
@@ -551,6 +556,57 @@ pub struct ChatRelayRoute {
 }
 
 impl ChatRelayRoute {
+    /// Post an envelope too large for one post in parts (#2420 R12): the chunked envelope, then
+    /// each part, in order. The ID counts as posted once the first post may have gone out, so a
+    /// failure after it is ambiguous (the receiver delivers what arrived after 10 minutes, the
+    /// missing parts named), never a silent repost.
+    fn post_in_parts(&self, id: &str, envelope: &Value) -> AttemptOutcome {
+        let posts =
+            match crate::relay::chunked_posts(&self.state_dir, envelope, self.max_post_bytes) {
+                Ok(posts) => posts,
+                Err(reason) => return AttemptOutcome::Skipped(reason),
+            };
+        if self.per_hour > 0 && self.recent_posts() + posts.len() as u64 > self.per_hour {
+            return AttemptOutcome::Skipped(format!(
+                "relay rate limit ({} posts/hour) leaves no room for the {} posts this message needs",
+                self.per_hour,
+                posts.len()
+            ));
+        }
+        let total = posts.len();
+        for (index, text) in posts.iter().enumerate() {
+            match crate::relay::run_post_argv_with_timeout(
+                &self.post_argv,
+                &self.channel,
+                "",
+                id,
+                text,
+                self.post_timeout_seconds,
+            ) {
+                Ok(_) => {
+                    if index == 0 {
+                        self.note_posted_id(id);
+                    }
+                    self.note_post();
+                }
+                Err(reason) if index == 0 && reason.contains("failed to start") => {
+                    return AttemptOutcome::NotDelivered(reason);
+                }
+                Err(reason) => {
+                    self.note_posted_id(id);
+                    return AttemptOutcome::Ambiguous(format!(
+                        "post {} of {total} failed: {reason}",
+                        index + 1
+                    ));
+                }
+            }
+        }
+        AttemptOutcome::Answered(json!({
+            "outcome": "posted", "state": "in-custody",
+            "detail": format!("posted to the relay channel in {total} parts; receipt follows in its thread"),
+        }))
+    }
+
     /// Whether the fenced envelope alone exceeds this route's post cap.
     fn envelope_alone_too_big(&self, envelope_bytes: usize) -> bool {
         // Estimate only (the rendered fence JSON-escapes characters at
@@ -738,6 +794,21 @@ impl Route for ChatRelayRoute {
         }
     }
     fn skip_reason(&self, envelope_bytes: usize) -> Option<String> {
+        // Sent in parts (#2420 R12): only the whole-body cap applies; the posts are measured
+        // when they are built.
+        if self.chunk_posts
+            && envelope_bytes
+                <= crate::relay::MAX_CHUNKED_BODY_BYTES
+                    + crate::relay::TAG_AND_JOINS_MARGIN_BYTES * 8
+        {
+            if self.per_hour > 0 && self.recent_posts() >= self.per_hour {
+                return Some(format!(
+                    "relay rate limit ({} posts/hour) reached",
+                    self.per_hour
+                ));
+            }
+            return None;
+        }
         if self.envelope_alone_too_big(envelope_bytes) {
             return Some(self.envelope_too_big_reason(envelope_bytes));
         }
@@ -774,7 +845,10 @@ impl Route for ChatRelayRoute {
                 }
                 let text = crate::relay::render_post_with_limit(payload, self.max_post_bytes);
                 if let Some(reason) = self.rendered_too_big(&text) {
-                    return AttemptOutcome::Skipped(reason);
+                    if !self.chunk_posts {
+                        return AttemptOutcome::Skipped(reason);
+                    }
+                    return self.post_in_parts(&id, payload);
                 }
                 match crate::relay::run_post_argv_with_timeout(
                     &self.post_argv,
@@ -867,6 +941,15 @@ pub fn relay_route_for(
             .to_string(),
         post_argv: strings("post_argv"),
         list_argv: strings("list_argv"),
+        chunk_posts: def
+            .raw
+            .get("chunk_posts")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        state_dir: links_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| links_dir.to_path_buf()),
         max_envelope_bytes: def
             .raw
             .get("max_envelope_bytes")

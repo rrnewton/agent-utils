@@ -2176,6 +2176,8 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     // lock, so two pumps never post the same alarm or race the quarantine.
     // #2420: posts a #2160 build held for a body-hash mismatch are delivered now.
     let _ = crate::relay::replay_held_body_hash_posts(&globals.state, &globals.host);
+    // Messages sent in parts whose missing parts are due are delivered (#2420 R12).
+    let _ = crate::relay::deliver_due_assemblies(&globals.state, &globals.host);
     let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());
     let _ = crate::relay::drain_quarantine(&globals.state, &globals.host);
     let teams = globals.load_teams()?;
@@ -2981,10 +2983,13 @@ fn cmd_relay_setup(globals: &Globals, args: &[String]) -> Result<i32, DataError>
 fn quarantine_summary(globals: &Globals) -> Value {
     let posts = crate::relay::quarantined_posts(&globals.state).len();
     let (warned, last) = crate::relay::body_hash_warning_count(&globals.state);
+    let (assemblies, assembly_bytes) = crate::relay::assembly_summary(&globals.state);
     json!({
         "posts": posts,
         "delivered_with_body_hash_warning": warned,
         "last_body_hash_warning": last.map(|(id, at)| json!({"id": id, "at": at})),
+        "body_part_assemblies": assemblies,
+        "body_part_assembly_bytes": assembly_bytes,
     })
 }
 
