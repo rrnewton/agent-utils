@@ -269,15 +269,12 @@ impl ProjectConfig {
     /// Discover a project config under `base`, in the Python loader's
     /// order: `local-ci-hub.toml`, then `ci/local-ci-hub.toml`.
     pub fn discover(base: &Path) -> Option<PathBuf> {
-        for candidate in [
+        [
             base.join("local-ci-hub.toml"),
             base.join("ci/local-ci-hub.toml"),
-        ] {
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-        None
+        ]
+        .into_iter()
+        .find(|candidate| candidate.exists())
     }
 
     fn from_raw(raw: RawConfig, root: PathBuf, loaded: bool) -> Result<Self, String> {
