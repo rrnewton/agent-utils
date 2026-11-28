@@ -1172,6 +1172,20 @@ SHIFT_E_JS = """(id) => {
 }"""
 
 
+def server_answered(walk: "Walk", api: "FakeApi", asked: int, said_at_once: str) -> None:
+    """`#2432 vibe-talk-keyboard-shift-e-status-race`. Shift+E's server half has happened: the fake API
+    has been asked to mark the message read (one more upstream read than `asked`), and the status line
+    no longer shows only the words Shift+E says at once (`said_at_once`, the optimistic line of `#892`).
+    Conditions with the hang backstop, never a clock."""
+    deadline = time.monotonic() + browser_waits.HANG_BACKSTOP_MS / 1000
+    while time.monotonic() < deadline and len(api.upstream_reads()) <= asked:
+        walk.page.wait_for_timeout(20)
+    check(len(api.upstream_reads()) > asked, "Shift+E never asked the server to mark the message read")
+    walk.page.wait_for_function(
+        "(once) => (document.getElementById('status').textContent || '') !== once",
+        arg=said_at_once, timeout=browser_waits.HANG_BACKSTOP_MS)
+
+
 def shift_e_state(walk: Walk, target: str) -> Json:
     value = walk.page.evaluate(SHIFT_E_JS, target)
     assert isinstance(value, dict)
@@ -1201,12 +1215,9 @@ def shift_e(walk: Walk, api: FakeApi, target: str) -> None:
             break
         walk.page.wait_for_timeout(20)
     # Said once the chat service has answered: "Marked read here and in ...", over the words said at once
-    # (`#892 voice-page-optimistic-done`). Polled rather than awaited, so a page that says something else
-    # fails on the checks below, which say what.
-    for _ in range(250):
-        if str(walk.page.evaluate("() => document.getElementById('status').textContent")).startswith("Marked read here and in"):
-            break
-        walk.page.wait_for_timeout(20)
+    # (`#892 voice-page-optimistic-done`). `#2432`: waited on the server's half having happened, never on
+    # words the optimistic line already shows; a page that says something else fails on the checks below.
+    server_answered(walk, api, asked, "Marked read here, and collapsed.")
     walk.settled()
     after = shift_e_state(walk, target)
     walk.shot("keymap-shift-e")
@@ -1238,12 +1249,10 @@ def shift_e(walk: Walk, api: FakeApi, target: str) -> None:
     # half asked again as a reply's mark, which the server's floor answers without asking the service.
     asks = len(api.upstream_reads())
     press(walk.cdp, "Shift+e")
-    # Said once the server has answered; polled rather than awaited, so a page that says something else
-    # fails on the checks below, which say what it did.
-    for _ in range(250):
-        if str(walk.page.evaluate("() => document.getElementById('status').textContent")).startswith("Already read"):
-            break
-        walk.page.wait_for_timeout(20)
+    # Said once the server has answered. `#2432`: "Already read" alone is what the optimistic line says at
+    # once ("Already read here, and collapsed."), before the server is asked; so wait on the server's half
+    # having happened, and a page that says something else fails on the checks below, which say what.
+    server_answered(walk, api, asks, "Already read here, and collapsed.")
     walk.settled()
     again = shift_e_state(walk, target)
     check(api.dismissals()[marked:] == [[target]], f"Shift+E on a Done message wrote another Done: {api.dismissals()[marked:]}")
