@@ -1,6 +1,6 @@
 ---
 title: 'search-copy-with-placed-hits: with server hits standing as cards, the search line says "plus 4 scattered older ones. None match." and the count says "4 found (0 loaded, 4 older)"; both contradict the cards on screen'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-shardcap
@@ -9,7 +9,8 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-27T21:15:00-05:00
-updated_at: 2026-11-27T21:15:00-05:00
+updated_at: 2026-11-27T23:00:00-05:00
+closed_at: 2026-11-27T23:00:00-05:00
 ---
 
 # Description
@@ -43,3 +44,21 @@ Make the copy true of what the screen shows. Keep it a page-only change, in its 
 
 - Found in the review of #2422's evidence: the cards stood, and the copy around them still said none.
 - Related: #2422 search-hits-vanish-after-redraw, #2200 search tab counts match cards, #2269 the reach sentence beside server hits, #578 search status clarity, #2426 the loading program.
+
+## Resolution
+
+Landed as a861ead3 on 2026-11-27. The landing replayed 9f599a47, gated on aace00b3, the landed #2422. The deploy waits for the evening's launch-hold release.
+
+**Change, page only.**
+
+- `olderwalks.ts` `historyReach` no longer counts placed server results as "scattered older ones" the browser searched. That count was the root of the contradiction.
+- `searchrows.ts`, the line: when the selected buckets' older matches stand below as cards, it reads "No match in the 60 loaded messages; 4 older matches shown below." The #2269 reach sentence keeps its rule: it stays when the server's answer stopped on its budget.
+- `searchrows.ts`, the count: a zero "loaded" part is dropped ("4 found (4 older)"). Two non-zero parts stay, and the thread form is unchanged.
+
+**Evidence per acceptance criterion.**
+
+- **The copy with placed results.** The walk checks the count and the line at placement and after the arrival's redraw. It passes 8 of 8 cells and fails 8 of 8 on aace00b3, where the count read "4 found (0 loaded, 4 older)".
+  - On a release build, `search_reach_server` reads "1 found (1 older)" and "No match in the 12 loaded messages; 1 older match shown below." The browser count is now 12 rather than 13, because the old count included the result card itself.
+- **Unchanged copy elsewhere.** The 11 search walks and the node suite (3494 of 3494) pass. Only the #2269 test's expected count and line changed, and its budget-stopped case still requires the reach sentence.
+- **Cells.** Before and after screenshots for phone and desk, light and dark, keyboard open and closed, and BUILD.txt, were accepted by the liaison (1118).
+- **Gate.** The owner gate on 9f599a47 passed: validate OK, all 243 steps ok, no NO_RESULT.

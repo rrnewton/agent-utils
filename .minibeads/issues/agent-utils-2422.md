@@ -1,6 +1,6 @@
 ---
 title: 'search-hits-vanish-after-redraw: server search hits shown as cards disappear after a later redraw, leaving a blank results page that reads "4 found (0 loaded, 4 older)"'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: cl-shardcap
@@ -9,7 +9,8 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-27T19:27:00-05:00
-updated_at: 2026-11-27T19:27:00-05:00
+updated_at: 2026-11-27T23:00:00-05:00
+closed_at: 2026-11-27T23:00:00-05:00
 ---
 
 # Description
@@ -44,3 +45,35 @@ What happens: a quoted phrase matches 4 messages in an old part of the channel, 
 
 - Reported through the coordinator (owner UI, fast-track). Slice 0 of the loading program #2426, which mu-clientperf owns.
 - Related: #2200 search tab counts match cards (the fold), #1786 search scope server hits, #1229 keyed row patching, #1846 windowed rendering.
+
+## Resolution
+
+Landed as aace00b3 on 2026-11-27, deployed the same evening (watch clean). The landing replayed d68d8f96, stacked on #2426 R1 (0d636513).
+
+**Cause, confirmed by a fixture repro.** It was the hypothesis above.
+
+- The 4 hits were placed as `data-server-hit` cards.
+- An arrival's poll redrew the list through `patchRows`, which removed them. Until R1, the windowed draw did the same.
+- `placeServerHits`' memo never put them back, because a poll does not change the answer key.
+- The count was right throughout: "older" means beyond the loaded rows.
+
+**Fix, page only.**
+
+- `rows.ts`: placed results are pinned residents of the list. `patchRows` passes them over and `keepPlacedHits` puts them back in time order in the same pass. A result whose own row is now drawn is dropped (#1864). `insertPlacedHits` is the one time-order rule, shared with placement.
+- `olderwalks.ts`: the placement memo stands only while every row it placed is still in the list.
+- `channelrows.ts`: the dress pass skips placed results, so a kept card stays as placed. Without this, the poll restyled the owner's cards into right-aligned bubbles.
+
+**Evidence per acceptance criterion.**
+
+- **Walk.** The new walk `tests/search_hits_pinned_browser.py` (DAG step `check.search-hits-pinned-browser`) fails 8 of 8 cells on main ("the arrival's redraw took the result cards away"; 0 cards, blank page) and passes 8 of 8 on the fix.
+  - Cells: phone and desk, light and dark, keyboard open and closed. Before R1 it also had two windowed cells, which failed on main and passed on the fix.
+  - Each poll is brought forward on the page's clock; every wait is a condition.
+  - A node test in `tests/js/view/channel.test.mjs` pins the `patchRows` behaviour and fails on main.
+- **Matrix.** Before and after screenshots and BUILD.txt were accepted by the liaison (1107). On the stacked head the web diff has the same patch-id as the reviewed one, less its windowed hunk.
+- **No regression.**
+  - The 11 search walks pass, and so does `search_reach_server` on a release build.
+  - The node suite passes 3494 of 3494.
+  - The owner gate on d68d8f96 passed.
+  - After the deploy, all 13 search guards passed on a local server built from aace00b3, at load1 139 to 170.
+
+The count-line wording follow-up is #2435.
