@@ -6,7 +6,7 @@ issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-27T13:05:08-05:00
-updated_at: 2026-11-27T13:05:08-05:00
+updated_at: 2026-11-27T21:07:26-05:00
 ---
 
 # Description
@@ -33,3 +33,7 @@ Survey every caller that loads with `require_repository=True` (create, register,
 # Notes
 
 Found while tracing #2396, on 2026-11-27: with one stale row, heartbeat and create of unrelated slots were refused (rc 3), while status and doctor, which already load leniently, still ran. Scope here is everything except heartbeat, which #2396 fixes first.
+
+## Parity call from #2396 (2026-11-27)
+
+#2396 (landed 45a7c774) made only the heartbeat tolerant of another row's missing repository. In Rust the tolerant census variants in hold_write.rs (refuse_target_storage_except_nested_tolerant, report_dead_findings_tolerant) have one caller, the heartbeat; hold and transfer-owner deliberately keep the strict ones (refuse_target_storage_except_nested, report_dead_findings), and in Python their loads stay strict. So today both editions refuse hold and transfer-owner of an unrelated slot beside a stale row, identically, as they refuse create. This issue owns those writers: move each per-slot writer to a strict check of its own row plus the tolerant census, in both editions in the same change, so the editions never diverge on which commands a stale row blocks.
