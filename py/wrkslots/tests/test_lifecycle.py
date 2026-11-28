@@ -12358,18 +12358,23 @@ def test_doctor_replays_hold_events_once_per_machine(
     held = command(project, "hold", "slot02", "--reason", "retain")
     assert held.returncode == 0, held.stderr
 
-    calls: list[tuple[str, frozenset[str]]] = []
-    original = wrkslots._holds_from_events
+    # Each hold event is folded once for the whole doctor run: by the one
+    # streamed pass of a bounded read (#2468), or by one list replay.
+    config = wrkslots._load_config(str(project), "testhost")
+    events = len(wrkslots._load_events(config, "testhost"))
+    calls: list[str] = []
+    original = wrkslots._fold_hold_event
 
     def counted(
-        events: Sequence[Mapping[str, object]],
+        holds: dict[str, dict[str, object]],
+        event: Mapping[str, object],
         machine: str,
-        slots: AbstractSet[str],
-    ) -> dict[str, dict[str, object]]:
-        calls.append((machine, frozenset(slots)))
-        return original(events, machine, slots)
+        slots: AbstractSet[str] | None,
+    ) -> None:
+        calls.append(machine)
+        original(holds, event, machine, slots)
 
-    monkeypatch.setattr(wrkslots, "_holds_from_events", counted)
+    monkeypatch.setattr(wrkslots, "_fold_hold_event", counted)
     rc = wrkslots.main(
         ["--project-root", str(project), "doctor", "--format", "json"]
     )
@@ -12381,7 +12386,7 @@ def test_doctor_replays_hold_events_once_per_machine(
     assert rows["slot01"]["hold_reason"] is None
     assert rows["slot02"]["held"] is True
     assert rows["slot02"]["hold_reason"] == "retain"
-    assert calls == [("testhost", frozenset({"slot01", "slot02"}))]
+    assert calls == ["testhost"] * events
 
 
 def test_interrupted_create_requires_and_supports_recovery(tmp_path: Path) -> None:

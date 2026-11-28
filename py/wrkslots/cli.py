@@ -45,7 +45,7 @@ import traceback
 import unicodedata
 import urllib.parse
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path, PurePosixPath
 from typing import IO, Literal, NoReturn, Protocol, TextIO, TypedDict, TypeVar, cast, overload
 
@@ -6641,29 +6641,44 @@ def _holds_from_events(
 
     holds: dict[str, dict[str, object]] = {}
     for event in events:
-        payload = _as_mapping(event["payload"], "append-only event.payload")
-        kind = event.get("kind")
-        if kind == "state-imported":
-            for item in _as_list(payload.get("holds", []), "imported holds"):
-                candidate = dict(_as_mapping(item, "imported hold"))
-                slot = candidate.get("slot")
-                if isinstance(slot, str) and slot in slots:
-                    holds[slot] = candidate
-        else:
-            slot = payload.get("slot")
-            if not isinstance(slot, str) or slot not in slots:
-                continue
-            if kind == "slot-held":
-                holds[slot] = {
-                    "schema": HOLD_SCHEMA,
-                    "machine": machine,
-                    "slot": slot,
-                    "held_at": event["recorded_at"],
-                    "reason": payload.get("reason"),
-                }
-            elif kind == "slot-hold-released":
-                holds.pop(slot, None)
+        _fold_hold_event(holds, event, machine, slots)
     return holds
+
+
+def _fold_hold_event(
+    holds: dict[str, dict[str, object]],
+    event: Mapping[str, object],
+    machine: str,
+    slots: AbstractSet[str] | None,
+) -> None:
+    """One event's effect on the holds of ``slots`` (every slot when None).
+
+    Each slot's hold depends only on its own events, so a fold over every
+    slot agrees, slot by slot, with a fold over any selection of them.
+    """
+
+    payload = _as_mapping(event["payload"], "append-only event.payload")
+    kind = event.get("kind")
+    if kind == "state-imported":
+        for item in _as_list(payload.get("holds", []), "imported holds"):
+            candidate = dict(_as_mapping(item, "imported hold"))
+            slot = candidate.get("slot")
+            if isinstance(slot, str) and (slots is None or slot in slots):
+                holds[slot] = candidate
+    else:
+        slot = payload.get("slot")
+        if not isinstance(slot, str) or (slots is not None and slot not in slots):
+            return
+        if kind == "slot-held":
+            holds[slot] = {
+                "schema": HOLD_SCHEMA,
+                "machine": machine,
+                "slot": slot,
+                "held_at": event["recorded_at"],
+                "reason": payload.get("reason"),
+            }
+        elif kind == "slot-hold-released":
+            holds.pop(slot, None)
 
 
 def _load_record_holds(
@@ -6675,12 +6690,26 @@ def _load_record_holds(
     for state in states:
         slots = {record.slot for record in state.slots}
         try:
-            events = _load_events(config, state.machine)
-            if events:
-                holds = _holds_from_events(events, state.machine, slots)
-                for slot in slots:
-                    results[(state.machine, slot)] = _HoldResult(holds.get(slot))
-                continue
+            if _replay_stream_wanted(config, state.machine):
+                # Streamed and resumed (#2468), as the pending fold is.
+                every_hold_state, count = _resumable_event_fold(
+                    config, state.machine, _HOLDS_FOLD
+                )
+                every_hold = cast("_Holds", every_hold_state)
+                if count:
+                    for slot in slots:
+                        hold = every_hold.get(slot)
+                        results[(state.machine, slot)] = _HoldResult(
+                            None if hold is None else dict(hold)
+                        )
+                    continue
+            else:
+                events = _load_events(config, state.machine)
+                if events:
+                    holds = _holds_from_events(events, state.machine, slots)
+                    for slot in slots:
+                        results[(state.machine, slot)] = _HoldResult(holds.get(slot))
+                    continue
         except Refusal as exc:
             for slot in slots:
                 results[(state.machine, slot)] = _HoldResult(None, str(exc))
@@ -10673,6 +10702,7 @@ def _bound_event_retention() -> None:
         memo.bytes_limit = _EVENT_MEMO_BYTES_LIMIT
         memo.chain_limit = _CHAIN_MEMO_EVENTS_LIMIT
 _REPLAY_MEMO_ENTRIES_LIMIT = 8
+_FOLD_MEMO_ENTRIES_LIMIT = 16
 _PENDING_MEMO_ENTRIES_LIMIT = 8
 _EPISODE_MEMO_ENTRIES_LIMIT = 64
 
@@ -10714,6 +10744,13 @@ class _EventMemo:
     chains: dict[tuple[str, str], _VerifiedEventChain] = dataclasses.field(
         default_factory=dict
     )
+    #: Derived states of _resumable_event_fold at a verified tip (#2468):
+    #: (count, tip digest, state, file identities), keyed by (config,
+    #: machine, fold name). Small: a fold keeps what it derives, never events.
+    folds: dict[
+        tuple[Config, str, Hashable],
+        tuple[int, str, object, tuple[_EventFileIdentity | None, ...]],
+    ] = dataclasses.field(default_factory=dict)
     #: Sum of the file sizes of the events kept in ``files`` (#1247 cap).
     file_bytes: int = 0
     #: Retention caps for this scope; None keeps the parse-once behaviour
@@ -11793,6 +11830,280 @@ def _memoize_verified_event(
     memo_scope.file_bytes += identity[2]
 
 
+def _stream_prefix_trusted(
+    directory: Path,
+    names: Sequence[str],
+    count: int,
+    tip: str,
+    identities: Sequence[_EventFileIdentity | None],
+) -> bool:
+    """Whether a remembered fold of the first ``count`` events still applies.
+
+    Every prefix file must still have the identity it was verified with, and
+    the file at ``count`` must still carry ``tip`` under a digest that checks
+    out: the hash chain makes that digest cover every earlier event.
+    """
+
+    if not (
+        0 < count <= len(names)
+        and len(identities) == count
+        and all(identity is not None for identity in identities)
+        and all(
+            _event_file_identity(directory / names[index]) == identities[index]
+            for index in range(count)
+        )
+    ):
+        return False
+    try:
+        tip_mapping = _as_mapping(
+            _read_json(directory / names[count - 1], "append-only event"),
+            "append-only event",
+        )
+        raw_tip = _as_str(tip_mapping["sha256"], "append-only event.sha256")
+        return raw_tip == tip and _event_digest(
+            {key: value for key, value in tip_mapping.items() if key != "sha256"}
+        ) == raw_tip
+    except StateError:
+        return False
+
+
+@dataclasses.dataclass(frozen=True)
+class _EventFoldSpec:
+    """One resumable fold over a machine's event log (#2468).
+
+    ``step(config, machine, state, event)`` applies one verified event;
+    ``copy`` makes the state a remembered copy cannot share with a caller.
+    """
+
+    name: Hashable
+    initial: Callable[[], object]
+    step: Callable[[Config, str, object, Mapping[str, object]], None]
+    copy: Callable[[object], object]
+
+
+def _step_count(
+    _config: Config, _machine: str, _state: object, _event: Mapping[str, object]
+) -> None:
+    return None
+
+
+_ReleaseEvents = dict[tuple[object, object], list[Mapping[str, object]]]
+_PendingOperations = dict[Path, Mapping[str, object]]
+_Holds = dict[str, dict[str, object]]
+
+
+def _step_release_events(
+    _config: Config,
+    _machine: str,
+    state: object,
+    event: Mapping[str, object],
+) -> None:
+    by_key = cast("_ReleaseEvents", state)
+    if event.get("kind") != OWNER_RELEASE_EVENT:
+        return
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        return
+    # Hashing the key raises TypeError on a malformed slot or generation,
+    # as _latest_owner_releases' membership test does.
+    by_key.setdefault((payload.get("slot"), payload.get("generation")), []).append(event)
+
+
+#: The folds a bounded read needs besides the registry replay. The streamed
+#: replay advances them in its own pass (see _states_from_event_stream), so a
+#: cold read parses the log once for all of them.
+_PENDING_FOLD = _EventFoldSpec(
+    "pending-operations",
+    dict,
+    lambda config, machine, state, event: _fold_pending_event(
+        config, machine, event, cast("_PendingOperations", state)
+    ),
+    lambda state: dict(cast("_PendingOperations", state)),
+)
+_HOLDS_FOLD = _EventFoldSpec(
+    "holds",
+    dict,
+    lambda _config, machine, state, event: _fold_hold_event(
+        cast("_Holds", state), event, machine, None
+    ),
+    lambda state: dict(cast("_Holds", state)),
+)
+_RELEASE_EVENTS_FOLD = _EventFoldSpec(
+    "owner-release-events",
+    dict,
+    _step_release_events,
+    lambda state: {key: list(items) for key, items in cast("_ReleaseEvents", state).items()},
+)
+_COUNT_FOLD = _EventFoldSpec("event-count", lambda: None, _step_count, lambda _state: None)
+_COMPANION_FOLDS: tuple[_EventFoldSpec, ...] = (
+    _PENDING_FOLD,
+    _HOLDS_FOLD,
+    _RELEASE_EVENTS_FOLD,
+    _COUNT_FOLD,
+)
+
+
+def _remember_fold(
+    config: Config,
+    machine: str,
+    spec: _EventFoldSpec,
+    total: int,
+    tip: str,
+    state: object,
+    identities: Sequence[_EventFileIdentity | None],
+) -> None:
+    if not _ACTIVE_EVENT_MEMO or not total or any(item is None for item in identities):
+        return
+    folds = _ACTIVE_EVENT_MEMO[-1].folds
+    key = (config, machine, spec.name)
+    folds.pop(key, None)
+    if len(folds) >= _FOLD_MEMO_ENTRIES_LIMIT:
+        folds.pop(next(iter(folds)))
+    folds[key] = (total, tip, spec.copy(state), tuple(identities))
+
+
+class _CompanionFolds:
+    """The companion folds a streamed replay advances in its own pass (#2468).
+
+    Started from nothing on a cold replay, or from their remembered states
+    when those end exactly where the replay resumes. A companion whose step
+    raises is dropped, unremembered: its own read later meets the same event
+    and refuses there, so the replay never refuses on a companion's behalf.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        machine: str,
+        start: int,
+        tip: str | None,
+        identities: Sequence[_EventFileIdentity | None],
+    ) -> None:
+        self.config = config
+        self.machine = machine
+        self.active: list[tuple[_EventFoldSpec, object]] = []
+        if not _ACTIVE_EVENT_MEMO:
+            return
+        folds = _ACTIVE_EVENT_MEMO[-1].folds
+        for spec in _COMPANION_FOLDS:
+            if start == 0:
+                self.active.append((spec, spec.initial()))
+                continue
+            cached = folds.get((config, machine, spec.name))
+            if cached is not None and cached[:2] == (start, tip) and cached[3] == tuple(identities):
+                self.active.append((spec, spec.copy(cached[2])))
+
+    def step(self, event: Mapping[str, object]) -> None:
+        kept: list[tuple[_EventFoldSpec, object]] = []
+        for spec, state in self.active:
+            try:
+                spec.step(self.config, self.machine, state, event)
+            except Exception:  # noqa: BLE001 -- its own read reports it
+                continue
+            kept.append((spec, state))
+        self.active = kept
+
+    def remember(
+        self, total: int, tip: str, identities: Sequence[_EventFileIdentity | None]
+    ) -> None:
+        for spec, state in self.active:
+            _remember_fold(self.config, self.machine, spec, total, tip, state, identities)
+
+
+def _resumable_event_fold(
+    config: Config,
+    machine: str,
+    spec: _EventFoldSpec,
+) -> tuple[object, int]:
+    """Fold one machine's verified log for a bounded read, resuming a remembered prefix.
+
+    A streamed read keeps no parsed history (#1247), so every reader of the
+    full event tuple re-parsed the whole log whenever its verified chain
+    was not kept: after one append, a doctor on a 2.6 GB log re-parsed it
+    seven times, twice under the shared registry lock (#2468). A fold here
+    remembers only its own derived state at a verified tip, the way the
+    states replay does (#1931), so a later read verifies and folds only the
+    events appended since. Returns the state and the verified event count;
+    the remembered state is a copy, so neither a caller nor a refusal
+    partway through the tail can alter it.
+    """
+
+    memo = _ACTIVE_EVENT_MEMO[-1] if _ACTIVE_EVENT_MEMO else None
+    key = (config, machine, spec.name)
+    directory = _event_directory(config, machine)
+    names = _event_file_names(directory)
+    state = spec.initial()
+    identities: list[_EventFileIdentity | None] = []
+    previous = "0" * 64
+    start = 0
+    cached = None if memo is None else memo.folds.get(key)
+    if (
+        memo is not None
+        and names
+        and spec in _COMPANION_FOLDS
+        and not (
+            cached is not None
+            and _stream_prefix_trusted(directory, names, cached[0], cached[1], cached[3])
+        )
+    ):
+        # Cold: let the streamed registry replay make the one pass, carrying
+        # this fold and its companions, so a bounded read parses the log
+        # once however many folds it needs. Best effort: a replay refusal
+        # is the replay's own read to report, and this fold then runs alone.
+        try:
+            _states_from_event_stream(
+                config, machine, require_repository=False, memo_key=(config, machine, False)
+            )
+        except Exception:  # noqa: BLE001 -- reported by the read that needs it
+            pass
+        cached = memo.folds.get(key)
+    if cached is not None:
+        count, tip, cached_state, cached_identities = cached
+        if _stream_prefix_trusted(directory, names, count, tip, cached_identities):
+            state = spec.copy(cached_state)
+            identities = list(cached_identities)
+            previous = tip
+            start = count
+    observed_ns = _event_memo_clock_ns()
+    files = None if memo is None else memo.files
+    for sequence in range(start + 1, len(names) + 1):
+        path = directory / names[sequence - 1]
+        identity = _event_file_identity(path)
+        kept = None if files is None else files.get((str(path), machine))
+        after: _EventFileIdentity | None
+        if identity is not None and kept is not None and kept[:3] == (
+            identity,
+            sequence,
+            previous,
+        ):
+            event = kept[3]
+            after = identity
+        else:
+            event = _event_from_path(path, machine, sequence, previous)
+            after = _event_file_identity(path)
+            _memoize_verified_event(
+                path, machine, identity, sequence, previous, event, observed_ns
+            )
+        identities.append(after if after == identity else None)
+        previous = _as_str(event["sha256"], "append-only event.sha256")
+        spec.step(config, machine, state, event)
+    total = len(names)
+    _remember_fold(config, machine, spec, total, previous, state, identities)
+    return state, total
+
+
+def _verified_event_count(config: Config, machine: str) -> int:
+    """How many events one machine's verified log holds now.
+
+    A bounded read verifies only what it has not folded already (#2468);
+    otherwise this is the length of the verified chain, as it always was.
+    """
+
+    if _replay_stream_wanted(config, machine):
+        return _resumable_event_fold(config, machine, _COUNT_FOLD)[1]
+    return len(_load_events(config, machine))
+
+
 def _states_from_event_stream(
     config: Config,
     machine: str,
@@ -11818,67 +12129,45 @@ def _states_from_event_stream(
         count, cached_tip, cached_fold, cached_identities = cached
         directory = _event_directory(config, machine)
         names = _event_file_names(directory)
-        if (
-            count <= len(names)
-            and len(cached_identities) == count
-            and all(identity is not None for identity in cached_identities)
-            and all(
-                _event_file_identity(directory / names[index]) == cached_identities[index]
-                for index in range(count)
+        if _stream_prefix_trusted(directory, names, count, cached_tip, cached_identities):
+            # The remembered tip still ends the prefix: the hash
+            # chain makes that digest cover every earlier event,
+            # so only what follows it is verified and folded, as
+            # _resume_replay trusts the same digest in list form.
+            _recheck_replay_repositories(config, cached_fold)
+            fold = cached_fold.copy()
+            companions = _CompanionFolds(
+                config, machine, count, cached_tip, cached_identities
             )
-        ):
-            try:
-                tip_mapping = _as_mapping(
-                    _read_json(directory / names[count - 1], "append-only event"),
-                    "append-only event",
+            identities = list(cached_identities)
+            previous = cached_tip
+            total = count
+            tip = cached_tip
+            resumed = True
+            observed_ns = _event_memo_clock_ns()
+            for sequence in range(count + 1, len(names) + 1):
+                path = directory / names[sequence - 1]
+                identity = _event_file_identity(path)
+                event = _event_from_path(path, machine, sequence, previous)
+                after = _event_file_identity(path)
+                identities.append(after if after == identity else None)
+                _memoize_verified_event(
+                    path, machine, identity, sequence, previous, event, observed_ns
                 )
-                raw_tip = _as_str(
-                    tip_mapping["sha256"], "append-only event.sha256"
+                previous = _as_str(
+                    event["sha256"], "append-only event.sha256"
                 )
-                tip_digest_ok = raw_tip == cached_tip and _event_digest(
-                    {
-                        key: value
-                        for key, value in tip_mapping.items()
-                        if key != "sha256"
-                    }
-                ) == raw_tip
-            except StateError:
-                raw_tip = None
-                tip_digest_ok = False
-            if tip_digest_ok:
-                # The remembered tip still ends the prefix: the hash
-                # chain makes that digest cover every earlier event,
-                # so only what follows it is verified and folded, as
-                # _resume_replay trusts the same digest in list form.
-                _recheck_replay_repositories(config, cached_fold)
-                fold = cached_fold.copy()
-                identities = list(cached_identities)
-                previous = cached_tip
-                total = count
-                tip = cached_tip
-                resumed = True
-                observed_ns = _event_memo_clock_ns()
-                for sequence in range(count + 1, len(names) + 1):
-                    path = directory / names[sequence - 1]
-                    identity = _event_file_identity(path)
-                    event = _event_from_path(path, machine, sequence, previous)
-                    after = _event_file_identity(path)
-                    identities.append(after if after == identity else None)
-                    _memoize_verified_event(
-                        path, machine, identity, sequence, previous, event, observed_ns
-                    )
-                    previous = _as_str(
-                        event["sha256"], "append-only event.sha256"
-                    )
-                    total = sequence
-                    tip = previous
-                    _fold_events_into(config, machine, (event,), fold)
+                total = sequence
+                tip = previous
+                _fold_events_into(config, machine, (event,), fold)
+                companions.step(event)
     if not resumed:
         # No prefix was trusted (no memory, an empty log, or its tip
         # moved): fold the whole log cold, as a cache miss does, and
         # keep each verified event in the memo so a later locked load
         # of the same log reads no file again (#1247 contract).
         fold = _ReplayFold()
+        companions = _CompanionFolds(config, machine, 0, None, ())
         identities = []
         total = 0
         tip = None
@@ -11898,6 +12187,7 @@ def _states_from_event_stream(
             total = sequence
             tip = previous
             _fold_events_into(config, machine, (event,), fold)
+            companions.step(event)
     if total == 0:
         return None
     if fold.active_revision is None or fold.archive_revision is None:
@@ -11907,6 +12197,7 @@ def _states_from_event_stream(
             _assert_record_paths(config, record, require_repository=True)
     assert tip is not None
     _remember_replay_fold(memo_key, total, tip, fold, identities)
+    companions.remember(total, tip, identities)
     return _states_from_fold(machine, fold)
 
 
@@ -12557,6 +12848,11 @@ def _fold_pending_event(
 def _pending_operations_from_events(
     config: Config, machine: str
 ) -> Mapping[Path, Mapping[str, object]]:
+    if _replay_stream_wanted(config, machine):
+        # A bounded read folds by streaming and resumes the pending set it
+        # remembered (#2468): the locked snapshot of a read-only scan reads
+        # only the events appended since, never the whole log again.
+        return cast("_PendingOperations", _resumable_event_fold(config, machine, _PENDING_FOLD)[0])
     events = _load_events(config, machine)
     start, pending = _resume_pending(config, machine, events)
     for event in events[start:]:
@@ -12845,37 +13141,61 @@ def _handoff_write_publications(
     before (#1794 review F3).
     """
 
-    wanted: dict[tuple[str, int], ActiveRecord] = {
-        (record.slot, record.generation): record for record in records
-    }
-    intents: dict[tuple[str, int], dict[int, Mapping[str, object]]] = {
-        key: {} for key in wanted
-    }
-    completed: dict[tuple[str, int], set[int]] = {key: set() for key in wanted}
-    owners: dict[tuple[str, int], ProcessIdentity | None] = {
-        key: None for key in wanted
-    }
-    errors: dict[tuple[str, int], StateError] = {}
+    fold = _PublicationFold(records)
     for event in events:
+        fold.step(event)
+    return fold.result()
+
+
+class _PublicationFold:
+    """The per-record handoff publication state of _handoff_write_publications, one event at a time.
+
+    Split out so a bounded read can remember it at a verified tip and fold
+    only the events appended since (#2468); the fold itself is unchanged.
+    """
+
+    def __init__(self, records: Sequence[ActiveRecord]) -> None:
+        self.wanted: dict[tuple[str, int], ActiveRecord] = {
+            (record.slot, record.generation): record for record in records
+        }
+        self.intents: dict[tuple[str, int], dict[int, Mapping[str, object]]] = {
+            key: {} for key in self.wanted
+        }
+        self.completed: dict[tuple[str, int], set[int]] = {key: set() for key in self.wanted}
+        self.owners: dict[tuple[str, int], ProcessIdentity | None] = {
+            key: None for key in self.wanted
+        }
+        self.errors: dict[tuple[str, int], StateError] = {}
+
+    def copy(self) -> _PublicationFold:
+        other = _PublicationFold(())
+        other.wanted = dict(self.wanted)
+        other.intents = {key: dict(value) for key, value in self.intents.items()}
+        other.completed = {key: set(value) for key, value in self.completed.items()}
+        other.owners = dict(self.owners)
+        other.errors = dict(self.errors)
+        return other
+
+    def step(self, event: Mapping[str, object]) -> None:
         kind = event.get("kind")
         payload = _as_mapping(event["payload"], f"{kind} event payload")
         if kind in ("state-imported", "active-state-recorded"):
-            for key, record in wanted.items():
-                owners[key] = _handoff_owner_step(owners[key], record, kind, payload)
+            for key, record in self.wanted.items():
+                self.owners[key] = _handoff_owner_step(self.owners[key], record, kind, payload)
         if kind == "handoff-write-intended":
             slot_value = payload.get("slot")
             if not isinstance(slot_value, str):
-                continue
+                return
             key = cast(
                 "tuple[str, int]", (slot_value, payload.get("generation"))
             )
             try:
-                matched = key in wanted
+                matched = key in self.wanted
             except TypeError:
-                continue
-            if not matched or key in errors:
-                continue
-            record = wanted[key]
+                return
+            if not matched or key in self.errors:
+                return
+            record = self.wanted[key]
             try:
                 artifact = _as_mapping(payload.get("artifact"), "handoff write intent artifact")
                 if (
@@ -12894,33 +13214,33 @@ def _handoff_write_publications(
                 intent_sequence = _as_int(
                     event["sequence"], "handoff write intent sequence", minimum=1
                 )
-                if owners[key] is None or writer != owners[key]:
+                if self.owners[key] is None or writer != self.owners[key]:
                     raise StateError(
                         "handoff write intent writer does not match the recorded slot owner"
                     )
-                intents[key][intent_sequence] = artifact
+                self.intents[key][intent_sequence] = artifact
             except StateError as exc:
-                errors[key] = exc
+                self.errors[key] = exc
         elif kind == "handoff-write-completed":
             slot_value = payload.get("slot")
             if not isinstance(slot_value, str):
-                continue
+                return
             key = cast(
                 "tuple[str, int]", (slot_value, payload.get("generation"))
             )
             try:
-                matched = key in wanted
+                matched = key in self.wanted
             except TypeError:
-                continue
-            if not matched or key in errors:
-                continue
+                return
+            if not matched or key in self.errors:
+                return
             try:
                 sequence = _as_int(
                     payload.get("intent_sequence"),
                     "handoff write completion intent_sequence",
                     minimum=1,
                 )
-                intended_artifact = intents[key].get(sequence)
+                intended_artifact = self.intents[key].get(sequence)
                 if intended_artifact is None:
                     raise StateError("handoff write completion references an unknown intent")
                 digest = _as_str(
@@ -12929,24 +13249,31 @@ def _handoff_write_publications(
                 )
                 if digest != _event_digest(intended_artifact):
                     raise StateError("handoff write completion digest does not match its intent")
-                completed[key].add(sequence)
+                self.completed[key].add(sequence)
             except StateError as exc:
-                errors[key] = exc
-    results: dict[tuple[str, int], tuple[int, Mapping[str, object], bool] | None] = {}
-    for key in wanted:
-        if key in errors:
-            continue
-        record_intents = intents[key]
-        if not record_intents:
-            results[key] = None
-            continue
-        sequence = max(record_intents)
-        results[key] = (
-            sequence,
-            record_intents[sequence],
-            sequence in completed[key],
-        )
-    return results, errors
+                self.errors[key] = exc
+
+    def result(
+        self,
+    ) -> tuple[
+        dict[tuple[str, int], tuple[int, Mapping[str, object], bool] | None],
+        dict[tuple[str, int], StateError],
+    ]:
+        results: dict[tuple[str, int], tuple[int, Mapping[str, object], bool] | None] = {}
+        for key in self.wanted:
+            if key in self.errors:
+                continue
+            record_intents = self.intents[key]
+            if not record_intents:
+                results[key] = None
+                continue
+            sequence = max(record_intents)
+            results[key] = (
+                sequence,
+                record_intents[sequence],
+                sequence in self.completed[key],
+            )
+        return results, dict(self.errors)
 
 
 def _legacy_projection_read(
@@ -43202,6 +43529,9 @@ def _owner_release_states(
         }
         if not wanted:
             continue
+        if _replay_stream_wanted(config, state.machine):
+            found.update(_owner_release_states_streamed(config, state, wanted))
+            continue
         events = _load_events(config, state.machine)
         releases = _latest_owner_releases(events, wanted)
         if not releases:
@@ -43212,6 +43542,65 @@ def _owner_release_states(
             )
             if release is not None:
                 found[(record.machine, record.slot)] = (release, void_reason)
+    return found
+
+
+def _owner_release_states_streamed(
+    config: Config,
+    state: ActiveState,
+    wanted: AbstractSet[tuple[str, int]],
+) -> dict[tuple[str, str], tuple[_OwnerRelease, str | None]]:
+    """_owner_release_states for one machine by resumable streamed folds (#2468).
+
+    The release events of every (slot, generation) and the handoff
+    publications of the released rows are folds remembered at a verified
+    tip, so a repeated read folds only the events appended since. The
+    answers are the list form's: releases are parsed in log order for the
+    wanted generations only, and a row whose publication history is
+    malformed is judged by the list form, which raises where it always did.
+    """
+
+    machine = state.machine
+    by_key = cast("_ReleaseEvents", _resumable_event_fold(config, machine, _RELEASE_EVENTS_FOLD)[0])
+    wanted_events = sorted(
+        (event for key in wanted for event in by_key.get(key, ())),
+        key=lambda event: _as_int(event["sequence"], "append-only event.sequence", minimum=1),
+    )
+    releases = _latest_owner_releases(wanted_events, wanted)
+    if not releases:
+        return {}
+    released = [
+        record
+        for record in state.slots
+        if record.slot_type == "agent" and (record.slot, record.generation) in releases
+    ]
+    publication_fold = _EventFoldSpec(
+        ("handoff-publications", tuple(sorted((r.slot, r.generation) for r in released))),
+        lambda: _PublicationFold(released),
+        lambda _config, _machine, fold, event: cast("_PublicationFold", fold).step(event),
+        lambda fold: cast("_PublicationFold", fold).copy(),
+    )
+    publications, errors = cast(
+        "_PublicationFold", _resumable_event_fold(config, machine, publication_fold)[0]
+    ).result()
+    found: dict[tuple[str, str], tuple[_OwnerRelease, str | None]] = {}
+    for record in released:
+        key = (record.slot, record.generation)
+        if key in errors:
+            release, void_reason = _owner_release_state(
+                config, record, _load_events(config, machine), releases
+            )
+        else:
+            release, void_reason = _owner_release_state(
+                config,
+                record,
+                (),
+                releases,
+                publication=publications.get(key),
+                publication_computed=True,
+            )
+        if release is not None:
+            found[(record.machine, record.slot)] = (release, void_reason)
     return found
 
 
@@ -45835,6 +46224,44 @@ class _WorktreeConfigState:
         return self.extension_enabled and self.shared_core_worktree is not None
 
 
+def _config_key_canonical(key: str) -> str:
+    """``key`` as `git config --list` prints it: section and name lowercased.
+
+    A subsection (the middle of ``section.subsection.name``) keeps its case,
+    as Git compares it case-sensitively.
+    """
+
+    section, _dot, rest = key.partition(".")
+    subsection, dot, name = rest.rpartition(".")
+    if not dot:
+        return f"{section.lower()}.{rest.lower()}"
+    return f"{section.lower()}.{subsection}.{name.lower()}"
+
+
+def _config_file_values(
+    vcs: _GitVcs, probe: Path, path: Path
+) -> dict[str, str] | None:
+    """Every key of one Git config file, valued as `--get KEY` prints it (#2468).
+
+    One `git config --file PATH -z --list` replaces a process per key: the
+    last value of a key wins, a key written without a value reads as the
+    empty string, and surrounding whitespace is stripped, as `--get` and
+    the old `.strip()` of its output did. None when Git cannot read the
+    file (missing or malformed), where every `--get` returned nonzero.
+    """
+
+    listed = vcs._run(probe, ["config", "--file", str(path), "-z", "--list"], check=False)
+    if listed.returncode != 0:
+        return None
+    values: dict[str, str] = {}
+    for entry in listed.stdout.split("\0"):
+        if not entry:
+            continue
+        key, _separator, value = entry.partition("\n")
+        values[key] = value.strip()
+    return values
+
+
 def _inspect_worktree_config(
     vcs: _GitVcs, probe: Path, common: Path
 ) -> _WorktreeConfigState:
@@ -45845,22 +46272,18 @@ def _inspect_worktree_config(
     ``extensions.worktreeConfig`` is safe cannot drift apart.
     """
 
+    # One Git process per file (#2468), answering each key exactly as
+    # `git config --file FILE --get KEY` did, one process per key.
+    shared = _config_file_values(vcs, probe, common / "config")
+
     def shared_get(key: str) -> str | None:
-        result = vcs._run(
-            probe, ["config", "--file", str(common / "config"), "--get", key],
-            check=False,
-        )
-        return result.stdout.strip() if result.returncode == 0 else None
+        return None if shared is None else shared.get(_config_key_canonical(key))
 
     held: str | None = None
     worktree_config = common / "config.worktree"
     if worktree_config.is_file() and not worktree_config.is_symlink():
-        result = vcs._run(
-            probe,
-            ["config", "--file", str(worktree_config), "--get", "core.worktree"],
-            check=False,
-        )
-        held = result.stdout.strip() if result.returncode == 0 else None
+        held_values = _config_file_values(vcs, probe, worktree_config)
+        held = None if held_values is None else held_values.get("core.worktree")
     bare = shared_get("core.bare")
     return _WorktreeConfigState(
         common=common,
@@ -46273,18 +46696,34 @@ def _is_shared_submodule_gitdir(git_dir: Path, common_dir: Path) -> bool:
     return git_dir != common_dir and git_dir.parent == common_dir / "worktrees"
 
 
+def _git_dir_lines(vcs: _GitVcs, path: Path) -> tuple[str, str] | None:
+    """Git's absolute (git dir, common dir) of ``path`` as printed, or None.
+
+    One `rev-parse` answers both (#2468): the two directories were two Git
+    processes, and doctor asks for them for every submodule of every slot.
+    None when Git cannot open ``path``.
+    """
+
+    completed = vcs._run(
+        path,
+        ["rev-parse", "--absolute-git-dir", "--path-format=absolute", "--git-common-dir"],
+        check=False,
+    )
+    lines = completed.stdout.splitlines()
+    if completed.returncode != 0 or len(lines) != 2:
+        return None
+    return lines[0].strip(), lines[1].strip()
+
+
 def _submodule_git_dirs(
     vcs: _GitVcs, path: Path
 ) -> tuple[Path, Path] | None:
     """Resolved (git dir, common dir) of ``path``, or None when Git cannot open it."""
 
-    git_dir = vcs._run(path, ["rev-parse", "--absolute-git-dir"], check=False)
-    common = vcs._run(
-        path, ["rev-parse", "--path-format=absolute", "--git-common-dir"], check=False
-    )
-    if git_dir.returncode != 0 or common.returncode != 0:
+    lines = _git_dir_lines(vcs, path)
+    if lines is None:
         return None
-    return Path(git_dir.stdout.strip()).resolve(), Path(common.stdout.strip()).resolve()
+    return Path(lines[0]).resolve(), Path(lines[1]).resolve()
 
 
 # One doctor run walks the same submodule trees twice (worktree-config
@@ -46293,6 +46732,104 @@ def _submodule_git_dirs(
 _DECLARED_SUBMODULES_MEMO: contextvars.ContextVar[
     dict[str, list[tuple[str, str]]] | None
 ] = contextvars.ContextVar("wrkslots_declared_submodules_memo", default=None)
+
+
+class _DoctorGitVcs(_GitVcs):
+    """Answer each read-only Git question once per doctor run (#2468).
+
+    Both submodule walks ask about the same paths, and every row that shares
+    the primary repository asked again about the primary and each of its
+    submodules: about 118 Git processes per populated row on a registry
+    whose slots privately populate eleven submodules, at tens of
+    milliseconds of CPU each. Only `rev-parse` queries and `config`
+    reads (`--get`, `--list`) with no input, environment override, extra
+    configuration or timeout are remembered; anything else runs as usual.
+    A remembered failure answers a later ``check=True`` caller with the
+    same refusal the run would have raised. Doctor only reads, so an
+    answer cannot be invalidated by this command itself.
+    """
+
+    def __init__(self) -> None:
+        self._answers: dict[tuple[str, tuple[str, ...]], subprocess.CompletedProcess[str]] = {}
+
+    @staticmethod
+    def _memoizable(args: Sequence[str]) -> bool:
+        if not args:
+            return False
+        if args[0] == "rev-parse":
+            return True
+        return args[0] == "config" and ("--get" in args or "--list" in args)
+
+    def _run(  # type: ignore[override]
+        self,
+        repository: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
+        timeout_refusal: str | None = None,
+        config: Sequence[tuple[str, str]] = (),
+    ) -> subprocess.CompletedProcess[str]:
+        if (
+            input_text is not None
+            or env_overrides
+            or timeout_seconds is not None
+            or config
+            or not self._memoizable(args)
+        ):
+            return _GitVcs._run(
+                repository,
+                args,
+                check=check,
+                input_text=input_text,
+                env_overrides=env_overrides,
+                timeout_seconds=timeout_seconds,
+                timeout_refusal=timeout_refusal,
+                config=config,
+            )
+        key = (str(repository), tuple(args))
+        completed = self._answers.get(key)
+        if completed is None:
+            completed = _GitVcs._run(repository, args, check=False)
+            self._answers[key] = completed
+        if check and completed.returncode != 0:
+            # The refusal _GitVcs._run raises for a failed local command.
+            detail = (completed.stderr or completed.stdout).strip()
+            raise Refusal(
+                f"Git refused in {repository}: git {' '.join(args)}"
+                + (f": {detail}" if detail else "")
+            )
+        return completed
+
+    def common_directory(self, repository: Path) -> Path:
+        # The same `rev-parse` that _submodule_git_dirs asks, so one Git
+        # process answers both walks; the checks are _GitVcs's.
+        lines = _git_dir_lines(self, repository)
+        if lines is None:
+            result = self._run(
+                repository,
+                ["rev-parse", "--absolute-git-dir", "--path-format=absolute", "--git-common-dir"],
+            )
+            raise Refusal(f"Git printed no common directory for {repository}: {result.stdout!r}")
+        common = Path(lines[1]).absolute()
+        if common.is_symlink() or not common.is_dir():
+            raise Refusal(f"Git reported an unsafe common directory: {common}")
+        return common
+
+
+# The memoizing Git of the doctor run in progress (#2468); None outside one.
+_DOCTOR_GIT_MEMO: contextvars.ContextVar[_DoctorGitVcs | None] = contextvars.ContextVar(
+    "wrkslots_doctor_git_memo", default=None
+)
+
+
+def _doctor_vcs() -> _GitVcs:
+    """The current doctor run's memoizing Git, or a plain one outside a run."""
+
+    memo = _DOCTOR_GIT_MEMO.get()
+    return _GitVcs() if memo is None else memo
 
 
 def _declared_submodules_cached(
@@ -47007,7 +47544,7 @@ def _shared_submodule_doctor_findings(
     """
 
     findings: list[dict[str, object]] = []
-    vcs = _GitVcs()
+    vcs = _doctor_vcs()
 
     def visit(
         record: ActiveRecord, machine: str, slot_sub: Path, source_sub: Path, display: str
@@ -47068,7 +47605,7 @@ def _shared_submodule_doctor_findings(
                     continue
                 if not path.is_dir():
                     continue
-                for _name, raw in _declared_submodules(vcs, path):
+                for _name, raw in _declared_submodules_cached(vcs, path):
                     relative = Path(raw)
                     if relative.is_absolute() or ".." in relative.parts:
                         continue
@@ -47096,7 +47633,7 @@ def _worktree_config_doctor_findings(
     """
 
     findings: list[dict[str, object]] = []
-    vcs = _GitVcs()
+    vcs = _doctor_vcs()
     seen: set[Path] = set()
 
     def check(record: ActiveRecord, machine: str, probe: Path, label: str) -> None:
@@ -63960,6 +64497,14 @@ class _PhasedReadCache:
     liveness: dict[tuple[str, str, int, str], tuple[str, str]] = dataclasses.field(
         default_factory=dict
     )
+    # The two submodule walks, keyed like the storage census (#2468): a
+    # retaken snapshot with the same checkouts repeated both in full.
+    shared_submodules: dict[str, list[dict[str, object]]] = dataclasses.field(
+        default_factory=dict
+    )
+    worktree_configs: dict[str, list[dict[str, object]]] = dataclasses.field(
+        default_factory=dict
+    )
 
     def storage_inconsistencies(
         self, config: Config, states: Sequence[ActiveState]
@@ -63986,6 +64531,22 @@ class _PhasedReadCache:
         if key not in self.image_locks:
             self.image_locks[key] = _image_lock_findings(config, states)
         return [dict(item) for item in self.image_locks[key]]
+
+    def shared_submodule_findings(
+        self, config: Config, states: Sequence[ActiveState]
+    ) -> list[dict[str, object]]:
+        key = _storage_subject_key(states)
+        if key not in self.shared_submodules:
+            self.shared_submodules[key] = _shared_submodule_doctor_findings(config, states)
+        return [dict(item) for item in self.shared_submodules[key]]
+
+    def worktree_config_findings(
+        self, config: Config, states: Sequence[ActiveState]
+    ) -> list[dict[str, object]]:
+        key = _storage_subject_key(states)
+        if key not in self.worktree_configs:
+            self.worktree_configs[key] = _worktree_config_doctor_findings(config, states)
+        return [dict(item) for item in self.worktree_configs[key]]
 
     def owner_liveness(
         self, config: Config, records: Sequence[ActiveRecord]
@@ -64743,6 +65304,16 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
         if token is not None:
             _SCAN_SUBPROCESSES.reset(token)
             _DOCTOR_SUBPROCESS_TOKEN.set(None)
+        git_token = _DOCTOR_GIT_TOKEN.get()
+        if git_token is not None:
+            _DOCTOR_GIT_MEMO.reset(git_token)
+            _DOCTOR_GIT_TOKEN.set(None)
+
+
+# Token for the full doctor's Git memo (#2468), reset by the wrapper.
+_DOCTOR_GIT_TOKEN: contextvars.ContextVar[
+    "contextvars.Token[_DoctorGitVcs | None] | None"
+] = contextvars.ContextVar("wrkslots_doctor_git_token", default=None)
 
 
 # Token for the full doctor's subprocess counter, reset by the wrapper.
@@ -64752,13 +65323,18 @@ _DOCTOR_SUBPROCESS_TOKEN: contextvars.ContextVar[
 
 
 def _cmd_doctor_scan_timed(args: argparse.Namespace, config: Config) -> int:
+    # The retention caps apply to the prewarm too (#2468): applied after it,
+    # the prewarm kept the whole parsed event history for the rest of the
+    # command (5.4 GB resident on a 2.6 GB log, against a 6 GiB scan limit).
+    # Bounded, the prewarm folds by streaming and the later reads resume
+    # from the folds it remembered.
+    _bound_event_retention()
     _prewarm_registry_read(
         lambda: _validate_global_state_beside_absent_batch(
             config, require_repository=False, announce=False
         )
     )
     deadline = _scan_deadline(args)
-    _bound_event_retention()
     cache = _PhasedReadCache(deadline=deadline)
     # Per-phase timing and subprocess counts for --json (#1706): the
     # next slowdown must be visible before a periodic gate times out.
@@ -64766,6 +65342,7 @@ def _cmd_doctor_scan_timed(args: argparse.Namespace, config: Config) -> int:
     subprocess_counter = [0]
     _DOCTOR_SUBPROCESS_TOKEN.set(_SCAN_SUBPROCESSES.set(subprocess_counter))
     _DECLARED_SUBMODULES_MEMO.set({})
+    _DOCTOR_GIT_TOKEN.set(_DOCTOR_GIT_MEMO.set(_DoctorGitVcs()))
     phases: dict[str, float] = {}
 
     def timed(name: str, fn):  # type: ignore[no-untyped-def]
@@ -64849,13 +65426,13 @@ def _cmd_doctor_scan_timed(args: argparse.Namespace, config: Config) -> int:
         findings.extend(
             timed(
                 "shared_submodule",
-                lambda: _shared_submodule_doctor_findings(config, states),
+                lambda: cache.shared_submodule_findings(config, states),
             )
         )
         findings.extend(
             timed(
                 "worktree_config",
-                lambda: _worktree_config_doctor_findings(config, states),
+                lambda: cache.worktree_config_findings(config, states),
             )
         )
         findings.extend(
@@ -65024,7 +65601,7 @@ def _cmd_doctor_scan_timed(args: argparse.Namespace, config: Config) -> int:
                     ),
                     "machines": [state.machine for state in states],
                     "event_counts": {
-                        state.machine: len(_load_events(config, state.machine))
+                        state.machine: _verified_event_count(config, state.machine)
                         for state in states
                     },
                     "active": rows,
@@ -65358,6 +65935,9 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
     )
     scoped_hold_results: dict[tuple[str, str], _HoldResult] = {}
     scoped_event_count: dict[str, int] = {}
+    # Bounded before the prewarm, as doctor is (#2468): the prewarm must not
+    # keep the whole parsed history for the rest of the command.
+    _bound_event_retention()
     if scoped_slot is None:
         _prewarm_registry_read(
             lambda: _validate_global_state_beside_absent_batch(
@@ -65365,7 +65945,6 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             )
         )
     deadline = _scan_deadline(args)
-    _bound_event_retention()
     cache = _PhasedReadCache(deadline=deadline)
 
     def snapshot() -> tuple[
@@ -65656,7 +66235,7 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
     events_total = (
         sum(scoped_event_count.get(state.machine, 0) for state in states)
         if scoped_event_count
-        else sum(len(_load_events(config, state.machine)) for state in states)
+        else sum(_verified_event_count(config, state.machine) for state in states)
     )
     if partial_detail is not None:
         registry_state, registry_count = "UNKNOWN", "UNKNOWN"
