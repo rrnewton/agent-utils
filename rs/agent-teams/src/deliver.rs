@@ -185,8 +185,9 @@ impl Default for AutoDrain {
 /// and the ledger claim that precedes every hand-over is what makes this
 /// ID single-writer, so the crate's no-replace create is the exact
 /// duplicate guard. Team items join the crate's `inbox.v2/` lane, which only
-/// drainers that re-check `not_after` and tombstones just before typing
-/// read; older drainers never see them.
+/// drainers that re-check tombstones just before typing read; older drainers
+/// never see them. Team items carry no `not_after` (#2420 R4b): a late one is
+/// typed, never set aside.
 pub struct AgentctlQueueDeliverer {
     /// The team this deliverer serves (for ledger reconcile after a drain).
     pub team: String,
@@ -211,13 +212,9 @@ impl AgentctlQueueDeliverer {
     fn document(&self, id: &str, envelope: &Value, rendered: &str) -> Value {
         let mut item = agent_queue::queue::plain_item(id, rendered);
         if let Some(obj) = item.as_object_mut() {
-            if let Some(ms) = envelope
-                .get("not_after")
-                .and_then(Value::as_str)
-                .and_then(crate::timeutil::parse_rfc3339_ms)
-            {
-                obj.insert("not_after".to_string(), json!(ms));
-            }
+            // No `not_after` on the item (#2420 R4b): a drainer sets an item past its not_after
+            // aside untyped, so a team message accepted in time but drained late was lost. The
+            // envelope below still carries it, and the rendered text shows it.
             obj.insert(
                 "topic".to_string(),
                 envelope.get("topic").cloned().unwrap_or(Value::Null),

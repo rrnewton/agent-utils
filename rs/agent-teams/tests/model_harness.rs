@@ -494,7 +494,9 @@ fn same_id_different_body_conflicts() {
 
 /// An expired envelope is refused and never pasted (I3's shape).
 #[test]
-fn expired_envelope_is_refused() {
+fn an_expired_envelope_is_delivered_late_with_the_warning_first() {
+    // #2420 R4: a message past its not_after was a terminal `expired`, never delivered. It is
+    // delivered late, and its first line names the not_after, so it never reads as fresh.
     let state = temp_state("expired");
     declaration_for(&state, "tools", "sim");
     let now_ms = agent_teams::timeutil::now_unix_ms();
@@ -513,13 +515,121 @@ fn expired_envelope_is_refused() {
         &[],
         false,
         now_ms - 10_000_000,
-        now_ms - 1_000,
+        now_ms - 3 * 3_600_000,
         None,
         "stale hold",
     );
     let answer = handle_verb(&state, "host-a", "host-a", "accept", &envelope);
-    assert_eq!(answer["state"], "expired");
-    assert_eq!(paste_count(&state, "tools", id), 0);
+    assert_eq!(answer["outcome"], "accepted", "{answer}");
+    assert_eq!(paste_count(&state, "tools", id), 1);
+    let text = delivered_text(&state, "tools", id).expect("delivered");
+    let first = text.lines().next().expect("first line");
+    assert!(
+        first.starts_with("[from sim@host-a via agent-teams")
+            && first.ends_with(&format!(
+                " · warning: late: its not_after {} passed 3h ago; reconfirm before acting]",
+                envelope["not_after"].as_str().expect("not_after")
+            )),
+        "{first}"
+    );
+    // The first line is still a sender header (the grammar agentctl's drainers parse).
+    assert!(!first[1..].contains('['), "{first}");
+    // A second copy is a known duplicate.
+    let again = handle_verb(&state, "host-a", "host-a", "accept", &envelope);
+    assert_eq!(again["outcome"], "known", "{again}");
+    assert_eq!(paste_count(&state, "tools", id), 1);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn a_message_past_the_replay_horizon_is_delivered_unverified_with_one_alarm() {
+    // #2420 R4, coordb: past the ledger's 30-day horizon a replay cannot be ruled out; the
+    // message is delivered (never refused) as UNVERIFIED, without its proof, with one alarm.
+    let state = temp_state("replay-horizon");
+    declaration_for(&state, "tools", "sim");
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let id = "tm-sim-b0b0b0b0b0b0b0b0";
+    let envelope = envelope_with(
+        id,
+        "very old",
+        now_ms - 40 * 86_400_000,
+        now_ms - 31 * 86_400_000,
+    );
+    let answer = handle_verb(&state, "host-a", "host-a", "accept", &envelope);
+    assert_eq!(answer["outcome"], "accepted", "{answer}");
+    let text = delivered_text(&state, "tools", id).expect("delivered");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].ends_with(
+            " · warning: UNVERIFIED: more than 30 days late; a replay cannot be ruled out; reconfirm before acting]"
+        ),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].contains("sender UNVERIFIED (a replay cannot be ruled out)")
+            && !lines[1].contains("harness-ancestry"),
+        "no proof shown: {lines:?}"
+    );
+    let notice_path = state
+        .join("teams.d/tools/notices")
+        .join(format!("{id}.json"));
+    let notice: Value =
+        serde_json::from_str(&std::fs::read_to_string(&notice_path).expect("one alarm"))
+            .expect("notice json");
+    assert_eq!(notice["event"], "replay-unproven-notice");
+    // Kept 30 days from now, so a copy of the same post is a known duplicate.
+    let again = handle_verb(&state, "host-a", "host-a", "accept", &envelope);
+    assert_eq!(again["outcome"], "known", "{again}");
+    assert_eq!(paste_count(&state, "tools", id), 1);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn a_claim_whose_not_after_passed_is_recovered_late_not_expired() {
+    // #2420 R4: a crashed claim found past its not_after was set `expired`, never delivered.
+    let state = temp_state("claim-late");
+    declaration_for(&state, "tools", "sim");
+    let declarations = agent_teams::proof::load_declarations(&state).expect("decls");
+    let (_, _, declaration) = &declarations[0];
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let id = "tm-sim-b1b1b1b1b1b1b1b1".to_string();
+    let envelope = envelope_with(&id, "body", now_ms - 7_200_000, now_ms - 60_000);
+    let fake = FakeDeliverer::default();
+    let ctx = AcceptContext {
+        state: &state,
+        this_host: "host-a",
+        declaration,
+        via: "local",
+        proof_note: "proved",
+        relayed_by: None,
+        peer_host: "host-a",
+        via_chat_relay: false,
+    };
+    let claim = json!({
+        "id": id, "state": "claimed", "body_sha256": envelope["body_sha256"],
+        "sender": "sim", "not_after": envelope["not_after"], "envelope": envelope,
+    });
+    std::fs::create_dir_all(state.join("teams.d/tools/ledger")).expect("ledger dir");
+    std::fs::write(
+        entry_path(&state, "tools", &id),
+        serde_json::to_string_pretty(&claim).unwrap(),
+    )
+    .expect("claim");
+    let answer = accept(&ctx, &envelope, &fake).expect("accept");
+    assert_eq!(answer.state.as_deref(), Some("accepted"), "{answer:?}");
+    let pastes = fake.pastes.lock().expect("pastes");
+    assert_eq!(pastes.len(), 1);
+    assert!(
+        pastes[0]
+            .1
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains(" · warning: late: its not_after "),
+        "{}",
+        pastes[0].1
+    );
+    drop(pastes);
     let _ = std::fs::remove_dir_all(&state);
 }
 
@@ -641,6 +751,8 @@ fn agentctl_queue_deliverer_uses_agent_queue() {
         Some("rendered text")
     );
     assert!(doc.get("external_delivery_record").is_some());
+    // #2420 R4b: no not_after on a team item, or a drainer sets it aside untyped when late.
+    assert!(doc.get("not_after").is_none(), "{doc:?}");
     // Idempotent: the crate refuses the duplicate, we recognise our own item.
     assert_eq!(
         deliverer.handover(id, &envelope, "rendered text"),

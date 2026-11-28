@@ -2484,12 +2484,19 @@ fn cmd_hook(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                 .map(|e| e["state"].as_str().unwrap_or("?").to_string())
                 .unwrap_or_default();
             let tombstoned = inbox.join("cancel").join(format!("{name}.json")).exists();
-            let expired = item["not_after"]
-                .as_str()
-                .and_then(parse_rfc3339_ms)
-                .is_some_and(|ms| ms <= now_unix_ms());
-            if tombstoned || expired || !matches!(ledger_state.as_str(), "accepted" | "claimed") {
+            if tombstoned || !matches!(ledger_state.as_str(), "accepted" | "claimed") {
                 continue; // moved aside by the claim; never printed twice
+            }
+            // An item past its not_after was moved aside unprinted (#2420 R4b): it is printed
+            // late, the late warning on its first line, never dropped.
+            let mut text = item["text"].as_str().unwrap_or_default().to_string();
+            let not_after = item["not_after"].as_str().unwrap_or_default();
+            let not_after_ms = parse_rfc3339_ms(not_after);
+            if let Some(not_after_ms) = not_after_ms.filter(|ms| *ms <= now_unix_ms()) {
+                let late = crate::ledger::late_warning(not_after, not_after_ms, now_unix_ms());
+                if !text.contains(&late[..late.find(" passed ").unwrap_or(late.len())]) {
+                    text = crate::envelope::add_header_warning(&text, &late);
+                }
             }
             if let Some(mut entry) = ledger {
                 entry["state"] = json!("presented");
@@ -2498,7 +2505,7 @@ fn cmd_hook(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                     &entry,
                 )?;
             }
-            print!("{}", item["text"].as_str().unwrap_or_default());
+            print!("{text}");
             printed_any = true;
         }
     }

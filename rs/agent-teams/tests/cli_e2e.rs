@@ -707,3 +707,45 @@ fn reply_envelope_gets_a_longer_default_ttl() {
         "reply TTL >= 24h: {reply_ttl:?}"
     );
 }
+
+#[test]
+fn the_hook_prints_an_item_that_went_late_in_its_inbox_with_the_late_warning_first() {
+    // #2420 R4b: an item accepted in time whose not_after passed before the hook ran was moved
+    // aside unprinted, so the message was lost at type time. It is printed late, the late
+    // warning on its first line (still a sender header), never dropped.
+    let world = World::new();
+    world.init_both();
+    let (code, out, err) = world.run(&[
+        "send",
+        "tools",
+        "--from-team",
+        "sim",
+        "--text",
+        "Ship it now.",
+        "--json",
+    ]);
+    assert_eq!(code, 75, "{out} {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+    let id = value["id"].as_str().expect("id").to_string();
+    // The message goes late while it waits in the inbox.
+    let item_path = world
+        .state
+        .join("teams.d/tools/hook-inbox")
+        .join(format!("{id}.json"));
+    let mut item: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&item_path).expect("item")).expect("json");
+    item["not_after"] = serde_json::json!("2026-01-01T00:00:00.000Z");
+    std::fs::write(&item_path, item.to_string()).expect("rewrite item");
+    let (code, out, err) = world.run(&["hook", "--team", "tools"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Ship it now."), "printed, not dropped: {out}");
+    let first = out.lines().next().expect("first line");
+    assert!(
+        first.starts_with("[from sim@host-a via agent-teams · to: tools@host-a")
+            && first.contains(" · warning: late: its not_after 2026-01-01T00:00:00.000Z passed ")
+            && first.ends_with(" ago; reconfirm before acting]"),
+        "{first}"
+    );
+    let (_, out, _) = world.run(&["hook", "--team", "tools"]);
+    assert!(!out.contains("Ship it now."), "printed once: {out}");
+}

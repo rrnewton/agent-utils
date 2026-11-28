@@ -595,11 +595,27 @@ envelopes).
 ## Exactly-once rules
 
 At most one enqueue and one paste per ID per team; at least once while some
-route to a verified contact stays up before `not_after`; never silently in
+route to a verified contact stays up; never silently in
 between — an unprovable hand-over ends `possibly_submitted` or `lost`,
 visible in receipts, and is never retried automatically. Ledger entries are
 kept until 30 days past each entry's own `not_after`, so pruning can never
 reopen an ID.
+
+`not_after` never drops a message (#2420). A message past it is delivered
+late, and its first line, the team tag, carries the warning as a field:
+`· warning: late: its not_after T passed 3h ago; reconfirm before acting`.
+That keeps the line a sender header for agentctl's drainers while the
+warning stays the first thing read. This holds when it arrives late, when
+a crashed claim is recovered late, and when it waits in a hook inbox past
+it. Team items in an agentctl queue carry no `not_after`, so a drainer
+types a late one and never sets it aside. A message more than 30 days past
+its `not_after` (beyond the ledger's horizon, where a replay cannot be
+ruled out) is delivered with `warning: UNVERIFIED: more than 30 days late;
+a replay cannot be ruled out; reconfirm before acting`. Its proof is
+replaced by `sender UNVERIFIED`, and one notice
+(`teams.d/<team>/notices/<id>.json`, event `replay-unproven-notice`) tells
+the coordinator. Its entry is kept 30 days from its arrival, so a copy is
+a known duplicate.
 
 States include `claimed`, `accepted`, `typing`/`presented`, `delivered`,
 `expired`, `superseded`, `retracted`, `fenced`, `possibly_submitted`,

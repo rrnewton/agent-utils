@@ -317,6 +317,32 @@ mod tests {
     }
 
     #[test]
+    fn a_head_warning_rides_on_the_first_line_as_a_header_field() {
+        let tag = "[from sim@host-a via agent-teams · to: tools@host-a · id: tm-sim-0]";
+        let text = format!("{tag}\n[team message: kind info]\nbody\n");
+        let once = add_header_warning(&text, "late: its not_after T passed 3h ago");
+        let first = once.lines().next().unwrap();
+        assert_eq!(
+            first,
+            "[from sim@host-a via agent-teams · to: tools@host-a · id: tm-sim-0 · warning: late: its not_after T passed 3h ago]"
+        );
+        assert!(once.ends_with("[team message: kind info]\nbody\n"));
+        // A second warning joins the same field; brackets and dots cannot break the header.
+        let twice = add_header_warning(&once, "superseded by [x] · y");
+        assert!(
+            twice.lines().next().unwrap().ends_with(
+                " · warning: late: its not_after T passed 3h ago; superseded by (x)   y]"
+            ),
+            "{twice}"
+        );
+        // Not a header: the warning is a line of its own above the text.
+        assert_eq!(
+            add_header_warning("plain\n", "w"),
+            "[relay warning: w]\nplain\n"
+        );
+    }
+
+    #[test]
     fn a_warning_line_sits_under_the_tag_on_one_line() {
         let env = build_envelope(
             "tm-sim-0123456789abcdef",

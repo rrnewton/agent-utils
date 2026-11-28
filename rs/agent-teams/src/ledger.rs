@@ -8,7 +8,7 @@ use crate::jsonfile::{
     create_private_dir_all, write_json_atomic, write_new, write_new_atomic, DataResult,
 };
 use crate::model::Declaration;
-use crate::timeutil::{format_rfc3339_ms, now_unix_ms, parse_rfc3339_ms};
+use crate::timeutil::{age_text, format_rfc3339_ms, now_unix_ms, parse_rfc3339_ms};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -121,6 +121,23 @@ impl AcceptAnswer {
 /// saved file: its path, its sha256 and its first lines, never inline (#2420, lead-014:
 /// lossless without flooding a lane's context).
 pub const PANE_INLINE_MAX_BYTES: usize = 16_384;
+/// How long past its own `not_after` a ledger entry is kept (design 9.2), and so how late a
+/// message can arrive with a replay still ruled out by the ledger (#2420 R4).
+pub const REPLAY_HORIZON_MS: i64 = 30 * 86_400_000;
+/// The first-line warning of a message more than [`REPLAY_HORIZON_MS`] past its `not_after`.
+pub const REPLAY_UNPROVEN_WARNING: &str =
+    "UNVERIFIED: more than 30 days late; a replay cannot be ruled out; reconfirm before acting";
+/// The proof shown for such a message, in place of the route's proof.
+const REPLAY_UNPROVEN_PROOF: &str = "sender UNVERIFIED (a replay cannot be ruled out)";
+
+/// The first-line warning of a message delivered after its `not_after` (#2420 R4).
+pub fn late_warning(not_after: &str, not_after_ms: i64, now_ms: i64) -> String {
+    format!(
+        "late: its not_after {not_after} passed {} ago; reconfirm before acting",
+        age_text(now_ms.saturating_sub(not_after_ms))
+    )
+}
+
 /// How much of a saved body is shown inline: its first lines, at most this many bytes.
 const PREVIEW_MAX_BYTES: usize = 2_000;
 const PREVIEW_MAX_LINES: usize = 20;
@@ -371,33 +388,24 @@ fn accept_checked(
                     findings: Vec::new(),
                 });
             }
+            // A claim whose not_after passed before its recovery was set `expired` and never
+            // delivered (#2420 R4): it is recovered late, with the late warning first. Its
+            // ledger entry exists, so a replay is ruled out whatever the age.
+            let mut warnings = DeliveryWarnings::from_body_warning(body_warning);
             let not_after_ms = existing
                 .get("not_after")
                 .and_then(Value::as_str)
                 .and_then(parse_rfc3339_ms)
                 .unwrap_or(0);
-            if not_after_ms > 0 && not_after_ms <= now_unix_ms() {
-                let lock2 = lock_ledger(&ledger_dir(ctx.state, team))?;
-                if let Some(mut entry) = read_entry(ctx.state, team, &id) {
-                    entry["state"] = json!("expired");
-                    entry["detail"] = json!("expired before recovery");
-                    write_json_atomic(&entry_path(ctx.state, team, &id), &entry)?;
-                }
-                unlock(lock2);
-                return Ok(AcceptAnswer {
-                    outcome: "refused".to_string(),
-                    state: Some("expired".to_string()),
-                    detail: "expired before recovery".to_string(),
-                    findings: Vec::new(),
-                });
+            let now_ms = now_unix_ms();
+            if not_after_ms > 0 && not_after_ms <= now_ms {
+                warnings.head.push(late_warning(
+                    envelope["not_after"].as_str().unwrap_or("?"),
+                    not_after_ms,
+                    now_ms,
+                ));
             }
-            let recovered = recover_claim(
-                ctx,
-                envelope,
-                deliverer,
-                &existing,
-                &DeliveryWarnings::from_body_warning(body_warning),
-            )?;
+            let recovered = recover_claim(ctx, envelope, deliverer, &existing, &warnings)?;
             return Ok(recovered);
         }
         // A retry of an accepted-but-maybe-undrained item nudges delivery:
@@ -523,8 +531,24 @@ fn accept_checked(
         );
         warnings.under.push(warning);
     }
+    // A message past its not_after was a terminal `expired` (#2420 R4): it is delivered late,
+    // the warning on its first line naming the not_after, so it never reads as a fresh
+    // instruction (lead-014). The ledger dedupes every copy while it keeps entries, until
+    // REPLAY_HORIZON_MS past not_after; later than that, a replay cannot be ruled out, so the
+    // message is delivered as UNVERIFIED, without its proof, and raises one alarm (coordb).
+    let mut replay_unproven = false;
     if not_after_ms <= now_ms {
-        return refuse("expired", "not_after has passed".to_string(), lock);
+        if now_ms >= not_after_ms.saturating_add(REPLAY_HORIZON_MS) {
+            replay_unproven = true;
+            warnings.head.push(REPLAY_UNPROVEN_WARNING.to_string());
+            warnings.proof_note = Some(REPLAY_UNPROVEN_PROOF.to_string());
+        } else {
+            warnings.head.push(late_warning(
+                envelope["not_after"].as_str().unwrap_or("?"),
+                not_after_ms,
+                now_ms,
+            ));
+        }
     }
     let created_ms = envelope["created_at"]
         .as_str()
@@ -608,6 +632,11 @@ fn accept_checked(
     if !warnings.all().is_empty() {
         claim["delivery_warnings"] = json!(warnings.all());
     }
+    if replay_unproven {
+        // Kept REPLAY_HORIZON_MS from now, not from its long-past not_after, so a copy of this
+        // post arriving again is a known duplicate for that long.
+        claim["not_after"] = json!(format_rfc3339_ms(now_ms));
+    }
     let claimed = write_new_atomic(
         &entry_path(ctx.state, team, &id),
         format!("{}\n", serde_json::to_string_pretty(&claim)?).as_bytes(),
@@ -629,6 +658,22 @@ fn accept_checked(
     // Supersede older untyped messages on the topic and explicit keys.
     apply_supersede(ctx, envelope, deliverer)?;
 
+    if replay_unproven {
+        let notice = json!({
+            "event": "replay-unproven-notice", "team": team, "id": id, "sender": sender,
+            "reason": format!(
+                "delivered as UNVERIFIED: more than 30 days past its not_after {}, so a replay cannot be ruled out; reconfirm with the sender before acting",
+                envelope["not_after"].as_str().unwrap_or("?")
+            ),
+            "at": format_rfc3339_ms(now_ms),
+        });
+        crate::sender::log_event(ctx.state, &notice);
+        write_notice(
+            &ctx.state.join("teams.d").join(team).join("notices"),
+            &id,
+            &notice,
+        );
+    }
     let rendered = warnings.render(ctx, envelope);
     let outcome = deliverer.handover(&id, envelope, &rendered);
     finish_handover(ctx, &id, outcome)
@@ -1274,7 +1319,7 @@ fn retention_horizon_ms(entry: &Value) -> Option<i64> {
             .and_then(|envelope| envelope.get("not_after"))
             .and_then(Value::as_str)
     })?;
-    parse_rfc3339_ms(not_after).map(|ms| ms + 30 * 86_400_000)
+    parse_rfc3339_ms(not_after).map(|ms| ms + REPLAY_HORIZON_MS)
 }
 
 /// Delete one entry file and any atomic-write backups (`<id>.json.<stamp>`)
