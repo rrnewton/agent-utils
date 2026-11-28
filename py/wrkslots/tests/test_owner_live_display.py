@@ -109,7 +109,13 @@ def test_a_live_owner_with_an_expired_heartbeat_is_named(
         doctor = _json(project, "doctor", capsys)
         (finding,) = _findings(doctor, "owner-live-heartbeat-expired")
         assert finding["slot"] == "slot01"
-        assert f"PID {os.getpid()}" in str(finding["detail"])
+        detail = str(finding["detail"])
+        assert f"PID {os.getpid()}" in detail
+        assert str(process["comm"]) in detail and str(process["started_at"]) in detail
+        # The command line stays out of the detail (consumers relay details
+        # into posts); the row's owner_process keeps it.
+        assert "command line" not in detail
+        assert str(process["argv"]) not in detail
         assert "by its PID" in str(finding["remedy"])
         keys.append((finding["kind"], finding["slot"], finding["detail"]))
     assert keys[0] == keys[1]

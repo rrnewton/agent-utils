@@ -27196,7 +27196,8 @@ def _boot_started_at() -> dt.datetime | None:
     return _boot_started_at_cache
 
 
-#: Characters of a live owner's command line shown by status and doctor (#2466).
+#: Characters of a live owner's command line shown in status and doctor rows
+#: (#2466); never in a doctor finding's detail.
 _OWNER_ARGV_DISPLAY_LIMIT = 300
 
 #: How long past its time-to-live a live owner's heartbeat must have lapsed
@@ -27273,7 +27274,10 @@ def _owner_live_heartbeat_expired_finding(
 
     Reported only past _owner_live_expired_finding_threshold, and keyed by
     its slot, so a consumer that alerts on new findings sees one stable
-    finding per stuck slot, never one per long turn.
+    finding per stuck slot, never one per long turn. The detail names the
+    process by PID, command name, start and cgroup, never by its command
+    line: consumers relay finding details into posts, and a command line
+    can carry anything. The status row's owner_process keeps the argv.
     """
 
     if record.owner is None:
@@ -27292,8 +27296,7 @@ def _owner_live_heartbeat_expired_finding(
         f"{process['started_at']}, cgroup {process['cgroup']}) is still running "
         f"although its heartbeat lapsed (last {record.heartbeat_at}, time-to-live "
         f"{record.heartbeat_ttl_seconds}s, reported past "
-        f"{_owner_live_expired_finding_threshold(record.heartbeat_ttl_seconds)}s); "
-        f"command line: {process['argv']}",
+        f"{_owner_live_expired_finding_threshold(record.heartbeat_ttl_seconds)}s)",
     )
     finding["remedy"] = (
         "if that process is a leftover of the slot's agent, stop it by its PID "

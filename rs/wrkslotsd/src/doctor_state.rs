@@ -287,7 +287,9 @@ fn owner_live_expired_finding_threshold(ttl: i64) -> i64 {
 
 /// Doctor's finding for a live owner whose heartbeat lapsed (#2466), as the
 /// Python edition's `_owner_live_heartbeat_expired_finding`: only past the
-/// threshold, measured from the recorded heartbeat, and keyed by its slot.
+/// threshold, measured from the recorded heartbeat, and keyed by its slot;
+/// the detail never carries the command line (consumers relay details into
+/// posts), which stays in the row's `owner_process`.
 /// The status row carries `owner_process` whenever its owner is live and
 /// the heartbeat expired.
 fn owner_live_heartbeat_expired(
@@ -322,12 +324,11 @@ fn owner_live_heartbeat_expired(
         slot,
         machine,
         format!(
-            "recorded owner PID {} ({}, started {}, cgroup {}) is still running although its heartbeat lapsed (last {heartbeat_at}, time-to-live {ttl}s, reported past {threshold}s); command line: {}",
+            "recorded owner PID {} ({}, started {}, cgroup {}) is still running although its heartbeat lapsed (last {heartbeat_at}, time-to-live {ttl}s, reported past {threshold}s)",
             shown("pid"),
             shown("comm"),
             shown("started_at"),
             shown("cgroup"),
-            shown("argv"),
         ),
     );
     finding["remedy"] = json!(
