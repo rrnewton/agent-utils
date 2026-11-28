@@ -8593,6 +8593,7 @@ def test_batch_network_namespace_links_require_complete_generation_bound_records
 
 
 @pytest.mark.ordinary_environment
+@pytest.mark.load_quarantine(issue="#2065", expires="2026-12-05")  # hot-host-census-tests: a 22 s wall-clock budget around a real host census (46.5 s at load in gate 1795870439918991988-1bbc670c); C3's fixture inventory is the fix
 @pytest.mark.parametrize("kind", ["relative-with-other-fd", "absolute-hardlink", "deleted-original", "rebound-original"])
 def test_batch_census_two_selected_trees_cannot_mask_socket_holder(
     tmp_path: Path, lsof_tmpfs_fixture: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
