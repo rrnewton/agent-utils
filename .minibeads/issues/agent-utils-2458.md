@@ -1,6 +1,6 @@
 ---
 title: 'merge-queue-cpu-budget-2458: rust.merge-queue.test outgrows its 2400 CPU-s budget (red in 12 gates on 7 heads since 11-27)'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-mqcpu
@@ -9,7 +9,8 @@ labels:
 - validation
 - hot-host
 created_at: 2026-11-28T07:35:00-05:00
-updated_at: 2026-11-28T13:05:00-05:00
+updated_at: 2026-11-28T13:40:00-05:00
+closed_at: 2026-11-28T13:40:00-05:00
 ---
 
 # Description
@@ -56,3 +57,11 @@ Budget site: `validation/rust.dag.yaml`, step `rust.merge-queue.test` (group `me
 ## Basis for 4000
 
 The loaded step needs about 2400-2600 CPU-s (the 10:37 kill extrapolates to 2423 CPU-s for all 687 tests before the doctest phase; the 11:58 kill spent 2400 with every test done and the doctest phase unfinished). 4000 is 2.06x the worst solo run (1944) and over 1.5x the loaded estimate, the same ~2x rule #1051 used. The wall ceiling stays 3600: at the slowest measured rate (2.07 cores average, Solo 2) 4000 CPU-s needs about 1930 s wall, and the gates ran at 2.7-3.0 cores. No wall-clock budget is added (owner rule 346). Sharding the step (for example `cli_donor`, `cli_run` and `cli_disjoint_root` into a second step) is the follow-up if the suite grows another ~25%, after #2479 measures the sys share; fixing one test cannot recover the budget.
+
+## Resolution
+
+Landed on main 2026-11-28 as ea92f6e2 (`cpu_timeout` 2400 to 4000 on `rust.merge-queue.test` only, with the measured basis in the DAG comment; the wall timeout stays 3600, no wall-clock budget added) and 685507a8 (#2479 filed, the sys-share investigation the raise was conditioned on), gated as 97fb290d.
+
+- Full gate (12:39 to 1:11 PM ET, 364 steps): `rust.merge-queue.test` used 2177.7 CPU-s of the new 4000 (54%) at 852.75 s wall with all 687 cases run, doctest phase included; no CPU timeout. The gate's two red steps were this one, on `cli_donor::a_mid_run_root_donor_job_records_the_base_it_was_planned_on` (the 60 s wall-clock wait tracked by #2378), and `python.agentctl.shard-0`, on the pid-file race tracked by #2482; this change touches neither test.
+- Exclusive rerun of both steps on the same tree (1:13 to 1:28 PM ET): passed. `rust.merge-queue.test` 2070.3 CPU-s (52%) at 875.9 s wall, 685 passed, 0 failed, the #2378 case included; load1 242.3 at its end.
+- Both measured runs stay well clear of the new budget, which meets the last acceptance criterion. #2479 stays open for the sys share, the doctest-phase rebuild and the `tests_started` over-count; sharding waits on its measurements.
