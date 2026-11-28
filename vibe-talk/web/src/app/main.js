@@ -2758,6 +2758,14 @@ const pendingReplies = createPendingReplies({
       .catch(() => { /* the read's own failure path has said so (`noteChannelReadFailure`) */ });
   },
   isThreadRoot: (row) => isOpenThreadRoot(row, openThreadRootId()),
+  // S-t1: the thread's layout, from the server's own copy, asked before its bodies.
+  readLayout: (id) => apiDecoded("ThreadLayoutResponse",
+    `/api/v1/channels/${encodeURIComponent(String(selectedChannelId()))}/threads/${encodeURIComponent(id)}/layout`)
+    .catch(() => null),
+  heldIds: () => new Set(channelStore.current().messages.map((message) => String(message.id))),
+  preservingScroll: (mutate) => preservingScroll(mutate, "other"),
+  scroller: () => el("scroll-area"),
+  keepColumn: (act) => /** @type {() => void} */ (inThisColumn(act)),
 });
 
 

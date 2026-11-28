@@ -88,8 +88,8 @@ export {
   versionOf,
 } from "./incremental.ts";
 export { DEFAULT_ROW_PX, correctionFor, estimatedHeightFor, forgetHeight, heightFor, measuredHeight, noteMeasured, rangeHeight, rowClassOf } from "./heights.ts";
-export { PENDING_REPLY_BOXES_MAX, PENDING_REPLY_PX_DEFAULT, pendingRepliesLine, pendingReplyPx, planPendingReplies } from "./pending.ts";
-export type { PendingRepliesPlan } from "./pending.ts";
+export { LAYOUT_CHARS_PER_LINE, LAYOUT_FOLDED_LINES, LAYOUT_LINE_STEP, PENDING_REPLY_BOXES_MAX, PENDING_REPLY_PX_DEFAULT, layoutReplyPx, pendingRepliesLine, pendingReplyPx, planLayoutReplies, planPendingReplies } from "./pending.ts";
+export type { LayoutReply, PendingRepliesPlan } from "./pending.ts";
 export type { RowClass } from "./heights.ts";
 export {
   LABEL_LIMITS,

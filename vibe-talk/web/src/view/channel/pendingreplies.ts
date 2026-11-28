@@ -16,9 +16,21 @@
 //   them moves nothing above; an entry with nothing unread among the held rows lands on the first
 //   box as on a first unread reply (threadentry.ts), and the read keeps that landing on the reply
 //   that takes the box's place (`keepEntryLanding`, by `heldBefore`).
+// - EACH BOX PRICED FROM ITS OWN REPLY (S-t1). As the boxes are drawn, and before the thread's
+//   bodies are read, the thread's layout is asked of the server (`readLayout`: each reply's id and
+//   the size of its stored body, from the server's own copy). When it lands, the boxes are priced
+//   again one per reply (`planLayoutReplies`) in ONE anchored transaction (`preservingScroll`):
+//   the boxes stand below the rows, so a new height moves nothing above them, and a box set that
+//   comes out shorter is held at least as tall as the scroll position needs (`reprice`), so the
+//   list can never be clamped up under the reader. The bodies then fill the boxes as before.
 
-import { planPendingReplies } from "../../core/channels/index.ts";
-import type { PendingRepliesPlan } from "../../core/channels/index.ts";
+import { planLayoutReplies, planPendingReplies } from "../../core/channels/index.ts";
+import type { LayoutReply, PendingRepliesPlan } from "../../core/channels/index.ts";
+
+/** A thread's layout as the boxes read it: the server's `ThreadLayoutResponse`, its entries in thread order. */
+export interface PendingRepliesLayout {
+  readonly entries: readonly LayoutReply[];
+}
 
 /** What drawing the boxes asks of the page. */
 export interface PendingRepliesDependencies {
@@ -38,6 +50,19 @@ export interface PendingRepliesDependencies {
   readThread(): void;
   /** Whether `row` is the open thread's root (`isOpenThreadRoot`): not a reply, so not a price for one. */
   isThreadRoot(row: HTMLElement): boolean;
+  /**
+   * Thread `id`'s layout from the server (`GET .../threads/{id}/layout`), or null where it has none
+   * to give; asked before the thread's bodies are read. Absent: the boxes keep the count's price.
+   */
+  readLayout?(id: string): Promise<PendingRepliesLayout | null>;
+  /** The ids of the messages the store holds (a reply drawn, or about to be). */
+  heldIds?(): ReadonlySet<string>;
+  /** Mutate the list holding the reader's row in place (`preservingScroll`, cause "other"). */
+  preservingScroll?(mutate: () => void): void;
+  /** The working column's scroller (`#scroll-area`), for the foot a re-price must not clamp. */
+  scroller?(): HTMLElement | null;
+  /** `act`, bound to the column it is made in, for a step that runs after a wait (`inThisColumn`). */
+  keepColumn?(act: () => void): () => void;
 }
 
 /** The boxes' commands. */
@@ -133,10 +158,23 @@ export function createPendingReplies(deps: PendingRepliesDependencies): PendingR
     box.replaceChildren(...(line ? [line] : []));
     box.removeAttribute("data-count");
     box.removeAttribute("data-px");
+    box.removeAttribute("data-priced");
+    box.style.minHeight = "";
+  }
+
+  /** The plan's heights in one word, to tell a re-price from the box set standing. */
+  function pricedAs(plan: PendingRepliesPlan): string {
+    return plan.heights ? `layout:${plan.heights.join(",")}` : "count";
+  }
+
+  /** Whether the boxes standing in `box` are `plan`'s already. */
+  function drawnAs(box: HTMLElement, plan: PendingRepliesPlan): boolean {
+    return box.getAttribute("data-count") === String(plan.count) && box.getAttribute("data-px") === String(plan.px) &&
+      box.getAttribute("data-priced") === pricedAs(plan) && listOf(box) !== null;
   }
 
   function draw(box: HTMLElement, plan: PendingRepliesPlan): void {
-    if (box.getAttribute("data-count") === String(plan.count) && box.getAttribute("data-px") === String(plan.px) && listOf(box)) return;
+    if (drawnAs(box, plan)) return;
     const shape = shapeOf();
     const list = document.createElement("ol");
     list.className = "messages pending-replies-list";
@@ -147,7 +185,9 @@ export function createPendingReplies(deps: PendingRepliesDependencies): PendingR
       item.className = "pending-reply";
       item.setAttribute("aria-busy", "true");
       item.setAttribute("data-pending-reply", String(index));
-      item.style.height = `${plan.px}px`;
+      const px = plan.heights ? (plan.heights[index] ?? plan.px) : plan.px;
+      item.setAttribute("data-px", String(px));
+      item.style.height = `${px}px`;
       if (shape) {
         item.style.marginLeft = shape.left;
         item.style.marginRight = shape.right;
@@ -166,8 +206,69 @@ export function createPendingReplies(deps: PendingRepliesDependencies): PendingR
     const announced = box.getAttribute("data-count") !== String(plan.count);
     box.setAttribute("data-count", String(plan.count));
     box.setAttribute("data-px", String(plan.px));
+    box.setAttribute("data-priced", pricedAs(plan));
     // Told once per box set: a re-price at the same count says nothing again.
     if (announced) line.textContent = plan.line;
+  }
+
+  /**
+   * The thread's layout as last answered, for the thread it was asked for; and the thread and
+   * shortfall it was last asked at, so one box set asks once and a new count asks again.
+   */
+  let layout: { thread: string; entries: readonly LayoutReply[] } | null = null;
+  let layoutAsked: string | null = null;
+
+  /** The box set for `thread`'s `missing` replies: priced one per reply when its layout has landed. */
+  function planFor(thread: string, missing: number, readComing: boolean): PendingRepliesPlan | null {
+    const measured = replyHeights();
+    const counted = planPendingReplies(missing, readComing, true, measured);
+    if (!counted || !layout || layout.thread !== thread || !deps.heldIds) return counted;
+    const held = deps.heldIds();
+    return planLayoutReplies(layout.entries, (id) => held.has(id), missing, counted.px) || counted;
+  }
+
+  /**
+   * Draw `plan` in place of the boxes standing, held as one anchored change: nothing above the
+   * boxes moves (they stand below the rows), and a box set that comes out shorter keeps the
+   * container as tall as the scroll position needs, so the browser never clamps the list up under
+   * the reader (owner rule 370). The hold goes with the boxes (`clear`).
+   */
+  function reprice(box: HTMLElement, plan: PendingRepliesPlan): void {
+    const area = deps.scroller ? deps.scroller() : null;
+    const before = box.getBoundingClientRect().height;
+    const below = area ? area.scrollHeight - area.clientHeight - area.scrollTop : 0;
+    const change = (): void => {
+      draw(box, plan);
+      const after = box.getBoundingClientRect().height;
+      const floor = Math.ceil(before - Math.max(0, below));
+      if (area && after < floor) box.style.minHeight = `${floor}px`;
+    };
+    if (deps.preservingScroll) deps.preservingScroll(change);
+    else change();
+  }
+
+  /** Ask the server for `thread`'s layout once per shortfall, and price the boxes by it when it lands. */
+  function askLayout(thread: string, missing: number): void {
+    const key = `${thread}|${missing}`;
+    if (!deps.readLayout || layoutAsked === key) return;
+    layoutAsked = key;
+    let answered: PendingRepliesLayout | null = null;
+    // In the column that asked: the answer lands in a later task, which starts in the left one.
+    const landed = (): void => {
+      if (!answered || !Array.isArray(answered.entries) || !answered.entries.length) return;
+      layout = { thread, entries: answered.entries };
+      // Only boxes still standing for the same thread are priced again: the bodies may have landed
+      // first, or the reader moved on, and then there is nothing to price.
+      const box = container();
+      if (!box || !listOf(box) || deps.openThread() !== thread || !deps.readComing() || !deps.enabled()) return;
+      const plan = planFor(thread, deps.missingReplies(thread), true);
+      if (plan && !drawnAs(box, plan)) reprice(box, plan);
+    };
+    const inColumn = deps.keepColumn ? deps.keepColumn(landed) : landed;
+    deps.readLayout(thread).then((answer) => {
+      answered = answer;
+      inColumn();
+    }).catch(() => { /* no layout: the boxes keep the count's price */ });
   }
 
   /**
@@ -185,6 +286,8 @@ export function createPendingReplies(deps: PendingRepliesDependencies): PendingR
     if (missing > 0 && !deps.readComing() && options.read && asked !== `${thread}|${missing}`) {
       asked = `${thread}|${missing}`;
       deps.oweRead();
+      // The layout goes out before the bodies' read, so it can price the boxes before they fill.
+      askLayout(thread as string, missing);
       deps.readThread();
     }
     // Nothing to draw is decided before anything is measured: a sync on every view switch and read
@@ -194,9 +297,16 @@ export function createPendingReplies(deps: PendingRepliesDependencies): PendingR
       clear(box);
       return;
     }
-    const plan = planPendingReplies(missing, readComing, true, replyHeights());
-    if (plan) draw(box, plan);
-    else clear(box);
+    const plan = planFor(thread, missing, readComing);
+    if (!plan) {
+      clear(box);
+      return;
+    }
+    // Boxes standing are priced again in place, held; a first box set is drawn below the rows.
+    if (listOf(box) && !drawnAs(box, plan)) reprice(box, plan);
+    else draw(box, plan);
+    // Asked as the boxes first stand, before the read that brings the bodies is sent.
+    askLayout(thread, missing);
   }
 
   function firstBox(): HTMLElement | null {

@@ -993,3 +993,43 @@ test("`#2385 vibe-talk-thread-open-layout-first`: the boxes for a thread's repli
   assert.equal(planPendingReplies(Number.NaN, true, true, [66]), null);
   assert.equal(planPendingReplies(500, true, true, []).count, PENDING_REPLY_BOXES_MAX);
 });
+
+test("`#2385` S-t1: each box priced from its own reply's layout entry, from the module alone", () => {
+  const { LAYOUT_FOLDED_LINES, PENDING_REPLY_BOXES_MAX, PENDING_REPLY_PX_DEFAULT, layoutReplyPx, planLayoutReplies } = CHANNELS;
+  const entry = (id, length, lines = 1, flags = {}) => ({ id, length_utf16: length, lines, flags: { attachments: false, long: false, ...flags } });
+  // Up to three lines (forty characters a line, or its own breaks) is the base; each line past that a
+  // step of the base, as the height estimator prices an unmeasured row (heights.ts `heightFor`).
+  assert.equal(layoutReplyPx(entry("a", 12), 80), 80);
+  assert.equal(layoutReplyPx(entry("a", 120), 80), 80);
+  assert.equal(layoutReplyPx(entry("a", 200), 80), Math.round(80 * (1 + 2 * 0.18)));
+  assert.equal(layoutReplyPx(entry("a", 10, 7), 80), Math.round(80 * (1 + 4 * 0.18)), "line breaks count as lines");
+  // A long body is drawn folded, so priced as the folded row, however long.
+  const folded = Math.round(80 * (1 + (LAYOUT_FOLDED_LINES - 3) * 0.18));
+  assert.equal(layoutReplyPx(entry("a", 4000, 1, { long: true }), 80), folded);
+  assert.equal(layoutReplyPx(entry("b", 290, 1, { long: true }), 80), folded);
+  // A file is a line of the body already: the flag adds nothing of its own.
+  assert.equal(layoutReplyPx(entry("a", 60, 3, { attachments: true }), 80), 80);
+  // No base to price from: the default box.
+  assert.equal(layoutReplyPx(entry("a", 12), Number.NaN), PENDING_REPLY_PX_DEFAULT);
+
+  // The boxes are the replies listed after the last one the page holds, each its own height, in order.
+  const held = new Set(["r1", "r2"]);
+  const has = (id) => held.has(id);
+  const entries = [entry("r1", 10), entry("r2", 10), entry("r3", 12), entry("r4", 200), entry("r5", 900, 1, { long: true })];
+  const plan = planLayoutReplies(entries, has, 3, 80);
+  assert.deepStrictEqual(plan, { count: 3, px: 80, line: "3 more replies loading",
+    heights: [80, Math.round(80 * 1.36), folded] });
+  // A reply listed above the last one held lands above the rows: no box stands for it below.
+  const gap = planLayoutReplies([entry("r1", 10), entry("x", 10), entry("r2", 10), entry("r3", 12)], has, 2, 80);
+  assert.deepStrictEqual(gap && gap.heights, [80]);
+  // More missing than the copy lists: the rest stand after them at the base.
+  assert.deepStrictEqual(planLayoutReplies(entries, has, 5, 80).heights, [80, Math.round(80 * 1.36), folded, 80, 80]);
+  // Nothing listed past the rows held: the count's boxes stand as they are.
+  assert.equal(planLayoutReplies([entry("r1", 10), entry("r2", 10)], has, 4, 80), null);
+  assert.equal(planLayoutReplies([], has, 4, 80), null);
+  // At most a page of boxes, the newest kept.
+  const many = Array.from({ length: 70 }, (_, k) => entry(`n${k}`, k === 69 ? 900 : 10, 1, { long: k === 69 }));
+  const capped = planLayoutReplies(many, () => false, 70, 80);
+  assert.equal(capped.count, PENDING_REPLY_BOXES_MAX);
+  assert.equal(capped.heights[capped.heights.length - 1], folded, "the newest reply's box is kept");
+});

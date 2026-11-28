@@ -330,6 +330,12 @@ fn routes(state: AppState) -> Router {
             "/api/v1/transcripts/{channel_id}/{thread_id}",
             get(api::transcript_thread),
         )
+        // `#2385 vibe-talk-thread-open-layout-first`: one thread's reply count and each reply's
+        // size, before its bodies, from this server's own copy alone.
+        .route(
+            "/api/v1/channels/{channel_id}/threads/{thread_id}/layout",
+            get(api::thread_layout),
+        )
         .route("/api/v1/channels/{channel_id}/count", get(api::count))
         // `#717 vt-unread-recap`. READ scope: a window grouped by thread with Done tags.
         .route("/api/v1/channels/{channel_id}/recap", get(api::recap))

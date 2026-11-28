@@ -27,7 +27,13 @@ bodies" is an order of events, never a clock (owner rule 346). At 412x915 (dark,
   one announcement: the boxes' status line says "8 more replies loading" once, and no box is
   a live region;
   the kill switch (negative control): with "vibe-talk.voice.thread-reply-boxes" kept "0", the
-  late-count case is the old behaviour: no box, and no read of the thread when the count lands.
+  late-count case is the old behaviour: no box, and no read of the thread when the count lands;
+  each box priced from its own reply (S-t1): the thread's layout (`GET .../threads/{id}/layout`,
+  each reply's id and stored body size) is asked BEFORE the bodies' read (by when the page sent
+  each, its resource timing), is answered at once while the bodies are held, and re-prices the
+  boxes one per reply: every box's drawn height equals its entry's price (`layoutReplyPx`,
+  core/channels/pending.ts, mirrored here as `layout_price`) within 1 px, and the varied cases'
+  boxes are not all one height. A page build without the layout read fails exactly this check.
 
 Pass --screenshots DIR to keep a PNG with the boxes up and one after the fill, per case.
 """
@@ -36,10 +42,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import tempfile
 import threading
 import time
+from datetime import datetime
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -63,6 +72,15 @@ HELD_ID = "207"
 LINE = f"{NEW_REPLIES} more replies loading"
 # Generous condition timeouts for a hot host (rule 346): a wait ends on its condition.
 WAIT_S = 90.0
+# The page's box pricing (core/channels/pending.ts `layoutReplyPx`), mirrored: forty characters a line,
+# a step of the base per line past three, a long body priced as its folded row (3 lines and the elided
+# line); and the server's fold threshold (the page's COLLAPSE_OVER_CHARS).
+CHARS_PER_LINE = 40
+LINE_STEP = 0.18
+FOLDED_LINES = 4
+LONG_OVER = 280
+FILE_MARK = "\U0001F4CE"
+LAYOUT_PATH = re.compile(r"^/api/v1/channels/[^/]+/threads/(.+)/layout$")
 
 # Per frame, whatever changed: the rows the thread list shows, the boxes, the status line, and the
 # screen tops of the root, the held reply, the first box and the first new reply.
@@ -104,10 +122,11 @@ SAMPLER = r"""
 class NightApi(fixture.FakeApi):
     """A channel of six notes and one thread: its root and one reply, then eight more posted."""
 
-    def __init__(self, long_replies: bool, tall_held: bool) -> None:
+    def __init__(self, long_replies: bool, tall_held: bool, varied: bool = False) -> None:
         super().__init__()
         self.long_replies = long_replies
-        self.gates = {"main": threading.Event(), "thread": threading.Event()}
+        self.varied = varied
+        self.gates = {"main": threading.Event(), "thread": threading.Event(), "layout": threading.Event()}
         for gate in self.gates.values():
             gate.set()
         self.root_thread = {"id": THREAD_ID, "root_message_id": ROOT_ID, "is_root": True,
@@ -151,8 +170,15 @@ class NightApi(fixture.FakeApi):
             start = len(self.messages)
             for k in range(NEW_REPLIES):
                 words = f"Reply {k + 2}: overnight step {k + 2} finished. "
-                words += ("The step's output, line by line, as the run wrote it. " * 14) if self.long_replies \
-                    else "Details of the step. " * (k % 3 + 1)
+                if self.varied:
+                    # Four shapes, so the boxes the layout prices are not all one height: one line, a
+                    # paragraph of five lines, eight short lines, and one long enough to fold.
+                    words += ["Done.", "The step's output as the run wrote it, line by line. " * 3,
+                              "\n".join(f"line {n}" for n in range(8)),
+                              "The step's output, line by line, as the run wrote it. " * 7][k % 4]
+                else:
+                    words += ("The step's output, line by line, as the run wrote it. " * 14) if self.long_replies \
+                        else "Details of the step. " * (k % 3 + 1)
                 self.messages.append(message(start + k, words, {**self.root_thread, "is_root": False}))
             count = self.held + NEW_REPLIES
             for row in self.messages:
@@ -161,6 +187,43 @@ class NightApi(fixture.FakeApi):
                     thread["reply_count"] = count
             self.threads[0]["reply_count"] = count
             self.threads[0]["updated_at"] = self.messages[-1]["timestamp"]
+
+    def layout_entries(self) -> list[Json]:
+        """The thread's replies as the server's layout describes them, in thread order."""
+        entries: list[Json] = []
+        for row in self.messages:
+            thread = fixture.thread_of(row)
+            if thread.get("id") != THREAD_ID or thread.get("is_root") is True:
+                continue
+            content = str(row["content"])
+            length = len(content.encode("utf-16-le")) // 2
+            stamp = str(row["timestamp"]).replace("Z", "+00:00")
+            entries.append({
+                "id": row["id"], "author_id": row["author_id"],
+                "created_ms": int(datetime.fromisoformat(stamp).timestamp() * 1000),
+                "length_utf16": length, "lines": content.count("\n") + 1,
+                "flags": {"attachments": any(line.lstrip().startswith(FILE_MARK) for line in content.split("\n")),
+                          "long": length > LONG_OVER},
+                "estimated": True,
+            })
+        return entries
+
+    def extra_get(self, path: str, query: dict[str, list[str]]) -> tuple[int, Json] | None:
+        """`#2385` S-t1: the thread's layout, answered at once (never behind the held reads)."""
+        del query
+        found = LAYOUT_PATH.match(path)
+        if not found or found.group(1) != THREAD_ID:
+            return None
+        # Held only where a walk holds it, to see the boxes before and after their re-price.
+        self.gates["layout"].wait(WAIT_S)
+        with self.lock:
+            entries = self.layout_entries()
+            return 200, {"channel_id": fixture.CHANNEL["id"], "thread_id": THREAD_ID, "total": len(entries),
+                         "total_exact": True, "entries": entries, "more_before": False}
+
+    def layout_reads(self) -> list[str]:
+        with self.lock:
+            return [r for r in self.requests if "/layout" in r]
 
     def thread_reads(self) -> list[str]:
         with self.lock:
@@ -221,12 +284,73 @@ def drift(trace: list[Frame], key: str, start: int) -> float:
     return max((abs(t - tops[0]) for t in tops), default=0.0)
 
 
+def layout_price(entry: Json, base: float) -> int:
+    """A box's price for its layout entry: core/channels/pending.ts `layoutReplyPx`, mirrored."""
+    length = max(0, int(str(entry["length_utf16"])))
+    breaks = max(1, int(str(entry["lines"])))
+    wrapped = max(1, math.ceil(length / CHARS_PER_LINE), breaks)
+    flags = entry["flags"]
+    drawn = min(wrapped, FOLDED_LINES) if isinstance(flags, dict) and flags.get("long") is True else wrapped
+    # JavaScript's Math.round, not Python's round-half-even.
+    return math.floor((base if drawn <= 3 else base * (1 + (drawn - 3) * LINE_STEP)) + 0.5)
+
+
+def layout_priced(case: Case, page: Page) -> str:
+    """Wait for the layout to price the boxes, and require each box's height to be its entry's price."""
+    until(page, "() => String((document.getElementById('pending-replies') || {getAttribute: () => ''})"
+                ".getAttribute('data-priced') || '').startsWith('layout:')",
+          f"{case.tag}: the layout never priced the boxes (a page without the layout read)")
+    settled(page)
+    drawn = page.evaluate("() => { const box = document.getElementById('pending-replies');"
+                          " return {base: Number(box.getAttribute('data-px')),"
+                          " heights: [...box.querySelectorAll('.pending-reply')].map((li) => li.getBoundingClientRect().height)}; }")
+    base = float(drawn["base"])
+    heights = [float(h) for h in drawn["heights"]]
+    new = [entry for entry in case.api.layout_entries() if str(entry["id"]) not in case.api.read_ids]
+    expected = [layout_price(entry, base) for entry in new]
+    check(len(heights) == len(expected) and all(abs(h - e) <= 1.0 for h, e in zip(heights, expected)),
+          f"{case.tag}: the boxes stand {heights}, not their entries' prices {expected} (base {base})")
+    if case.api.varied:
+        check(len(set(expected)) > 1, f"{case.tag}: the varied replies priced one height {expected}")
+    return f"boxes priced per reply {[round(h) for h in heights]} (base {base:.0f})"
+
+
+def layout_first(case: Case, page: Page) -> None:
+    """The layout read was sent before the bodies' read, by when the page started each (resource timing)."""
+    starts = page.evaluate("() => performance.getEntriesByType('resource').map((e) => [e.name, e.startTime])")
+    layout = [float(t) for name, t in starts if "/layout" in str(name)]
+    bodies = [float(t) for name, t in starts if "view=thread" in str(name)]
+    check(bool(layout) and bool(bodies) and min(layout) < min(bodies),
+          f"{case.tag}: the layout read did not go out before the bodies' read "
+          f"(layout {layout}, bodies {bodies}; reads at the fake API {case.api.layout_reads()} / {case.api.thread_reads()})")
+
+
+def reprice(case: Case, page: Page, mark: int) -> float:
+    """Release the held layout and require that its re-price moves neither the head, the held reply nor
+    the first box on any frame from `mark` (the count's boxes standing, the entry landed) on (rule 370)."""
+    deadline = time.monotonic() + WAIT_S
+    while not case.api.layout_reads() and time.monotonic() < deadline:
+        page.wait_for_timeout(25)
+    check(bool(case.api.layout_reads()), f"{case.tag}: the boxes stood and no layout was asked")
+    case.api.release("layout")
+    until(page, "() => String((document.getElementById('pending-replies') || {getAttribute: () => ''})"
+                ".getAttribute('data-priced') || '').startsWith('layout:')",
+          f"{case.tag}: the layout never priced the boxes (a page without the layout read)")
+    settled(page)
+    settled(page)
+    trace = frames(page)
+    moved = max(drift(trace, "root", mark), drift(trace, "held", mark), drift(trace, "box", mark))
+    check(moved <= 0.5, f"{case.tag}: the layout's re-price moved the rows {moved:.2f} px (rule 370)")
+    return moved
+
+
 class Case:
     def __init__(self, pw: Playwright, args: argparse.Namespace, label: str, size: tuple[int, int], scheme: str,
-                 name: str, long_replies: bool = False, tall_held: bool = False, switch_off: bool = False) -> None:
+                 name: str, long_replies: bool = False, tall_held: bool = False, switch_off: bool = False,
+                 varied: bool = False) -> None:
         self.pw, self.args, self.label, self.size, self.scheme = pw, args, label, size, scheme
         self.name, self.switch_off = name, switch_off
-        self.api = NightApi(long_replies, tall_held)
+        self.api = NightApi(long_replies, tall_held, varied)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(self.api))
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -286,6 +410,7 @@ def late_count(case: Case, profile: str) -> str:
     case.api.add_replies()
     case.api.hold("main")
     case.api.hold("thread")
+    case.api.hold("layout")
     context, page = case.context(profile)
     try:
         page.goto(case.url, wait_until="load")
@@ -336,7 +461,11 @@ def late_count(case: Case, profile: str) -> str:
         settled(page)
         before = frames(page)
         landing = max(drift(before, "root", start), drift(before, "held", start))
-        filling = len(before) - 1
+        # S-t1: the layout lands (released here, the bodies still held) and prices each box, in one
+        # held change: from the count's boxes on, nothing above them moves.
+        repriced = reprice(case, page, len(before) - 1)
+        priced = layout_priced(case, page)
+        filling = len(frames(page)) - 1
         case.shot(page, "boxes")
         case.api.release("thread")
         until(page, f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {1 + self_held(case) + NEW_REPLIES} "
@@ -358,11 +487,14 @@ def late_count(case: Case, profile: str) -> str:
               f"(the coverage line above changed {seam:.2f} px) (rule 370)")
         said = page.evaluate("() => window.__said")
         check([text for text in said if text] == [LINE], f"{case.tag}: the status line said {said}, not {LINE!r} once")
-        return (f"{case.tag}: count landed -> {NEW_REPLIES} boxes + thread read at once (landing {landing:.2f} px); "
-                f"fill moved the rows {own:.2f} px of its own (coverage line {seam:.2f} px, #2391); said once")
+        layout_first(case, page)
+        return (f"{case.tag}: count landed -> {NEW_REPLIES} boxes, layout then thread read at once (landing {landing:.2f} px); "
+                f"{priced}, re-price moved {repriced:.2f} px; fill moved the rows {own:.2f} px of its own "
+                f"(coverage line {seam:.2f} px, #2391); said once")
     finally:
         case.api.release("main")
         case.api.release("thread")
+        case.api.release("layout")
         context.close()
 
 
@@ -371,6 +503,7 @@ def count_at_entry(case: Case, profile: str) -> str:
     case.earlier_visit(profile)
     case.api.add_replies()
     case.api.hold("thread")
+    case.api.hold("layout")
     context, page = case.context(profile)
     try:
         page.goto(case.url, wait_until="load")
@@ -391,6 +524,11 @@ def count_at_entry(case: Case, profile: str) -> str:
         check(all(num(f, "rows") == held_rows for f in shown), f"{case.tag}: a body folded before the read was released")
         reads = case.api.thread_reads()
         check(len(reads) == 1 and "reason=enter" in reads[0], f"{case.tag}: entering read: {reads}")
+        # S-t1: the layout lands (released here, the bodies still held) and prices each box, in one
+        # held change: the first box and the head stay where the entry put them.
+        settled(page)
+        repriced = reprice(case, page, len(frames(page)) - 1)
+        priced = layout_priced(case, page)
         box_top = page.evaluate("() => document.querySelector('#pending-replies .pending-reply').getBoundingClientRect().top")
         landed = len(frames(page)) - 1
         case.shot(page, "boxes")
@@ -420,10 +558,13 @@ def count_at_entry(case: Case, profile: str) -> str:
         check([text for text in said if text] == [LINE], f"{case.tag}: the status line said {said}, not {LINE!r} once")
         live = page.evaluate("() => document.querySelectorAll('#pending-replies [aria-live]').length")
         check(live == 1, f"{case.tag}: {live} live regions among the boxes: one status line, none per box")
-        return (f"{case.tag}: {NEW_REPLIES} boxes in the first frame; landed with the {head} at the head; first reply "
-                f"stands where its box stood ({abs(first_top - box_top):.2f} px); head moved {moved:.2f} px; said once")
+        layout_first(case, page)
+        return (f"{case.tag}: {NEW_REPLIES} boxes in the first frame; {priced}, re-price moved {repriced:.2f} px; landed "
+                f"with the {head} at the head; first reply stands where its box stood ({abs(first_top - box_top):.2f} px); "
+                f"head moved {moved:.2f} px; said once")
     finally:
         case.api.release("thread")
+        case.api.release("layout")
         context.close()
 
 
@@ -448,6 +589,9 @@ def main() -> int:
         ("count-at-entry", count_at_entry, {}),
         ("long-replies", count_at_entry, {"long_replies": True}),
         ("box-at-head", count_at_entry, {"tall_held": True}),
+        # S-t1: replies of four shapes, so the layout's prices are not all one height.
+        ("varied-replies", count_at_entry, {"varied": True}),
+        ("late-varied", late_count, {"varied": True}),
         ("switch-off", late_count, {"switch_off": True}),
     )
     report: list[str] = []

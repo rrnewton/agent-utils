@@ -267,6 +267,13 @@ fn inventory() -> Vec<Route> {
             Read,
             Query("?cap=5", "?cap=soon"),
         ),
+        // `#2385 vibe-talk-thread-open-layout-first`: a read, from the server's copy alone.
+        route(
+            "GET",
+            "/api/v1/channels/{channel_id}/threads/{thread_id}/layout",
+            Read,
+            limit,
+        ),
         // `#1608 agent-transcripts-timeline`: reads, store/cache only.
         route("GET", "/api/v1/transcripts", Read, limit),
         route(

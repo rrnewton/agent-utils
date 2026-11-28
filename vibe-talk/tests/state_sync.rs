@@ -370,6 +370,43 @@ async fn timeline_newest_thread_and_delta_answer_while_the_provider_is_held() {
 }
 
 #[tokio::test]
+async fn a_threads_layout_answers_while_the_provider_is_held_and_begins_no_call() {
+    // `#2385 vibe-talk-thread-open-layout-first`: the page asks for a thread's layout as it draws
+    // the boxes for the replies it lacks, just before it reads the thread. It is the copy's alone:
+    // answered while the next provider call is held, and stronger than held, no call begun at all,
+    // behind included (the thread read beside it schedules any fill). The entries themselves are
+    // `message_cache_serve`'s, on a Slack copy whose replies are filed in their thread.
+    let d = deployment("state-sync-layout").await;
+    let root = d.ids[5].clone();
+    d.fake.seed_reply(
+        &ChannelId(READ_CHANNEL.to_owned()),
+        "Ada",
+        "thread reply",
+        &root,
+    );
+    d.fill_timeline().await;
+    d.fill_thread(&root).await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    for token in [WRITE_TOKEN, READ_TOKEN] {
+        let before = d.counting.calls().len();
+        let body = ok_while_held_as(
+            &d,
+            &path(READ_CHANNEL, &format!("/threads/{root}/layout")),
+            token,
+        )
+        .await;
+        assert!(body["entries"].is_array(), "{body}");
+        assert_eq!(body["thread_id"], root.0.as_str(), "{body}");
+        assert_eq!(
+            calls_since(&d, before),
+            Vec::<String>::new(),
+            "the layout began a provider call"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_step_back_from_a_served_page_answers_while_the_provider_is_held() {
     // As `message_cache_serve`'s cursor walk, through the counting hold: a proven page
     // first (hours later, serving on), then its own cursor back into held history.
@@ -1423,6 +1460,12 @@ fn classification() -> Vec<Entry> {
             },
         ),
         e("GET", "/api/v1/channels/{channel_id}/timeline", Class::Held),
+        // `#2385`: from the copy alone; its case also requires no call begun at all.
+        e(
+            "GET",
+            "/api/v1/channels/{channel_id}/threads/{thread_id}/layout",
+            Class::Held,
+        ),
         e("GET", "/api/v1/channels/{channel_id}/search", Class::Held),
         e("GET", "/api/v1/search", Class::Held),
         e(
@@ -1876,6 +1919,10 @@ const HELD_TEMPLATES: &[(&str, &str)] = &[
     ("GET", "/api/v1/search"),
     ("GET", "/api/v1/channels/{channel_id}/digest"),
     ("GET", "/api/v1/channels/{channel_id}/recap"),
+    (
+        "GET",
+        "/api/v1/channels/{channel_id}/threads/{thread_id}/layout",
+    ),
 ];
 
 /// Every `(METHOD, path)` the router source registers with a literal path. The same

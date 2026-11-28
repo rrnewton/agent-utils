@@ -1827,6 +1827,49 @@
       "upstream": "none"
     }
   ],
+  "ThreadLayoutResponse": [
+    {
+      "channel_id": "100",
+      "entries": [
+        {
+          "author_id": "7",
+          "created_ms": 1700000000200,
+          "estimated": true,
+          "flags": {
+            "attachments": false,
+            "long": false
+          },
+          "id": "1700000000.000200",
+          "length_utf16": 12,
+          "lines": 1
+        },
+        {
+          "author_id": "8",
+          "created_ms": 1700000000300,
+          "estimated": true,
+          "flags": {
+            "attachments": true,
+            "long": true
+          },
+          "id": "1700000000.000300",
+          "length_utf16": 640,
+          "lines": 9
+        }
+      ],
+      "more_before": true,
+      "thread_id": "1700000000.000100",
+      "total": 3,
+      "total_exact": true
+    },
+    {
+      "channel_id": "100",
+      "entries": [],
+      "more_before": false,
+      "thread_id": "1700000000.000100",
+      "total": null,
+      "total_exact": false
+    }
+  ],
   "ThreadPinChangeResponse": [
     {
       "changed": true,

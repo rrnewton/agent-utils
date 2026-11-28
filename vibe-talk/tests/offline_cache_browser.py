@@ -357,6 +357,15 @@ class FakeApi:
         self.provider_name = "Discord"
         self.upstream_read = False
 
+    def extra_get(self, path: str, query: dict[str, list[str]]) -> tuple[int, Json] | None:
+        """A GET route a walk's own fake serves beyond the shared ones (status, body), or None.
+
+        `#2385`: the thread layout route, for one. None here: a page asking a route no walk serves
+        is answered 404, as an older server would answer it.
+        """
+        del path, query
+        return None
+
     def pin_list(self) -> Json:
         with self.lock:
             pins = sorted(self.pins.values(), key=lambda pin: str(pin["timestamp"]))
@@ -783,6 +792,8 @@ def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
                 self.json(*api.summary(summary.group(1)))
             elif path.endswith("/stream"):
                 self.stream()
+            elif (extra := api.extra_get(path, parse_qs(parts.query))) is not None:
+                self.json(*extra)
             else:
                 self.json(404, {"error": "not_found", "detail": "not served by this check"})
 

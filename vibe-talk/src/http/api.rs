@@ -3256,6 +3256,40 @@ pub async fn recap(
     Ok(no_store(Json(response)))
 }
 
+/// Query parameters for a thread's layout. `#2385 vibe-talk-thread-open-layout-first`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ThreadLayoutQuery {
+    /// How many of the thread's newest replies to describe: the page's thread page (50) unless
+    /// given, at most a timeline page's maximum.
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/v1/channels/{channel_id}/threads/{thread_id}/layout` — one thread's reply count and
+/// one entry per reply this server holds (id, time, author, the stored body's size, what it is),
+/// before any body. READ scope. Answered from this server's own copy alone: no read of the chat
+/// service begins for it, inline or behind. See [`crate::thread_layout`].
+pub async fn thread_layout(
+    State(state): State<AppState>,
+    ReadScope(_caller): ReadScope,
+    Path((channel_id, thread_id)): Path<(String, String)>,
+    Query(query): Query<ThreadLayoutQuery>,
+) -> Result<Response, ApiError> {
+    if thread_id.trim().is_empty()
+        || thread_id.len() > 1024
+        || thread_id.chars().any(char::is_control)
+    {
+        return Err(ApiError::bad_request(
+            "thread_id must be a non-empty thread identifier",
+        ));
+    }
+    let limit = query
+        .limit
+        .unwrap_or(crate::thread_layout::DEFAULT_LIMIT)
+        .clamp(1, crate::thread_layout::MAX_LIMIT);
+    let response = ops::thread_layout(&state, &channel_id, &thread_id, limit).await?;
+    Ok(no_store(Json(response)))
+}
+
 /// Discuss is not available on this deployment's summariser backend. `catchup-side-agent`.
 ///
 /// A distinguishable 503, never the bare summariser-not-configured: a deployment whose

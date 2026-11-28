@@ -4720,3 +4720,225 @@ async fn after_a_drop_all_is_walked_back_to_its_start_from_the_copy_with_one_wal
         walk_lines(&capture).join("\n")
     );
 }
+
+// --- `#2385 vibe-talk-thread-open-layout-first`: one thread's layout from the server's copy ----
+
+/// A Slack channel of three messages, the second the root of a thread of four replies of
+/// different shapes (one line; three lines; longer than the page's fold; a shared file from
+/// another author), filled into a cache through a read of Main and of the thread, serving on.
+/// Answers the root's id (the thread's), and the replies' message ids as the thread read gave them.
+async fn slack_layout_deployment(
+    tag: &str,
+) -> (AppState, slack_fake::Fake, TempDir, String, Vec<String>) {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut history: Vec<Value> = (0..3)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
+        .collect();
+    let root = slack_fake::ts(60, 0);
+    slack_fake::thread(
+        &mut fixture,
+        SLACK_CH,
+        &mut history[1],
+        &[
+            (slack_fake::ts(70, 0), "short".to_owned()),
+            (slack_fake::ts(80, 0), "one\ntwo\nthree".to_owned()),
+            (
+                slack_fake::ts(90, 0),
+                "long ".repeat(60).trim_end().to_owned(),
+            ),
+        ],
+    );
+    fixture.history.insert(SLACK_CH.to_owned(), history);
+    slack_fake::add_reply_message(
+        &mut fixture,
+        SLACK_CH,
+        &root,
+        slack_fake::file_post(
+            &slack_fake::ts(100, 0),
+            "UBEA00002",
+            "Bea",
+            "the run's log",
+            vec![slack_fake::file(
+                "F0000LOG1",
+                "run.log",
+                "Plain Text",
+                "https://files.example/",
+            )],
+        ),
+    );
+    let fake = slack_fake::Fake::start(fixture, 10).await;
+    let dir = TempDir::new(tag);
+    let clock = ManualClock::at(slack_ms(3_600));
+    let text = format!(
+        r#"
+[auth]
+read_token = "{READ_TOKEN}"
+write_token = "{WRITE_TOKEN}"
+
+[[providers]]
+key = "{SLACK}"
+kind = "slack"
+api_base = "{base}"
+token = "{token}"
+
+[[channels]]
+id = "{SLACK_CH}"
+label = "team"
+writable = true
+"#,
+        base = fake.base,
+        token = slack_fake::TOKEN,
+    );
+    let (mut state, _discord, _store) = testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    let state = testing::with_message_cache(state, dir.path(), clock).await;
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    let thread = ok(
+        &state,
+        &path(
+            SLACK_CH,
+            &format!("/timeline?view=thread&thread_id={root}&limit=50"),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    let replies: Vec<String> = thread["messages"]
+        .as_array()
+        .expect("the thread's messages")
+        .iter()
+        .filter(|message| message["thread"]["is_root"] != true)
+        .map(|message| message["id"].as_str().expect("an id").to_owned())
+        .collect();
+    assert_eq!(replies.len(), 4, "the fill read the four replies: {thread}");
+    settled(&state).await;
+    state.message_cache.set_serve(true);
+    (state, fake, dir, root, replies)
+}
+
+/// Every call the Slack fake has answered so far, of any method.
+fn slack_calls(fake: &slack_fake::Fake) -> usize {
+    fake.with(|fixture| fixture.calls.values().sum())
+}
+
+/// The layout route of `thread` in the Slack channel, with `query` after it.
+fn layout_path(thread: &str, query: &str) -> String {
+    path(SLACK_CH, &format!("/threads/{thread}/layout{query}"))
+}
+
+#[tokio::test]
+async fn a_threads_layout_is_its_replies_in_order_with_their_sizes_from_the_copy_alone() {
+    let (state, fake, _dir, root, replies) = slack_layout_deployment("thread-layout").await;
+    // Any replies read of the thread would wait here until released, and none is: the layout is
+    // the copy's, and nothing reads Slack for it, inline or behind.
+    fake.with(|fixture| fixture.hold_replies = Some(slack_fake::Hold::new(&root)));
+    let before = slack_calls(&fake);
+    let body = tokio::time::timeout(WAIT, ok(&state, &layout_path(&root, ""), READ_TOKEN))
+        .await
+        .expect("the layout answered with the replies read held");
+    settled(&state).await;
+    assert_eq!(slack_calls(&fake), before, "the layout read Slack: {body}");
+
+    assert_eq!(body["channel_id"], SLACK_CH, "{body}");
+    assert_eq!(body["thread_id"], root.as_str(), "{body}");
+    assert_eq!(body["total"], 4, "the record's count: {body}");
+    assert_eq!(body["total_exact"], true, "{body}");
+    assert_eq!(body["more_before"], false, "{body}");
+    let entries = body["entries"].as_array().expect("entries");
+    let ids: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("an id"))
+        .collect();
+    assert_eq!(
+        ids, replies,
+        "the replies in thread order, by the ids the thread read gives, the root left out: {body}"
+    );
+    let created: Vec<i64> = entries
+        .iter()
+        .map(|entry| entry["created_ms"].as_i64().expect("a time"))
+        .collect();
+    assert_eq!(
+        created,
+        [slack_ms(70), slack_ms(80), slack_ms(90), slack_ms(100)],
+        "{body}"
+    );
+    let shape = |at: usize| {
+        let entry = &entries[at];
+        (
+            entry["length_utf16"].as_u64().expect("a length"),
+            entry["lines"].as_u64().expect("lines"),
+            entry["flags"]["long"] == true,
+            entry["flags"]["attachments"] == true,
+            entry["estimated"] == true,
+        )
+    };
+    assert_eq!(shape(0), (5, 1, false, false, true), "short: {body}");
+    assert_eq!(shape(1), (13, 3, false, false, true), "three lines: {body}");
+    assert_eq!(
+        shape(2),
+        (299, 1, true, false, true),
+        "over the fold: {body}"
+    );
+    let (_, file_lines, file_long, file_listed, _) = shape(3);
+    assert!(
+        file_listed && !file_long && file_lines >= 3,
+        "the shared file is a line of the body: {body}"
+    );
+    assert_eq!(entries[0]["author_id"], "UREPLIER1", "{body}");
+    assert_eq!(entries[3]["author_id"], "UBEA00002", "{body}");
+
+    // The newest two, and a word that older ones are held.
+    let newest = ok(&state, &layout_path(&root, "?limit=2"), READ_TOKEN).await;
+    let ids: Vec<&str> = newest["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("an id"))
+        .collect();
+    assert_eq!(ids, replies[2..], "{newest}");
+    assert_eq!(newest["more_before"], true, "{newest}");
+    assert_eq!(
+        slack_calls(&fake),
+        before,
+        "the layout read Slack: {newest}"
+    );
+}
+
+#[tokio::test]
+async fn a_threads_layout_the_copy_cannot_give_is_empty_and_never_reads_slack() {
+    let (state, fake, _dir, root, _replies) = slack_layout_deployment("thread-layout-empty").await;
+    let before = slack_calls(&fake);
+    // A thread the copy holds nothing of: no entries and no count, and no read of Slack begun.
+    let unknown = slack_fake::ts(120, 0);
+    let body = ok(&state, &layout_path(&unknown, ""), READ_TOKEN).await;
+    assert_eq!(body["entries"], serde_json::json!([]), "{body}");
+    assert!(body["total"].is_null(), "{body}");
+    // Serving off: the copy answers no page read, the layout included.
+    state.message_cache.set_serve(false);
+    let off = ok(&state, &layout_path(&root, ""), READ_TOKEN).await;
+    assert_eq!(off["entries"], serde_json::json!([]), "{off}");
+    settled(&state).await;
+    assert_eq!(slack_calls(&fake), before, "the layout read Slack");
+    // A channel off the allowlist does not exist here, and an empty thread id is refused.
+    let (status, _) = call(
+        &state,
+        &format!("/api/v1/channels/C0000NOPE1/threads/{root}/layout"),
+        READ_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&state, &layout_path("%20", ""), READ_TOKEN).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

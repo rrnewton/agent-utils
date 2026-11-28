@@ -24,10 +24,11 @@ use vibe_talk::contract::{
     MessageLabelChangeResponse, MessageLabelRequest, MessageLabelsResponse, MessagesResponse,
     NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
-    ThreadPinChangeResponse, ThreadPinsResponse, TimelineAround, TimelineResponse, TokenScope,
-    TranscriptRole, TranscriptThreadInfo, TranscriptsResponse, UpstreamClearAttemptView,
-    UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
-    VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
+    ThreadLayoutEntry, ThreadLayoutFlags, ThreadLayoutResponse, ThreadPinChangeResponse,
+    ThreadPinsResponse, TimelineAround, TimelineResponse, TokenScope, TranscriptRole,
+    TranscriptThreadInfo, TranscriptsResponse, UpstreamClearAttemptView, UpstreamClearNowOutcome,
+    UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
+    VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
 };
 use vibe_talk::contract::{ChannelHistoryState, HistoryModeChoice, HistoryModeRequest};
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
@@ -953,6 +954,49 @@ fn samples() -> Value {
                 channel_id: vibe_talk::model::ChannelId("100".into()),
                 messages: Vec::new(),
                 revision: 0,
+            }),
+        ],
+        "ThreadLayoutResponse": [
+            to(&ThreadLayoutResponse {
+                channel_id: ChannelId("100".into()),
+                thread_id: "1700000000.000100".into(),
+                total: Some(3),
+                total_exact: true,
+                entries: vec![
+                    ThreadLayoutEntry {
+                        id: MessageId("1700000000.000200".into()),
+                        created_ms: 1_700_000_000_200,
+                        author_id: UserId("7".into()),
+                        length_utf16: 12,
+                        lines: 1,
+                        flags: ThreadLayoutFlags {
+                            attachments: false,
+                            long: false,
+                        },
+                        estimated: true,
+                    },
+                    ThreadLayoutEntry {
+                        id: MessageId("1700000000.000300".into()),
+                        created_ms: 1_700_000_000_300,
+                        author_id: UserId("8".into()),
+                        length_utf16: 640,
+                        lines: 9,
+                        flags: ThreadLayoutFlags {
+                            attachments: true,
+                            long: true,
+                        },
+                        estimated: true,
+                    },
+                ],
+                more_before: true,
+            }),
+            to(&ThreadLayoutResponse {
+                channel_id: ChannelId("100".into()),
+                thread_id: "1700000000.000100".into(),
+                total: None,
+                total_exact: false,
+                entries: Vec::new(),
+                more_before: false,
             }),
         ],
         "MessageLabelRequest": [

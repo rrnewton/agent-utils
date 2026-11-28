@@ -5191,3 +5191,132 @@ test("`#2346 vibe-talk-search-landed-reader-follows-foot`: a search that leaves 
   const other = run({ typed: false });
   assert.deepStrictEqual(other.calls.map((c) => c.split(" ")[0]), ["nudge"], `another filter's placement changed: ${JSON.stringify(other.calls)}`);
 });
+
+test("`#2385` S-t1: the layout goes out before the bodies' read and prices each box in one held change, from the module alone", async () => {
+  const { createPendingReplies } = CHANNEL_VIEW;
+  const { layoutReplyPx } = await moduleForTests("src/core/channels/index.ts");
+  /** A stand-in element enough for the boxes: attributes, children, a style, a height. */
+  class El {
+    constructor(tag, height = 0) {
+      Object.assign(this, { tagName: tag.toUpperCase(), className: "", textContent: "", hidden: false, children: [], style: {}, attrs: new Map(), fixed: height });
+    }
+    setAttribute(name, value) { this.attrs.set(name, String(value)); }
+    getAttribute(name) { return this.attrs.has(name) ? this.attrs.get(name) : null; }
+    removeAttribute(name) { this.attrs.delete(name); }
+    append(...kids) { this.children.push(...kids); }
+    replaceChildren(...kids) { this.children = [...kids]; }
+    getBoundingClientRect() {
+      const own = parseFloat(this.style.height || "") || this.fixed;
+      const kids = this.children.reduce((sum, kid) => sum + kid.getBoundingClientRect().height, 0);
+      return { height: Math.max(own, kids, parseFloat(this.style.minHeight || "") || 0), top: 0, bottom: 0 };
+    }
+  }
+  const was = globalThis.document;
+  globalThis.document = { createElement: (tag) => new El(tag) };
+  try {
+    const reply = new El("li", 70);
+    reply.setAttribute("data-id", "r1");
+    const log = new El("ol");
+    log.append(reply);
+    const box = new El("div");
+    const area = { scrollHeight: 1000, clientHeight: 800, scrollTop: 200 };
+    const calls = [];
+    let owed = false;
+    let missing = 0;
+    let answer = null;
+    let held = new Set(["r1"]);
+    const owner = createPendingReplies({
+      el: (id) => (id === "pending-replies" ? box : id === "discord-log" ? log : null),
+      enabled: () => true,
+      openThread: () => "T",
+      missingReplies: () => missing,
+      readComing: () => owed,
+      oweRead: () => { calls.push("owe"); owed = true; },
+      readThread: () => calls.push("read"),
+      isThreadRoot: () => false,
+      readLayout: (id) => { calls.push(`layout:${id}`); return new Promise((done) => { answer = done; }); },
+      heldIds: () => held,
+      preservingScroll: (mutate) => { calls.push("held"); mutate(); },
+      scroller: () => area,
+      keepColumn: (act) => () => { calls.push("column"); act(); },
+    });
+    const items = () => box.children.find((kid) => kid.className.includes("pending-replies-list"))?.children || [];
+    const heights = () => items().map((item) => parseFloat(item.style.height));
+    const flush = () => new Promise((done) => setTimeout(done, 0));
+
+    // The late count: the layout is asked BEFORE the read that brings the bodies, and the boxes stand
+    // at the count's price meanwhile.
+    missing = 3;
+    owner.sync({ read: true });
+    assert.deepStrictEqual(calls, ["owe", "layout:T", "read"]);
+    assert.deepStrictEqual(heights(), [70, 70, 70]);
+    // The layout lands: each box priced from its own entry, in one held change, in the asking column.
+    const entry = (id, length, flags = {}) => ({ id, length_utf16: length, lines: 1, flags: { attachments: false, long: false, ...flags } });
+    const entries = [entry("r1", 10), entry("r2", 12), entry("r3", 200), entry("r4", 2000, { long: true })];
+    answer({ entries });
+    await flush();
+    assert.deepStrictEqual(calls.slice(3), ["column", "held"]);
+    assert.deepStrictEqual(heights(), entries.slice(1).map((one) => layoutReplyPx(one, 70)));
+    assert.deepStrictEqual(items().map((item) => Number(item.getAttribute("data-px"))), heights());
+    assert.ok(String(box.getAttribute("data-priced")).startsWith("layout:"));
+    // A sync with nothing new keeps the priced boxes, asks nothing again and holds nothing.
+    owner.sync();
+    assert.equal(calls.length, 5);
+    assert.deepStrictEqual(heights(), entries.slice(1).map((one) => layoutReplyPx(one, 70)));
+
+    // The bodies land: the boxes go, and a layout answered after that prices nothing.
+    held = new Set(["r1", "r2", "r3", "r4"]);
+    missing = 0;
+    owed = false;
+    owner.sync();
+    assert.equal(items().length, 0);
+    missing = 2;
+    owed = true;
+    owner.sync();
+    assert.equal(calls[calls.length - 1], "layout:T", "a new shortfall asks again");
+    missing = 0;
+    owed = false;
+    owner.sync();
+    const before = calls.length;
+    answer({ entries: [...entries, entry("r5", 30), entry("r6", 30)] });
+    await flush();
+    assert.deepStrictEqual(calls.slice(before), ["column"], "a layout landing with no boxes standing priced them");
+
+    // A layout that knows more replies after the rows than the count: a box for each it lists.
+    held = new Set(["r1"]);
+    missing = 3;
+    owed = true;
+    owner.sync();
+    assert.equal(items().length, 5, "the layout's five replies after r1, not the count's three");
+
+    // A box set that comes out shorter, at the foot (nothing below the viewport): held as tall as
+    // the scroll position needs, so the list is never clamped up under the reader; the hold goes
+    // with the boxes.
+    const foot = new El("div");
+    let footAnswer = null;
+    const short = createPendingReplies({
+      el: (id) => (id === "pending-replies" ? foot : id === "discord-log" ? log : null),
+      enabled: () => true,
+      openThread: () => "T",
+      missingReplies: () => 3,
+      readComing: () => true,
+      oweRead: () => {},
+      readThread: () => {},
+      isThreadRoot: () => false,
+      readLayout: () => new Promise((done) => { footAnswer = done; }),
+      heldIds: () => new Set(["r1", "r3"]),
+      preservingScroll: (mutate) => mutate(),
+      scroller: () => ({ scrollHeight: 1000, clientHeight: 800, scrollTop: 200 }),
+    });
+    short.sync();
+    const listOf = (el) => el.children.find((kid) => kid.className.includes("pending-replies-list"))?.children || [];
+    assert.equal(listOf(foot).length, 3);
+    // r2 lands above the rows (no box below for it); r4 after them; one more the copy has not read.
+    footAnswer({ entries: [entry("r1", 10), entry("r2", 10), entry("r3", 10), entry("r4", 2000, { long: true })] });
+    await flush();
+    assert.deepStrictEqual(listOf(foot).map((item) => parseFloat(item.style.height)), [layoutReplyPx(entry("r4", 2000, { long: true }), 70), 70]);
+    assert.equal(foot.style.minHeight, "210px", "the shorter box set was let clamp the list under the reader");
+  } finally {
+    globalThis.document = was;
+  }
+});

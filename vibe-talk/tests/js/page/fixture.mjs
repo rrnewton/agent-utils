@@ -6598,6 +6598,9 @@ const TUNING_BANDS = {
   // `#2385 vibe-talk-thread-open-layout-first`: the boxes for an open thread's replies on their way.
   PENDING_REPLY_BOXES_MAX: [50, 50, "boxes at once: the bodies read brings the thread's newest page of 50"],
   PENDING_REPLY_PX_DEFAULT: [40, 200, "a box's height with no reply on screen to measure, px"],
+  // `#2385` S-t1: pricing each box from its reply's layout entry.
+  LAYOUT_CHARS_PER_LINE: [20, 80, "characters a reply's line holds when a box is priced from its body's length"],
+  LAYOUT_FOLDED_LINES: [1, 10, "lines a folded long reply's box is priced at: the collapsed lines and the elided line"],
   REPLY_SAMPLE: [4, 24, "reply rows nearest the boxes a box is priced from (a fixed number of layout reads)"],
 };
 

@@ -2818,6 +2818,59 @@ impl Sink {
         })
     }
 
+    /// What the file holds of one thread, for its layout (`#2385
+    /// vibe-talk-thread-open-layout-first`, [`crate::thread_layout`]): its record, when it has
+    /// one, and the thread scope's newest `limit` rows and two more (the root may be one), oldest
+    /// first. Read from the file alone; nothing here or behind it reads the provider.
+    ///
+    /// `None` wherever a page read may not be answered from the file either: serving off, the
+    /// channel unrouted or its account unchecked, a channel scoped to one conversation (its Main
+    /// holds the replies), or the thread's scope blocked. Checked again after the read, as a
+    /// serve is, so rows read as one account never leave as another's.
+    pub async fn thread_layout_rows(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        limit: usize,
+    ) -> Option<(Option<ThreadRecord>, Vec<super::CachedMessage>)> {
+        if !self.serve_enabled() || thread.is_empty() {
+            return None;
+        }
+        let route_of = |sink: &Self| {
+            let routes = sink.state.routes();
+            routes
+                .fills
+                .get(channel)
+                .filter(|route| sink.verification(&route.key) == Verification::Verified)
+                .map(|route| (route.key.clone(), route.shape))
+        };
+        let (key, shape) = route_of(self)?;
+        if shape == Shape::SlackThread {
+            return None;
+        }
+        let cache = self.cache()?;
+        let chan = ChanKey::new(key.clone(), channel.as_str());
+        let scope = Scope::Thread(thread.to_owned());
+        let thread = thread.to_owned();
+        let read = tokio::task::spawn_blocking(move || {
+            let Read::Served(rows) = cache.newest(&chan, &scope, limit.saturating_add(2)) else {
+                return None;
+            };
+            let record = match cache.thread(&chan, &thread) {
+                Read::Served(record) => record,
+                Read::Off | Read::Failed(_) => None,
+                Read::Moved | Read::Blocked => return None,
+            };
+            Some((record, rows))
+        })
+        .await
+        .ok()
+        .flatten()?;
+        route_of(self)
+            .is_some_and(|(again, _)| again == key)
+            .then_some(read)
+    }
+
     /// Slack's thread list as the file holds it: the `limit` threads with the latest activity
     /// whose roots it holds whole, oldest activity first, each summarised as Slack's own list
     /// summarises it (its root, the root's first line as its title, its reply count, and its latest

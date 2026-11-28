@@ -3030,6 +3030,95 @@ declare namespace VibeTalk {
   }
 
   /**
+   * One reply in a [`ThreadLayoutResponse`]: who wrote it, when, and how big its body is.
+   */
+  interface ThreadLayoutEntry {
+    /**
+     * The author's provider user id.
+     */
+    author_id: UserId;
+    /**
+     * Provider creation time, milliseconds since the Unix epoch.
+     */
+    created_ms: number;
+    /**
+     * Always true: the size is estimated from the stored body, not a drawn row's height.
+     */
+    estimated: boolean;
+    /**
+     * What the body is, beyond its size.
+     */
+    flags: ThreadLayoutFlags;
+    /**
+     * The reply's message id.
+     */
+    id: MessageId;
+    /**
+     * The stored body's length in UTF-16 code units: what JavaScript's `String.length` says of
+     * the message's `content`, the measure the page folds a long body by.
+     */
+    length_utf16: number;
+    /**
+     * The stored body's lines: its line breaks plus one.
+     */
+    lines: number;
+  }
+
+  /**
+   * What a [`ThreadLayoutEntry`]'s body is, beyond its size.
+   */
+  interface ThreadLayoutFlags {
+    /**
+     * The body lists a shared file or an embed (a line starting with the file mark), which the
+     * page draws as a line of its own.
+     */
+    attachments: boolean;
+    /**
+     * The body is longer than the page's fold threshold, so the page draws it folded.
+     */
+    long: boolean;
+  }
+
+  /**
+   * One thread's layout, before its bodies: `GET
+   * /api/v1/channels/{id}/threads/{thread_id}/layout`. `#2385 vibe-talk-thread-open-layout-first`.
+   *
+   * Answered from this server's own copy only, never by a read of the chat service: the page asks
+   * for it as it draws boxes for the replies it lacks, just before it reads the thread itself, and
+   * prices each box from its own entry. Every size here is an estimate from the stored body, never
+   * a measured height. An answer with no entries (the copy holds none of the thread's replies, or
+   * may not answer for them) leaves the page's boxes priced as they were.
+   */
+  interface ThreadLayoutResponse {
+    /**
+     * The channel, as the request named it.
+     */
+    channel_id: ChannelId;
+    /**
+     * The thread's newest replies the copy holds, at most the request's `limit`, in thread order
+     * (oldest first). The root is not among them.
+     */
+    entries: ThreadLayoutEntry[];
+    /**
+     * Whether the copy holds replies older than the first entry, left out by the `limit`.
+     */
+    more_before: boolean;
+    /**
+     * The thread the request named.
+     */
+    thread_id: string;
+    /**
+     * How many replies the copy's record of the thread counts, when it has a record that says;
+     * may be more than `entries` holds (replies this server has not read yet).
+     */
+    total: number | null;
+    /**
+     * Whether `total` is the provider's exact count.
+     */
+    total_exact: boolean;
+  }
+
+  /**
    * One author in a thread's `participants`, with how many of its replies this server holds.
    */
   interface ThreadParticipant {
@@ -4079,6 +4168,7 @@ declare namespace VibeTalk {
     MessageLabelRequest: MessageLabelRequest;
     MessageLabelChangeResponse: MessageLabelChangeResponse;
     MessageLabelsResponse: MessageLabelsResponse;
+    ThreadLayoutResponse: ThreadLayoutResponse;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

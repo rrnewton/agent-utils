@@ -3820,6 +3820,118 @@
       ],
       "type": "object"
     },
+    "ThreadLayoutEntry": {
+      "description": "One reply in a [`ThreadLayoutResponse`]: who wrote it, when, and how big its body is.",
+      "properties": {
+        "author_id": {
+          "$ref": "#/$defs/UserId",
+          "description": "The author's provider user id."
+        },
+        "created_ms": {
+          "description": "Provider creation time, milliseconds since the Unix epoch.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "estimated": {
+          "description": "Always true: the size is estimated from the stored body, not a drawn row's height.",
+          "type": "boolean"
+        },
+        "flags": {
+          "$ref": "#/$defs/ThreadLayoutFlags",
+          "description": "What the body is, beyond its size."
+        },
+        "id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The reply's message id."
+        },
+        "length_utf16": {
+          "description": "The stored body's length in UTF-16 code units: what JavaScript's `String.length` says of\nthe message's `content`, the measure the page folds a long body by.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lines": {
+          "description": "The stored body's lines: its line breaks plus one.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "created_ms",
+        "author_id",
+        "length_utf16",
+        "lines",
+        "flags",
+        "estimated"
+      ],
+      "type": "object"
+    },
+    "ThreadLayoutFlags": {
+      "description": "What a [`ThreadLayoutEntry`]'s body is, beyond its size.",
+      "properties": {
+        "attachments": {
+          "description": "The body lists a shared file or an embed (a line starting with the file mark), which the\npage draws as a line of its own.",
+          "type": "boolean"
+        },
+        "long": {
+          "description": "The body is longer than the page's fold threshold, so the page draws it folded.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "attachments",
+        "long"
+      ],
+      "type": "object"
+    },
+    "ThreadLayoutResponse": {
+      "description": "One thread's layout, before its bodies: `GET\n/api/v1/channels/{id}/threads/{thread_id}/layout`. `#2385 vibe-talk-thread-open-layout-first`.\n\nAnswered from this server's own copy only, never by a read of the chat service: the page asks\nfor it as it draws boxes for the replies it lacks, just before it reads the thread itself, and\nprices each box from its own entry. Every size here is an estimate from the stored body, never\na measured height. An answer with no entries (the copy holds none of the thread's replies, or\nmay not answer for them) leaves the page's boxes priced as they were.",
+      "properties": {
+        "channel_id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "The channel, as the request named it."
+        },
+        "entries": {
+          "description": "The thread's newest replies the copy holds, at most the request's `limit`, in thread order\n(oldest first). The root is not among them.",
+          "items": {
+            "$ref": "#/$defs/ThreadLayoutEntry"
+          },
+          "type": "array"
+        },
+        "more_before": {
+          "description": "Whether the copy holds replies older than the first entry, left out by the `limit`.",
+          "type": "boolean"
+        },
+        "thread_id": {
+          "description": "The thread the request named.",
+          "type": "string"
+        },
+        "total": {
+          "description": "How many replies the copy's record of the thread counts, when it has a record that says;\nmay be more than `entries` holds (replies this server has not read yet).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_exact": {
+          "description": "Whether `total` is the provider's exact count.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "channel_id",
+        "thread_id",
+        "total",
+        "total_exact",
+        "entries",
+        "more_before"
+      ],
+      "type": "object"
+    },
     "ThreadParticipant": {
       "description": "One author in a thread's `participants`, with how many of its replies this server holds.",
       "properties": {
@@ -5500,6 +5612,9 @@
     },
     {
       "$ref": "#/$defs/MessageLabelsResponse"
+    },
+    {
+      "$ref": "#/$defs/ThreadLayoutResponse"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

@@ -1309,6 +1309,62 @@ pub struct ThreadPinChangeResponse {
     pub revision: i64,
 }
 
+/// One thread's layout, before its bodies: `GET
+/// /api/v1/channels/{id}/threads/{thread_id}/layout`. `#2385 vibe-talk-thread-open-layout-first`.
+///
+/// Answered from this server's own copy only, never by a read of the chat service: the page asks
+/// for it as it draws boxes for the replies it lacks, just before it reads the thread itself, and
+/// prices each box from its own entry. Every size here is an estimate from the stored body, never
+/// a measured height. An answer with no entries (the copy holds none of the thread's replies, or
+/// may not answer for them) leaves the page's boxes priced as they were.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ThreadLayoutResponse {
+    /// The channel, as the request named it.
+    pub channel_id: ChannelId,
+    /// The thread the request named.
+    pub thread_id: String,
+    /// How many replies the copy's record of the thread counts, when it has a record that says;
+    /// may be more than `entries` holds (replies this server has not read yet).
+    pub total: Option<u64>,
+    /// Whether `total` is the provider's exact count.
+    pub total_exact: bool,
+    /// The thread's newest replies the copy holds, at most the request's `limit`, in thread order
+    /// (oldest first). The root is not among them.
+    pub entries: Vec<ThreadLayoutEntry>,
+    /// Whether the copy holds replies older than the first entry, left out by the `limit`.
+    pub more_before: bool,
+}
+
+/// One reply in a [`ThreadLayoutResponse`]: who wrote it, when, and how big its body is.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ThreadLayoutEntry {
+    /// The reply's message id.
+    pub id: MessageId,
+    /// Provider creation time, milliseconds since the Unix epoch.
+    pub created_ms: i64,
+    /// The author's provider user id.
+    pub author_id: crate::model::UserId,
+    /// The stored body's length in UTF-16 code units: what JavaScript's `String.length` says of
+    /// the message's `content`, the measure the page folds a long body by.
+    pub length_utf16: u64,
+    /// The stored body's lines: its line breaks plus one.
+    pub lines: u64,
+    /// What the body is, beyond its size.
+    pub flags: ThreadLayoutFlags,
+    /// Always true: the size is estimated from the stored body, not a drawn row's height.
+    pub estimated: bool,
+}
+
+/// What a [`ThreadLayoutEntry`]'s body is, beyond its size.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ThreadLayoutFlags {
+    /// The body lists a shared file or an embed (a line starting with the file mark), which the
+    /// page draws as a line of its own.
+    pub attachments: bool,
+    /// The body is longer than the page's fold threshold, so the page draws it folded.
+    pub long: bool,
+}
+
 /// One channel's bookmark, read or written: `GET`, `PUT` and `DELETE /api/v1/channels/{id}/bookmark`.
 /// `#240 reading-bookmark`.
 ///
@@ -2350,6 +2406,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<MessageLabelRequest>(),
         generator.subschema_for::<MessageLabelChangeResponse>(),
         generator.subschema_for::<MessageLabelsResponse>(),
+        // `#2385 vibe-talk-thread-open-layout-first`. Appended, for the same reason.
+        generator.subschema_for::<ThreadLayoutResponse>(),
     ]
 }
 

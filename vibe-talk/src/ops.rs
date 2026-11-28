@@ -7637,6 +7637,35 @@ fn dismissed_among(dismissed: Vec<MessageId>, messages: &[Message]) -> Vec<Messa
         .collect()
 }
 
+/// One thread's layout from this server's own copy (`#2385 vibe-talk-thread-open-layout-first`,
+/// [`crate::thread_layout`]): its record's reply count and one entry per reply it holds, newest
+/// `limit` in thread order. Nothing here reads the chat service, inline or behind: a copy that
+/// holds none of the thread, or may not answer for it, answers no entries.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] for a channel off the allowlist.
+pub async fn thread_layout(
+    state: &AppState,
+    channel_id: &str,
+    thread_id: &str,
+    limit: usize,
+) -> Result<crate::contract::ThreadLayoutResponse, OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let limit = limit.clamp(1, crate::thread_layout::MAX_LIMIT);
+    let answer = match state
+        .message_cache
+        .thread_layout_rows(&channel.id, thread_id, limit)
+        .await
+    {
+        Some((record, rows)) => {
+            crate::thread_layout::answer(channel.id, thread_id, record.as_ref(), rows, limit)
+        }
+        None => crate::thread_layout::empty(channel.id, thread_id),
+    };
+    Ok(answer)
+}
+
 /// The most Done marks one [`crate::contract::ReplyDismissals`] carries. `#222 unread-replies`.
 ///
 /// A thousand ids is about twenty kilobytes before compression, on a newest read of Main and not on
