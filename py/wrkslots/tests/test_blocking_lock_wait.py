@@ -98,13 +98,26 @@ def test_a_waiter_past_its_deadline_never_acts_and_leaves_the_lock_free(
     project, _repository, _remote = make_project(tmp_path)
     config_path = project / ".wrkslots.yml"
     with _held_config_lock(project) as release:
+        before = set(threading.enumerate())
         with pytest.raises(cli._LockBusy):
             with cli._locked_config(config_path, 0.2):
                 pass
+        # The cancelled waits still block in the kernel (_flock_blocking's
+        # helper threads); each takes the lock once the holder lets go and
+        # drops it at once, asynchronously to this test (#2481).
+        waiters = [
+            thread
+            for thread in threading.enumerate()
+            if thread not in before and "wait_in_kernel" in thread.name
+        ]
         # The deadline passed while the holder still holds: any late
         # acquisition by the waiter must have been released at once.
         release.set()
-    # Condition, not a clock: the lock is free now and stays free.
+    # Condition, not a clock: once every cancelled wait has finished (a hang
+    # backstop, never a timing check), the lock is free and stays free.
+    for waiter in waiters:
+        waiter.join(300)
+        assert not waiter.is_alive(), f"a cancelled lock wait never finished: {waiter.name}"
     fd = os.open(project, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
