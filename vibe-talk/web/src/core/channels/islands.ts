@@ -371,6 +371,23 @@ export function typicalRowPx(heights: readonly number[], fallback: number, max: 
 }
 
 /**
+ * What the seams below the reader add to "how much is below" (`#2426`, liaison 1150 (B)(a)): the
+ * messages counted seams stand for, and whether any seam's count is unknown, so the jump to the newest
+ * says "at least". `readingBottom` is the reading row's bottom; a seam whose top is at or under it is
+ * below the reader.
+ */
+export function seamsBelow(seams: readonly { top: number; count: number | null }[], readingBottom: number): { count: number; open: boolean } {
+  let count = 0;
+  let open = false;
+  for (const seam of seams) {
+    if (seam.top < readingBottom - 1) continue;
+    if (seam.count === null) open = true;
+    else count += seam.count;
+  }
+  return { count, open };
+}
+
+/**
  * The words a gap says: "42 messages not loaded", "1 message not loaded", or "Messages not loaded" uncounted.
  * After its last fill failed, it says the seam is tappable too ("· tap to load"): the reader's tap
  * is then the way to ask again (liaison 1126).

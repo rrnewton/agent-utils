@@ -107,6 +107,7 @@ export {
   planBreakOff,
   planTopTrim,
   repliesLeftOut,
+  seamsBelow,
   typicalRowPx,
   timeOfId,
   withGap,

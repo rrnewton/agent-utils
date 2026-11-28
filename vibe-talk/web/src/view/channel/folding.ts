@@ -6,7 +6,7 @@
 // selection stay the page's and are asked for here.
 
 import type { ScrollCause } from "./scrollkeep.ts";
-import { createSummaries, summaryKey } from "../../core/channels/index.ts";
+import { createSummaries, seamsBelow, summaryKey } from "../../core/channels/index.ts";
 import type { Summaries, SummaryAnswer } from "../../core/channels/index.ts";
 import {
   SUMMARY_FAILED_MARK, SUMMARY_MARK, SUMMARY_MODE_OFF, SUMMARY_MODE_ON, SUMMARY_WAITING,
@@ -448,7 +448,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
    * draws: a reply drawn as its own row in All counts, one folded under its root in Main does
    * not, and a collapsed run of read messages is the one line it stands on screen as.
    */
-  let belowHeld: { key: string; count: number | null } | null = null;
+  let belowHeld: { key: string; count: number | null; open?: boolean } | null = null;
   /** Whether a recount of the rows below is already asked for in the next frame. */
   let belowDue = false;
   /** Whether the jump is being drawn again by that recount, which asks for no further one. */
@@ -474,8 +474,19 @@ export function createFolding(deps: FoldingDependencies): Folding {
     // count under a reader who never moved.
     const area = pane.scroller();
     const head = area.getBoundingClientRect().top;
-    const count = rowsBelowReadingPosition(rows, head, head + (area.clientHeight || 0));
-    belowHeld = { key, count };
+    const rowsBelow = rowsBelowReadingPosition(rows, head, head + (area.clientHeight || 0));
+    // `#2426` (liaison 1150 (B)(a)): a seam below the reader stands for messages not held: a counted
+    // one adds its count, an uncounted one makes the count a floor ("Newest (59+)").
+    const reading = rows[rows.length - 1 - rowsBelow];
+    const list = (rows[0] as HTMLElement).parentElement;
+    const seams = list ? [...list.children].filter((node) => (node as HTMLElement).hasAttribute && (node as HTMLElement).hasAttribute("data-gap-count"))
+      .map((node) => {
+        const said = (node as HTMLElement).getAttribute("data-gap-count") || "";
+        return { top: node.getBoundingClientRect().top, count: /^\d+$/.test(said) ? Number(said) : null };
+      }) : [];
+    const beyond = seamsBelow(seams, reading ? reading.getBoundingClientRect().bottom : head);
+    const count = rowsBelow + beyond.count;
+    belowHeld = { key, count, open: beyond.open };
     return count;
   }
 
@@ -492,7 +503,8 @@ export function createFolding(deps: FoldingDependencies): Folding {
   /** Recount now, and draw the jump again where the count moved. In this column. */
   function recountBelowNow(): void {
     const before = belowHeld === null ? null : belowHeld.count;
-    if (recountBelow(belowKey()) === before) return;
+    const wasOpen = belowHeld !== null && belowHeld.open === true;
+    if (recountBelow(belowKey()) === before && (belowHeld !== null && belowHeld.open === true) === wasOpen) return;
     belowFresh = true;
     try {
       renderJumpNewest();
@@ -584,8 +596,11 @@ export function createFolding(deps: FoldingDependencies): Folding {
     // floor, said as "New (6+)". A reply of the reader's own or a draft at the foot is another
     // offer, and says neither.
     const below = shown && unsent === null && !draft ? belowForJump() : null;
-    const suffix = below !== null && below > 0 ? ` (${below}${arrived === true ? "+" : ""})` : "";
-    const belowWords = below !== null && below > 0 ? `${arrived === true ? "at least " : ""}${below} below` : null;
+    // A count the page could not complete — arrivals beyond one read, or a seam below whose size it
+    // does not know (`#2426`) — is a floor.
+    const floor = arrived === true || (belowHeld !== null && belowHeld.open === true);
+    const suffix = below !== null && below > 0 ? ` (${below}${floor ? "+" : ""})` : "";
+    const belowWords = below !== null && below > 0 ? `${floor ? "at least " : ""}${below} below` : null;
     const label = unsent !== null ? (failed ? "Reply not sent" : "Reply unconfirmed")
       : draft ? "Draft to send" : arrived === false ? `Newest${suffix}` : count ? `${many} new${suffix}` : `New${suffix}`;
     const name = unsent !== null

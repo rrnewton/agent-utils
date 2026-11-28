@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -383,6 +384,12 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(len(census["seams"]) == 1, f"{label}: {len(census['seams'])} seams stand, not one: {census['seams']}")
             check("messages not loaded" in census["seams"][0], f"{label}: the seam says {census['seams'][0]!r}")
             check(worst <= 1.0, f"{label}: the row being read moved {worst:.2f} px across the steps and break-offs")
+            # The jump to the newest counts the messages the seam stands for (liaison 1150 (B)(a)).
+            seam_count = int(re.match(r"(\d+)", census["seams"][0]).group(1))  # type: ignore[union-attr]
+            jump_words = str(page.evaluate("() => document.getElementById('jump-newest-label').textContent || ''"))
+            said = re.search(r"\((\d+)\)$", jump_words)
+            check(said is not None and int(said.group(1)) >= seam_count,
+                  f"{label}: the jump says {jump_words!r}, not counting the {seam_count} messages the seam stands for")
             notes.append(f"scroll-back: broke off at step {broke_at}, {len(census['ids'])} held, seam {census['seams'][0]!r}, "
                          f"row being read moved at most {worst:.2f} px")
             if args.screenshots:

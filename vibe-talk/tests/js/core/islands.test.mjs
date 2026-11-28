@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { moduleForTests } from "../../../web/build.mjs";
 
 const CHANNELS = await moduleForTests("src/core/channels/index.ts");
-const { gapForRun, gapLine, gapPlaces, gapsAboveFloor, narrowGap, placeStretch, planBreakOff, planTopTrim, typicalRowPx, withGap } = CHANNELS;
+const { gapForRun, gapLine, gapPlaces, gapsAboveFloor, narrowGap, placeStretch, planBreakOff, planTopTrim, seamsBelow, typicalRowPx, withGap } = CHANNELS;
 
 const T0 = Date.parse("2026-11-01T00:00:00Z");
 const held = (n) => Array.from({ length: n }, (_, i) => ({ id: String(1000 + i), ms: T0 + i * 60000 }));
@@ -177,4 +177,11 @@ test("`#2426` R3: a link's box is as tall as the median message measured near it
   assert.equal(typicalRowPx([40, 50, 60], 84, 500), 84, "never under the fallback");
   assert.equal(typicalRowPx([900, 1000, 1100], 84, 500), 500, "never over the cap");
   assert.equal(typicalRowPx([0, NaN, 216], 84, 500), 216, "unmeasured rows are left out");
+});
+
+test("`#2426` (B)(a): seams below the reader add their counts; an uncounted one makes the count a floor", () => {
+  assert.deepStrictEqual(seamsBelow([], 300), { count: 0, open: false });
+  assert.deepStrictEqual(seamsBelow([{ top: 100, count: 50 }, { top: 400, count: 19 }], 300), { count: 19, open: false }, "a seam above the reader is not below");
+  assert.deepStrictEqual(seamsBelow([{ top: 400, count: 19 }, { top: 900, count: null }], 300), { count: 19, open: true });
+  assert.deepStrictEqual(seamsBelow([{ top: 299.5, count: 7 }], 300), { count: 7, open: false }, "a seam at the reading row's foot is below it");
 });

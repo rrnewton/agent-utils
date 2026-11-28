@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -144,7 +145,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 return {{ top: r.top, h: r.height }}; }}""")
             box_mid = box["top"] + box["h"] / 2
             row_mid = rect["top"] + rect["h"] / 2
-            notes.append(f"link to {target}: box stood at once ({box['words']!r}); landed with {arounds} and no step back; "
+            # The seam below the link's island has no count: the jump to the newest says a floor (liaison 1150 (B)(a)).
+            jump = str(page.evaluate("() => document.getElementById('jump-newest-label').textContent || ''"))
+            check(re.search(r"\(\d+\+\)$", jump) is not None, f"{label}: the jump says {jump!r}, not a floor ('(N+)') over the uncounted seam")
+            notes.append(f"link to {target}: box stood at once ({box['words']!r}); landed with {arounds} and no step back; jump {jump!r}; "
                          f"the message took the box's place (tops {rect['top']:.1f} vs {box['top']:.1f}, box {box['h']:.0f} px tall, "
                          f"centres {row_mid:.1f} vs {box_mid:.1f}); seams {census['seams']}")
             if args.screenshots:

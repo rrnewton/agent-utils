@@ -123,6 +123,9 @@ export function createIslandView(deps: IslandViewDependencies): IslandView {
       seam.append(line);
       seams.set(key, seam);
     }
+    // What it stands for, for the jump to the newest's count (folding.ts): a number, or "" unknown.
+    const counted = gap.count === null ? "" : String(gap.count);
+    if (seam.getAttribute("data-gap-count") !== counted) seam.setAttribute("data-gap-count", counted);
     const line = seam.firstElementChild as HTMLElement;
     // An uncounted seam (a link's island, `#2426` R3) says what it is doing without a count.
     const loading = gap.count === null ? "Loading messages…" : `Loading — ${gapLine(gap).replace(" not loaded", "")}`;
