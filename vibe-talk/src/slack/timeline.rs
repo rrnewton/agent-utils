@@ -484,11 +484,10 @@ impl HttpSlackClient {
         channel: &ChannelId,
         request: &TimelineRequest,
     ) -> Result<TimelinePage, ChatError> {
+        // `#2433`: transient, never a refusal kept as the view's next answer.
         tokio::time::timeout(TIMELINE_TIMEOUT, self.timeline_inner(channel, request))
             .await
-            .map_err(|_| {
-                refused("the timeline exceeded its time budget; no partial timeline was returned")
-            })?
+            .map_err(|_| ChatError::time_budget_spent("the timeline"))?
     }
 
     async fn timeline_inner(

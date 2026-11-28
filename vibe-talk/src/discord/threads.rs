@@ -437,13 +437,10 @@ impl HttpDiscordClient {
                 parse_bridge_page(value, channel, request)
             }
             ThreadApi::Native => {
+                // `#2433`: transient, never a refusal kept as the view's next answer.
                 tokio::time::timeout(TIMELINE_TIMEOUT, self.native_timeline(channel, request))
                     .await
-                    .map_err(|_| {
-                        refused(
-                    "thread discovery exceeded its time budget; no partial timeline was returned",
-                )
-                    })?
+                    .map_err(|_| ChatError::time_budget_spent("thread discovery"))?
             }
         }
     }

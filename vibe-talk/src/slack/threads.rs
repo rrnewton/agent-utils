@@ -143,11 +143,10 @@ impl HttpSlackClient {
                 }
             }
         };
+        // `#2433`: transient, never a refusal kept as the view's next answer.
         tokio::time::timeout(TIMELINE_TIMEOUT, read)
             .await
-            .map_err(|_| {
-                refused("the thread read exceeded its time budget; nothing was returned")
-            })?
+            .map_err(|_| ChatError::time_budget_spent("the thread read"))?
     }
 
     /// The thread view's newest page of `thread`, from one `conversations.replies` window read

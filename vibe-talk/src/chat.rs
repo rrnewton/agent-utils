@@ -158,6 +158,20 @@ impl ChatError {
         }
     }
 
+    /// A read that ran out of its own time budget (`what` names it: "the timeline", "the thread
+    /// read") after it had begun asking the provider. `#2433 slack-timeline-budget-drops-reads`.
+    ///
+    /// Transient, like a request that timed out, so the cache stands in and the read is retried
+    /// on its schedule. It is never a [`ChatError::Refused`]: that one means the server refused
+    /// before contacting the provider, and a refusal is kept as the view's next answer, so a
+    /// timeout classed as one used to reach the page's next poll as an HTTP 400.
+    #[must_use]
+    pub fn time_budget_spent(what: &str) -> Self {
+        Self::Transport(format!(
+            "{what} did not finish within its time budget; no partial answer was returned"
+        ))
+    }
+
     /// The underlying failure, independent of its provider label.
     #[must_use]
     pub fn cause(&self) -> &Self {

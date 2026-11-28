@@ -796,6 +796,54 @@ async fn a_failed_refresh_behind_a_stand_in_retries_on_the_schedule_not_the_next
     live_arrival(&mut subscription, &late).await;
 }
 
+#[tokio::test]
+async fn a_refresh_that_outruns_its_time_budget_never_becomes_the_next_answer() {
+    // `#2433 slack-timeline-budget-drops-reads`: the read behind a cache-first answer ran
+    // out of the provider's timeline budget. That expiry used to be a refusal, kept as the
+    // view's next answer, so the page's next poll got an HTTP 400 instead of the copy. It is
+    // transient: the next poll is answered from the copy again, marked as the server's.
+    let d = deployment("state-sync-budget-spent").await;
+    d.fill_timeline().await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    let before = d.counting.count("fetch_timeline");
+    d.counting.fail_next(
+        "fetch_timeline",
+        None,
+        ChatError::time_budget_spent("the timeline"),
+    );
+    let first = ok(
+        &d.state,
+        &path(READ_CHANNEL, "/timeline?view=main&limit=50&reason=enter"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_answered_at_once(&first);
+    claim_free(&d.state, READ_CHANNEL, TimelineView::Main, 50).await;
+    assert_eq!(
+        d.counting.count("fetch_timeline"),
+        before + 1,
+        "the read behind the answer (the one that ran out of budget) was not made"
+    );
+
+    let (status, next) = call(
+        &d.state,
+        &path(READ_CHANNEL, "/timeline?view=main&limit=50&reason=poll"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the budget expiry was kept as the next answer: {next}"
+    );
+    assert_eq!(texts(&next).len(), 12, "the copy answers: {next}");
+    assert!(
+        next["refresh_failed"].is_string(),
+        "the copy is not marked as the server's: {next}"
+    );
+}
+
 /// The texts a recap answer carries, group by group as [`texts`] reads one page.
 fn recap_texts(body: &Value) -> Vec<String> {
     body["groups"]

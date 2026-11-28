@@ -774,6 +774,60 @@ async fn the_flat_view_merges_replies_of_the_roots_on_the_page_and_states_its_bo
     assert_eq!(quiet.notice, None, "no bound applied, so none is stated");
 }
 
+/// `#2433 slack-timeline-budget-drops-reads`: a Flat read still waiting on one thread's
+/// replies when its time budget runs out fails as a transient error, like a request that
+/// timed out, so the cache stands in and the read is retried. It used to fail as a
+/// refusal, which the server keeps as the view's next answer: an HTTP 400 to the page.
+///
+/// The held thread does not answer until the end, so the budget is what ends the read at
+/// any host load. The clock is paused only once that request is in flight, and from then
+/// advances only while nothing else can run.
+#[tokio::test]
+async fn a_timeline_that_outruns_its_time_budget_fails_transient_not_refused() {
+    let (state, [_, busy, _]) = three_threads();
+    let fake = Fake::start(state, 20).await;
+    let hold = slack_fake::Hold::new(&busy);
+    fake.with(|state| state.hold_replies = Some(hold.clone()));
+    // A per-request timeout far past the budget, so the budget, not the request, ends it.
+    let client = std::sync::Arc::new(
+        HttpSlackClient::new(&vibe_talk::slack::SlackConfig {
+            request_timeout_seconds: 3_600,
+            ..fake.config()
+        })
+        .expect("client"),
+    );
+    let reading = {
+        let client = std::sync::Arc::clone(&client);
+        tokio::spawn(async move {
+            client
+                .fetch_timeline(&channel(), &page_request(TimelineView::Flat, 50))
+                .await
+        })
+    };
+    // Hang backstop only: the held request arrives as soon as the history read answers.
+    tokio::time::timeout(Duration::from_secs(60), hold.arrived.notified())
+        .await
+        .expect("the held thread's replies request reached the fake");
+    tokio::time::pause();
+    let error = reading
+        .await
+        .expect("the read ran")
+        .expect_err("the held thread outlasts the budget");
+    hold.release.notify_one();
+    assert!(
+        !matches!(error.cause(), ChatError::Refused(_)),
+        "a budget expiry is no refusal: {error}"
+    );
+    assert!(
+        matches!(error.cause(), ChatError::Transport(detail) if detail.contains("time budget")),
+        "{error}"
+    );
+    assert_eq!(
+        vibe_talk::upstream_profile::Outcome::of(&error),
+        vibe_talk::upstream_profile::Outcome::Transport
+    );
+}
+
 #[tokio::test]
 async fn posting_escapes_room_pings_and_a_reply_goes_into_the_targets_thread() {
     let (state, [r1, _, _]) = three_threads();
