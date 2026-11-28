@@ -1,6 +1,6 @@
 ---
 title: 'lifecycle-recovery-cases-outside-gates: 27 test_lifecycle.py frozen/ownerless-validate recovery cases fail outside a gate; establish per case whether the environment or the code is at fault'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-flaketriage
@@ -9,7 +9,8 @@ labels:
 - tests
 - lifecycle
 created_at: 2026-11-28T08:41:00-05:00
-updated_at: 2026-11-28T11:32:00-05:00
+updated_at: 2026-11-28T12:55:00-05:00
+closed_at: 2026-11-28T12:55:00-05:00
 ---
 
 # Description
@@ -90,3 +91,17 @@ Fix (test-only): one guard, `require_host_temp_exclusion_view`, at the start of 
 Related:
 - #2383: the gate's private temp root and the wrkslots host-temp exception (#2415 interim).
 - #2065: the hot-host census tests.
+
+## Resolution
+
+Fixed in 82f6d6f2 (`py/wrkslots/tests/test_lifecycle.py` only, test-only; the evidence notes in 71fe10ca), gated as 7582169c.
+- Gate 1795883841170273936-02c92bc8 (full selection): all 9 lifecycle steps passed with 0 failed. The 27 ran in the gate's own shards, located by re-collecting each shard with the gate's command (every shard digest matched the gate log):
+  - 25 in host mode (host shards 0, 1, 2: 21, 3 and 1 cases);
+  - 2 in namespace mode (namespace shards 2 and 4);
+  - the guard test in namespace shard 0.
+- The guard cannot skip inside a gate (`GATE_ADMISSION_RUN_ID` is set in every gate step), so all 27 passed and none skipped.
+- The 5 skips in those shards are the pre-existing root-coverage skips: `test_lifecycle.py:1188` x3, `foreign_mount_ns_cases.py:631`, `test_lifecycle.py:28896`. They were named by a re-run of the three shards with `-rs`, at the same counts.
+- Off-path reds in that gate were cleared by a solo rerun on the unchanged commit (gate 1795886405429317163-896d240e, rerun passed): `python.wrkslots.shard-0` (#2481), `python.agentctl.shard-0` (#2482), `rust.merge-queue.test` (#2458). The two vibe-talk known-red steps were untouched.
+- Landed with the coordinator's overlap exception: #2468 also changed this file, in disjoint hunks. On the combined tree the 27 cases, the 2 tampered parameters, the guard test and #2468's two tests passed, and strict mypy was clean.
+- No real defect was found among the 27, the closed-fds case included. No production change.
+
