@@ -343,6 +343,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             broke_at = None
             for step in range(16):
                 asked = api.count("before")
+                quiet(page)
                 api.hold.clear()
                 # The reader's own step back: the "Older messages" control at the head of the list.
                 page.locator("#load-older").click()
@@ -438,19 +439,25 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 if not page.evaluate(CENSUS_JS)["seams"]:
                     break
                 asked = api.count("around")
-                quiet(page)
                 api.hold.clear()
-                seam_top = page.evaluate("() => { const s = document.querySelector('#discord-log > li.island-gap'); "
-                                         "return s ? s.getBoundingClientRect().top : null; }")
-                check(seam_top is not None, f"{label}: no seam below the far-back island")
-                band = page.evaluate("() => { const a = document.getElementById('scroll-area'); const r = a.getBoundingClientRect(); "
-                                     "return { top: r.top, bottom: r.top + a.clientHeight }; }")
-                page.evaluate("(dy) => { const a = document.getElementById('scroll-area'); a.scrollTop += dy; "
-                              "a.dispatchEvent(new Event('scroll')); }", seam_top - band["bottom"] + 100)
-                waited = 0
-                while api.count("around") == asked and waited < 300:
-                    frames(page, 1)
-                    waited += 1
+                # A redraw already under way (a break-off after the last fill, which keeps the row being
+                # read where it stands) can move the seam between the measure and the scroll, on a hot
+                # host: measure and scroll again, at most three times, as a reader keeps scrolling.
+                for _attempt in range(3):
+                    quiet(page)
+                    seam_top = page.evaluate("() => { const s = document.querySelector('#discord-log > li.island-gap'); "
+                                             "return s ? s.getBoundingClientRect().top : null; }")
+                    check(seam_top is not None, f"{label}: no seam below the far-back island")
+                    band = page.evaluate("() => { const a = document.getElementById('scroll-area'); const r = a.getBoundingClientRect(); "
+                                         "return { top: r.top, bottom: r.top + a.clientHeight }; }")
+                    page.evaluate("(dy) => { const a = document.getElementById('scroll-area'); a.scrollTop += dy; "
+                                  "a.dispatchEvent(new Event('scroll')); }", seam_top - band["bottom"] + 100)
+                    waited = 0
+                    while api.count("around") == asked and waited < 300:
+                        frames(page, 1)
+                        waited += 1
+                    if api.count("around") > asked:
+                        break
                 if api.count("around") == asked:
                     api.hold.set()
                     dbg = page.evaluate("""() => { const a = document.getElementById('scroll-area'); const s = document.querySelector('#discord-log > li.island-gap');
@@ -484,6 +491,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             seed_reads = len(api.read_log)
             for _ in range(2):
                 asked = len(api.read_log)
+                # The step before's landing is held by the scroll owner for a while, which puts a
+                # programmatic scroll back (the click's scroll to the control): the click waits for it,
+                # as a reader's hand does, so the reader stands at the head the step is taken from.
+                quiet(page)
                 page.locator("#load-older").click()
                 waited = 0
                 while len(api.read_log) == asked and waited < 300:
@@ -532,6 +543,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 api.hold.clear()
                 seam_top = page.evaluate("() => { const s = document.querySelector('#discord-log > li.island-gap'); "
                                          "return s ? s.getBoundingClientRect().top : null; }")
+                if seam_top is None:
+                    # The last fill closed it while the scroll went quiet (a hot host lands it late): look again.
+                    api.hold.set()
+                    continue
                 area_top = page.evaluate("() => document.getElementById('scroll-area').getBoundingClientRect().top")
                 # Scroll so the seam stands just above the band (the reader below it): it fills from below.
                 page.evaluate("(dy) => { const a = document.getElementById('scroll-area'); a.scrollTop += dy; "
@@ -607,6 +622,7 @@ def left_out_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
             settle(page)
             for _ in range(14):
                 asked = len(api.read_log)
+                quiet(page)
                 page.locator("#load-older").click()
                 waited = 0
                 while len(api.read_log) == asked and waited < 300:
