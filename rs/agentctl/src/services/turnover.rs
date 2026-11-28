@@ -71,8 +71,10 @@ pub struct TurnoverOptions {
     pub global_binary: Option<PathBuf>,
     /// Signal flag passed through to each refresh.
     pub interrupted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Never run a daemon-reload (#2441), passed through to each refresh.
-    pub no_reload: bool,
+    /// Run a daemon-reload where a unit-file move needs one (#2441). Off by default: an
+    /// unattended host-wide turnover skips such a unit by name (fail closed) and moves the
+    /// rest; an operator turns it on for a migration window.
+    pub allow_reload: bool,
 }
 
 /// The designed notify identity for timer-driven turnover runs (#1220):
@@ -1130,7 +1132,7 @@ pub fn turnover(
                     drop_in_dir: options.drop_in_dir.clone(),
                     interrupted: options.interrupted.clone(),
                     pin_check: Some(pin_check),
-                    no_reload: options.no_reload,
+                    allow_reload: options.allow_reload,
                 };
                 let report =
                     super::refresh(host, tables, registry, &options.root, &refresh_options)?;
@@ -1146,43 +1148,37 @@ pub fn turnover(
                         }
                     }
                 }
-                // #2441: under --no-reload a unit whose move needs a daemon-reload is refused
-                // unchanged; like a completed rollback, that leaves it on its old build and the
-                // remaining units still move.
-                let reload_refused = |entry: &Value| {
-                    entry["action"] == "refused"
-                        && entry["reason"]
-                            .as_str()
-                            .is_some_and(|reason| reason.starts_with(super::refresh::NEEDS_RELOAD))
-                };
+                // #2441: without --allow-reload a unit whose move needs a daemon-reload is
+                // skipped unchanged; each one is named, and the remaining units still move.
                 let entries: Vec<&Value> = report.document["services"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .collect();
-                for entry in entries.iter().filter(|entry| reload_refused(entry)) {
-                    notes.push(format!(
-                        "{} not moved: {}",
-                        entry["unit"].as_str().unwrap_or("?"),
-                        entry["reason"].as_str().unwrap_or("")
-                    ));
+                for entry in &entries {
+                    let reason = entry["reason"].as_str().unwrap_or("");
+                    if entry["action"] == "skipped"
+                        && reason.starts_with(super::refresh::NEEDS_RELOAD)
+                    {
+                        notes.push(format!(
+                            "{} not moved (no reload without --allow-reload): {reason}",
+                            entry["unit"].as_str().unwrap_or("?")
+                        ));
+                    }
                 }
-                let only_rollbacks = entries
-                    .iter()
-                    .any(|entry| entry["action"] == "rolled-back" || reload_refused(entry))
+                let only_rollbacks = entries.iter().any(|entry| entry["action"] == "rolled-back")
                     && entries.iter().all(|entry| {
-                        reload_refused(entry)
-                            || entry["action"].as_str().is_some_and(|action| {
-                                matches!(
-                                    action,
-                                    "rolled-back"
-                                        | "refreshed"
-                                        | "current"
-                                        | "skipped"
-                                        | "updated-inactive"
-                                        | "would-refresh"
-                                )
-                            })
+                        entry["action"].as_str().is_some_and(|action| {
+                            matches!(
+                                action,
+                                "rolled-back"
+                                    | "refreshed"
+                                    | "current"
+                                    | "skipped"
+                                    | "updated-inactive"
+                                    | "would-refresh"
+                            )
+                        })
                     });
                 let hard_failure = report.exit_code != 0 && !only_rollbacks;
                 if hard_failure {

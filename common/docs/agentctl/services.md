@@ -194,28 +194,31 @@ restarts the unit. The unit file itself is never edited.
 
 systemd applies a changed drop-in to a loaded unit only after a user-manager
 daemon-reload (systemd.unit(5)), and an active service is always loaded. So a
-move reloads only when the drop-in must change (the first move of a unit to
-link form, or a changed command in the unit file), or when systemd already
-reports `NeedDaemonReload=yes` for the unit; then the drop-in is written, the
-link repointed, `systemctl --user daemon-reload` run, and the unit's effective
-`ExecStart=` must be the planned one (another drop-in sorted later would win)
-before the restart. Every other move of a link-form unit runs no reload: the
-loaded `ExecStart=` must already be the planned one, and after the restart
-systemd must still report `NeedDaemonReload=no`. The report says per unit
-`form` (`transient`, `link`, or `drop-in` for a unit file not in link form yet)
-and `reload` (`none` or `daemon-reload`), and for a unit file `link` (its path
-and its old and new targets).
+move needs a reload only when the drop-in must change (the first move of a unit
+to link form, or a changed command in the unit file), or when systemd already
+reports `NeedDaemonReload=yes` for the unit. Every other move of a link-form
+unit runs no reload: the loaded `ExecStart=` must already be the planned one,
+and after the restart systemd must still report `NeedDaemonReload=no`. The
+report says per unit `form` (`transient`, `link`, or `drop-in` for a unit file
+not in link form yet) and `reload` (`none` or `daemon-reload`), and for a unit
+file `link` (its path and its old and new targets).
 
-**`--no-reload`** never runs `systemctl --user daemon-reload`, not even in a
-rollback. A unit file whose move would need one is refused before anything is
-written (no drop-in write, no timestamp change, no stop or restart), with a
-reason that starts `needs-daemon-reload:`, when its drop-in must change or
-systemd already reports `NeedDaemonReload=yes` for it. Both are checked when
-the unit is planned and again just before its first change. Transient units
-are moved as always: their replay never reloads. A refused unit counts as a
-refusal (exit 1); the other units are still tried. `services turnover
---no-reload` passes the flag through, names each refused unit in its notes
-and goes on with the rest.
+**No reload unless `--allow-reload`**, the same rule for `services refresh`
+and `services turnover`. A user-manager reload is host-wide, so by default
+nothing runs `systemctl --user daemon-reload`, not even a rollback. It fails
+closed: a unit file whose move would need one is skipped before anything is
+written (no drop-in write, no timestamp change, no stop or restart), so no
+drop-in systemd has not loaded is ever left for the next, unrelated reload to
+apply. The skip is reported by unit name with a reason that starts
+`needs-daemon-reload:` (turnover also names it in its notes). Both conditions
+are checked when the unit is planned and again just before its first change.
+Transient units are moved as always: their replay never reloads. Like other
+skips, it does not change the exit status, and the other units are still
+tried. With `--allow-reload`, such a move writes the drop-in, repoints the
+link, runs `systemctl --user daemon-reload`, checks that the unit's effective
+`ExecStart=` is the planned one (another drop-in sorted later would win), and
+restarts. Use it only in a window the teams whose units it touches have
+chosen: turnover is host-wide.
 
 **Moving a unit file to link form** takes one reload per unit, once. Run it in
 a window where a reload is safe on that host, with `services transients`
@@ -224,13 +227,13 @@ around it (below):
 1. Every agentctl that runs `services prune` on the host must read links
    (a build with this change); an older prune does not see a link as in use.
 2. `agentctl services transients --save FILE` just before.
-3. `agentctl --registry REG services refresh --only UNIT` (without
-   `--no-reload`): writes the link-form drop-in, reloads once, restarts.
+3. `agentctl --registry REG services refresh --allow-reload --only UNIT` (or
+   `services turnover --allow-reload` for every unit at once): writes the
+   link-form drop-in, reloads once, restarts.
 4. `agentctl services transients --check FILE` just after: exit 0 means no
    live transient unit was lost by the reload.
 
-After that, every move of the unit is reload-free, with or without
-`--no-reload`.
+After that, every move of the unit is reload-free, without `--allow-reload`.
 
 **Health.** Each service must pass the same check before anything changes
 (without the "since the restart" conditions); a service that does not is left

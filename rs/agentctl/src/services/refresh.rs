@@ -9,10 +9,11 @@
 //! express. A unit file gets a drop-in that replaces `ExecStart=` (and sets `AGENTCTL_HOME`),
 //! followed by a daemon reload and a restart.
 //!
-//! With `no_reload` (#2441) nothing runs a user-manager daemon-reload. systemd applies a changed
+//! Unless `allow_reload` (#2441) nothing runs a user-manager daemon-reload. systemd applies a changed
 //! drop-in to a loaded unit only after a reload (systemd.unit(5)), and an active service is
 //! always loaded, so a unit-file service whose drop-in must change, or for which systemd already
-//! reports `NeedDaemonReload=yes`, is refused before anything is written. Transient units are
+//! reports `NeedDaemonReload=yes`, is skipped (named, reason `needs-daemon-reload: ...`) before
+//! anything is written: fail closed, never a drop-in systemd has not loaded. Transient units are
 //! replayed as always: that path never reloads.
 
 use std::collections::BTreeMap;
@@ -92,9 +93,10 @@ pub struct RefreshOptions {
     /// Fresh pin check run immediately before any action on each service
     /// (#2120); `None` for a plain `services refresh`, which has no pins.
     pub pin_check: Option<PinCheck>,
-    /// Never run `systemctl --user daemon-reload`, not even in a rollback (#2441): a
-    /// unit-file service whose move needs one is refused unchanged.
-    pub no_reload: bool,
+    /// Run `systemctl --user daemon-reload` where a unit-file move needs one (#2441). Off by
+    /// default: no path reloads, not even a rollback, and such a unit is skipped unchanged and
+    /// named (fail closed).
+    pub allow_reload: bool,
 }
 
 /// How long a restarted service must stay up and healthy before it counts as refreshed.
@@ -1346,8 +1348,9 @@ pub fn refresh(
             });
         }
         // #2441: a unit-file move reloads only when its drop-in must change or systemd already
-        // reports NeedDaemonReload=yes, read now. With --no-reload such a move is refused
-        // before anything is written.
+        // reports NeedDaemonReload=yes, read now. Without allow_reload such a move is skipped before
+        // anything is written (fail closed): no drop-in systemd has not loaded is ever left
+        // for the next unrelated reload to apply.
         let needs_reload = match &plan.method {
             Method::Transient { .. } => None,
             Method::DropIn { .. } => match need_daemon_reload(host, &service.unit) {
@@ -1357,13 +1360,12 @@ pub fn refresh(
                 )),
             },
         };
-        if options.no_reload {
+        if !options.allow_reload {
             if let Some(reason) = needs_reload {
-                entry["action"] = json!("refused");
+                entry["action"] = json!("skipped");
                 entry["reason"] = json!(reason);
                 let dry = if options.dry_run { " (dry run)" } else { "" };
-                text.push_str(&format!("{label}: refused{dry}: {reason}\n"));
-                exit_code = exit_code.max(1);
+                text.push_str(&format!("{label}: skipped{dry}: {reason}\n"));
                 rows.push(entry);
                 continue;
             }

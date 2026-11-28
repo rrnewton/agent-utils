@@ -892,7 +892,8 @@ fn options(world: &World) -> RefreshOptions {
         drop_in_dir: world.fake.drop_in_dir.clone(),
         interrupted: None,
         pin_check: None,
-        no_reload: false,
+        // Tests of a normal move; the CLI default (no reload) is tested on its own.
+        allow_reload: true,
     }
 }
 
@@ -2167,7 +2168,7 @@ fn turnover_options(world: &World, checkout: PathBuf) -> TurnoverOptions {
         notify: None,
         global_binary: None,
         interrupted: None,
-        no_reload: false,
+        allow_reload: false,
     }
 }
 
@@ -2862,7 +2863,7 @@ fn turnover_expands_percent_h_in_execstart_and_honours_the_pin_it_finds() {
         notify: None,
         global_binary: None,
         interrupted: None,
-        no_reload: false,
+        allow_reload: false,
     };
     let report = turnover(&fake, &Tables, &options).unwrap();
     let rows = report.document["services"].as_array().unwrap();
@@ -3251,7 +3252,7 @@ fn row_for<'a>(report: &'a super::refresh::RefreshReport, unit: &str) -> &'a Val
 }
 
 #[test]
-fn no_reload_refuses_a_unit_file_whose_drop_in_would_be_written() {
+fn no_reload_skips_a_unit_file_whose_drop_in_would_be_written() {
     let world = world();
     add_headless_unit_file(&world);
     let before = world.fake.service_text("headless.service");
@@ -3259,12 +3260,13 @@ fn no_reload_refuses_a_unit_file_whose_drop_in_would_be_written() {
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
     let mut only = options(&world);
     only.only = vec!["headless.service".into()];
-    only.no_reload = true;
+    only.allow_reload = false;
     let calls_before = world.fake.calls().len();
     let report = refresh(&world.fake, &services, &only).unwrap();
-    assert_eq!(report.exit_code, 1, "{}", report.text);
+    // Fail closed: skipped and named, never a stale drop-in left for the next reload.
+    assert_eq!(report.exit_code, 0, "{}", report.text);
     let row = row_for(&report, "headless.service");
-    assert_eq!(row["action"], "refused", "{}", report.text);
+    assert_eq!(row["action"], "skipped", "{}", report.text);
     assert_eq!(row["form"], "drop-in");
     let reason = row["reason"].as_str().unwrap();
     assert!(reason.starts_with("needs-daemon-reload: "), "{reason}");
@@ -3282,14 +3284,18 @@ fn no_reload_refuses_a_unit_file_whose_drop_in_would_be_written() {
     assert_eq!(world.fake.pid("headless.service"), pid);
     assert!(report.document["run_directory"].is_null());
     assert!(
-        report.text.contains("refused: needs-daemon-reload"),
+        report
+            .text
+            .contains("headless.service (run-headless): skipped: needs-daemon-reload"),
         "{}",
         report.text
     );
+    let state = &world.fake.show(&["headless.service".to_owned()]).unwrap()[0];
+    assert!(!state.need_daemon_reload);
 }
 
 #[test]
-fn no_reload_leaves_an_existing_drop_in_and_its_timestamp_alone() {
+fn no_reload_skip_leaves_the_drop_in_bytes_and_need_daemon_reload_unchanged() {
     let world = world();
     add_headless_unit_file(&world);
     // An earlier refresh's drop-in for another binary, loaded.
@@ -3311,9 +3317,18 @@ fn no_reload_leaves_an_existing_drop_in_and_its_timestamp_alone() {
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
     let mut only = options(&world);
     only.only = vec!["headless.service".into()];
-    only.no_reload = true;
+    only.allow_reload = false;
+    let state = &world.fake.show(&["headless.service".to_owned()]).unwrap()[0];
+    assert!(!state.need_daemon_reload);
+    let pid = world.fake.pid("headless.service");
     let report = refresh(&world.fake, &services, &only).unwrap();
-    assert_eq!(report.exit_code, 1, "{}", report.text);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(
+        row_for(&report, "headless.service")["action"],
+        "skipped",
+        "{}",
+        report.text
+    );
     let reason = row_for(&report, "headless.service")["reason"]
         .as_str()
         .unwrap()
@@ -3327,11 +3342,16 @@ fn no_reload_leaves_an_existing_drop_in_and_its_timestamp_alone() {
         fs::metadata(&drop_in).unwrap().modified().unwrap(),
         old_time
     );
+    // The loaded drop-in is exactly as it was (same bytes, same timestamp), so systemd still
+    // reports NeedDaemonReload=no; the unit was neither reloaded nor restarted.
+    let state = &world.fake.show(&["headless.service".to_owned()]).unwrap()[0];
+    assert!(!state.need_daemon_reload);
     assert_eq!(reload_calls(&world), reloads);
+    assert_eq!(world.fake.pid("headless.service"), pid);
 }
 
 #[test]
-fn no_reload_refuses_a_unit_whose_files_are_not_what_systemd_loaded() {
+fn no_reload_skips_a_unit_whose_files_are_not_what_systemd_loaded() {
     let world = world();
     add_headless_unit_file(&world);
     // The planned drop-in, as a normal refresh writes it.
@@ -3353,9 +3373,10 @@ fn no_reload_refuses_a_unit_whose_files_are_not_what_systemd_loaded() {
     let reloads = reload_calls(&world);
     let pid = world.fake.pid("headless.service");
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
-    only.no_reload = true;
+    only.allow_reload = false;
     let report = refresh(&world.fake, &services, &only).unwrap();
-    assert_eq!(report.exit_code, 1, "{}", report.text);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(row_for(&report, "headless.service")["action"], "skipped");
     let reason = row_for(&report, "headless.service")["reason"]
         .as_str()
         .unwrap()
@@ -3372,7 +3393,7 @@ fn no_reload_still_moves_a_transient_unit_by_replay() {
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
     let mut only = options(&world);
     only.only = vec!["watch.service".into()];
-    only.no_reload = true;
+    only.allow_reload = false;
     let report = refresh(&world.fake, &services, &only).unwrap();
     assert_eq!(report.exit_code, 0, "{}", report.text);
     let row = row_for(&report, "watch.service");
@@ -3388,7 +3409,7 @@ fn no_reload_still_moves_a_transient_unit_by_replay() {
 }
 
 #[test]
-fn no_reload_dry_run_shows_form_reload_and_refusals() {
+fn no_reload_dry_run_shows_form_reload_and_skips() {
     let world = world();
     add_headless_unit_file(&world);
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
@@ -3400,12 +3421,12 @@ fn no_reload_dry_run_shows_form_reload_and_refusals() {
     assert_eq!(headless["form"], "drop-in");
     assert_eq!(headless["reload"], "daemon-reload");
     assert_eq!(row_for(&report, "watch.service")["reload"], "none");
-    dry.no_reload = true;
+    dry.allow_reload = false;
     let calls_before = world.fake.calls().len();
     let report = refresh(&world.fake, &services, &dry).unwrap();
-    assert_eq!(report.exit_code, 1, "{}", report.text);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
     let headless = row_for(&report, "headless.service");
-    assert_eq!(headless["action"], "refused");
+    assert_eq!(headless["action"], "skipped");
     assert!(headless["reason"]
         .as_str()
         .unwrap()
@@ -3413,7 +3434,7 @@ fn no_reload_dry_run_shows_form_reload_and_refusals() {
     assert!(
         report
             .text
-            .contains("headless.service (run-headless): refused (dry run): needs-daemon-reload"),
+            .contains("headless.service (run-headless): skipped (dry run): needs-daemon-reload"),
         "{}",
         report.text
     );
@@ -3438,7 +3459,7 @@ fn no_reload_force_restarts_a_loaded_drop_in_without_writing_or_reloading() {
     let pid = world.fake.pid("headless.service");
     // Already on the snapshot, drop-in loaded: --force restarts it, reload-free.
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
-    only.no_reload = true;
+    only.allow_reload = false;
     only.force = true;
     let report = refresh(&world.fake, &services, &only).unwrap();
     assert_eq!(report.exit_code, 0, "{}", report.text);
@@ -3473,7 +3494,7 @@ fn no_reload_rollback_never_reloads() {
     // The forced reload-free restart fails its check: the rollback is a restart, no reload.
     *world.fake.crashing.borrow_mut() = Some(world.snapshot.agentctl());
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
-    only.no_reload = true;
+    only.allow_reload = false;
     only.force = true;
     let report = refresh(&world.fake, &services, &only).unwrap();
     assert_ne!(report.exit_code, 0, "{}", report.text);
@@ -3512,22 +3533,22 @@ fn refresh_unit(
     world: &World,
     unit: &str,
     snapshot: &Snapshot,
-    no_reload: bool,
+    allow_reload: bool,
 ) -> super::refresh::RefreshReport {
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
     let mut only = options(world);
     only.only = vec![unit.to_owned()];
     only.snapshot = snapshot.clone();
-    only.no_reload = no_reload;
+    only.allow_reload = allow_reload;
     refresh(&world.fake, &services, &only).unwrap()
 }
 
 #[test]
-fn a_link_form_unit_moves_by_repointing_its_link_with_no_reload() {
+fn a_link_form_unit_moves_by_repointing_its_link_with_no_reload_either_way() {
     let world = world();
     add_headless_unit_file(&world);
     // The first move writes the link-form drop-in: the one reload.
-    let report = refresh_unit(&world, "headless.service", &world.snapshot, false);
+    let report = refresh_unit(&world, "headless.service", &world.snapshot, true);
     assert_eq!(report.exit_code, 0, "{}", report.text);
     let row = row_for(&report, "headless.service");
     assert_eq!(row["form"], "drop-in");
@@ -3540,9 +3561,9 @@ fn a_link_form_unit_moves_by_repointing_its_link_with_no_reload() {
     assert_eq!(fs::read_link(&link).unwrap(), world.snapshot.path);
     // Later moves, with and without --no-reload: the link moves, nothing else changes.
     let mut previous = world.snapshot.path.clone();
-    for (commit, no_reload) in [(THIRD, true), (FOURTH, false)] {
+    for (commit, allow_reload) in [(THIRD, false), (FOURTH, true)] {
         let next = next_snapshot(&world, commit);
-        let report = refresh_unit(&world, "headless.service", &next, no_reload);
+        let report = refresh_unit(&world, "headless.service", &next, allow_reload);
         assert_eq!(report.exit_code, 0, "{}", report.text);
         let row = row_for(&report, "headless.service");
         assert_eq!(row["action"], "refreshed", "{}", report.text);
@@ -3584,12 +3605,12 @@ fn a_failed_link_form_move_points_the_link_back_with_no_reload() {
     let world = world();
     add_headless_unit_file(&world);
     assert_eq!(
-        refresh_unit(&world, "headless.service", &world.snapshot, false).exit_code,
+        refresh_unit(&world, "headless.service", &world.snapshot, true).exit_code,
         0
     );
     let next = next_snapshot(&world, THIRD);
     *world.fake.crashing.borrow_mut() = Some(next.agentctl());
-    let report = refresh_unit(&world, "headless.service", &next, true);
+    let report = refresh_unit(&world, "headless.service", &next, false);
     assert_eq!(report.exit_code, 1, "{}", report.text);
     assert_eq!(
         row_for(&report, "headless.service")["action"],
@@ -3619,7 +3640,7 @@ fn moving_a_legacy_drop_in_to_link_form_takes_exactly_one_reload() {
     world.fake.daemon_reload().unwrap();
     world.fake.restart("headless.service").unwrap();
     let reloads = reload_calls(&world);
-    let report = refresh_unit(&world, "headless.service", &world.snapshot, false);
+    let report = refresh_unit(&world, "headless.service", &world.snapshot, true);
     assert_eq!(report.exit_code, 0, "{}", report.text);
     assert_eq!(row_for(&report, "headless.service")["form"], "drop-in");
     assert_eq!(reload_calls(&world), reloads + 1);
@@ -3638,7 +3659,7 @@ fn moving_a_legacy_drop_in_to_link_form_takes_exactly_one_reload() {
         "{rollback}"
     );
     let next = next_snapshot(&world, THIRD);
-    let report = refresh_unit(&world, "headless.service", &next, false);
+    let report = refresh_unit(&world, "headless.service", &next, true);
     assert_eq!(report.exit_code, 0, "{}", report.text);
     assert_eq!(reload_calls(&world), reloads + 1);
 }
@@ -3653,7 +3674,7 @@ fn a_unit_file_bridge_keeps_one_drop_in_text_across_snapshots() {
             "[Unit]\nDescription=file bridge\n\n[Service]\nEnvironment=AGENTCTL_HOME=/state/home-old PATH=/usr/bin:/bin\nExecStart=/state/bin/agentctl-old --registry {registry} chat run --bridge-state /state/filebridge\n"
         ),
     );
-    let report = refresh_unit(&world, "filebridge.service", &world.snapshot, false);
+    let report = refresh_unit(&world, "filebridge.service", &world.snapshot, true);
     assert_eq!(report.exit_code, 0, "{}", report.text);
     let link = snapshot::links_dir(&world.root).join("filebridge.service");
     let drop_in = world
@@ -3667,7 +3688,7 @@ fn a_unit_file_bridge_keeps_one_drop_in_text_across_snapshots() {
         "{text}"
     );
     let next = next_snapshot(&world, THIRD);
-    let report = refresh_unit(&world, "filebridge.service", &next, true);
+    let report = refresh_unit(&world, "filebridge.service", &next, false);
     assert_eq!(report.exit_code, 0, "{}", report.text);
     let row = row_for(&report, "filebridge.service");
     assert_eq!(row["form"], "link");
@@ -3702,7 +3723,7 @@ fn an_inactive_link_form_restore_unit_moves_its_link_only() {
         ),
     );
     world.fake.stop("restore.service").unwrap();
-    let report = refresh_unit(&world, "restore.service", &world.snapshot, false);
+    let report = refresh_unit(&world, "restore.service", &world.snapshot, true);
     assert_eq!(report.exit_code, 0, "{}", report.text);
     assert_eq!(
         row_for(&report, "restore.service")["action"],
@@ -3710,7 +3731,7 @@ fn an_inactive_link_form_restore_unit_moves_its_link_only() {
     );
     assert_eq!(reload_calls(&world), 1);
     let next = next_snapshot(&world, THIRD);
-    let report = refresh_unit(&world, "restore.service", &next, true);
+    let report = refresh_unit(&world, "restore.service", &next, false);
     assert_eq!(report.exit_code, 0, "{}", report.text);
     let row = row_for(&report, "restore.service");
     assert_eq!(row["action"], "updated-inactive", "{}", report.text);
@@ -3960,7 +3981,7 @@ fn fabricate_candidate(world: &World, new: &str) -> PathBuf {
 }
 
 #[test]
-fn turnover_no_reload_moves_the_rest_and_names_a_unit_that_needs_a_reload() {
+fn turnover_by_default_skips_a_unit_that_needs_a_reload_and_moves_the_rest() {
     let world = world();
     add_headless_unit_file(&world);
     let (checkout, old, new) = turnover_checkout(&world._temporary.0);
@@ -3972,16 +3993,19 @@ fn turnover_no_reload_moves_the_rest_and_names_a_unit_that_needs_a_reload() {
         .insert(PathBuf::from("/state/bin/agentctl-old"), old.clone());
     let mut options = turnover_options(&world, checkout);
     options.report_only = false;
-    options.no_reload = true;
+    assert!(!options.allow_reload);
     let report = turnover(&world.fake, &Tables, &options).unwrap();
-    // The unit file is refused unchanged; the transient units still move.
-    assert_eq!(report.exit_code, 1, "{}", report.text);
+    // The unit file is skipped unchanged and named; the transient units still move, and a
+    // scheduled run is not a failure for it.
+    assert_eq!(report.exit_code, 0, "{}", report.text);
     assert_eq!(reload_calls(&world), 0, "{:?}", world.fake.calls());
     assert!(!headless_drop_in(&world).exists());
+    let state = &world.fake.show(&["headless.service".to_owned()]).unwrap()[0];
+    assert!(!state.need_daemon_reload);
     assert!(
-        report
-            .text
-            .contains("headless.service not moved: needs-daemon-reload"),
+        report.text.contains(
+            "headless.service not moved (no reload without --allow-reload): needs-daemon-reload"
+        ),
         "{}",
         report.text
     );

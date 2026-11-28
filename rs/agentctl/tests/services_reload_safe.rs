@@ -1,4 +1,4 @@
-//! `agentctl services refresh --no-reload` and `agentctl services transients` end to end through
+//! `agentctl services refresh` (no reload by default) and `agentctl services transients` end to end through
 //! the real CLI (#2441), with a fake `systemctl` (`--systemctl PATH`) that answers list-units,
 //! list-unit-files, show and cat from fixture files and logs every call. Nothing here reaches a
 //! user manager. Linux only (the fake is a POSIX shell script).
@@ -147,7 +147,7 @@ fn write_headless_unit(scene: &Scene) {
 }
 
 #[test]
-fn no_reload_refuses_a_unit_file_move_without_touching_systemd() {
+fn refresh_by_default_skips_a_unit_file_move_without_touching_systemd() {
     let scene = scene("refuse");
     write_headless_unit(&scene);
     let output = agentctl(
@@ -159,7 +159,6 @@ fn no_reload_refuses_a_unit_file_move_without_touching_systemd() {
             "--root",
             &scene.root.to_string_lossy(),
             "refresh",
-            "--no-reload",
             "--drop-in-dir",
             &scene.drop_ins.to_string_lossy(),
             "--json",
@@ -167,11 +166,11 @@ fn no_reload_refuses_a_unit_file_move_without_touching_systemd() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
     let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let row = &report["services"][0];
     assert_eq!(row["unit"], "headless.service", "{report}");
-    assert_eq!(row["action"], "refused", "{report}");
+    assert_eq!(row["action"], "skipped", "{report}");
     assert_eq!(row["form"], "drop-in", "{report}");
     assert!(
         row["reason"]

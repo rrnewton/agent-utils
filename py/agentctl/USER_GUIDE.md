@@ -1626,7 +1626,9 @@ clean `git archive` of one commit, into its own snapshot
 directory with the Slack plugin home and manifest. `refresh` handles one
 service at a time: it backs up the unit, writes rollback commands, restarts the
 service on the snapshot with every other argument and variable unchanged,
-checks its health, and rolls it back if the check fails. `agentctl services
+checks its health, and rolls it back if the check fails. Neither `refresh` nor
+`turnover` runs a user-manager daemon-reload unless `--allow-reload`: a unit
+file whose move needs one is skipped and named. `agentctl services
 userguide` documents the whole flow.
 
 ### The coordinator and the control tree (Rust edition)
