@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-overscroll-follow-short: the column overscroll check intermittently follows a reply a few px short of the right column''s foot, with the reader in the room'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-flaketriage
@@ -9,7 +9,8 @@ labels:
 - scroll-stability
 - tests
 created_at: 2026-11-28T01:55:00-05:00
-updated_at: 2026-11-28T01:55:00-05:00
+updated_at: 2026-11-28T10:11:00-05:00
+closed_at: 2026-11-28T10:11:00-05:00
 ---
 
 # Description
@@ -55,3 +56,20 @@ Related:
 - #2427: residency (live in 3c5da567; not implicated by the attribution above).
 - #2437: the reply keyboard header fix (not implicated alone).
 - #2423: the trees where it was seen with #2427.
+
+## Resolution
+
+[opus 5.5] Closed by `#2445` search-clear-two-columns-found-hold step 1 (90ff376b, live in 022cf893, deployed 2026-11-28 before 10:10 AM ET). Its trace named the cause.
+
+The cause: on main, FOLLOW passed only by timing. The left column's Newest pill grows `#scroll-tools`, and `--scroll-tools-clearance`, shared with the channel's box, padded the right column's box too. A reply arriving with the reader in the right column's room left them short of the new foot. A frame later the pill hid and shrank the right foot under them, and the foot keeper's size-change follow closed the last pixels. When that frame slipped, the reader stayed 4 px short: this issue's miss. All of its recorded misses were at desk-1920, where the step is reached; at desk-1280 the walk does not reach FOLLOW.
+
+The fix:
+- The right column's box and reply pane keep no room for the left column's chips.
+- FOLLOW now expects the row being read to keep its top (<= 0.5 px) with the reply shown below it (owner rule 370, `#2230`, liaison 1152), so no frame's timing decides the result.
+
+Evidence (`column_overscroll_browser.py --size desk-1920`, fixture server, alone):
+- Before the fix, the new FOLLOW against main's page failed 9 of 10 (the row moved 53 -> 57 px as the follow caught up); with step 1, 10 of 10 passed (load1 114-157).
+- After the landing, on main 022cf893: 25 of 25 passed (2026-11-28 9:54-10:11 AM ET). 20 of those runs started under load1 237 (193-236), and the other 5 started at 237-256.
+- The rebased head passed 3 of 3, with every negative control failing as it must; the owner gate's column-overscroll steps passed at 1280 and 1920.
+
+The hygiene change parked on `cl-flaketriage/2444` (4b10b24b) is no longer needed for this step.
