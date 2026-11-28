@@ -8,7 +8,7 @@ labels:
 - wrkslots
 - state-lock
 created_at: 2026-11-28T09:35:00-05:00
-updated_at: 2026-11-28T09:35:00-05:00
+updated_at: 2026-11-28T11:00:00-05:00
 ---
 
 # Description
@@ -37,3 +37,31 @@ Related: #1247 wrkslots-status-lock (read-only scans measure outside the lock, s
 # Notes
 
 Report evidence at filing time; no measurement by this lane yet. Number pre-assigned by the coordinator (2026-11-28).
+
+## Root cause (cl-wrkdoctor, 2026-11-28)
+
+Measured read-only on the reporting host's 9:37 AM ET run (/proc/locks, the unit's cgroup cpu.stat, /proc/PID/stat; no attach) and on scratch registries. Both edition surfaces read below; the consumer runs the Python edition.
+
+- CPU is Git processes. The 8:37 run spawned 31,672 subprocesses; one `git rev-parse` through the host's default Git costs about 55 ms of CPU including the telemetry helper it leaves behind (2 ms through the system Git), which is the reported 1,884 CPU-s. The 9:37 run (17,585 subprocesses) used 793 CPU-s in its cgroup: 86 s in the Python process, 214 s in reaped children, the rest in the helpers.
+- Where the processes come from (py/wrkslots/cli.py): the worktree-config walk (`_worktree_config_doctor_findings`) asked Git for a common directory before its seen-set test and re-walked the primary repository and every one of its submodules once per row; `_inspect_worktree_config` ran one `git config --get` per key; the shared-submodule walk (`_shared_submodule_doctor_findings`) probed the primary's submodule (`_shared_module_prep_state`, five processes) once per row and asked for the git dir and the common dir in two processes. A scratch registry shaped like the reporter's (seven submodules, four nested, private clones in every slot) needed 118 Git processes per populated row, all in those two walks; neither walk was cached across a retaken snapshot.
+- The 8:37 run was two measurements: the registry changed during the first, the snapshot was retaken, and the retake spent 80 s + 37 s under the shared lock re-parsing the event log (2.6 GB, 101,826 files). Doctor applied its event-retention caps after its prewarm, so the prewarm kept the whole parsed history (5.45 GB resident against the 6 GiB scan limit); one appended event then dropped that chain, and every later reader of the full event tuple (pending operations, holds, owner releases, the event count) re-parsed the whole log because the memo caps (5,000 events, 256 MiB) are far below its size: eight full passes per run, two inside the locked snapshot.
+- The Python lock scope itself was right (snapshot under the lock, measurement outside, #1247); the lock was held for the snapshot, which was slow. The Rust readers' `consistent_read` still ran its last measurement under the shared lock after three changed reads, which on a busy registry is a whole-scan hold.
+
+## Fix
+
+- One memoizing Git per doctor run for both walks (`_DoctorGitVcs`): each read-only question once; git dir and common dir from one `rev-parse`; each config file read with one `git config -z --list` (per-key answers unchanged, tested against the old per-key reads). Both walks cached by storage subject across retakes.
+- Retention caps before the prewarm (doctor and status). Pending operations, holds, owner-release events, handoff publications and the event count are resumable streamed folds (`_resumable_event_fold`) remembered at a verified tip; the streamed registry replay advances them in its own pass, so a cold read parses the log once and a retaken snapshot reads only the events appended since.
+- Rust `consistent_read` publishes its last lock-free measurement after the bounded retries, as the Python readers do; no reader measures under the shared lock.
+
+## Measurements
+
+Unit-scope cgroup CPU (the doctor and every process it leaves behind), host's default Git, --scan-timeout 1500, load1 about 220-235, 100-row scratch registry shaped like the reporter's (seven submodules, four nested, private clones in every slot; 1,500 findings):
+
+| run | wall | cgroup CPU-s | subprocesses |
+|---|---|---|---|
+| before, events appended during the run | 1,059 s | 2,222 | 32,613 (three measurements) |
+| after, events appended during the run | 90 s | 183 | 2,729 |
+| before, quiet | 369 s | 756 | 11,141 |
+| after, quiet | 100 s | 189 | 2,729 |
+
+Doctor JSON byte-identical to main on the 5- and 100-row registries (timings, subprocess counts and heartbeat ages removed). Event-file parses per doctor with consumer-scaled caps and one append between prewarm and snapshot: 216 (eight passes) before, 27 (one pass) after, with only the appended event read under the lock. Per-spawn cost on the reporting host, 200 `git rev-parse` in a user scope: 55 ms CPU through the host's default Git (its telemetry helper included), 2 ms through the system Git.
