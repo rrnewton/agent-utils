@@ -10,7 +10,7 @@ labels:
 - slack
 - bridge
 created_at: 2026-11-27T23:12:00-05:00
-updated_at: 2026-11-28T01:20:00-05:00
+updated_at: 2026-11-28T03:45:00-05:00
 ---
 
 # Description
@@ -44,3 +44,10 @@ Step (c) of #2420 relay-never-lossy. The owner decided on 2026-11-27: no lossy t
   - Tests: a_full_store_puts_one_alarm_line_in_the_agents_pane_at_once; a_closed_owner_request_awaiting_a_reply_gets_an_alarm_line_naming_its_key; the capacity admission test, rewritten so the next owner message is admitted at once and the oldest unanswered request is retired.
   - The request cap stays 2,048, deliberately, with no request_hard_cap key. More reply routes would push RouteCache::patterns past the 96 KiB herdr output-subscription budget and break reply capture. A higher cap needs a reworked matcher, which is a separate design.
   - D5/D6 landed as 23077655; cl-gapreconcile writes its close note.
+- 2026-11-28 (cl-gapreconcile), D5/D6 close note:
+  - D5/D6 landed on main as 23077655 (gated as 04516726), in the chat-stack landing d3494a71..23077655.
+  - D5, chat run: a batch holding one gap event is admitted like a checkpoint at its far side, through the normal commit path, so the pump keeps running. gap.json keeps its keys and is written only as `resolved` for a provider gap; the new gap-reconcile.json (schema agentctl-chat-gap-reconcile/v1) records the window (last commit before the gap to the gap) and whether the agent and the owner were told. ONE pane line (queue ID `chat-gap-reconciled-<observed ms>`) and ONE owner-alarm notice per gap; `chat status` shows `gap_reconcile` for 24 h and `chat health` reports it DEGRADED until finished (agent told, provider alive 5 min past the gap).
+  - Also in D5: a gap mixed with other events keeps the old halt; an older build's unresolved provider gap no longer blocks reconnect (the next batch resolves it and opens a reconcile; retry approvals are optional); a provider gap supersedes a rolled-back admission that waits for a replay the provider will never send.
+  - D6, Slack plugin: a GAP record, a stderr overflow, an unknown saved cursor and an event behind a proven position are reported at the far side, a `slack1:since:` cursor taken when the gap was seen; the reason says whether the rescan backfills. The ledger's new `gap_cursor` makes a resume from that far side known and admits back to the ledger's start, so the gap's window is filled across a restart. Older plugins ignore `gap_cursor`.
+  - Acceptance: D5 met by provider_gap_is_admitted_like_a_checkpoint_and_the_bridge_keeps_running and end_to_end_a_gap_is_admitted_alarmed_once_and_its_message_delivered_once (agentctl), plus a_provider_gap_puts_one_alarm_line_in_the_pane_and_one_owner_notice. D6 met by provider_gaps_and_unreadable_cursors_are_reported_at_their_far_side_and_the_stream_goes_on (GAP record, stderr overflow, unknown cursor), a_provider_gap_never_halts_the_bridge_and_the_rescan_fills_its_window_across_a_restart and an_owner_message_sent_inside_a_gap_is_delivered_exactly_once_across_restarts (lead-014's condition). Each fails on the code before it (the gap halted the bridge).
+  - Status stays open. Remaining before close: (1) the rollout, with the Slack plugin and agentctl moving together from one snapshot (lead-014's coordinator bridge in daytime with their knowledge; ours in the maintenance window); a new plugin under an older agentctl loses that agentctl's 10-minute outage auto-resolve for gaps; (2) the live check in the maintenance window: the running bridge on that snapshot shows `gap_reconcile` (null when no gap occurred) in `chat status`, and `chat health` is not DEGRADED for a gap. Any #2439/#2440 status change waits for that check.
