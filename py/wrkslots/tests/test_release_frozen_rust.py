@@ -236,6 +236,7 @@ def test_release_dry_run_matches_python(
 
 
 @pytest.mark.ordinary_environment(reason="validation exclusion needs a root-owned sticky /tmp parent (#2065)")
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: the host /proc census meets unrelated exiting threads
 def test_release_yes_matches_python(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

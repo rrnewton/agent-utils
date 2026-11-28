@@ -84,7 +84,7 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
     - `test_slice_fallbacks.py` (2): root-owned sudo and host scopes.
     - `test_seal_recover_scoped_census.py` (2) and `test_recover_late_census_rollback.py` (1): the real census.
     - `test_release_frozen_rust.py` (1): a root-owned sticky /tmp parent.
-  - In all, 284 cases run on the host (94, 99 and 91 per host shard). The 9 `test_remove_write_rust.py` cases are also `load_quarantine`, so they run there only on opt-in.
+  - In all, 283 cases run on the host (81, 96 and 106 per host shard). The 9 `test_remove_write_rust.py` cases are also `load_quarantine`, so they run there only on opt-in.
 - **`load_quarantine` additions.** Each has a #2065 pointer and stays runnable with `WRKSLOTS_INCLUDE_QUARANTINED=1` or `-m load_quarantine`.
   - Host cases that need a live census inside the remove budget:
     - `test_remove_write_rust.py`: 9 cases;
@@ -97,6 +97,9 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
     - `test_census_late_fork.py::test_naming_matches_read_argv_and_environ_from_proc`: red on unrelated heads.
     - `test_lifecycle.py::test_validate_batch_census_deadline_restores_seals_before_outer_bound`. It asserts an 8 s wall-clock rollback reserve, measured at 10.18 s on gate `1795786086386213333-9d85f162`. Proposed fix: assert ordering and outcome, or a budget derived from measured CPU. It was red on more than 27 heads on 2026-11-27 (29.6 s and 11.3 s among them).
     - `test_worktrees_image.py::test_unmount_busy_clears_on_a_bounded_retry`: it times out in the real host /proc holder scan, as #2372's two image tests did. The fixture proc root for it is #2434.
+    - `test_shared_submodules.py::test_remove_keeps_every_linked_worktree_index_of_private_clone`: the remove item budget ran out in salvage git work even in the namespace, like its quarantined sibling (gate `1795844957763037888-56f2b0d5`).
+  - Host, on the live census:
+    - `test_release_frozen_rust.py::test_release_yes_matches_python`: the host /proc census met an unrelated exiting thread whose fd directory was unreadable (case 2 above), on the same gate. It stays `ordinary_environment` for its root-owned sticky /tmp.
 - **Not un-quarantined in this commit.** Quarantined cases are deselected in gates, so none passed in this gate, as the coordinator's rule requires.
   - Local evidence for a later step: 12 of the 21 existing #2065 Python cases passed inside the namespace on 2026-11-27. They are `test_batch_lock_scope` x2, `test_dead_fuse_entry` x2, `test_remove_fenced_lock_scope` x6, `test_journal_actor_liveness::test_remove_waits_for_a_live_finish_journal_then_proceeds` and `test_audit_state_rust::test_audit_size_unknown_text_matches_python`.
   - `test_wait_lock_waits_for_a_live_journal_then_proceeds` still failed: a 300 s wall-clock thread join.
@@ -110,6 +113,7 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
   - Five runs alone in the namespace with the sampler all passed, but every run had about 130 of the host git wrapper's orphaned helpers working in the slot the audit judges.
   - Both editions count a live process using the slot as a running agent, so the faster Rust census seeing one is the #2418 cause, not an edition bug.
   - The two tests are `ordinary_environment` with that reason. Their 15 sibling audit differentials already pass on the host shards.
+- **Test fix, not a mark.** `test_eden_restart.py::test_hung_daemon_times_out_and_the_other_slot_still_restarts` patched both eden timeouts to 0.5 s, so the healthy slot's start was refused inside a gate's host shard. Both timeouts are now 10 s: the hung fake sleeps 30 s and still times out by name. Alone 5 of 5 at load1 215-261.
 - **Coverage.** Removal-path coverage for the quarantined set now rests on #2392's new tests and on this on-demand set. The 9 `test_remove_write_rust.py` Rust/Python remove differentials come back to the namespaced shards when #2418 lands.
 - **Related.**
   - Two `test_worktrees_image` busy-holder tests hit the 600 s per-test timeout inside `scan_mount_holders` on another gate. #2372's test fix (906b54fc) gives them a fixture proc root, and its production change (#2372 50a174b4, pending) parses each distinct mount table once.

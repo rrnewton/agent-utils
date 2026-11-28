@@ -459,8 +459,10 @@ def test_hung_daemon_times_out_and_the_other_slot_still_restarts(
     _write_row(root, _record(root, "eden-b"))
     hung, dead = _config_dir(root, "eden-hang"), _config_dir(root, "eden-b")
     log = _install_fake_eden(tmp_path, monkeypatch, {hung: "hang", dead: "dead"})
-    monkeypatch.setattr(eden, "INFO_TIMEOUT_SECONDS", 0.5)
-    monkeypatch.setattr(eden, "START_TIMEOUT_SECONDS", 0.5)
+    # Generous headroom (#2065, owner rule 346): the hung fake sleeps 30 s, so it still times out by name,
+    # and the healthy slot's start has room on a loaded host (0.5 s refused it inside a gate's host shard).
+    monkeypatch.setattr(eden, "INFO_TIMEOUT_SECONDS", 10.0)
+    monkeypatch.setattr(eden, "START_TIMEOUT_SECONDS", 10.0)
 
     assert _run(root) == 3
     report = json.loads(capsys.readouterr().out)

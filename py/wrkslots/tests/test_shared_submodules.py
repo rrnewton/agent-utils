@@ -1081,6 +1081,7 @@ def test_remove_never_loses_orphan_head_commit(tmp_path: Path) -> None:
     assert removed.returncode != 0 or _object_survives(tmp_path, sha), "PRIVATE COMMIT LOST"
 
 
+@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: remove item budget runs out in salvage git work under load
 def test_remove_keeps_every_linked_worktree_index_of_private_clone(
     tmp_path: Path,
 ) -> None:
