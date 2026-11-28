@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-read-run-separator-over-label: the folded read run line draws its rule through "N read messages, M pinned", and the label is not centred'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-27T19:04:07-05:00
-updated_at: 2026-11-27T19:04:07-05:00
+updated_at: 2026-11-27T23:09:06-05:00
+closed_at: 2026-11-27T23:09:06-05:00
 ---
 
 # Description
@@ -36,3 +37,13 @@ The pinned run's line is drawn in pieces (#1854): the head "… N read messages,
 # Notes
 
 Filed at the coordinator's request (owner-UI fast track), issue file only.
+
+## Resolution
+
+Fixed by 9eeaa847 (vibe-talk: a folded run's line with pins keeps its rules in the line, whatever its head row's state). Deployed; post-deploy guards green (read_run_line, fold_pins, read_modes).
+
+- Cause: a pinned run's line draws its two dashed rules as the head row's own ::before and ::after. Row states (the pin edge, the read veil of a reply / seam / bookmark / thread strip, the landed and Done moments) also claim li::after and make it position: absolute.
+- Effect: with a pinned or reply head, or the line selected, the right rule left the line. The sentence stood far right, and the veil drew the rule across the whole row through the words: the owner's screenshot.
+- Fix: both rules reset to plain flex items (position static, no inset, background, shadow, outline or animation, !important).
+- Walk: tests/read_run_line_browser.py (dag 190), 18 cases including the owner's view at 1117x800. Main failed every pinned, reply and selected head.
+- The line stays at list width (liaison 1095).

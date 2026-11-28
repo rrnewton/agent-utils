@@ -8,7 +8,7 @@ labels:
 - owner-ui
 - perf
 created_at: 2026-11-27T19:35:00-05:00
-updated_at: 2026-11-27T19:35:00-05:00
+updated_at: 2026-11-27T23:10:13-05:00
 ---
 
 # Description
@@ -37,3 +37,5 @@ The open path (view/channel/replysession.ts openReply, dockReply and their helpe
 # Notes
 
 Filed at the coordinator's request (owner P0, fast track), issue file only.
+
+Landed e2baf4c3; deploy pending (it waits for the launch-hold release). It closes after the deploy and its post-deploy guards.

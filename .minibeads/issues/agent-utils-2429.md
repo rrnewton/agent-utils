@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-typing-never-lags: keystrokes and caret moves in any composer must cost O(1), with no list scan, row layout read or re-render'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - owner-ui
 - perf
 created_at: 2026-11-27T19:39:10-05:00
-updated_at: 2026-11-27T19:39:10-05:00
+updated_at: 2026-11-27T23:09:06-05:00
+closed_at: 2026-11-27T23:09:06-05:00
 ---
 
 # Description
@@ -41,3 +42,12 @@ The owner's lists run to about 100k px of rows, with windowed rendering off.
 # Notes
 
 Filed at the coordinator's request (owner P0, fast track), issue file only. It shares a trace with #2428 (Reply open); they land separately.
+
+## Resolution
+
+Fixed by 39ac57f1 (vibe-talk: typing in a composer no longer relinks the whole list's glossary terms at every key). Deployed in 99a3399b; post-deploy guards green (typing_lag, glossary page tests, reply_continuity, inline_reply, search_unmatched).
+
+- Cause: glossary.ts relinked the whole list on every collapsed selection (a composer's caret, so every keystroke) and on every list mutation (the reply box's own, the minute time tick).
+- Fix: selectionchange links only roots a pass skipped while a selection stood. The observer links only rows added or whose message words changed.
+- Measured, script ms per key at 1,216 rows: p95 98.5 -> 0.70 (composer), 98.8 -> 0.64 (reply box).
+- Walk: tests/typing_lag_browser.py (dag 191). Main walked 9,691 text nodes at each key.

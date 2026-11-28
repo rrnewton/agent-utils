@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-keyboard-shift-e-status-race: keyboard-browser reads the Shift+E status before the server has answered, on a prefix the optimistic words already match'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 - tests
 created_at: 2026-11-27T21:20:57-05:00
-updated_at: 2026-11-27T21:20:57-05:00
+updated_at: 2026-11-27T23:09:06-05:00
+closed_at: 2026-11-27T23:09:06-05:00
 ---
 
 # Description
@@ -40,3 +41,12 @@ Shown by bisect and repro:
 # Notes
 
 Filed at the coordinator's request after the #2375 bisect (issue file only); the fix follows #2428.
+
+## Resolution
+
+Fixed by 51fb81b3 (vibe-talk: keyboard-browser waits on Shift+E's server half, not on words the optimistic line already says). Test only.
+
+- Both Shift+E checks wait, as conditions with the hang backstop, until the fake API has recorded the upstream-read and the status no longer shows only the optimistic words.
+- With the server's answer 400 ms late: old 0/3, new 3/3. A negative control still fails.
+- Landed under the liaison's step-waiver for an off-path known red, screenshots-phones (#2175).
+- Seen on the side, not fixed: one keyboard_browser run failed "back from Settings the list was at 4005, not where the reader left it (4100)", a separate Settings-return check (the coordinator numbers it if it recurs).
