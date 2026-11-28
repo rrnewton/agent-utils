@@ -2298,8 +2298,6 @@ const filterPlaceOwner = createFilterPlace({
   rowMessages: (row) => rowMessages(/** @type {any} */ (row)),
   clearEntryLanding: () => { entryState().landing = null; entryState().threadOwed = null; entryState().threadAwaitsRead = false; },
   sideShowing: () => sideShowing(),
-  // `#2423`: whether the right column is up beside the channel list (two columns at a desk).
-  twoColumnsUp: () => sideColumnUp(),
 });
 const { filterChanges, filterKey, filterState, endFilterWalk, anchorAt, anchorHolder, anchorRow, nearestShownRow, currentFilterHold, heldFilterRow, readerActed, followsNewest, keepFilterHold, filterAnchor, keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace, holdFilterRow, holdFastPassRow } = filterPlaceOwner;
 

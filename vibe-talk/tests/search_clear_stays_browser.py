@@ -103,7 +103,7 @@ QUIET_JS = """(still) => new Promise((resolve) => {
 # of the screen the reader sees first (the message their eye is on): the band under the floating
 # search bar, above the list's own tools at its foot, an open keyboard and the dock bar. A message
 # cut by an edge counts by the middle of the part that shows.
-HITS_JS = """() => {
+HITS_JS = """(word) => {
   const area = document.getElementById('scroll-area');
   const clip = area.getBoundingClientRect();
   const bar = document.getElementById('search-float');
@@ -120,7 +120,7 @@ HITS_JS = """() => {
   const hits = [...document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)')]
     .map((li) => ({id: li.dataset.id, top: li.getBoundingClientRect().top, bottom: li.getBoundingClientRect().bottom,
       text: li.textContent || ''}))
-    .filter((hit) => /needle/.test(hit.text) && hit.bottom > head && hit.top < foot)
+    .filter((hit) => hit.text.toLowerCase().includes(word) && hit.bottom > head && hit.top < foot)
     .map((hit) => ({id: hit.id, top: hit.top, bottom: hit.bottom,
       gap: Math.abs((Math.max(hit.top, head) + Math.min(hit.bottom, foot)) / 2 - middle)}));
   hits.sort((a, b) => a.gap - b.gap);
@@ -172,6 +172,28 @@ class ClearApi(FakeApi):
         return {**super().client_config(), "discuss_available": True}
 
 
+class ClearThreadsApi(ClearApi):
+    """`ClearApi` with one thread (message 40 its root, 41 its reply), so the layout button offers two
+    columns at a desk (`#2445`): the channel list on the left holds every message but the reply."""
+
+    threads_held: list[Json] = []
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        thread_id = "spaces/A/threads/clear"
+        root = self.messages[40]
+        root["thread"] = {"id": thread_id, "root_message_id": root["id"], "is_root": True, "reply_count": 1,
+                          "reply_count_exact": True}
+        self.messages[41]["thread"] = {"id": thread_id, "root_message_id": root["id"], "is_root": False,
+                                       "reply_count": 1, "reply_count_exact": True}
+        self.threads_held = [{"id": thread_id, "root": root, "title": "Thread", "reply_count": 1,
+                              "reply_count_exact": True, "updated_at": self.messages[41]["timestamp"],
+                              "summary": "One thread, so two columns are offered."}]
+
+    def timeline(self, query: dict[str, list[str]]) -> Json:
+        return {**super().timeline(query), "threads": list(self.threads_held), "has_threads": True}
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--browser-executable", default=os.environ.get("VIBE_TALK_CHROMIUM"),
@@ -194,7 +216,7 @@ def quiet(page: Page, frames: int = 30) -> None:
     page.evaluate(QUIET_JS, frames)
 
 
-def sign_in(page: Page, keyboard: bool) -> None:
+def sign_in(page: Page, keyboard: bool, rows: int | None = None) -> None:
     if keyboard:
         page.evaluate(f"() => window.__iosKeyboard(window.innerHeight - {KEYBOARD_PX})")
     page.fill("#api-token", TOKEN)
@@ -206,7 +228,7 @@ def sign_in(page: Page, keyboard: bool) -> None:
     except Exception:
         pass  # no first-run Welcome on this path (#1781)
     page.wait_for_selector("#search-toggle", state="visible")
-    page.wait_for_function(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT}")
+    page.wait_for_function(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {rows or COUNT}")
     quiet(page)
 
 
@@ -302,8 +324,8 @@ def search(page: Page, word: str, touch: bool) -> Json:
     return reading
 
 
-def hits(page: Page) -> Json:
-    found = page.evaluate(HITS_JS)
+def hits(page: Page, word: str = "needle") -> Json:
+    found = page.evaluate(HITS_JS, word)
     return found if isinstance(found, dict) else {}
 
 
@@ -331,7 +353,7 @@ def clear(page: Page, how: str, touch: bool) -> None:
 
 
 def walk(page: Page, name: str, parked: int, find: str, how: str, touch: bool, shots: Path | None,
-         traces: Path | None) -> tuple[str, float, bool]:
+         traces: Path | None, rows: int | None = None) -> tuple[str, float, bool]:
     park(page, parked, touch)
     reading = search(page, "needle", touch)
     if find == "scrolled":
@@ -394,7 +416,7 @@ def walk(page: Page, name: str, parked: int, find: str, how: str, touch: bool, s
     line = (f"{name}: target {target} top {first} -> worst {tops[worst]} at frame {worst} of {len(frames)} "
             f"(drift {drift:.2f} px{', gone ' + str(len(gone)) + ' frames' if gone else ''}), rows {shown}")
     # Emptying the field clears the search but leaves its bar open; every other clear folds it.
-    check(shown == COUNT and (how == "emptied" or not searching),
+    check(shown == (rows or COUNT) and (how == "emptied" or not searching),
           f"{name}: the clear left {shown} rows shown, searching={searching}")
     return line, drift, bool(gone)
 
@@ -434,7 +456,10 @@ def launch(playwright: Playwright, args: argparse.Namespace, profile: str, width
 # dark once per profile. `--all-schemes` runs every walk in dark too. Over 200 rows the typing's fast
 # pass keeps the reader's place (`#2257`; `#2424` holds it to the settled pass): the entry does not
 # land on the newest hits there, so the landed walks are a short list's; typed-closed runs on both.
-PROFILES = {"desk": (1280, 800, False, "escape"), "phone": (412, 915, True, "x")}
+PROFILES = {"desk": (1280, 800, False, "escape"), "phone": (412, 915, True, "x"),
+            # `#2445`: two columns at a desk, the channel list on the left (the fixture with a thread).
+            "desk2": (1920, 1080, False, "escape")}
+TWO_COLUMN_WALKS = ("landed", "landed-glass", "landed-tapped", "onscreen-scrolled", "typed-closed")
 BIG = 260
 BIG_WALKS = ("landed-scrolled", "onscreen-scrolled", "landed-tapped", "landed-scrolled-emptied", "typed-closed")
 
@@ -447,7 +472,7 @@ Run = tuple[str, str, bool, tuple[str, int, str, str | None], int, bool]
 def plan(all_schemes: bool, count: int | None) -> list[Run]:
     """(scheme, profile, keyboard, walk, channel size, Discuss open) for every walk to run."""
     runs: list[Run] = []
-    places = (("desk", False), ("phone", False), ("phone", True))
+    places = (("desk", False), ("phone", False), ("phone", True))  # one column; two columns below
     for scheme in ("light", "dark"):
         for label, keyboard in places:
             for spec in WALKS:
@@ -456,18 +481,24 @@ def plan(all_schemes: bool, count: int | None) -> list[Run]:
     if count is None:
         for label, keyboard in places[:2]:
             runs.extend(("light", label, keyboard, spec, BIG, False) for spec in WALKS if spec[0] in BIG_WALKS)
+    # Two columns at a desk (`#2445`): every two-column walk in light, the landed one in dark too.
+    for scheme in ("light", "dark"):
+        runs.extend((scheme, "desk2", False, spec, count or COUNT, False) for spec in WALKS
+                    if spec[0] in TWO_COLUMN_WALKS and (scheme == "light" or all_schemes or spec[0] == "landed"))
     # The Discuss half-pane open beside the channel (desk and phone; every place and scheme with
     # `--all-schemes`).
     for scheme in ("light", "dark") if all_schemes else ("light",):
         for label, keyboard in places if all_schemes else places[:2]:
             runs.extend((scheme, label, keyboard, spec, count or COUNT, True) for spec in WALKS if spec[0] in DISCUSS_WALKS)
+        # Two columns with Discuss open (`#2445`).
+        runs.extend((scheme, "desk2", False, spec, count or COUNT, True) for spec in WALKS if spec[0] == "onscreen-scrolled")
     return runs
 
 
 def side_thread_walk(playwright: Playwright, args: argparse.Namespace) -> str:
     """Two columns at a desk (1920x1080): a search typed in the right column's cards past their foot and
     closed with Escape, then a thread opened on the right and a reply arriving with the reader a little
-    way into its room: the reply is followed as at the thread's foot. The found message is the channel list's to keep; a reader working in
+    way into its room: the row being read holds and the reply shows below it (`#2445`). The found message is the channel list's to keep; a reader working in
     the right column keeps its own close, and nothing the clear holds may outlive it there (the gate's
     catch on the first `#2423` head: column_overscroll_browser.py's FOLLOW)."""
     import column_overscroll_browser as overscroll
@@ -495,7 +526,7 @@ def side_thread_walk(playwright: Playwright, args: argparse.Namespace) -> str:
                 overscroll.open_columns(reader)
                 overscroll.search_walk(reader)
                 # The thread walk the gate caught: the short thread opened on the right, a little way into
-                # its room past the foot, a reply arriving followed as at the foot (FOLLOW), and on.
+                # its room past the foot, a reply arriving that moves nothing (FOLLOW, `#2445`), and on.
                 overscroll.thread_walk(reader)
                 check(not errors, f"two-columns: the page threw: {errors}")
             finally:
@@ -529,7 +560,9 @@ def main() -> int:
             if args.only and args.only not in name:
                 continue
             use_count(count)
-            api = ClearApi()
+            two = label == "desk2"
+            api = ClearThreadsApi() if two else ClearApi()
+            rows = COUNT - 1 if two else None
             server, thread, url = serve(api, web_root)
             try:
                 with tempfile.TemporaryDirectory(prefix="vibe-talk-search-clear-") as profile:
@@ -540,10 +573,18 @@ def main() -> int:
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(url, wait_until="load")
                     sign_in(page, keyboard)
+                    if two:
+                        # Two columns: the thread's reply goes to the right, the list on the left holds the rest.
+                        page.click("#column-toggle")
+                        page.wait_for_function("() => document.getElementById('screen-main')"
+                                               ".getAttribute('data-columns') === 'two'")
+                        page.wait_for_function(f"() => document.querySelectorAll('#discord-log > li[data-id]')"
+                                               f".length === {rows}")
+                        quiet(page)
                     if discuss:
                         open_discuss(page)
                     line, drift, gone = walk(page, name, parked, find, how or default_clear, touch,
-                                             args.screenshots, args.trace)
+                                             args.screenshots, args.trace, rows)
                     check(not errors, f"{name}: the page threw: {errors}")
                     context.close()
             finally:

@@ -143,8 +143,6 @@ export interface FilterPlaceDependencies {
   rowMessages(row: HTMLElement): readonly { timestamp?: unknown }[];
   clearEntryLanding(): void;
   sideShowing(): boolean;
-  /** `#2423`: whether the right column is up beside the channel list. Optional for doubles. */
-  twoColumnsUp?(): boolean;
 }
 
 /** The filter-kept place, as the page calls it. */
@@ -473,11 +471,10 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
    * `#243`/`#1968` have it), with no list on screen, or with no row shown.
    */
   function foundAnchor(): FilterAnchor | null {
-    // The channel list's own, with one column on screen. The right column (cards, a thread) keeps its
-    // own place through the close as before, and with two columns up the list keeps today's close too:
-    // a found row held on the left there left the thread opened next on the right short of following
-    // an arriving reply (the first owner gate's catch), so two columns wait for that to be understood.
-    if (deps.screen() !== "main" || deps.columnSide() || (deps.twoColumnsUp && deps.twoColumnsUp())) return null;
+    // The channel list's own: the right column (cards, a thread) keeps its own place through the close
+    // as before. With two columns up too (`#2445`): the right column's foot no longer takes the left
+    // column's chips room, which a found row held on the left grew under its thread.
+    if (deps.screen() !== "main" || deps.columnSide()) return null;
     const area = deps.el("scroll-area");
     const pane = deps.view() === "discord" ? (deps.columnSide() ? deps.sidePane() : deps.channelPane()) : null;
     const mark = pane ? deps.markOf(pane) : null;
