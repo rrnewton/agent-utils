@@ -475,6 +475,89 @@ fn a_full_population_retires_answered_requests_first_then_holds_new_messages_unt
 }
 
 #[test]
+fn a_full_store_puts_one_alarm_line_in_the_agents_pane_at_once() {
+    // #2440 chat-bridge-never-halt, lead-014: the full store held owner messages for hours with
+    // only a log line; the agent now gets ONE chat-visible alarm at once, per hold.
+    use crate::chat_service::reply_windows::capacity_hold_step;
+    let (state, _, root) = delivered_request("window-capacity-pane");
+    let checkpoint = state.read_checkpoint().expect("checkpoint");
+    let start = 1_790_000_000_000;
+    let mut told_hold = None;
+    let mut told: Vec<(String, String)> = Vec::new();
+    let step =
+        |told_hold: &mut Option<u64>, at: u64, told: &mut Vec<(String, String)>, fail: bool| {
+            capacity_hold_step(
+                told_hold,
+                state.request_capacity_hold().as_ref(),
+                at,
+                &mut |body, id| {
+                    if fail {
+                        return Err("queue locked".to_owned());
+                    }
+                    told.push((body.to_owned(), id.to_owned()));
+                    Ok(())
+                },
+                &mut |_| {},
+            );
+        };
+    // No hold: nothing.
+    step(&mut told_hold, start, &mut told, false);
+    assert!(told.is_empty());
+    {
+        let lock = agent::open_private_lock(&root.join(".state.lock"), "test state lock")
+            .expect("open state lock");
+        lock.lock_exclusive().expect("lock state");
+        state
+            .note_capacity_refusal_locked(&checkpoint, 12, start)
+            .expect("record the hold");
+    }
+    // A failed queue is tried again at the next check.
+    step(&mut told_hold, start + 30_000, &mut told, true);
+    assert!(told.is_empty());
+    step(&mut told_hold, start + 60_000, &mut told, false);
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(
+        told[0]
+            .0
+            .starts_with("[chat-bridge ALARM] The chat bridge's request store is FULL ("),
+        "{}",
+        told[0].0
+    );
+    assert!(told[0]
+        .0
+        .contains("12 new owner message(s) are held unacknowledged"));
+    assert_eq!(told[0].1, format!("chat-capacity-hold-{start}"));
+    // Once per hold, however many checks see it.
+    for offset in [90_000, 120_000, HOUR] {
+        step(&mut told_hold, start + offset, &mut told, false);
+    }
+    assert_eq!(told.len(), 1);
+    // The hold clears, then a new one: told again.
+    {
+        let lock = agent::open_private_lock(&root.join(".state.lock"), "test state lock")
+            .expect("open state lock");
+        lock.lock_exclusive().expect("lock state");
+        state.clear_capacity_hold_locked().expect("clear");
+    }
+    step(&mut told_hold, start + 2 * HOUR, &mut told, false);
+    {
+        let lock = agent::open_private_lock(&root.join(".state.lock"), "test state lock")
+            .expect("open state lock");
+        lock.lock_exclusive().expect("lock state");
+        state
+            .note_capacity_refusal_locked(&checkpoint, 1, start + 3 * HOUR)
+            .expect("record a new hold");
+    }
+    step(&mut told_hold, start + 3 * HOUR, &mut told, false);
+    assert_eq!(told.len(), 2);
+    assert_eq!(
+        told[1].1,
+        format!("chat-capacity-hold-{}", start + 3 * HOUR)
+    );
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn the_full_store_warning_repeats_hourly_and_clears_once() {
     let (state, _, root) = delivered_request("window-capacity-alarm");
     let checkpoint = state.read_checkpoint().expect("checkpoint");

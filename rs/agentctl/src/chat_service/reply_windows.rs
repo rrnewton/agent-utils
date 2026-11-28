@@ -36,6 +36,8 @@ pub(crate) struct ReplyWindowWatch {
     next_sweep: Option<Instant>,
     next_check: Instant,
     high_water: HighWater,
+    /// The capacity hold whose alarm the agent was given, by when it began (#2440).
+    hold_told: Option<u64>,
 }
 
 impl Default for ReplyWindowWatch {
@@ -44,6 +46,7 @@ impl Default for ReplyWindowWatch {
             next_sweep: None,
             next_check: Instant::now(),
             high_water: HighWater::default(),
+            hold_told: None,
         }
     }
 }
@@ -133,6 +136,53 @@ pub(crate) fn high_water_step(
     }
 }
 
+/// Put ONE alarm line in the agent's pane, at once, when the request store fills and new owner
+/// messages are held (#2440 chat-bridge-never-halt, lead-014: on 2026-11-26 the full store held
+/// twelve owner messages for about two hours with only a log line and an hourly owner alarm to
+/// show for it). Once per hold, by when it began; the notice's message ID is the hold's, so a
+/// restarted service queues it no twice. A notice that cannot be queued is tried again at the
+/// next check.
+pub(crate) fn capacity_hold_step(
+    told: &mut Option<u64>,
+    hold: Option<&chat_runtime::RequestCapacityHold>,
+    now_millis: u64,
+    notify: &mut dyn FnMut(&str, &str) -> Result<(), String>,
+    log: &mut dyn FnMut(String),
+) {
+    let Some(hold) = hold else {
+        *told = None;
+        return;
+    };
+    if *told == Some(hold.held_since_millis) {
+        return;
+    }
+    let minutes = now_millis.saturating_sub(hold.held_since_millis) / 60_000;
+    let body = format!(
+        "[chat-bridge ALARM] The chat bridge's request store is FULL ({} of {} requests kept): {} \
+         new owner message(s) are held unacknowledged, for {minutes} min so far. They are admitted \
+         as soon as space frees: close requests you have finished with `agentctl chat close \
+         --request KEY` (`agentctl chat status` lists them).",
+        hold.request_count, hold.max_requests, hold.waiting_messages
+    );
+    match notify(
+        &body,
+        &format!("chat-capacity-hold-{}", hold.held_since_millis),
+    ) {
+        Ok(()) => {
+            log(format!(
+                "agentctl: error: chat request store full ({} of {}); {} owner message(s) held; \
+                 the agent was given the alarm",
+                hold.request_count, hold.max_requests, hold.waiting_messages
+            ));
+            *told = Some(hold.held_since_millis);
+        }
+        Err(error) => log(format!(
+            "agentctl: error: chat request store full; the alarm could not be queued to the \
+             agent, and is tried again: {error}"
+        )),
+    }
+}
+
 impl ReplyWindowWatch {
     /// Sweep, tell and alarm when each is due.
     pub(crate) fn step<A: ManagedApi + ?Sized>(
@@ -189,6 +239,13 @@ impl ReplyWindowWatch {
                  {error}"
             )),
         }
+        capacity_hold_step(
+            &mut self.hold_told,
+            state.request_capacity_hold().as_ref(),
+            chat_runtime::unix_millis(),
+            &mut notify,
+            &mut |line| service_log(line),
+        );
         if let Some(alarm) = alarm {
             capacity_alarm(
                 state,
