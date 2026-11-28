@@ -345,15 +345,25 @@ steps:
   - group: merge-queue
     job: test
     desc: merge-queue Rust tests (local bare-repository fixtures)
-    # CPU budget (#1051): solo whole-suite runs measure 738-875 CPU-s in
-    # tests alone (about 75% sys: git/donor/queue subprocess churn across
-    # 51 binaries) and up to 1189 CPU-s including recompilation, against
-    # the old 1200 cap — the step died CPU-TIMEOUT in a full gate before
-    # finishing. 2400 is roughly twice the worst completed run. The wall
-    # ceiling deliberately does not follow the file's usual 8x pairing:
-    # measured wall is ~420-600 s solo, so 3600 keeps a loaded run's
-    # starvation headroom (2400 CPU-s at well under a core) without
-    # letting a real hang hold a gate slot for 5+ hours.
+    # CPU budget (#1051, #2458): #1051 set 2400 from 738-875 CPU-s
+    # tests-alone (about 75% sys) and up to 1189 with recompilation. By
+    # 2026-11-28 the suite grew 557 -> 687 tests (+23%, 57 binaries).
+    # Solo step-form runs: 1944 CPU-s including compilation (User 822.0 +
+    # Sys 1121.8; load1 183.8 -> 267.3) and 1541 CPU-s tests-alone (User
+    # 321.6 + Sys 1219.5; load1 233.6 -> 156.5), wall 724-744 s. Sys is
+    # 79% of tests-alone CPU (git/donor/queue subprocess churn, measured
+    # by #2479); the heaviest test is 93.9 s wall by design (validator
+    # sleep plus donor waits) and the top 50 tests are 39.2% of summed
+    # duration, so no single test fix recovers the budget. Two gate kills
+    # the same day hit 2400 with 681 of 687 tests done (803 s wall) and
+    # with all 687 done, in the doctest phase's library rebuild (888 s
+    # wall): the loaded step needs about 2400-2600 CPU-s. 4000 is 2.06x
+    # the worst solo run and over 1.5x the loaded estimate, the same ~2x
+    # rule #1051 used. The wall ceiling deliberately does not follow the
+    # file's usual 8x pairing: at the slowest measured rate (2.07 cores,
+    # solo tests-alone) 4000 CPU-s needs about 1930 s wall, so 3600 keeps
+    # starvation headroom without letting a real hang hold a gate slot
+    # for 5+ hours.
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
@@ -361,7 +371,7 @@ steps:
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-merge-queue]
     timeout: 3600
-    cpu_timeout: 2400
+    cpu_timeout: 4000
     hint: *rust_test_hint
 
   - group: local-ci-hub
