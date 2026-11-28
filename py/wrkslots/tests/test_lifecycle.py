@@ -41024,11 +41024,12 @@ def test_audit_does_not_replay_event_log_per_record(
     payload = json.loads(capsys.readouterr().out)
     rows = {row["slot"]: row for row in payload["slots"]}
 
-    # Audit row observations and recovery journals each inspect the log
-    # once through _load_events; neither audit row adds another pass.
-    # Active and archived state are derived by the streamed replay fold
-    # (#1794), which never materializes the log through _load_events.
-    assert calls == ["testhost"] * 2
+    # Audit row observations inspect the log once through _load_events;
+    # neither audit row adds another pass. Active and archived state are
+    # derived by the streamed replay fold (#1794), and the recovery
+    # journals' pending operations by a resumable fold that replay carries
+    # (#2468); neither materializes the log through _load_events.
+    assert calls == ["testhost"]
     assert rows["slot01"]["verdict"] == "HELD"
     assert not any(
         "unread HANDOFF.md" in reason for reason in rows["slot02"]["reasons"]
