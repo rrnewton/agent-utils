@@ -12,8 +12,8 @@ cards and its line drawn), at a desk (1280x800) and on a phone (412x915, keyboar
   answer and its cards). A per-frame trace, from the first key until 120 still frames after the
   last change, follows the row being read (the first row standing below the floating search
   panel): in every frame where that row still stands, it moved at most 0.5 px since the frame
-  before (1.0 px in a frame where the list stands at the foot the browser clamps it to, which is on
-  whole pixels). A row the new words hide hands the place to the next row standing; that change of row
+  before (1.0 px in a phone frame where the list stands at the foot the browser clamps it to, which
+  is on whole pixels; each such frame is named in the report and the trace). A row the new words hide hands the place to the next row standing; that change of row
   is allowed only on a frame a key changed the query.
 
 On a channel over 200 rows the typing's fast pass (`#1913`) runs at each key; under that, the
@@ -205,7 +205,12 @@ def walk(page: Page, api: TypingApi, name: str, parked: int, delay: int, touch: 
     check(api.searches > 0, f"{name}: the server was never asked, so no answer landed to measure")
     failures: list[str] = []
     handed = 0
-    worst = 0.0
+    # The worst move of the row being read, kept apart for frames off the clamp (limit 0.5 px) and for
+    # clamp-bound frames (limit 1.0 px), and every clamp-bound frame named, so the whole-pixel allowance
+    # stays on the frames it is for (the liaison's condition for it).
+    worst_free = 0.0
+    worst_clamped = 0.0
+    clamped: list[int] = []
     for before, frame in zip(frames, frames[1:]):
         if "prior" not in frame:
             continue
@@ -217,20 +222,32 @@ def walk(page: Page, api: TypingApi, name: str, parked: int, delay: int, touch: 
                                 f"(query {frame.get('query')!r})")
             continue
         moved = abs(clear_walk.number(drift))
-        worst = max(worst, moved)
-        # A frame where the list stands at the foot the browser clamps it to is placed on whole pixels
-        # (`scrollHeight` is a whole number over fractional rows): 1.0 px there, 0.5 px everywhere else.
+        # A phone frame where the list stands at the foot the browser clamps it to is placed on whole
+        # pixels (`scrollHeight` is a whole number over fractional rows): 1.0 px there, 0.5 px everywhere
+        # else, desk frames included.
         foot_gap = clear_walk.number(frame.get("height")) - clear_walk.number(frame.get("client")) - \
             clear_walk.number(frame.get("scrollTop"))
-        limit = WHOLE_PIXEL_PX if foot_gap <= 1 else LIMIT_PX
+        # On a phone only (liaison 1147): its scroll offsets snap to device pixels as well.
+        bound = touch and foot_gap <= 1
+        frame["clamp_bound"] = bound
+        limit = WHOLE_PIXEL_PX if bound else LIMIT_PX
+        if bound:
+            worst_clamped = max(worst_clamped, moved)
+            if moved > 0:
+                clamped.append(int(clear_walk.number(frame.get("frame"))))
+        else:
+            worst_free = max(worst_free, moved)
         if moved > limit:
             failures.append(f"frame {frame.get('frame')} (query {frame.get('query')!r}): the row being read "
-                            f"{frame.get('prior')} moved {clear_walk.number(drift):+.2f} px")
+                            f"{frame.get('prior')} moved {clear_walk.number(drift):+.2f} px"
+                            f"{' on a clamp-bound frame (limit 1.0 px)' if bound else ' (limit 0.5 px)'}")
     if traces is not None:
         (traces / f"{name}.json").write_text(json.dumps({"walk": name, "parked": parked, "delay_ms": delay,
-                                                         "worst_px": worst, "failures": failures,
-                                                         "frames": frames}, indent=1) + "\n")
-    line = (f"{name}: {len(frames)} frames, worst move of the row being read {worst:.2f} px, "
+                                                         "worst_px": worst_free, "worst_px_clamp_bound": worst_clamped,
+                                                         "clamp_bound_frames_moving": clamped,
+                                                         "failures": failures, "frames": frames}, indent=1) + "\n")
+    line = (f"{name}: {len(frames)} frames, worst move of the row being read {worst_free:.2f} px (limit 0.5), "
+            f"{worst_clamped:.2f} px on clamp-bound frames {clamped or '[]'} (limit 1.0), "
             f"{handed} hand-over(s) to the next row, {len(failures)} failure(s)")
     return line, failures
 
