@@ -1941,15 +1941,24 @@ fn a_body_over_max_bytes_is_delivered_with_a_warning_and_a_huge_one_by_file() {
     let text = delivered_text(&state, "tools", id).expect("delivered");
     let saved = agent_teams::ledger::body_file_path(&state, "tools", id);
     assert_eq!(std::fs::read_to_string(&saved).expect("saved"), body);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&saved)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o444, "written once, read-only");
+    }
     let digest = agent_teams::envelope::sha256_hex(body.as_bytes());
     let warning = text.lines().nth(1).expect("warning line");
-    assert!(
-        warning.starts_with(&format!(
-            "[relay warning: {} bytes, over this team's max_bytes 8192; full body saved: {} sha256 {digest}",
+    assert_eq!(
+        warning,
+        format!(
+            "[relay warning: {} bytes, over this team's max_bytes 8192; full body saved: {} sha256 {digest}, matches its signed hash]",
             body.len(),
             saved.display()
-        )),
-        "{warning}"
+        ),
     );
     assert!(
         text.contains("line 0\n") && text.contains("line 19\n"),
@@ -2029,5 +2038,63 @@ fn an_older_message_arriving_after_a_newer_one_on_its_topic_is_delivered_superse
         )),
         "{text}"
     );
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn a_second_delivery_of_a_huge_body_gets_its_own_file_and_never_overwrites_the_first() {
+    // lead-014 (#2420): a saved body is written once, read-only, and a later delivery of the
+    // same message (here a crashed claim recovered) gets its own file.
+    let state = temp_state("body-second");
+    declaration_for(&state, "tools", "sim");
+    let declarations = agent_teams::proof::load_declarations(&state).expect("decls");
+    let (_, _, declaration) = &declarations[0];
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let id = "tm-sim-a3a3a3a3a3a3a3a3".to_string();
+    let body: String = (0..3_000).map(|n| format!("row {n}\n")).collect();
+    let envelope = envelope_with(&id, &body, now_ms, now_ms + 7_200_000);
+    let first = agent_teams::ledger::body_file_path(&state, "tools", &id);
+    std::fs::create_dir_all(first.parent().expect("dir")).expect("bodies dir");
+    std::fs::write(&first, "the first delivery's file").expect("first file");
+    let claim = json!({
+        "id": id, "state": "claimed", "body_sha256": envelope["body_sha256"],
+        "sender": "sim", "not_after": envelope["not_after"], "envelope": envelope,
+    });
+    std::fs::create_dir_all(state.join("teams.d/tools/ledger")).expect("ledger dir");
+    std::fs::write(
+        entry_path(&state, "tools", &id),
+        serde_json::to_string_pretty(&claim).unwrap(),
+    )
+    .expect("claim");
+    let fake = FakeDeliverer::default();
+    let ctx = AcceptContext {
+        state: &state,
+        this_host: "host-a",
+        declaration,
+        via: "local",
+        proof_note: "proved",
+        relayed_by: None,
+        peer_host: "host-a",
+        via_chat_relay: false,
+    };
+    let answer = accept(&ctx, &envelope, &fake).expect("accept");
+    assert_eq!(answer.state.as_deref(), Some("accepted"), "{answer:?}");
+    assert_eq!(
+        std::fs::read_to_string(&first).expect("first"),
+        "the first delivery's file",
+        "never overwritten"
+    );
+    let second = first.with_file_name(format!("{id}-2.txt"));
+    assert_eq!(std::fs::read_to_string(&second).expect("own file"), body);
+    let pastes = fake.pastes.lock().expect("pastes");
+    assert!(
+        pastes[0]
+            .1
+            .contains(&format!("full body saved: {}", second.display())),
+        "{}",
+        pastes[0].1
+    );
+    assert!(!pastes[0].1.contains("row 2999"), "not inline");
+    drop(pastes);
     let _ = std::fs::remove_dir_all(&state);
 }
