@@ -10,7 +10,7 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
@@ -69,19 +69,90 @@ while True:
     life(uuid, "completed")
 "##;
 
-/// Double-fork so the console's parentage reaches init, never a harness
-/// an ancestor scan could find (the suite itself may run inside one).
+/// Start `agentctl console NAME` on the terminal that is standard input.
+/// See [`Launch`] for the modes. In the orphan modes it double-forks so
+/// the console's parentage reaches init, never a harness an ancestor
+/// scan could find (the suite itself may run inside one). The child
+/// execs the console only once the intermediate has exited: until then
+/// its parent is still this launcher, whose ancestors are the suite's,
+/// and a console that scanned in that window refused under load (#2381
+/// console-pty-launcher-race). The wait is an event wait with a generous
+/// cap, so a stuck launcher fails by name.
 const LAUNCHER: &str = r##"
-import fcntl, os, sys, termios
-pidfile, agentctl, registry = sys.argv[1], sys.argv[2], sys.argv[3]
-if os.fork() > 0:
+import fcntl, os, sys, termios, time
+pidfile, agentctl, registry, name, mode = sys.argv[1:6]
+console = [agentctl, "--registry", registry, "console", name]
+
+def publish(path):
+    # Whole or absent: the suite never reads a half-written pid.
+    with open(path + ".tmp", "w") as handle:
+        handle.write(str(os.getpid()))
+    os.rename(path + ".tmp", path)
+
+def wait_until(what, done):
+    deadline = time.monotonic() + 60
+    while not done():
+        if time.monotonic() > deadline:
+            sys.stderr.write("console launcher: gave up after 60 s waiting for " + what + "\n")
+            os._exit(1)
+        time.sleep(0.01)
+
+if mode != "orphan":
+    # Stand in for a coding-agent harness: the console's ancestor scan
+    # matches the program name.
+    with open("/proc/self/comm", "w") as comm:
+        comm.write("claude")
+    publish(pidfile + ".harness")
+if mode == "child-of-harness":
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    child = os.fork()
+    if child == 0:
+        publish(pidfile)
+        os.execvpe(agentctl, console, os.environ)
+    os.waitpid(child, 0)
+    os._exit(0)
+launcher = os.getpid()
+child = os.fork()
+if child > 0:
+    if mode == "orphan-held":
+        # Stay alive, and so the child's parent, until the child has
+        # parked (or a child that never parks has exited).
+        wait_until("the console's process to park", lambda: os.path.exists(pidfile + ".parked")
+                   or os.waitpid(child, os.WNOHANG)[0] != 0)
     os._exit(0)
 os.setsid()
 fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-with open(pidfile, "w") as handle:
-    handle.write(str(os.getpid()))
-os.execvpe(agentctl, [agentctl, "--registry", registry, "console", "worker"], os.environ)
+publish(pidfile)
+open(pidfile + ".parked", "w").close()
+wait_until("launcher pid %d to exit" % launcher, lambda: os.getppid() != launcher)
+os.execvpe(agentctl, console, os.environ)
 "##;
+
+/// How [`launch_console`] starts the console.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    /// Orphaned onto the pty, as an owner's terminal would run it.
+    Orphan,
+    /// Orphaned, with the intermediate named like a harness and kept
+    /// alive until the console's process has parked: a launcher that
+    /// execs the console before its intermediate exits is refused every
+    /// time, wherever the suite runs.
+    OrphanHeld,
+    /// A direct child of a process named like a harness, which holds the
+    /// pty as its controlling terminal: the console must refuse.
+    ChildOfHarness,
+}
+
+impl Launch {
+    fn mode(self) -> &'static str {
+        match self {
+            Self::Orphan => "orphan",
+            Self::OrphanHeld => "orphan-held",
+            Self::ChildOfHarness => "child-of-harness",
+        }
+    }
+}
 
 fn executable(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -183,32 +254,47 @@ impl Drop for Fixture {
 }
 
 /// One console under a pty: the master side, the accumulated output,
-/// and the console's own pid (from its pidfile, never a name search).
+/// the console's own pid (from its pidfile, never a name search), and
+/// the launcher process the suite spawned.
 struct Console {
     master: fs::File,
     output: String,
     pid: i32,
+    launched: std::process::Child,
 }
 
 impl Console {
-    fn pump(&mut self) {
+    /// Read what the console has written so far. True once its terminal
+    /// has closed: every holder of the pty's other side is gone, so
+    /// nothing more can arrive.
+    fn pump(&mut self) -> bool {
         let mut buffer = [0_u8; 8192];
         loop {
             match self.master.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => return true,
                 Ok(read) => {
                     self.output
                         .push_str(&String::from_utf8_lossy(&buffer[..read]));
                 }
-                Err(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return false,
+                Err(_) => return true,
             }
         }
     }
 
     fn wait_for(&mut self, what: &str, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(60);
-        while !self.output.contains(needle) {
-            self.pump();
+        loop {
+            let closed = self.pump();
+            if self.output.contains(needle) {
+                return;
+            }
+            assert!(
+                !closed,
+                "the console's terminal closed before {what} ({needle:?}); console output:\n{}",
+                self.output
+            );
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for {what} ({needle:?}) in console output:\n{}",
@@ -305,8 +391,17 @@ impl Console {
 
     fn wait_for_screen(&mut self, what: &str, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(60);
-        while !self.screen_contains(needle) {
-            self.pump();
+        loop {
+            let closed = self.pump();
+            if self.screen_contains(needle) {
+                return;
+            }
+            assert!(
+                !closed,
+                "the console's terminal closed before {what} ({needle:?}) was on the screen:\n{}\n--- raw ---\n{}",
+                self.screen_lines().join("\n"),
+                self.output
+            );
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for {what} ({needle:?}) on the console screen:\n{}\n--- raw ---\n{}",
@@ -318,8 +413,8 @@ impl Console {
     }
 }
 
-/// Launch `agentctl console worker` orphaned onto a fresh pty.
-fn launch_console(fixture: &Fixture) -> Console {
+/// Launch `agentctl console NAME` on a fresh pty, as `launch` says.
+fn launch_console(fixture: &Fixture, name: &str, launch: Launch) -> Console {
     let (mut master_fd, mut slave_fd) = (-1, -1);
     let opened = unsafe {
         libc::openpty(
@@ -331,6 +426,15 @@ fn launch_console(fixture: &Fixture) -> Console {
         )
     };
     assert_eq!(opened, 0, "openpty failed");
+    // SAFETY: fcntl only marks the two descriptors close-on-exec (and the
+    // slave's copies below are made with the flag), so no other process,
+    // a console launched by a parallel case included, keeps this pty
+    // open; the child gets the slave as its standard streams, which the
+    // spawn duplicates without the flag.
+    unsafe {
+        libc::fcntl(master_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(slave_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
     let size = libc::winsize {
         ws_row: 24,
         ws_col: 100,
@@ -347,13 +451,17 @@ fn launch_console(fixture: &Fixture) -> Console {
         std::env::var("PATH").unwrap_or_default()
     );
     let slave_in = unsafe { fs::File::from_raw_fd(slave_fd) };
-    let slave_out = unsafe { fs::File::from_raw_fd(libc::dup(slave_fd)) };
-    let slave_err = unsafe { fs::File::from_raw_fd(libc::dup(slave_fd)) };
+    let slave_out =
+        unsafe { fs::File::from_raw_fd(libc::fcntl(slave_fd, libc::F_DUPFD_CLOEXEC, 0)) };
+    let slave_err =
+        unsafe { fs::File::from_raw_fd(libc::fcntl(slave_fd, libc::F_DUPFD_CLOEXEC, 0)) };
     let mut launched = Command::new("python3")
         .arg(&launcher)
         .arg(&pidfile)
         .arg(env!("CARGO_BIN_EXE_agentctl"))
         .arg(fixture.registry.as_os_str())
+        .arg(name)
+        .arg(launch.mode())
         .env("PATH", path)
         .env("CLAUDE_CONFIG_DIR", &fixture.config)
         .env("FAKE_INPUTS", &fixture.inputs)
@@ -365,7 +473,11 @@ fn launch_console(fixture: &Fixture) -> Console {
         .stderr(Stdio::from(slave_err))
         .spawn()
         .expect("launch console");
-    let _ = launched.wait();
+    if launch != Launch::ChildOfHarness {
+        // The launcher's own processes exit once the console is orphaned;
+        // a harness stand-in lives as long as its console.
+        let _ = launched.wait();
+    }
     // SAFETY: fcntl only sets the master nonblocking.
     unsafe {
         let flags = libc::fcntl(master_fd, libc::F_GETFL);
@@ -382,7 +494,20 @@ fn launch_console(fixture: &Fixture) -> Console {
         master,
         output: String::new(),
         pid,
+        launched,
     }
+}
+
+/// The pid the harness stand-in published (`Launch::OrphanHeld` and
+/// `Launch::ChildOfHarness`).
+fn harness_pid(fixture: &Fixture) -> i32 {
+    let published = fixture.root.join("console.pid.harness");
+    fixture.wait_for("harness stand-in pid", || published.exists());
+    fs::read_to_string(&published)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
 }
 
 #[test]
@@ -435,7 +560,7 @@ fn console_shows_a_follower_error_instead_of_silence() {
     // segments errors at follower start.
     fs::remove_dir_all(&events).unwrap();
     fs::write(&events, b"not a directory").unwrap();
-    let mut console = launch_console(&fixture);
+    let mut console = launch_console(&fixture, "worker", Launch::Orphan);
     console.wait_for_screen("follower error shown", "console follower failed");
     console.wait_for_screen(
         "follower death announced",
@@ -475,7 +600,7 @@ fn console_delivers_typed_lines_as_plain_turns() {
         fixture.registry.join("agents/worker/control.sock").exists()
     });
 
-    let mut console = launch_console(&fixture);
+    let mut console = launch_console(&fixture, "worker", Launch::Orphan);
     console.wait_for_screen("banner on screen", "agentctl console worker");
 
     // A typed line arrives byte for byte: no sender header anywhere.
@@ -576,4 +701,50 @@ fn console_delivers_typed_lines_as_plain_turns() {
     );
     let status = fixture.agentctl(&["status", "worker"]);
     assert!(status.status.success(), "{status:?}");
+}
+
+/// The negative control for the launcher's wait (#2381): the console's
+/// owner proof still refuses a harness ancestor. The console runs as the
+/// direct child of a process named like a harness that holds the pty as
+/// its controlling terminal, so the refusal must name that process.
+#[test]
+fn console_refuses_to_run_under_a_harness_ancestor() {
+    let Some(fixture) = Fixture::new() else {
+        eprintln!("python3 not installed; skipping");
+        return;
+    };
+    let mut console = launch_console(&fixture, "worker", Launch::ChildOfHarness);
+    let harness = harness_pid(&fixture);
+    console.wait_for_screen(
+        "the harness refusal",
+        &format!("console refuses to run inside a harness (claude pid {harness})"),
+    );
+    fixture.wait_for("console exit", || !console.alive());
+    let _ = console.launched.wait();
+}
+
+/// The launcher's wait (#2381 console-pty-launcher-race): the console's
+/// process execs only after the launcher's intermediate has exited. The
+/// intermediate is named like a harness and stays alive until that
+/// process has parked, so a launcher that execs the console at once is
+/// refused every time, wherever the suite runs. The registry is empty:
+/// past its owner proof the console stops at the agent lookup.
+#[test]
+fn console_launcher_waits_for_its_intermediate_to_exit() {
+    let Some(fixture) = Fixture::new() else {
+        eprintln!("python3 not installed; skipping");
+        return;
+    };
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&fixture.registry)
+        .unwrap();
+    let mut console = launch_console(&fixture, "ghost", Launch::OrphanHeld);
+    let harness = harness_pid(&fixture);
+    console.wait_for_screen("the agent lookup failure", "unknown agent \"ghost\"");
+    assert!(
+        !console.screen_contains("inside a harness"),
+        "the console started while the intermediate (pid {harness}) was its parent:\n{}",
+        console.screen_lines().join("\n")
+    );
 }
