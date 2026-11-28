@@ -1017,7 +1017,7 @@ def test_remove_never_loses_linked_worktree_head_of_private_clone(
     assert removed.returncode != 0 or _object_survives(tmp_path, sha), "PRIVATE COMMIT LOST"
 
 
-@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: the per-item remove wall-clock budget (#2459) runs out in salvage git work under load; out with #2459's fix
+@pytest.mark.load_quarantine(issue="#2459", expires="2026-12-05")  # #2065 hot-host-census-tests: the per-item remove wall-clock budget (#2459) runs out in salvage git work under load; out with #2459's fix
 def test_remove_never_loses_index_only_blob_of_private_clone(tmp_path: Path) -> None:
     # #2168 N1/P4: staged-only content in the private clone.
     project, repository, slot_sub, _module = _private_clone_setup(tmp_path)
@@ -1082,7 +1082,7 @@ def test_remove_never_loses_orphan_head_commit(tmp_path: Path) -> None:
     assert removed.returncode != 0 or _object_survives(tmp_path, sha), "PRIVATE COMMIT LOST"
 
 
-@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: the per-item remove wall-clock budget (#2459) runs out in salvage git work under load; out with #2459's fix
+@pytest.mark.load_quarantine(issue="#2459", expires="2026-12-05")  # #2065 hot-host-census-tests: the per-item remove wall-clock budget (#2459) runs out in salvage git work under load; out with #2459's fix
 def test_remove_keeps_every_linked_worktree_index_of_private_clone(
     tmp_path: Path,
 ) -> None:
