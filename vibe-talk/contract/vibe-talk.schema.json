@@ -4090,6 +4090,57 @@
       ],
       "type": "object"
     },
+    "TimelineAround": {
+      "description": "What a timeline read `around` one message answered (`#2426 vibe-talk-sparse-loading-program`,\nslice A): the message and its neighbours in the view's order, from this server's own copy only.\n\nThe page's `messages` are then ONE stretch the copy proves has no hole: every message of the\nview between the oldest and the newest returned is among them, oldest first, the target\nincluded when `held`. A neighbour the copy cannot prove is next to the stretch is left out, and\nthat side says there may be more. The page's `next_before` (present when `more_below` is and\nthe target is held) steps back below the oldest message returned as from any page; a step up\nis another `around` read at the newest message returned, with `below=0`.\n\nSlack's All, whose order the copy keeps none of, is answered as its pages from the copy are put\ntogether: Main's proven stretch around the target (around its root, for a reply), and with each\nroot in it the newest replies of its thread, at most twenty, when the copy proves them every\nreply in their stretch; `below` and `above` count Main's messages, and a reply rides with its\nroot whatever its date, so it may be dated after the newest top-level message returned. A thread\nit cannot prove is named in `replies_left_out`, its replies left out; a reply asked about in\nsuch a thread is answered alone. Discord's All is the target alone, with more both ways.",
+      "properties": {
+        "above": {
+          "description": "How many messages newer than the target were asked for, after the server's page cap.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "below": {
+          "description": "How many messages older than the target were asked for, after the server's page cap.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "held": {
+          "description": "Whether this server's copy holds the target, whole, as a message of this view. When false\nthe page carries no messages: the copy is never filled from the chat service for this\nrequest, before the answer or behind it.",
+          "type": "boolean"
+        },
+        "more_above": {
+          "description": "Whether messages newer than the newest returned may exist, as far as this server knows:\nfalse only when the stretch reaches the newest message the latest read of the view's newest\nend listed. A message written since is the live stream's to bring.",
+          "type": "boolean"
+        },
+        "more_below": {
+          "description": "Whether messages older than the oldest returned may exist: false only when the copy proves\nit holds the view from its very start.",
+          "type": "boolean"
+        },
+        "replies_left_out": {
+          "description": "Slack's All only: the threads rooted among the returned messages whose replies this\nserver's copy cannot prove whole, by thread id, oldest root first. Their replies are left\nout of the answer, as an All page leaves out a thread it could not read: the page reads\nsuch a thread itself before showing its replies as complete. Absent when there are none.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "target": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message asked about."
+        }
+      },
+      "required": [
+        "target",
+        "held",
+        "below",
+        "above",
+        "more_below",
+        "more_above"
+      ],
+      "type": "object"
+    },
     "TimelineDelta": {
       "description": "What a forward read says about the changes it carries. `#203 incremental-refresh`.",
       "properties": {
@@ -4129,6 +4180,17 @@
     "TimelineResponse": {
       "description": "A provider-neutral timeline plus this application's channel and read-state metadata.",
       "properties": {
+        "around": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineAround"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present exactly on an answer to `around`: what this server's copy holds of that message and\nits neighbours. `#2426 vibe-talk-sparse-loading-program`. See [`TimelineAround`]."
+        },
         "as_of": {
           "description": "The instant, RFC 3339, up to which the backend knows this page is complete, when it is\nserving data it could not bring up to date just now. Absent means now.",
           "type": [

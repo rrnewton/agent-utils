@@ -410,6 +410,79 @@ async fn a_step_back_from_a_served_page_answers_while_the_provider_is_held() {
 }
 
 #[tokio::test]
+async fn an_around_read_answers_from_the_copy_while_the_provider_is_held() {
+    // `#2426 vibe-talk-sparse-loading-program`, slice A: a message and its neighbours, from
+    // the copy, with the provider's next call held. Stronger than held, as search is: no
+    // upstream call begins at all, behind the answer included; a target the copy does not
+    // hold is answered unheld, not fetched.
+    let d = deployment("state-sync-around").await;
+    d.fill_timeline().await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    for (token, label) in [(WRITE_TOKEN, "write"), (READ_TOKEN, "read")] {
+        let before = d.counting.calls().len();
+        let body = ok_while_held_as(
+            &d,
+            &path(
+                READ_CHANNEL,
+                &format!("/timeline?view=main&around={}&below=2&above=2", d.ids[6]),
+            ),
+            token,
+        )
+        .await;
+        assert_eq!(
+            texts(&body),
+            [
+                "message 4",
+                "message 5",
+                "message 6",
+                "message 7",
+                "message 8"
+            ],
+            "{label}: {body}"
+        );
+        assert_eq!(body["around"]["held"], true, "{label}: {body}");
+        assert_eq!(calls_since(&d, before), Vec::<String>::new(), "{label}");
+    }
+    let before = d.counting.calls().len();
+    let unheld = ok_while_held(
+        &d,
+        &path(
+            READ_CHANNEL,
+            "/timeline?view=main&around=404404&below=2&above=2",
+        ),
+    )
+    .await;
+    assert_eq!(unheld["around"]["held"], false, "{unheld}");
+    assert!(texts(&unheld).is_empty(), "{unheld}");
+    assert_eq!(calls_since(&d, before), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn an_around_read_of_slack_s_all_answers_from_the_copy_while_slack_is_held() {
+    // `#2426`: Slack's All around a message, put together from the copy (Main's stretch and
+    // the replies it proves), with every Slack answer held back an hour: the read completes
+    // with none begun. `WAIT` is the hang backstop only.
+    let (state, fake, _clock, _dir) =
+        crate::timeline_around::slack_all_deployment("state-sync-around-all").await;
+    fake.with(|fixture| fixture.delay = Some(Duration::from_secs(3_600)));
+    let target = vibe_talk::slack::ids::message_id_from_ts(&crate::slack_fake::ts(180, 0))
+        .expect("a Slack ts");
+    let asked = format!("view=flat&around={target}&below=2&above=2");
+    let body = tokio::time::timeout(
+        WAIT,
+        crate::timeline_around::slack_around(&state, &fake, &asked),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{asked} waited on Slack"));
+    assert_eq!(body["around"]["held"], true, "{body}");
+    assert!(
+        texts(&body).iter().any(|text| text == "reply 2a"),
+        "the proven thread's replies come from the copy: {body}"
+    );
+}
+
+#[tokio::test]
 async fn window_answers_while_the_provider_is_held() {
     // The fresh-window priming of `message_cache_serve`'s window case: fill, five
     // seconds on (the head is still fresh), serving on.

@@ -24,10 +24,10 @@ use vibe_talk::contract::{
     MessageLabelChangeResponse, MessageLabelRequest, MessageLabelsResponse, MessagesResponse,
     NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
-    ThreadPinChangeResponse, ThreadPinsResponse, TimelineResponse, TokenScope, TranscriptRole,
-    TranscriptThreadInfo, TranscriptsResponse, UpstreamClearAttemptView, UpstreamClearNowOutcome,
-    UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
-    VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
+    ThreadPinChangeResponse, ThreadPinsResponse, TimelineAround, TimelineResponse, TokenScope,
+    TranscriptRole, TranscriptThreadInfo, TranscriptsResponse, UpstreamClearAttemptView,
+    UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
+    VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
 };
 use vibe_talk::contract::{ChannelHistoryState, HistoryModeChoice, HistoryModeRequest};
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
@@ -445,6 +445,7 @@ fn timeline(view: TimelineView, page: TimelinePage) -> TimelineResponse {
         bookmark: None,
         // `#529 page-build-stale-notice`.
         page_build: Some("0123456789abcdef0123456789abcdef"),
+        around: None,
         untrusted_content_notice: "third-party text",
     }
 }
@@ -776,6 +777,46 @@ fn samples() -> Value {
                 older_pending: true,
                 ..TimelinePage::default()
             })),
+            // `#2426 vibe-talk-sparse-loading-program`: an answer around one message, from the
+            // copy alone: the stretch it holds, more below with this server's cursor, and nothing
+            // newer known.
+            to(&TimelineResponse {
+                around: Some(TimelineAround {
+                    target: MessageId("150".into()),
+                    held: true,
+                    below: 10,
+                    above: 10,
+                    more_below: true,
+                    more_above: false,
+                    replies_left_out: Vec::new(),
+                }),
+                ..timeline(TimelineView::Main, TimelinePage {
+                    messages: vec![plain.clone()],
+                    has_more: true,
+                    next_before: Some("vt-served.cursor".into()),
+                    observed_ms: Some(1_790_000_000_000),
+                    ..TimelinePage::default()
+                })
+            }),
+            // And in Slack's All, naming a thread whose replies the copy cannot prove whole.
+            to(&TimelineResponse {
+                around: Some(TimelineAround {
+                    target: MessageId("300".into()),
+                    held: true,
+                    below: 10,
+                    above: 10,
+                    more_below: true,
+                    more_above: true,
+                    replies_left_out: vec!["t1".into()],
+                }),
+                ..timeline(TimelineView::Flat, TimelinePage {
+                    messages: vec![plain.clone()],
+                    has_threads: true,
+                    has_more: true,
+                    next_before: Some("vt-served.cursor".into()),
+                    ..TimelinePage::default()
+                })
+            }),
             // `#203 incremental-refresh`: a newest page that can be continued forward, a complete
             // delta with one upsert and one deletion, and an incomplete one that says there is
             // more and that the backend could not bring it up to date just now.

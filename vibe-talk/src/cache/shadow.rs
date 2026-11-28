@@ -306,6 +306,22 @@ pub enum Query {
         /// How many messages.
         limit: usize,
     },
+    /// One message and its neighbours in a scope's order, answered from the copy alone: the
+    /// message `id` as a row of `scope`, at most `below` of the scope's messages before it and
+    /// `above` after it, oldest first with the message among them, and the scope's head and
+    /// coverage; no rows when the scope does not hold it. With no scope (a view whose order the
+    /// copy keeps none of), the message alone wherever it is at home, as [`Query::Message`]
+    /// reads it. `#2426 vibe-talk-sparse-loading-program`, slice A ([`super::around`]).
+    Around {
+        /// The scope whose order places the neighbours, or `None` for the message alone.
+        scope: Option<Scope>,
+        /// The message.
+        id: String,
+        /// How many messages before it to read.
+        below: usize,
+        /// How many messages after it to read.
+        above: usize,
+    },
 }
 
 impl Query {
@@ -316,6 +332,7 @@ impl Query {
             Self::Newest { scope, .. } | Self::Span { scope, .. } | Self::Below { scope, .. } => {
                 Some(scope)
             }
+            Self::Around { scope, .. } => scope.as_ref(),
             Self::Message { .. } => None,
         }
     }

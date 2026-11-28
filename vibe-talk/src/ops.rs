@@ -2042,6 +2042,83 @@ struct WalkTally {
     refusals: u32,
 }
 
+/// One message of an allowlisted channel and its neighbours in `view` (Main or Flat), from this
+/// server's own copy only: at most `below` older and `above` newer messages, oldest first with the
+/// target among them, a stretch the copy proves has no hole (see
+/// [`crate::cache::sink::Sink::held_around`]). `#2426 vibe-talk-sparse-loading-program`, slice A.
+///
+/// Never a read upstream, before the answer or behind it: a target the copy does not hold is
+/// answered `held: false` with no messages. (A later slice schedules a fill of it behind that
+/// answer and tells the page by live event; nothing here begins one.) Every caller the route
+/// admits is answered from the copy while serving is on, the read token and the test credential
+/// included: the read writes nothing and begins nothing, as a search of the copy does not.
+///
+/// The page's `next_before`, when more may be older, is this server's served cursor below the
+/// oldest message returned ([`crate::timeline_served`]), so the page's own walk back continues
+/// from the bottom of the answer; a walk up is another around read at the newest message returned
+/// with `below` zero.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] for a channel outside the allowlist; [`OpError::Chat`] when the
+/// backward cursor cannot be encoded.
+pub async fn timeline_around(
+    state: &AppState,
+    channel_id: &str,
+    view: crate::threads::TimelineView,
+    target: &MessageId,
+    (below, above): (u16, u16),
+) -> Result<
+    (
+        ChannelInfo,
+        crate::threads::TimelinePage,
+        crate::contract::TimelineAround,
+    ),
+    OpError,
+> {
+    let channel = allowed(state, channel_id).await?;
+    let held = state
+        .message_cache
+        .held_around(
+            &channel.id,
+            view,
+            target.as_str(),
+            (usize::from(below), usize::from(above)),
+        )
+        .await;
+    // As for a step back from the copy (`older_from_cache`): a cursor needs a dated message to step
+    // on from, or it would keep everything and the next step would hand back the newest page.
+    let dated = held
+        .messages
+        .iter()
+        .any(|message| crate::clock::instant_ms(&message.timestamp).is_some());
+    let next_before = (held.held && held.more_below && dated)
+        .then(|| crate::timeline_served::encode(&channel.id, view, None, &held.messages))
+        .transpose()?;
+    let around = crate::contract::TimelineAround {
+        target: target.clone(),
+        held: held.held,
+        below,
+        above,
+        more_below: held.more_below,
+        more_above: held.more_above,
+        replies_left_out: held.replies_left_out,
+    };
+    let mut page = crate::threads::TimelinePage {
+        messages: held.messages,
+        has_threads: held.has_threads,
+        observed_ms: held.observed_ms,
+        has_more: next_before.is_some(),
+        next_before,
+        ..crate::threads::TimelinePage::default()
+    };
+    let noise = crate::noise::filter_for(state, &channel.id).await;
+    stamp(state, &mut page.messages);
+    noise.mark(&mut page.messages);
+    crate::cache_first::note(crate::cache_first::Source::Around);
+    Ok((channel, page, around))
+}
+
 /// What a step back the copy could not answer at once ([`older_from_cache`]) is answered with.
 enum OlderAnswer {
     /// The provider's page: read in time, or kept from the view's walk that landed after an

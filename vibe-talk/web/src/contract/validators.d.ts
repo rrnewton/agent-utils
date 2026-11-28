@@ -3227,6 +3227,64 @@ export interface ThreadSummary {
 }
 
 /**
+ * What a timeline read `around` one message answered (`#2426 vibe-talk-sparse-loading-program`,
+ * slice A): the message and its neighbours in the view's order, from this server's own copy only.
+ *
+ * The page's `messages` are then ONE stretch the copy proves has no hole: every message of the
+ * view between the oldest and the newest returned is among them, oldest first, the target
+ * included when `held`. A neighbour the copy cannot prove is next to the stretch is left out, and
+ * that side says there may be more. The page's `next_before` (present when `more_below` is and
+ * the target is held) steps back below the oldest message returned as from any page; a step up
+ * is another `around` read at the newest message returned, with `below=0`.
+ *
+ * Slack's All, whose order the copy keeps none of, is answered as its pages from the copy are put
+ * together: Main's proven stretch around the target (around its root, for a reply), and with each
+ * root in it the newest replies of its thread, at most twenty, when the copy proves them every
+ * reply in their stretch; `below` and `above` count Main's messages, and a reply rides with its
+ * root whatever its date, so it may be dated after the newest top-level message returned. A thread
+ * it cannot prove is named in `replies_left_out`, its replies left out; a reply asked about in
+ * such a thread is answered alone. Discord's All is the target alone, with more both ways.
+ */
+export interface TimelineAround {
+  /**
+   * How many messages newer than the target were asked for, after the server's page cap.
+   */
+  above: number;
+  /**
+   * How many messages older than the target were asked for, after the server's page cap.
+   */
+  below: number;
+  /**
+   * Whether this server's copy holds the target, whole, as a message of this view. When false
+   * the page carries no messages: the copy is never filled from the chat service for this
+   * request, before the answer or behind it.
+   */
+  held: boolean;
+  /**
+   * Whether messages newer than the newest returned may exist, as far as this server knows:
+   * false only when the stretch reaches the newest message the latest read of the view's newest
+   * end listed. A message written since is the live stream's to bring.
+   */
+  more_above: boolean;
+  /**
+   * Whether messages older than the oldest returned may exist: false only when the copy proves
+   * it holds the view from its very start.
+   */
+  more_below: boolean;
+  /**
+   * Slack's All only: the threads rooted among the returned messages whose replies this
+   * server's copy cannot prove whole, by thread id, oldest root first. Their replies are left
+   * out of the answer, as an All page leaves out a thread it could not read: the page reads
+   * such a thread itself before showing its replies as complete. Absent when there are none.
+   */
+  replies_left_out?: string[];
+  /**
+   * The message asked about.
+   */
+  target: MessageId;
+}
+
+/**
  * What a forward read says about the changes it carries. `#203 incremental-refresh`.
  */
 export interface TimelineDelta {
@@ -3256,6 +3314,11 @@ export interface TimelineDelta {
  * A provider-neutral timeline plus this application's channel and read-state metadata.
  */
 export interface TimelineResponse {
+  /**
+   * Present exactly on an answer to `around`: what this server's copy holds of that message and
+   * its neighbours. `#2426 vibe-talk-sparse-loading-program`. See [`TimelineAround`].
+   */
+  around?: TimelineAround | null;
   /**
    * The instant, RFC 3339, up to which the backend knows this page is complete, when it is
    * serving data it could not bring up to date just now. Absent means now.

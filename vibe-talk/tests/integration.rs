@@ -322,6 +322,9 @@ mod test_read;
 #[path = "threads.rs"]
 mod threads;
 
+#[path = "timeline_around.rs"]
+mod timeline_around;
+
 #[path = "todo.rs"]
 mod todo;
 

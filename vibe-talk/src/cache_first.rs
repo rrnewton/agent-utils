@@ -340,6 +340,9 @@ pub enum Source {
     /// from [`Source::Older`] so the log never calls an empty answer a cache answer
     /// (`#2066 vibe-talk-page-freeze`).
     OlderEmpty,
+    /// The cache alone, for a message and its neighbours (`around`): never a read upstream,
+    /// before the answer or behind it, held or not. `#2426 vibe-talk-sparse-loading-program`.
+    Around,
     /// The provider, read for this request.
     Upstream,
     /// The cache, after the provider failed the read or kept it waiting (`#611`).
@@ -363,6 +366,7 @@ impl Source {
             Self::OlderPartial => "cache-older-partial",
             Self::OlderEmpty => "cache-older-empty",
             Self::OlderPending => "cache-older-pending",
+            Self::Around => "cache-around",
             Self::Upstream => "upstream",
             Self::StandIn => "stand-in",
             Self::Held => "held",

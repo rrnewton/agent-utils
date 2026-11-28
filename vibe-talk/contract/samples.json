@@ -2190,6 +2190,100 @@
       "view": "flat"
     },
     {
+      "around": {
+        "above": 10,
+        "below": 10,
+        "held": true,
+        "more_above": false,
+        "more_below": true,
+        "target": "150"
+      },
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": true,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "next_before": "vt-served.cursor",
+      "notice": null,
+      "observed_ms": 1790000000000,
+      "page_build": "0123456789abcdef0123456789abcdef",
+      "returned": 1,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "main"
+    },
+    {
+      "around": {
+        "above": 10,
+        "below": 10,
+        "held": true,
+        "more_above": true,
+        "more_below": true,
+        "replies_left_out": [
+          "t1"
+        ],
+        "target": "300"
+      },
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": true,
+      "has_threads": true,
+      "limit": 50,
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "next_before": "vt-served.cursor",
+      "notice": null,
+      "page_build": "0123456789abcdef0123456789abcdef",
+      "returned": 1,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "flat"
+    },
+    {
       "bookmark": {
         "anchor": {
           "message_id": "301",

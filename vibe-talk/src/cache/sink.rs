@@ -177,8 +177,8 @@ use super::observe::{self, PageRead, Shape, TimelineRead};
 use super::orphans::{self, Summaries};
 use super::shadow::{self, Ask, Decision, Differing, Miss, Upstream, View};
 use super::{
-    lock, Account, CacheStats, ChanKey, Counts, MessageCache, Observation, Offered, Read,
-    RouteSnapshot, Scope, Stamp, ThreadRecord,
+    lock, Account, CacheStats, CachedMessage, ChanKey, Counts, MessageCache, Observation, Offered,
+    Read, RouteSnapshot, Scope, Stamp, ThreadRecord,
 };
 use crate::chat::{ChatClient, ChatError, RecentRead};
 use crate::config::{Config, ProviderKind, RecentView};
@@ -1189,6 +1189,224 @@ pub struct HeldBelow {
     /// How many messages of the view's scope are at or above the page's oldest, counted to
     /// [`Sink::held_below`]'s `newer_cap`: how far below the newest end the step lies.
     pub newer: usize,
+}
+
+/// One message and its neighbours answered from the file ([`Sink::held_around`]): a stretch the
+/// claims prove has no hole, and what may lie beyond each end of it. `#2426
+/// vibe-talk-sparse-loading-program`, slice A.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldAround {
+    /// The messages, oldest first, the target among them, each carrying the observation that set
+    /// it (`observed_ms`), unstamped and unmarked as the cache holds them. Empty when not `held`.
+    pub messages: Vec<Message>,
+    /// Whether the file holds the target, whole, as a message of the view.
+    pub held: bool,
+    /// Whether the file holds any thread of the channel.
+    pub has_threads: bool,
+    /// Whether anything of the view may be older than the oldest message.
+    pub more_below: bool,
+    /// Whether anything of the view may be newer than the newest message.
+    pub more_above: bool,
+    /// What the answer is as of: the oldest of the claims it rests on and of its messages' own
+    /// observations. `None` when not `held`.
+    pub observed_ms: Option<i64>,
+    /// Slack's All only: the threads rooted in the stretch whose replies the file cannot prove
+    /// whole ([`MessageCache::around_replies`]), by thread id, oldest root first. Their replies
+    /// are left out of `messages`.
+    pub replies_left_out: Vec<String>,
+}
+
+impl HeldAround {
+    /// The answer when the file cannot say: nothing held, and anything may lie either way.
+    #[must_use]
+    pub fn unheld() -> Self {
+        Self {
+            messages: Vec::new(),
+            held: false,
+            has_threads: false,
+            more_below: true,
+            more_above: true,
+            observed_ms: None,
+            replies_left_out: Vec::new(),
+        }
+    }
+}
+
+/// The scope whose order an `around` read of `view` places neighbours by, on a channel of
+/// `shape`: Main's own, and a bridge's Flat list, the scopes a newest page of those views is
+/// served from. `None` for an All view the copy keeps no order of (Slack's, put together from
+/// Main and each thread by [`slack_all_around`] instead; Discord's), where the read answers the
+/// message alone.
+fn around_scope(shape: Shape, view: TimelineView) -> Option<Scope> {
+    match (shape, view) {
+        (Shape::SlackThread, _) | (_, TimelineView::Main) => Some(Scope::Main),
+        (Shape::Bridge, TimelineView::Flat) => Some(Scope::Flat),
+        _ => None,
+    }
+}
+
+/// The rows an around read of `scope` serves, oldest first with the message `id` among them, and
+/// what the claims proved of them ([`super::around`]); with no scope, the message alone and more
+/// both ways. `None` when the file does not hold the message (in the scope), whole, or the read is
+/// blocked. Run off the async threads. `#2426`, slice A.
+fn proven_around(
+    cache: &MessageCache,
+    chan: &ChanKey,
+    scope: Option<Scope>,
+    id: &str,
+    (below, above): (usize, usize),
+) -> Option<(Vec<CachedMessage>, super::around::Around, bool)> {
+    let scoped = scope.is_some();
+    // One more each way than asked: the rows that say whether the file holds more.
+    let query = shadow::Query::Around {
+        scope,
+        id: id.to_owned(),
+        below: below.saturating_add(1),
+        above: above.saturating_add(1),
+    };
+    let Read::Served(view) = cache.shadow_view(chan, &query) else {
+        return None;
+    };
+    let at = view
+        .rows
+        .iter()
+        .position(|row| row.message.id.as_str() == id)?;
+    let mut rows = view.rows;
+    let mut newer = rows.split_off(at + 1);
+    let target = rows.pop()?;
+    let mut older = rows;
+    if target.content_partial {
+        return None;
+    }
+    let more_older = older.len() > below;
+    if more_older {
+        older.remove(0);
+    }
+    let more_newer = newer.len() > above;
+    newer.truncate(above);
+    let proof = if scoped {
+        // A drop the writer has not recorded yet counts as one it has, as for a step back.
+        let dropped_ms = view.dropped_ms.max(cache.last_drop_ms(chan));
+        super::around::around(
+            &view.coverage,
+            view.head.as_ref(),
+            dropped_ms,
+            &target,
+            (&older, below, more_older),
+            (&newer, more_newer),
+        )
+    } else {
+        alone(older.len())
+    };
+    newer.truncate(proof.newer_to);
+    let served = older
+        .drain(proof.older_from..)
+        .chain(std::iter::once(target))
+        .chain(newer)
+        .collect();
+    Some((served, proof, view.has_threads))
+}
+
+/// What serving the target alone proves: nothing either way.
+fn alone(older: usize) -> super::around::Around {
+    super::around::Around {
+        older_from: older,
+        newer_to: 0,
+        more_below: true,
+        more_above: true,
+        listed_ms: None,
+    }
+}
+
+/// The answer from served rows and their proof.
+fn held_answer(
+    served: Vec<CachedMessage>,
+    proof: &super::around::Around,
+    has_threads: bool,
+    replies_left_out: Vec<String>,
+) -> HeldAround {
+    let observed_ms = served
+        .iter()
+        .map(|row| row.observed_ms)
+        .chain(proof.listed_ms)
+        .min();
+    HeldAround {
+        messages: served
+            .into_iter()
+            .map(|row| {
+                let mut message = row.message;
+                message.observed_ms = Some(row.observed_ms);
+                message
+            })
+            .collect(),
+        held: true,
+        has_threads,
+        more_below: proof.more_below,
+        more_above: proof.more_above,
+        observed_ms,
+        replies_left_out,
+    }
+}
+
+/// An around read of Slack's All, put together as its pages from the file are
+/// ([`Sink::held_around`]): Main's proven stretch around the message, or around its root for a
+/// reply, and the proven newest replies of each thread rooted in it. A reply whose thread is not
+/// proven, that is older than the newest replies All carries of it, or whose root Main does not
+/// hold, is answered alone. `None` when the file does not hold
+/// the message whole, or a scope read is blocked: a thread in doubt is in doubt for All too, as
+/// for the stand-in. Run off the async threads. `#2426`.
+fn slack_all_around(
+    cache: &MessageCache,
+    chan: &ChanKey,
+    id: &str,
+    counts: (usize, usize),
+) -> Option<HeldAround> {
+    let target = match cache.message(chan, &MessageId(id.to_owned())) {
+        Read::Served(Some(row)) if !row.content_partial => row,
+        _ => return None,
+    };
+    let reply_root = target
+        .message
+        .thread
+        .as_ref()
+        .filter(|thread| !thread.is_root && !thread.broadcast)
+        .and_then(|thread| thread.root_message_id.clone());
+    // The message alone, as a view the file keeps no order of answers it.
+    let lone = || {
+        proven_around(cache, chan, None, id, (0, 0))
+            .map(|(rows, proof, has_threads)| held_answer(rows, &proof, has_threads, Vec::new()))
+    };
+    let anchor = reply_root.as_ref().map_or(id, MessageId::as_str);
+    let Some((main, proof, has_threads)) =
+        proven_around(cache, chan, Some(Scope::Main), anchor, counts)
+    else {
+        // Main does not hold the root (or the message): nothing places it in All.
+        return lone();
+    };
+    let mut rows = main.clone();
+    let mut left_out = Vec::new();
+    for root in &main {
+        let Some(thread) = root.message.thread.as_ref().filter(|thread| thread.is_root) else {
+            continue;
+        };
+        match cache.around_replies(
+            chan,
+            &thread.id,
+            (&root.message.id, root.created_ms, thread.reply_count),
+            STALE_FLAT_REPLIES,
+        ) {
+            Read::Served(super::AroundReplies::Proven(replies)) => rows.extend(replies),
+            Read::Served(super::AroundReplies::Unproven) => left_out.push(thread.id.clone()),
+            Read::Served(super::AroundReplies::None) => {}
+            _ => return None,
+        }
+    }
+    rows.sort_by_key(|row| (row.created_ms, row.message.id.clone()));
+    rows.dedup_by(|a, b| a.message.id == b.message.id);
+    if reply_root.is_some() && !rows.iter().any(|row| row.message.id == target.message.id) {
+        return lone();
+    }
+    Some(held_answer(rows, &proof, has_threads, left_out))
 }
 
 /// An answer to hand back from the cache. `#384 cache-serve`.
@@ -2900,6 +3118,73 @@ impl Sink {
             return None;
         }
         Some(held)
+    }
+
+    /// The message `id` of `channel` and at most `below` older and `above` newer neighbours in
+    /// `view`'s order, from the file alone: never a read upstream, before the answer or behind it.
+    /// The neighbours are a stretch the claims prove has no hole ([`super::around`]); a side they
+    /// prove nothing of is left out and said to have more. `#2426
+    /// vibe-talk-sparse-loading-program`, slice A.
+    ///
+    /// Slack's All, which the file keeps no order of, is put together as its pages from the file
+    /// are ([`Self::stale_timeline`], [`Self::held_below`]): Main's proven stretch around the
+    /// message (around its root, for a reply), and with each root in it the newest replies of its
+    /// thread, at most [`STALE_FLAT_REPLIES`], when reads listed every reply of them
+    /// ([`MessageCache::around_replies`]). A thread whose replies the file cannot prove is left out
+    /// and named in [`HeldAround::replies_left_out`]; a reply asked about in such a thread, or
+    /// older than the newest replies All carries of it, is answered alone. `below` and `above` count Main's messages; replies ride with their roots,
+    /// whatever their dates. Discord's All, which no page from the file answers, is the message
+    /// alone ([`around_scope`]).
+    ///
+    /// Under the gates [`Self::held_below`] keeps that are not about the claims: serving on, the
+    /// channel routed with its provider's account checked against the file before and after the
+    /// read, the scopes read not blocked, and no text a push brought that no read has proven
+    /// whole. [`HeldAround::unheld`] when any fails, or when the file does not hold the message in
+    /// the view. Main and Flat only: a thread's page carries its root and summary, which rows
+    /// alone do not rebuild, and the caller refuses the Thread view before asking.
+    pub async fn held_around(
+        &self,
+        channel: &ChannelId,
+        view: TimelineView,
+        id: &str,
+        counts: (usize, usize),
+    ) -> HeldAround {
+        if !self.serve_enabled() || matches!(view, TimelineView::Thread | TimelineView::Threads) {
+            return HeldAround::unheld();
+        }
+        let route_of = |sink: &Self| {
+            let routes = sink.state.routes();
+            routes
+                .fills
+                .get(channel)
+                .filter(|route| sink.verification(&route.key) == Verification::Verified)
+                .map(|route| (route.key.clone(), route.shape))
+        };
+        let Some((key, shape)) = route_of(self) else {
+            return HeldAround::unheld();
+        };
+        let Some(cache) = self.cache() else {
+            return HeldAround::unheld();
+        };
+        let chan = ChanKey::new(key.clone(), channel.as_str());
+        let slack_all = shape == Shape::Slack && view == TimelineView::Flat;
+        let scope = around_scope(shape, view);
+        let target = id.to_owned();
+        let held = tokio::task::spawn_blocking(move || {
+            if slack_all {
+                return slack_all_around(&cache, &chan, &target, counts);
+            }
+            let (rows, proof, has_threads) = proven_around(&cache, &chan, scope, &target, counts)?;
+            Some(held_answer(rows, &proof, has_threads, Vec::new()))
+        })
+        .await
+        .ok()
+        .flatten();
+        // Checked again after the read, as a serve is.
+        if route_of(self).is_none_or(|(again, _)| again != key) {
+            return HeldAround::unheld();
+        }
+        held.unwrap_or_else(HeldAround::unheld)
     }
 
     /// The messages of `channel` among `ids` that the cache holds whole, by id, for speech

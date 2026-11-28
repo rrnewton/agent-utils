@@ -57,9 +57,8 @@ pub(crate) struct Snapshot<'a> {
 
 /// The replies, oldest first, when the snapshot is the thread `root` describes and may be handed
 /// out; see the module documentation.
-pub(crate) fn whole(snapshot: Snapshot<'_>, root: &RootSays) -> Option<Vec<Message>> {
-    let replies: Vec<CachedMessage> = snapshot
-        .rows
+pub(crate) fn whole(mut snapshot: Snapshot<'_>, root: &RootSays) -> Option<Vec<Message>> {
+    let replies: Vec<CachedMessage> = std::mem::take(&mut snapshot.rows)
         .into_iter()
         .filter(|row| row.message.id != root.root_id)
         .collect();
@@ -71,42 +70,9 @@ pub(crate) fn whole(snapshot: Snapshot<'_>, root: &RootSays) -> Option<Vec<Messa
     if last.message.id != root.latest_reply
         || replies.iter().any(|row| row.content_partial)
         || replies.first()?.created_ms < root.root_ms
+        || !listed(&snapshot, &replies, root.root_ms)
     {
         return None;
-    }
-    let record = snapshot.head?;
-    let head = record.head;
-    let top = head.settled_top();
-    let trusted = |began_ms: i64| {
-        began_ms >= snapshot.fresh_after_ms
-            && snapshot.dropped_ms.is_none_or(|dropped| began_ms > dropped)
-    };
-    // Below the settled top: the claims, down to the root.
-    if root.root_ms < top {
-        let horizon = coverage::horizon(snapshot.intervals, Some(&head), snapshot.cutoff_ms)?;
-        // `from_ms` is never below the age limit: a root older than that may have lost replies to
-        // eviction.
-        if horizon.from_ms > root.root_ms || !trusted(horizon.as_of_ms) {
-            return None;
-        }
-    }
-    // In the band: what the latest read of the newest end listed, from at or below where the
-    // thread enters it.
-    if last.created_ms >= top {
-        let lowest = root.root_ms.max(top);
-        let listed_from = record.checked_from_ms?;
-        let vouched = replies
-            .iter()
-            .filter(|row| row.created_ms >= top)
-            .all(|row| {
-                row.created_ms <= head.head_ms
-                    && row
-                        .vouched_ms
-                        .is_some_and(|vouched| vouched >= record.checked_ms)
-            });
-        if listed_from > lowest || !vouched || !trusted(record.checked_ms) {
-            return None;
-        }
     }
     Some(
         replies
@@ -117,6 +83,59 @@ pub(crate) fn whole(snapshot: Snapshot<'_>, root: &RootSays) -> Option<Vec<Messa
             })
             .collect(),
     )
+}
+
+/// Whether reads listed every reply of a thread from `from_ms` up to the newest of `replies`
+/// (oldest first, the root left out), as [`whole`] requires from the thread's root: below the
+/// head's settled top the claims, followed down from the head ([`coverage::horizon`]), reach
+/// `from_ms`; in the unsettled band every reply was listed by the latest read of the thread's newest
+/// end, whose listing began at or below where the stretch enters the band. Each claim used, and that
+/// read when the band is used, began at or after `fresh_after_ms` and after the latest drop. The
+/// part of [`whole`] that is about reads, not about what the root counts; `#2426`'s around read of
+/// Slack's All asks it of a thread's newest replies too.
+pub(crate) fn listed(snapshot: &Snapshot<'_>, replies: &[CachedMessage], from_ms: i64) -> bool {
+    let Some(record) = snapshot.head else {
+        return false;
+    };
+    let head = record.head;
+    let top = head.settled_top();
+    let trusted = |began_ms: i64| {
+        began_ms >= snapshot.fresh_after_ms
+            && snapshot.dropped_ms.is_none_or(|dropped| began_ms > dropped)
+    };
+    // Below the settled top: the claims, down to `from_ms`.
+    if from_ms < top {
+        let Some(horizon) = coverage::horizon(snapshot.intervals, Some(&head), snapshot.cutoff_ms)
+        else {
+            return false;
+        };
+        // `from_ms` of the horizon is never below the age limit: a root older than that may have
+        // lost replies to eviction.
+        if horizon.from_ms > from_ms || !trusted(horizon.as_of_ms) {
+            return false;
+        }
+    }
+    // In the band: what the latest read of the newest end listed, from at or below where the
+    // stretch enters it.
+    if replies.last().is_some_and(|last| last.created_ms >= top) {
+        let lowest = from_ms.max(top);
+        let Some(listed_from) = record.checked_from_ms else {
+            return false;
+        };
+        let vouched = replies
+            .iter()
+            .filter(|row| row.created_ms >= top)
+            .all(|row| {
+                row.created_ms <= head.head_ms
+                    && row
+                        .vouched_ms
+                        .is_some_and(|vouched| vouched >= record.checked_ms)
+            });
+        if listed_from > lowest || !vouched || !trusted(record.checked_ms) {
+            return false;
+        }
+    }
+    true
 }
 
 #[async_trait]

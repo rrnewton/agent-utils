@@ -250,6 +250,125 @@ fn below(
     Ok(rows)
 }
 
+/// Which side of a message [`beside`] reads.
+#[derive(Clone, Copy)]
+enum Side {
+    /// Before it in the scope's order.
+    Older,
+    /// After it.
+    Newer,
+}
+
+/// A scope's messages beside one of its own rows, in the order every read here pages by,
+/// `(created_ms, numeric_id, message_id)` with a missing number first: the newest `limit` before
+/// `at` or the oldest `limit` after it, oldest first. `#2426`, slice A.
+///
+/// Not [`below`]'s same-millisecond rule. A step back from a page keeps every other message of the
+/// page's oldest millisecond, because that message need not be the first of its millisecond in this
+/// order (a repeat is harmless there, a skip is not). Here `at` is a row of the scope itself, read
+/// in the same snapshot, so its place in the order is exact, and the two sides split its millisecond
+/// between them: no row on both sides of the target, and none on neither.
+fn beside(
+    connection: &Connection,
+    chan: &ChanKey,
+    chan_id: i64,
+    scope_key: &str,
+    (at_ms, at_numeric, at_id): (i64, Option<i64>, &str),
+    side: Side,
+    limit: usize,
+) -> rusqlite::Result<Vec<CachedMessage>> {
+    // The plain bound on `created_ms` lets the scope's index start its walk at the target rather
+    // than at an end of the scope. `IS` compares a missing number as equal to a missing number;
+    // `<` and `>` are false against one, so the first clause of each places a missing number
+    // before every present one, as the ascending sort does.
+    let (place, order) = match side {
+        Side::Older => (
+            "s.created_ms <= ?3 AND (s.created_ms < ?3 OR (s.created_ms = ?3 AND (
+                 (m.numeric_id IS NULL AND ?4 IS NOT NULL)
+                 OR m.numeric_id < ?4
+                 OR (m.numeric_id IS ?4 AND m.message_id < ?5))))",
+            "s.created_ms DESC, m.numeric_id DESC, m.message_id DESC",
+        ),
+        Side::Newer => (
+            "s.created_ms >= ?3 AND (s.created_ms > ?3 OR (s.created_ms = ?3 AND (
+                 (m.numeric_id IS NOT NULL AND ?4 IS NULL)
+                 OR m.numeric_id > ?4
+                 OR (m.numeric_id IS ?4 AND m.message_id > ?5))))",
+            "s.created_ms, m.numeric_id, m.message_id",
+        ),
+    };
+    let mut statement = connection.prepare(&format!(
+        "SELECT {MESSAGE_COLUMNS}, s.vouched_ms
+         FROM message_scope s JOIN message m ON m.row_id = s.row_id
+         WHERE s.chan = ?1 AND s.scope_key = ?2 AND {place}
+         ORDER BY {order} LIMIT ?6"
+    ))?;
+    let mut rows = statement
+        .query_map(
+            params![
+                chan_id,
+                scope_key,
+                at_ms,
+                at_numeric,
+                at_id,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| scoped(&chan.channel_id, row),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if matches!(side, Side::Older) {
+        rows.reverse();
+    }
+    Ok(rows)
+}
+
+/// The message `id` as a row of a scope, with at most `below` of the scope's messages before it and
+/// `above` after it ([`beside`]), oldest first with the message among them. Empty when the scope
+/// does not hold the message. `#2426`, slice A.
+fn around(
+    connection: &Connection,
+    chan: &ChanKey,
+    chan_id: i64,
+    scope_key: &str,
+    id: &str,
+    (below, above): (usize, usize),
+) -> rusqlite::Result<Vec<CachedMessage>> {
+    let target = connection
+        .query_row(
+            &format!(
+                "SELECT {MESSAGE_COLUMNS}, s.vouched_ms, m.numeric_id, s.created_ms
+                 FROM message m
+                 JOIN message_scope s ON s.row_id = m.row_id AND s.chan = m.chan AND s.scope_key = ?2
+                 WHERE m.chan = ?1 AND m.message_id = ?3"
+            ),
+            params![chan_id, scope_key, id],
+            |row| {
+                Ok((
+                    scoped(&chan.channel_id, row)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, i64>(12)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((target, numeric, at_ms)) = target else {
+        return Ok(Vec::new());
+    };
+    let at = (at_ms, numeric, id);
+    let mut rows = beside(connection, chan, chan_id, scope_key, at, Side::Older, below)?;
+    rows.push(target);
+    rows.extend(beside(
+        connection,
+        chan,
+        chan_id,
+        scope_key,
+        at,
+        Side::Newer,
+        above,
+    )?);
+    Ok(rows)
+}
+
 /// What a shadow evaluation reads, in ONE read transaction: every part of it is of the same
 /// moment, so a batch the writer commits meanwhile is either wholly in it or not at all.
 pub(crate) fn shadow_view(
@@ -328,6 +447,42 @@ pub(crate) fn shadow_view(
                 dropped_ms,
             }
         }
+        Query::Around {
+            scope: Some(scope),
+            id,
+            below,
+            above,
+        } => {
+            let key = scope.key();
+            let head = head_by_id(&snapshot, chan_id, &key)?;
+            View {
+                head: head.map(|record| record.head),
+                head_checked_ms: head.map(|record| record.checked_ms),
+                head_checked_from_ms: head.and_then(|record| record.checked_from_ms),
+                coverage: coverage_by_id(&snapshot, chan_id, &key)?,
+                rows: around(&snapshot, chan, chan_id, &key, id, (*below, *above))?,
+                home: None,
+                has_threads,
+                dropped_ms,
+            }
+        }
+        // The message alone, at home wherever it is (so a block of that scope stops the read).
+        Query::Around {
+            scope: None, id, ..
+        } => match message_and_home(&snapshot, chan, &MessageId(id.clone()))? {
+            Some((row, home)) => View {
+                rows: vec![row],
+                home: Scope::parse(&home),
+                has_threads,
+                dropped_ms,
+                ..View::default()
+            },
+            None => View {
+                has_threads,
+                dropped_ms,
+                ..View::default()
+            },
+        },
         Query::Message { id } => match message_and_home(&snapshot, chan, id)? {
             Some((row, home)) => View {
                 coverage: coverage_by_id(&snapshot, chan_id, &home)?,

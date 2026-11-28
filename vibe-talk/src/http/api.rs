@@ -2677,7 +2677,21 @@ pub struct TimelineQuery {
     pub after: Option<String>,
     /// Entries requested, clamped to the configured limit and 99.
     pub limit: Option<u16>,
+    /// The id of one message to read with its neighbours, from this server's own copy only, in
+    /// place of a page: `view=main` or `view=flat`, never with `before` or `after`. `#2426
+    /// vibe-talk-sparse-loading-program`; see [`crate::contract::TimelineAround`].
+    pub around: Option<String>,
+    /// With `around`: how many messages older than it to return. Default
+    /// [`AROUND_DEFAULT`], at most [`ops::MAX_PAGE`].
+    pub below: Option<u16>,
+    /// With `around`: how many messages newer than it to return. Default
+    /// [`AROUND_DEFAULT`], at most [`ops::MAX_PAGE`].
+    pub above: Option<u16>,
 }
+
+/// How many neighbours an `around` read returns on a side it names no count for: the owner's
+/// "about ten each way around a target" (`#2426`, choice O3).
+pub const AROUND_DEFAULT: u16 = 10;
 
 /// `GET /api/v1/channels/{channel_id}/search` and `GET /api/v1/search`. `#605 server-side-search`.
 #[derive(Debug, Deserialize)]
@@ -3019,6 +3033,7 @@ pub async fn transcript_thread(
         dismissed: Vec::new(),
         reply_dismissals: None,
         page_build: Some(crate::http::assets::page_build()),
+        around: None,
         untrusted_content_notice: untrusted::NOTICE,
     })))
 }
@@ -3063,15 +3078,36 @@ pub async fn timeline(
             "after must be a next_after returned by this view",
         ));
     }
-    let limit = state.effective_limit(query.limit).min(ops::MAX_PAGE);
-    let request = crate::threads::TimelineRequest {
-        view: query.view,
-        thread_id: query.thread_id,
-        before: query.before,
-        after: query.after,
-        limit,
+    let around = around_ask(&query)?;
+    let (limit, request, (channel, mut page), around) = match around {
+        // `#2426`: a message and its neighbours, from this server's copy alone.
+        Some((target, below, above)) => {
+            let limit = below.saturating_add(above).saturating_add(1);
+            let request = crate::threads::TimelineRequest {
+                view: query.view,
+                thread_id: None,
+                before: None,
+                after: None,
+                limit,
+            };
+            let (channel, page, around) =
+                ops::timeline_around(&state, &channel_id, query.view, &target, (below, above))
+                    .await?;
+            (limit, request, (channel, page), Some(around))
+        }
+        None => {
+            let limit = state.effective_limit(query.limit).min(ops::MAX_PAGE);
+            let request = crate::threads::TimelineRequest {
+                view: query.view,
+                thread_id: query.thread_id,
+                before: query.before,
+                after: query.after,
+                limit,
+            };
+            let answer = ops::timeline(&state, caller, &channel_id, &request).await?;
+            (limit, request, answer, None)
+        }
     };
-    let (channel, mut page) = ops::timeline(&state, caller, &channel_id, &request).await?;
     // `#1608 agent-transcripts-timeline`: class what this page carries,
     // then keep transcripts out of every raw-feed view.
     attach_transcript_classes(&state, &channel.id, &mut page, caller != Scope::TestRead).await;
@@ -3109,6 +3145,7 @@ pub async fn timeline(
     // to one conversation, whose Main holds the replies themselves.
     let replies = request.view == crate::threads::TimelineView::Main
         && request.before.is_none()
+        && around.is_none()
         && page.has_threads
         && page.thread.is_none();
     // `#1986 vibe-talk-one-page-complete-rows`: the thread facts this server can count, on the
@@ -3137,8 +3174,52 @@ pub async fn timeline(
         dismissed,
         reply_dismissals,
         page_build: Some(crate::http::assets::page_build()),
+        around,
         untrusted_content_notice: untrusted::NOTICE,
     })))
+}
+
+/// The `around` form of a timeline read, checked (`#2426 vibe-talk-sparse-loading-program`): the
+/// target and how many neighbours to return older and newer, each defaulting to
+/// [`AROUND_DEFAULT`] and clamped to [`ops::MAX_PAGE`]. `None` for an ordinary page read.
+///
+/// # Errors
+///
+/// A 400 for `around` beside `before` or `after`, in the Thread or Threads view, or naming no
+/// message identifier; and for `below` or `above` without `around`.
+fn around_ask(query: &TimelineQuery) -> Result<Option<(MessageId, u16, u16)>, ApiError> {
+    let Some(target) = &query.around else {
+        if query.below.is_some() || query.above.is_some() {
+            return Err(ApiError::bad_request(
+                "below and above are read only with around",
+            ));
+        }
+        return Ok(None);
+    };
+    if query.before.is_some() || query.after.is_some() {
+        return Err(ApiError::bad_request(
+            "around cannot be given with before or after",
+        ));
+    }
+    // A thread's page carries its root and summary, which the copy's rows alone do not rebuild;
+    // the thread list is no scope's order at all.
+    if matches!(
+        query.view,
+        crate::threads::TimelineView::Thread | crate::threads::TimelineView::Threads
+    ) {
+        return Err(ApiError::bad_request("around reads view=main or view=flat"));
+    }
+    if target.trim().is_empty() || target.len() > 1024 || target.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "around must be a non-empty message identifier",
+        ));
+    }
+    let side = |asked: Option<u16>| asked.unwrap_or(AROUND_DEFAULT).min(ops::MAX_PAGE);
+    Ok(Some((
+        MessageId(target.clone()),
+        side(query.below),
+        side(query.above),
+    )))
 }
 
 /// Query parameters for a recap. `#717 vt-unread-recap`.

@@ -3730,3 +3730,280 @@ fn a_cache_search_stops_only_on_a_whole_millisecond() {
         assert_eq!(second.resume_below_ms, None);
     }
 }
+
+// ---- around reads: `#2426 vibe-talk-sparse-loading-program`, slice A ---------------------------
+
+/// A snowflake id written at `ms`, the `k`th of its millisecond: its time is `ms` exactly, and its
+/// number orders it among the others of that millisecond.
+fn snowflake(ms: i64, k: u64) -> String {
+    let base: u64 = MessageId::at_time_ms(ms).0.parse().expect("a number");
+    (base + k).to_string()
+}
+
+/// An around read's rows, by id.
+fn around_ids(
+    fx: &Fixture,
+    scope: Option<Scope>,
+    id: &str,
+    (below, above): (usize, usize),
+) -> Vec<String> {
+    fx.cache
+        .shadow_view(
+            &fx.chan,
+            &shadow::Query::Around {
+                scope,
+                id: id.to_owned(),
+                below,
+                above,
+            },
+        )
+        .served()
+        .expect("served")
+        .rows
+        .into_iter()
+        .map(|row| row.message.id.0)
+        .collect()
+}
+
+#[test]
+fn an_around_read_splits_a_shared_millisecond_by_the_scopes_own_order() {
+    // Four messages share instant b: one with no number (first of its millisecond, as the sort
+    // puts a missing number), and three snowflakes listed out of order. Around each message, for
+    // every count each way, the read is exactly the window of the scope's newest order around it:
+    // no row on both sides of the target, none on neither.
+    let fx = Fixture::new("cache-around-ties");
+    let (a, b, c) = (T0 + STEP, T0 + 2 * STEP, T0 + 3 * STEP);
+    fx.list(
+        vec![
+            message(&snowflake(c, 1), "ada", "c", c),
+            message(&snowflake(b, 3), "ada", "b3", b),
+            message("named", "ada", "b0", b),
+            message(&snowflake(b, 1), "ada", "b1", b),
+            message(&snowflake(a, 1), "ada", "a", a),
+            message(&snowflake(b, 2), "ada", "b2", b),
+        ],
+        T0 + 1_000,
+        Some(newest_proof(ListStart::At(a))),
+    );
+    let order = fx.ids(&Scope::Main);
+    assert_eq!(
+        order,
+        [
+            snowflake(a, 1),
+            "named".to_owned(),
+            snowflake(b, 1),
+            snowflake(b, 2),
+            snowflake(b, 3),
+            snowflake(c, 1),
+        ],
+        "the order newest() and below() page by"
+    );
+    for (at, target) in order.iter().enumerate() {
+        for below in 0..=6 {
+            for above in 0..=6 {
+                let window = &order[at.saturating_sub(below)..(at + above + 1).min(order.len())];
+                assert_eq!(
+                    around_ids(&fx, Some(Scope::Main), target, (below, above)),
+                    window,
+                    "around {target}, {below} below and {above} above"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_around_read_places_its_neighbours_by_the_scope_it_names() {
+    // Main holds m1..m3; Flat holds them and a reply between m2 and m3. The reply is Flat's
+    // neighbour of m2 and not Main's, and Main does not hold the reply at all.
+    let fx = Fixture::new("cache-around-scopes");
+    let reply_at = T0 + 2 * STEP + 1_000;
+    let answer = reply("r1", "m2", "a reply", reply_at);
+    fx.list(vec![m(1), m(2), m(3)], T0 + 1_000, None);
+    fx.list_scope(
+        Scope::Flat,
+        vec![m(1), m(2), answer, m(3)],
+        T0 + 1_000,
+        None,
+    );
+    assert_eq!(
+        around_ids(&fx, Some(Scope::Main), "m2", (5, 5)),
+        ids(&["m1", "m2", "m3"])
+    );
+    assert_eq!(
+        around_ids(&fx, Some(Scope::Flat), "m2", (5, 5)),
+        ids(&["m1", "m2", "r1", "m3"])
+    );
+    assert_eq!(
+        around_ids(&fx, Some(Scope::Flat), "r1", (1, 1)),
+        ids(&["m2", "r1", "m3"])
+    );
+    assert!(
+        around_ids(&fx, Some(Scope::Main), "r1", (5, 5)).is_empty(),
+        "Main holds no reply"
+    );
+    assert!(around_ids(&fx, Some(Scope::Main), "absent", (5, 5)).is_empty());
+    // No scope: the message alone, wherever it is at home.
+    assert_eq!(around_ids(&fx, None, "r1", (5, 5)), ids(&["r1"]));
+    assert!(around_ids(&fx, None, "absent", (5, 5)).is_empty());
+    // A blocked scope is not read.
+    fx.cache.block_scope(&fx.chan, &Scope::Main);
+    let query = shadow::Query::Around {
+        scope: Some(Scope::Main),
+        id: "m2".to_owned(),
+        below: 5,
+        above: 5,
+    };
+    assert_eq!(fx.cache.shadow_view(&fx.chan, &query), Read::Blocked);
+    fx.cache.unblock(&fx.chan, Some(&Scope::Main));
+}
+
+#[test]
+fn a_coverage_hole_on_either_side_of_an_around_read_truncates_that_side() {
+    // m1..m5 proven by a range read, m8..m12 by a newest read: no claim holds m5..m8, where a
+    // message could stand upstream. Around m9 the older side stops at m8; around m4 the newer side
+    // stops at m5. Read and proven as the sink does it.
+    let fx = Fixture::new("cache-around-hole");
+    fx.list(
+        vec![m(8), m(9), m(10), m(11), m(12)],
+        T0 + 1_000,
+        Some(newest_proof(ListStart::At(T0 + 8 * STEP))),
+    );
+    fx.list(
+        vec![m(1), m(2), m(3), m(4), m(5)],
+        T0 + 1_000,
+        Some(Proof {
+            from: ListStart::At(T0 + STEP),
+            until: ListEnd::Before(T0 + 5 * STEP + 1),
+            complete: true,
+            full: true,
+            source: Source::Range,
+        }),
+    );
+    let served = |id: &str, (below, above): (usize, usize)| {
+        let view = fx
+            .cache
+            .shadow_view(
+                &fx.chan,
+                &shadow::Query::Around {
+                    scope: Some(Scope::Main),
+                    id: id.to_owned(),
+                    below: below + 1,
+                    above: above + 1,
+                },
+            )
+            .served()
+            .expect("served");
+        let at = view
+            .rows
+            .iter()
+            .position(|row| row.message.id.as_str() == id)
+            .expect("held");
+        let mut older = view.rows[..at].to_vec();
+        let mut newer = view.rows[at + 1..].to_vec();
+        let more_older = older.len() > below;
+        if more_older {
+            older.remove(0);
+        }
+        let more_newer = newer.len() > above;
+        newer.truncate(above);
+        let proof = around::around(
+            &view.coverage,
+            view.head.as_ref(),
+            None,
+            &view.rows[at],
+            (&older, below, more_older),
+            (&newer, more_newer),
+        );
+        let ids: Vec<String> = older[proof.older_from..]
+            .iter()
+            .chain(std::iter::once(&view.rows[at]))
+            .chain(&newer[..proof.newer_to])
+            .map(|row| row.message.id.0.clone())
+            .collect();
+        (ids, proof.more_below, proof.more_above)
+    };
+    assert_eq!(
+        served("m9", (4, 1)),
+        (ids(&["m8", "m9", "m10"]), true, true),
+        "the older side stops above the hole"
+    );
+    assert_eq!(
+        served("m4", (2, 4)),
+        (ids(&["m2", "m3", "m4", "m5"]), true, true),
+        "the newer side stops below the hole"
+    );
+}
+
+#[test]
+fn around_replies_prove_a_threads_newest_replies_or_say_they_cannot() {
+    // Thread `t`, rooted at m1, five replies a step apart, listed by a read of the thread from its
+    // root; thread `u` holds a reply no listing stands behind.
+    let fx = Fixture::new("cache-around-replies");
+    let root_at = T0 + STEP;
+    let replies: Vec<Message> = (1..=5)
+        .map(|n| reply(&format!("t{n}"), "t", "a reply", root_at + n * STEP))
+        .collect();
+    let mut listed = vec![message("t", "ada", "root", root_at)];
+    listed.extend(replies);
+    fx.list_scope(
+        Scope::Thread("t".to_owned()),
+        listed,
+        T0 + 1_000,
+        Some(newest_proof(ListStart::At(root_at))),
+    );
+    fx.list_scope(
+        Scope::Thread("u".to_owned()),
+        vec![reply("u1", "u", "a reply", root_at + STEP)],
+        T0 + 1_000,
+        None,
+    );
+    let ask = |thread: &str, counts: Option<u64>, limit: usize| {
+        fx.cache
+            .around_replies(&fx.chan, thread, (&mid(thread), root_at, counts), limit)
+            .served()
+            .expect("served")
+    };
+    let ids_of = |found: AroundReplies| -> Vec<String> {
+        match found {
+            AroundReplies::Proven(rows) => rows.into_iter().map(|row| row.message.id.0).collect(),
+            other => panic!("not proven: {other:?}"),
+        }
+    };
+    assert_eq!(
+        ids_of(ask("t", Some(5), 20)),
+        ids(&["t1", "t2", "t3", "t4", "t5"])
+    );
+    assert_eq!(
+        ids_of(ask("t", Some(5), 3)),
+        ids(&["t3", "t4", "t5"]),
+        "a longer thread: its newest, proven from the oldest of them"
+    );
+    assert_eq!(ask("u", Some(1), 20), AroundReplies::Unproven, "no listing");
+    assert_eq!(
+        ask("v", None, 20),
+        AroundReplies::None,
+        "nothing held or counted"
+    );
+    assert_eq!(
+        ask("v", Some(2), 20),
+        AroundReplies::Unproven,
+        "counted, none held"
+    );
+    // A reply a push brought, newer than the thread's last read: the thread is no longer proven.
+    fx.offer(
+        &fx.chan,
+        Observation::Push {
+            push: Push::Upsert {
+                message: Box::new(Incoming::new(
+                    reply("t6", "t", "pushed", root_at + 6 * STEP),
+                    Scope::Thread("t".to_owned()),
+                )),
+                update: false,
+                partial: false,
+            },
+            observed_ms: T0 + 2_000,
+        },
+    );
+    assert_eq!(ask("t", Some(6), 20), AroundReplies::Unproven);
+}

@@ -119,6 +119,7 @@
 //! writer's commits never checkpoint), and two readers, each with its own connection.
 
 pub mod access;
+pub mod around;
 pub mod arrivals;
 pub mod below;
 mod checkpoint;
@@ -439,6 +440,19 @@ pub struct ThreadRecord {
     pub reply_count_exact: bool,
     /// Provider time of the latest activity known.
     pub last_activity_ms: i64,
+}
+
+/// What an around read of Slack's All may carry of one thread rooted in its stretch
+/// ([`MessageCache::around_replies`]). `#2426 vibe-talk-sparse-loading-program`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AroundReplies {
+    /// The copy holds no reply of the thread, and nothing counts one.
+    None,
+    /// The thread's newest replies, oldest first, proven every reply of it in their stretch.
+    Proven(Vec<CachedMessage>),
+    /// Replies the copy cannot prove whole: held with no listing behind them, a text a push
+    /// brought, or a count no listing since accounts for. An around answer leaves them out.
+    Unproven,
 }
 
 /// The replies this file holds for one thread, oldest first: what a serve-time thread summary
@@ -2594,6 +2608,112 @@ impl MessageCache {
                 },
                 root,
             ))
+        })
+    }
+
+    /// What an around read of Slack's All may carry of the thread `thread_id`, whose root
+    /// `root_id`, written at `root_ms`, is in its stretch (`#2426 vibe-talk-sparse-loading-program`):
+    /// the thread's newest `limit` replies, as All's pages from the copy carry a thread, when reads
+    /// listed every reply of it in their stretch ([`held::listed`], with no freshness asked: an
+    /// around answer is as old as the claims it rests on, as a step back from the copy is). From
+    /// the root up when that is all of them, and from the oldest of the `limit` up when the thread
+    /// is longer. Not when a text a push brought is among them, nor when the thread's record counts
+    /// more replies than are held and no listing of the whole thread since the count was learned
+    /// accounts for the difference (the rule [`Self::thread_shortfall`] keeps). Blocked while the
+    /// thread's scope is.
+    #[must_use]
+    pub fn around_replies(
+        &self,
+        chan: &ChanKey,
+        thread_id: &str,
+        (root_id, root_ms, root_counts): (&MessageId, i64, Option<u64>),
+        limit: usize,
+    ) -> Read<AroundReplies> {
+        use rusqlite::OptionalExtension as _;
+        let now_ms = self.now_ms();
+        let cutoff_ms = self.shared.limits.cutoff_ms(&chan.channel_id, now_ms);
+        let memory_dropped_ms = self.last_drop_ms(chan);
+        let scope_key = Scope::Thread(thread_id.to_owned()).key();
+        self.read_scope(chan, &scope_key, |connection| {
+            let snapshot = connection.unchecked_transaction()?;
+            // The root, and one more than the limit: the row that says the thread is longer.
+            let rows = reader::newest(&snapshot, chan, &scope_key, limit.saturating_add(2))?;
+            let intervals = reader::coverage(&snapshot, chan, &scope_key)?;
+            let head = reader::head_record(&snapshot, chan, &scope_key)?;
+            let dropped_ms = reader::dropped_ms(&snapshot, chan)?.max(memory_dropped_ms);
+            let record = reader::thread(&snapshot, chan, thread_id)?;
+            let counted_at: Option<i64> = match reader::chan_id(&snapshot, chan)? {
+                Some(id) => snapshot
+                    .query_row(
+                        "SELECT verified_ms FROM thread WHERE chan = ?1 AND thread_id = ?2",
+                        rusqlite::params![id, thread_id],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten(),
+                None => None,
+            };
+            snapshot.finish()?;
+            let mut replies: Vec<CachedMessage> = rows
+                .into_iter()
+                .filter(|row| {
+                    row.message.id != *root_id
+                        && row
+                            .message
+                            .thread
+                            .as_ref()
+                            .is_none_or(|thread| !thread.is_root)
+                })
+                .collect();
+            let counted = record
+                .and_then(|record| record.reply_count)
+                .max(root_counts)
+                .filter(|count| *count > 0);
+            if replies.is_empty() {
+                return Ok(if counted.is_some() {
+                    AroundReplies::Unproven
+                } else {
+                    AroundReplies::None
+                });
+            }
+            let longer = replies.len() > limit;
+            if longer {
+                replies.drain(..replies.len() - limit);
+            }
+            if replies.iter().any(|row| row.content_partial)
+                || replies.first().is_some_and(|row| row.created_ms < root_ms)
+            {
+                return Ok(AroundReplies::Unproven);
+            }
+            let short = !longer
+                && counted.is_some_and(|count| count > u64::try_from(replies.len()).unwrap_or(0));
+            let from_ms = if longer {
+                replies.first().map_or(root_ms, |row| row.created_ms)
+            } else {
+                root_ms
+            };
+            let proven = held::listed(
+                &held::Snapshot {
+                    rows: Vec::new(),
+                    intervals: &intervals,
+                    head,
+                    cutoff_ms,
+                    dropped_ms,
+                    // A count no listing since accounts for leaves the thread unproven.
+                    fresh_after_ms: if short {
+                        counted_at.unwrap_or(i64::MAX)
+                    } else {
+                        i64::MIN
+                    },
+                },
+                &replies,
+                from_ms,
+            );
+            Ok(if proven {
+                AroundReplies::Proven(replies)
+            } else {
+                AroundReplies::Unproven
+            })
         })
     }
 
