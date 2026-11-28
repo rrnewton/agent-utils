@@ -9,7 +9,7 @@ labels:
 - tests
 - lifecycle
 created_at: 2026-11-28T08:41:00-05:00
-updated_at: 2026-11-28T08:41:00-05:00
+updated_at: 2026-11-28T11:32:00-05:00
 ---
 
 # Description
@@ -54,6 +54,38 @@ So the attribution must be shown per case, not assumed. `test_frozen_validate_ba
 Filed by `cl-flaketriage` at the coordinator's request (2026-11-28; number pre-assigned).
 
 Evidence: `cl-census`'s receipts for this run (the failed list, the run log and the command line), kept by that lane while this issue is open.
+
+Evidence (2026-11-28, `cl-flaketriage`, main 3192c821). The 27 ids were run alone, 3 rounds each:
+
+| environment | ids | result | load1 at start |
+|---|---|---|---|
+| gate wrapper, namespace mode (`with-private-tmp --host-temp` + user/PID namespace; the ids not marked `ordinary_environment`) | 2 | 2 passed, 3 of 3 rounds | 218, 228, 173 |
+| gate wrapper, host mode (`with-private-tmp --host-temp`; the `ordinary_environment` ids) | 25 | 25 passed, 3 of 3 rounds | 238, 233, 172 |
+| lane scratch root (plain pytest, `--basetemp` under the lane's scratch directory) | 27 | 27 FAILED, 3 of 3 rounds | 234, 246, 164 |
+
+Per case (rows grouped by test function):
+
+| case | ids | gate wrapper (mode) | lane scratch root | cause in the lane run |
+|---|---|---|---|---|
+| `test_result_recorded_frozen_removal_resumes_from_its_journal` | 9 (after-ownerless-validate-*) | pass 3 of 3 (host) | FAIL 3 of 3 | the sticky-parent requirement, raised |
+| `test_frozen_validate_checkout_recovers_each_durable_crash_boundary` | 9 (after-ownerless-validate-*) | pass 3 of 3 (host) | FAIL 3 of 3 | the sticky-parent requirement, raised |
+| `test_release_frozen_incomplete_resumes_from_its_journal` | 2 (after-ownerless-validate-journal, -remove) | pass 3 of 3 (host) | FAIL 3 of 3 | the sticky-parent requirement, raised |
+| `test_frozen_validate_recovery_refuses_exclusion_identity_tampering` | 2 (guard-identity, source-alias) | pass 3 of 3 (host) | FAIL 3 of 3 | the sticky-parent requirement, raised |
+| `test_ownerless_validate_recovery_resumes_without_reauthorizing` | 1 | pass 3 of 3 (namespace) | FAIL 3 of 3 | the sticky-parent requirement, raised |
+| `test_recover_ownerless_validate_cargo_home_requires_terminal_or_manual_evidence` | 1 | pass 3 of 3 (namespace) | FAIL 3 of 3 | the sticky-parent requirement, raised |
+| `test_frozen_validate_batch_accepts_exact_validation_removal_proof` | 1 | pass 3 of 3 (host) | FAIL 3 of 3 | the sticky-parent requirement, the batch retained the checkout with it as the reason |
+| `test_ownerless_validate_batch_removes_terminal_frozen_checkout` | 1 | pass 3 of 3 (host) | FAIL 3 of 3 | the sticky-parent requirement, the batch retained the checkout with it as the reason |
+| `test_frozen_validate_batch_closes_operation_owned_fds_before_censuses` | 1 | pass 3 of 3 (host) | FAIL 3 of 3 | the sticky-parent requirement, the batch retained the checkout with it as the reason, so the fresh census never ran (census stages: shared only) |
+
+Named cause, the same for all 27: "validation exclusion found no trusted root-owned, same-filesystem sticky parent". The lane scratch root is not in the filesystem view of the host temp dir ("validation path is outside the filesystem view containing the exclusion root").
+- The candidate real defect, the closed-fds case, is environmental too. Its batch retains the checkout for this reason before the exclusion phase, so the closed-fds record is never written. This was captured from the batch report.
+- No production change.
+
+Fix (test-only): one guard, `require_host_temp_exclusion_view`, at the start of each of the 27 cases. For the two parametrized functions it applies only to the ownerless-validate boundaries; their tampered-* parameters do not reach the exclusion and still run anywhere.
+- The guard runs the product's own view check (`_mount_alias_path`) from the test temp dir to the host temp dir.
+- Outside a gate, a missing view SKIPS the case, naming the requirement and the remedy (`scripts/with-private-tmp --host-temp`).
+- Inside a gate (`GATE_ADMISSION_RUN_ID` set) the guard never skips; it FAILS.
+- `test_exclusion_view_guard_fails_rather_than_skips_inside_a_gate` proves that branch: with the view check forced to refuse and the gate marker set, a skip fails the test (the lead's condition).
 
 Related:
 - #2383: the gate's private temp root and the wrkslots host-temp exception (#2415 interim).
