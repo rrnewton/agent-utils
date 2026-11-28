@@ -1,16 +1,17 @@
 ---
 title: 'console-pty-launcher-race: the console_pty test launcher execs the console before its intermediate fork has exited, so under load the console finds the harness that started the gate and refuses (4 of 24 at 12 in parallel)'
-status: open
+status: closed
 priority: 2
 issue_type: bug
-assignee: cl-bridgeretire
+assignee: cl-consolepty
 labels:
 - agentctl
 - console
 - tests
 - gate
 created_at: 2026-11-27T08:52:21-05:00
-updated_at: 2026-11-27T08:52:21-05:00
+updated_at: 2026-11-28T10:32:00-05:00
+closed_at: 2026-11-28T10:32:00-05:00
 ---
 
 # Description
@@ -61,3 +62,18 @@ This puts no wall-clock budget on the outcome, only an event wait with a generou
 - Found by cl-bridgeretire while triaging the #2338 gate (2026-11-27); coordb assigned the number.
 - The fix is a separate small commit off main, after #2366 and #2338 land.
 - Related: #670 (the console's owner-at-a-terminal proof), #2338.
+
+## Resolution
+
+Fixed in 5949efb4 (test file only, `rs/agentctl/tests/console_pty.rs`; `console.rs` and `sender_header.rs` unchanged). Gated as d2c5839a: gate 1795877999177054146-49967911, pass, no failed or incomplete steps. That gate ran `gate.py` inline in a lane's Claude session, the setup that used to fail, and all four console_pty cases passed.
+
+- The two failing gates of 2026-11-28 (1795844957763037888-56f2b0d5, 1795865238081247654-6865f313) each named the Claude lane that ran `gate.py` inline. In both, the sibling case with the same launcher passed, so the cause was the launcher race, not anything in the gate's process chain that refuses on every run. No process in the gate chain is a child subreaper.
+- The launcher records its pid before the fork. Its child publishes its pid file (whole or absent) and polls `getppid()` until it changes, then execs the console. The poll has a 60 s cap that prints a named message; there is no wall-clock budget on the outcome.
+- The console waits now fail at once, showing the screen, when the console's terminal closes (the pty master reads EIO), instead of after a 60 s banner timeout. The pty descriptors are close-on-exec, so a console launched by a parallel case cannot hold this case's pty open.
+- New negative control `console_refuses_to_run_under_a_harness_ancestor`: the console runs as the direct child of a process named `claude` and must refuse, naming that pid.
+- New regression check `console_launcher_waits_for_its_intermediate_to_exit`: the intermediate is named `claude` and held alive until the child parks. A launcher that execs at once is refused every time, wherever the suite runs.
+- Before and after, from inside a lane's Claude session, same agentctl binary, release build, `RUST_TEST_THREADS=4`: base and fix rounds interleaved, 12 copies at once per round, 12 rounds each, load1 164-215 (below the 237 hot bar).
+  - Base (main's test file): 33 of 288 runs of the two original cases failed, in 6 of 12 rounds. Every failure was the refusal naming that session's own claude pid, and each cost about 61 s.
+  - Fix: 576 of 576 cases passed (each original case 144 of 144, the negative control 144 of 144, the regression check 144 of 144), with no refusals.
+  - The new tests with the launcher's wait removed: the regression check failed 3 of 3, by name, in about 4 s.
+- Negative control against a real harness: `agentctl console` started directly on a pty from that session's shell refused with that session's claude pid, exit 2.
