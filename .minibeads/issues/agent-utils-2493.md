@@ -1,6 +1,6 @@
 ---
 title: 'private-tmp-bound-test-report-race: the host-temp bound test child writes its report after the oversized file, so the bound can stop it before the report exists'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: cl-flaketriage
@@ -9,7 +9,8 @@ labels:
 - tests
 - hot-host
 created_at: 2026-11-28T14:08:00-05:00
-updated_at: 2026-11-28T14:08:00-05:00
+updated_at: 2026-11-28T15:45:00-05:00
+closed_at: 2026-11-28T15:45:00-05:00
 ---
 
 # Description
@@ -43,3 +44,12 @@ Filed by `cl-flaketriage` at the coordinator's request (2026-11-28; number pre-a
 
 Related:
 - #2383: the private temp root and its host-temp bound.
+
+## Resolution
+
+Fixed in ccf1641f (`py/tests/test_private_tmp.py`, test-only), gated as ee2fff80: gate 1795894776097312074-bd122e61 (full selection).
+- `python.repository-infrastructure.test` passed there (409 passed), with this case in it.
+- The gate's three off-path reds passed in a solo rerun on the unchanged commit (gate 1795897801794897034-b79d7ab8). They are filed as #2498, #2499 and #2500.
+- What changed: the child writes and closes its report before it writes the oversized file, so the wrapper's bound can never stop it first.
+- Control, with a scratch hook that makes opening the report for writing wait 0.5 s: the test from main failed (FileNotFoundError on the report), and the fixed test passed. Without the hook, the file passed 24 of 24 in 3 of 3 rounds.
+
