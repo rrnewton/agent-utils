@@ -188,7 +188,12 @@ explicit rule.
   (state `deferred`); `agentctl watch-agents` pumps that way. One pump runs
   at a time per state directory (`pump.lock`); a second one does nothing.
   Mirror copies (below) are not pump's business: a mirror is attempted
-  once, when the direct delivery lands, and never retried.
+  once, when the direct delivery lands, and never retried. An entry pump
+  cannot walk this run is reported, not dropped (#2420): one whose team or
+  host is gone from teams.json, or whose host names an undefined route,
+  prints `<id>: skipped: <reason>`, keeps the reason on the entry as
+  `pump_skipped`, and is tried again on the next pump. The other entries
+  are walked as usual.
 - `seen ID` — this host's ledger state for an ID.
 - `resolve ID (--fence | --mark-delivered)` — human-only settlement on the
   receiving host.
@@ -517,7 +522,15 @@ sender is confirmed (`relay confirm`) or banned (`relay ban`; `relay unban` reve
 sender's posts are dropped without new alarms. `relay status` shows open
 stranger alarms first. Quarantined posts addressed to us are delivered,
 in arrival order and exactly once, as soon as their sender is confirmed —
-nothing is silently lost. Posts for other fleets from confirmed senders
+nothing is silently lost. A post the receiving ledger refuses at that
+point (for example its sender is not in `accepts_from`) stays
+quarantined, with the refusal kept on it as `drain_refused`, for the
+owner to see and dismiss (#2420). `relay quarantine retry` likewise
+removes a post only once its message is recorded delivered, or once a
+receipt or announcement in it is handled. A sender records every state a
+receiver answers in a receipt (`possibly_submitted`, `quarantined`,
+`not-recorded`, and `route-refused`, retried as `deferred`), so no entry
+stays `in-custody` because its receipt was refused. Posts for other fleets from confirmed senders
 are still dropped silently (above); only strangers and malformed posts
 are loud. A malformed post from a CONFIRMED sender (a split or truncated
 relay post is the usual cause; a sender listed in a declaration's
