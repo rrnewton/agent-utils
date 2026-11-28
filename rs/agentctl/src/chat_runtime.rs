@@ -5894,6 +5894,11 @@ pub(crate) trait TranscriptReplies: Send + fmt::Debug {
 /// with a table, which a screen draws mangled, is refused and told to the owner and the
 /// coordinator.
 pub(crate) const SCREEN_FALLBACK_AFTER: Duration = Duration::from_secs(60);
+/// The line put above a reply whose table was read only from the screen (#2420 C3): it is
+/// posted, never refused, with this warning that the table may be drawn mangled.
+pub(crate) const SCREEN_TABLE_WARNING: &str = "[chat-bridge warning: the bridge read this reply \
+only from the screen, which can draw its table mangled; the coordinator was asked to resend it if \
+it reads wrong]";
 /// Most screen blocks remembered as held back before the memory starts over.
 const MAX_HELD_SCREEN_BLOCKS: usize = 4_096;
 /// Screen blocks held back, by `transcript_digest`: when a capture first read each, in Unix
@@ -14729,6 +14734,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 continue;
             }
             let from_transcript = body != &block.body || transcript.only.contains(body);
+            let mut screen_table_warning = false;
             // Screen text is the last resort while a transcript is followed (#783
             // chat-reply-capture-miss): a block the transcript does not pair waits for it to catch
             // up. Past the wait a plain block is stored as the screen drew it, but a table, which
@@ -14744,13 +14750,12 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                     continue;
                 }
                 if agent_harness::replies::has_table(body) {
+                    // Posted with a warning line, never refused (#2420 C3, owner decision:
+                    // warning at most, never hold): the screen may have drawn the table mangled.
+                    // The owner and the coordinator are told once, and the mark keeps a later
+                    // sighting of the same block from being stored twice.
                     self.refuse_screen_table(key, &block.identifier, body, first_seen);
-                    refused.push(refusal(
-                        &"its table was read only from the screen, which draws tables mangled, \
-                          and the coordinator's transcript holds no such block; it was not sent, \
-                          and the owner and the coordinator were told",
-                    ));
-                    continue;
+                    screen_table_warning = true;
                 }
             }
             if expected > MAX_REPLY_ORDINAL {
@@ -14765,7 +14770,12 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 refused.push(refusal(&error));
                 continue;
             }
-            let reply = match ReplyRecord::new(key, expected, body.clone()) {
+            let stored_body = if screen_table_warning {
+                format!("{SCREEN_TABLE_WARNING}\n{body}")
+            } else {
+                body.clone()
+            };
+            let reply = match ReplyRecord::new(key, expected, stored_body) {
                 Ok(reply) => reply,
                 Err(error) => {
                     refused.push(refusal(&error));
@@ -15356,6 +15366,12 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         self.root
             .join("replies")
             .join(format!("{key}-{ordinal:06}.json"))
+    }
+
+    /// A stored reply's body, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn reply_body(&self, key: &str, ordinal: u32) -> Result<String> {
+        Ok(self.read_reply(key, ordinal)?.body)
     }
 
     fn read_reply(&self, key: &str, ordinal: u32) -> Result<ReplyRecord> {
@@ -34995,7 +35011,8 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
 
     /// #783 chat-reply-capture-miss slice (d): while a transcript is followed, a screen block it
     /// does not pair waits for it; past the wait a plain block is stored as drawn, and a table is
-    /// refused once and queued for the owner loop to tell. A command reply is never held.
+    /// posted once with a warning line (#2420) and queued for the owner loop to tell. A command
+    /// reply is never held.
     #[test]
     fn screen_text_is_the_last_resort_while_a_transcript_is_followed() {
         let (state, key, nonce, root) = open_request("screen-last-resort");
@@ -35017,18 +35034,25 @@ opening line for, the reply block marked {nonce}_2, so that block was not sent.\
             .capture_snapshot(&reply_block(&id, plain))
             .expect("plain, past the wait");
         assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        // #2420 C3: past the wait a screen-only table is posted with a warning line, never
+        // refused, and still queued once for the owner loop to tell.
         let capture = state
             .capture_snapshot(&reply_block(&id, DRAWN))
             .expect("table, past the wait");
-        assert!(capture.replies.is_empty(), "{capture:?}");
-        assert_eq!(capture.refused.len(), 1, "{capture:?}");
+        assert_eq!(capture.replies, [(key.clone(), vec![2])], "{capture:?}");
+        assert!(capture.refused.is_empty(), "{capture:?}");
+        assert!(state
+            .read_reply(&key, 2)
+            .expect("reply")
+            .body
+            .starts_with(SCREEN_TABLE_WARNING));
         let refusals = state.take_screen_refusals();
         assert_eq!(refusals.len(), 1, "{refusals:?}");
         assert_eq!(
             (refusals[0].key.as_str(), refusals[0].identifier.as_str()),
             (key.as_str(), id.as_str())
         );
-        // Refused once: a later read of it is skipped quietly.
+        // Posted once: a later read of it is skipped quietly.
         let capture = state
             .capture_snapshot(&reply_block(&id, DRAWN))
             .expect("table again");

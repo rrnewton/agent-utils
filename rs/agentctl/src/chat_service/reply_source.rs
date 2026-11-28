@@ -205,29 +205,31 @@ impl ReplySourceWatch {
         // refused screen table whose request has been answered.
         self.told.retain(|key, told| match told.kind {
             Kind::Uncaptured => misses.iter().any(|miss| miss.key == *key),
-            Kind::ScreenTable => candidates.iter().any(|candidate| candidate.key == *key),
+            // Told once; the posted reply answers its request, so the entry is kept, never
+            // dropped and told again (#2420 C3).
+            Kind::ScreenTable => true,
         });
         let mut owner = Vec::new();
         for refusal in state.take_screen_refusals() {
-            if self.told.contains_key(&refusal.key)
-                || !candidates
-                    .iter()
-                    .any(|candidate| candidate.key == refusal.key)
-            {
+            // A screen table is posted with its warning (#2420 C3), so its request is answered
+            // by then: the notice goes out whether or not the request is still a candidate.
+            if self.told.contains_key(&refusal.key) {
                 continue;
             }
             service_log(format_args!(
-                "agentctl: SCREEN TABLE REFUSED: a reply block for reply ID {} (request {}) holds \
-                 a table that was read only from the screen, and the coordinator's transcript has \
-                 held no such block since {}; it was not sent",
+                "agentctl: SCREEN TABLE POSTED WITH A WARNING: a reply block for reply ID {} \
+                 (request {}) holds a table that was read only from the screen, and the \
+                 coordinator's transcript has held no such block since {}; it was posted with a \
+                 warning line (#2420)",
                 refusal.identifier,
                 refusal.key.get(..12).unwrap_or(&refusal.key),
                 chat_runtime::utc_timestamp(refusal.first_seen_millis)
             ));
             owner.push(format!(
                 "[chat-bridge WARNING] {agent} wrote a reply with a table to your message (reply \
-                 ID {}), but the bridge could read it only from the screen, where tables are \
-                 drawn mangled, so it was not posted. {agent} has been asked to send it again.",
+                 ID {}), but the bridge could read it only from the screen, where tables can be \
+                 drawn mangled. It was posted with a warning line; {agent} has been asked to send \
+                 it again if it reads wrong.",
                 refusal.identifier
             ));
             self.told.insert(
@@ -466,7 +468,7 @@ impl ReplySourceWatch {
                     "key": told.miss.key,
                     "kind": match told.kind {
                         Kind::Uncaptured => "uncaptured",
-                        Kind::ScreenTable => "screen-table-refused",
+                        Kind::ScreenTable => "screen-table-posted",
                     },
                     "reply_id": told.miss.reply_id,
                     "block_at_millis": told.miss.block_at_millis,
@@ -543,9 +545,15 @@ fn coordinator_notice(state: &BridgeState, miss: &Miss, kind: Kind, now: u64) ->
 nothing for it and posted nothing",
             now.saturating_sub(miss.block_at_millis) / 60_000
         ),
-        Kind::ScreenTable => "the bridge could read your reply only from the screen, which draws \
-its table mangled, and your transcript holds no such block, so it posted nothing"
-            .to_owned(),
+        Kind::ScreenTable => {
+            return format!(
+                "[chat-bridge WARNING] The chat bridge could read your reply to the chat request \
+with reply ID {} only from the screen, which can draw its table mangled, and your transcript holds \
+no such block. It posted it with a warning line (#2420). If the table reads wrong, send that reply \
+again {send}. This notice is sent only once.",
+                miss.reply_id
+            );
+        }
     };
     format!(
         "[chat-bridge WARNING] The chat bridge did not send your reply to the chat request with \

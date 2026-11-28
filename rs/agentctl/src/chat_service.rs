@@ -17745,10 +17745,11 @@ esac
         fs::remove_dir_all(root).ok();
     }
 
-    /// #783 chat-reply-capture-miss slice (d): a table read only from the screen while a
-    /// transcript is followed is refused past the wait, and the owner is warned once.
+    /// #783 chat-reply-capture-miss slice (d), changed by #2420 C3: a table read only from the
+    /// screen while a transcript is followed is posted past the wait with a warning line (it
+    /// used to be refused, so the owner never got the reply), and the owner is told once.
     #[test]
-    fn a_table_read_only_from_the_screen_is_refused_and_told_once() {
+    fn a_table_read_only_from_the_screen_is_posted_with_a_warning_and_told_once() {
         let fixture = crate::subagents::tests::Fixture::new();
         let (state, key, root) = state_with_request();
         state
@@ -17780,9 +17781,21 @@ esac
             .replies
             .is_empty());
         state.age_screen_holds(chat_runtime::SCREEN_FALLBACK_AFTER);
-        let capture = state.capture_snapshot(&table).expect("refused");
-        assert!(capture.replies.is_empty(), "{capture:?}");
-        assert_eq!(capture.refused.len(), 1, "{capture:?}");
+        let capture = state.capture_snapshot(&table).expect("posted");
+        assert!(capture.refused.is_empty(), "{capture:?}");
+        assert_eq!(capture.replies.len(), 1, "{capture:?}");
+        let stored = state.reply_body(&key, 1).expect("stored reply");
+        assert!(
+            stored.starts_with(chat_runtime::SCREEN_TABLE_WARNING),
+            "{stored}"
+        );
+        assert!(stored.contains("│ Leg │ Time │"), "{stored}");
+        // A later sighting of the same block is not stored twice.
+        assert!(state
+            .capture_snapshot(&table)
+            .expect("again")
+            .replies
+            .is_empty());
         let stop = StopState::default();
         let manager = fixture.manager();
         let delivery = DrainOptions {
@@ -17799,7 +17812,7 @@ esac
             roots.posts[0].1
         );
         let record = state.reply_source_record().expect("recorded");
-        assert_eq!(record["capture_misses"][0]["kind"], "screen-table-refused");
+        assert_eq!(record["capture_misses"][0]["kind"], "screen-table-posted");
         watch.step(&state, &manager, &stop, delivery, Some(&mut roots));
         assert_eq!(roots.posts.len(), 1, "told once: {:?}", roots.posts);
         fs::remove_dir_all(root).ok();
