@@ -2396,49 +2396,28 @@ fn relay_deliver(
             ));
         }
     }
+    // A body that differs from its hash, after the provider-rewrite restores above, is
+    // delivered as received with a warning under its team tag and counted (#2420, owner
+    // decision 2026-11-27: never hold or drop a message on a fragile check). The ledger still
+    // keys it by its ID and signed hash, so a copy of a delivered message stays `known`.
+    let mut body_warning: Option<String> = None;
     if let Err(reason) = check_envelope(envelope) {
         if reason == "body-hash-mismatch" {
-            // From an admitted sender this is its own integrity kind:
-            // the body differs from what was hashed/signed, so it can
-            // never deliver and the post is evidence (#794 review).
-            let signed = envelope.get("relay").is_some();
-            let (qid, alarms_at) = record_integrity_confirmed(
+            body_warning = Some(body_hash_warning(envelope.get("relay").is_some()));
+        } else {
+            record_stranger(
                 state,
                 declaration,
-                route,
+                entry,
                 peer_sender,
-                channel,
-                text,
                 envelope,
-                id,
-                signed,
+                text,
+                &format!("malformed: envelope refused: {reason}"),
             )?;
-            let detail = match alarms_at {
-                // The same message was delivered another way (#2160): only a damaged copy.
-                None => format!(
-                    "body does not match its hash, but the same message was already \
-                     delivered; kept as {qid} without an alarm"
-                ),
-                Some(at) => format!(
-                    "body does not match its hash; quarantined as {qid}, and it alarms at {at} \
-                     unless the same message is delivered first — dismiss with: \
-                     agent-teams relay quarantine dismiss {qid}"
-                ),
-            };
-            return Ok(result(NOT_RECORDED, detail));
+            let mut out = receipt_for(NOT_RECORDED, &format!("envelope refused: {reason}"));
+            out.outcome = "stranger-quarantined".to_string();
+            return Ok(post_receipt(state, entry, channel, thread, id, out));
         }
-        record_stranger(
-            state,
-            declaration,
-            entry,
-            peer_sender,
-            envelope,
-            text,
-            &format!("malformed: envelope refused: {reason}"),
-        )?;
-        let mut out = receipt_for(NOT_RECORDED, &format!("envelope refused: {reason}"));
-        out.outcome = "stranger-quarantined".to_string();
-        return Ok(post_receipt(state, entry, channel, thread, id, out));
     }
     let team_dir = state.join("teams.d").join(&declaration.team);
     let ledger_path = crate::ledger::entry_path(state, &declaration.team, id);
@@ -2455,7 +2434,27 @@ fn relay_deliver(
         peer_host: "",
         via_chat_relay: true,
     };
-    let answer = accept(&ctx, envelope, deliverer.as_ref())?;
+    let answer = match &body_warning {
+        Some(warning) => {
+            let answer = crate::ledger::accept_with_body_warning(
+                &ctx,
+                envelope,
+                deliverer.as_ref(),
+                warning,
+            )?;
+            note_body_hash_warning(
+                state,
+                declaration,
+                route,
+                peer_sender,
+                envelope,
+                id,
+                &answer,
+            )?;
+            answer
+        }
+        None => accept(&ctx, envelope, deliverer.as_ref())?,
+    };
     let state_name = answer
         .state
         .clone()
@@ -2800,106 +2799,128 @@ fn record_unparseable_confirmed(
     Ok(id)
 }
 
-/// How long a body-hash quarantine waits for a delivered copy of the same message before it
-/// alarms (#2160): a relay copy can arrive before the direct one.
-pub const INTEGRITY_TWIN_GRACE_MS: i64 = 10 * 60 * 1000;
-
-/// Ledger states in which a message counts as delivered for a twin check (#2160).
-const TWIN_STATES: [&str; 5] = ["claimed", "accepted", "typing", "presented", "delivered"];
-
-/// Why a body-hash mismatch from an admitted sender was quarantined.
-fn integrity_reason(signed: bool) -> String {
+/// The warning shown under the team tag of a message delivered although its body differs from
+/// the hash its sender signed (or, unsigned, declared) (#2420).
+fn body_hash_warning(signed: bool) -> String {
     format!(
-        "body does not match its {} hash (after undoing Slack link markup and bullets): \
-         possible tampering or an unrecognised provider rewrite; not delivered",
+        "this body differs from the hash its sender {} (after undoing Slack link markup and \
+         bullets): a provider rewrite or tampering; it is delivered as received",
         if signed { "signed" } else { "declared" }
     )
 }
 
-/// The delivered copy of the same message, when the receiving team's ledger holds one with
-/// the same id and the same (signed) body hash (#2160): `{state, recorded_at}` for the
-/// quarantine record. Such a relay copy is only a provider's damaged duplicate.
-fn delivered_twin(state: &Path, team: &str, id: &str, envelope: &Value) -> Option<Value> {
-    if !crate::model::valid_team_name(team) || !crate::envelope::valid_message_id(id) {
-        return None;
-    }
-    let expected = envelope.get("body_sha256").and_then(Value::as_str)?;
-    let text = std::fs::read_to_string(crate::ledger::entry_path(state, team, id)).ok()?;
-    let entry: Value = serde_json::from_str(&text).ok()?;
-    let entry_state = entry.get("state").and_then(Value::as_str)?;
-    (TWIN_STATES.contains(&entry_state)
-        && entry.get("body_sha256").and_then(Value::as_str) == Some(expected))
-    .then(|| {
-        json!({
-            "state": entry_state,
-            "recorded_at": entry.get("recorded_at").cloned().unwrap_or(Value::Null),
-        })
-    })
+/// `relay/body-hash-warnings.json`: how many relay copies were delivered (or found already
+/// delivered) despite a body that differs from its hash (#2420), and the most recent ones.
+const BODY_HASH_WARNINGS_FILE: &str = "body-hash-warnings.json";
+const BODY_HASH_WARNINGS_SCHEMA: &str = "agent-teams-body-hash-warnings/v1";
+const MAX_RECENT_BODY_HASH_WARNINGS: usize = 64;
+
+fn body_hash_warnings_path(state: &Path) -> PathBuf {
+    state.join("relay").join(BODY_HASH_WARNINGS_FILE)
 }
 
-/// Record a body-hash mismatch from an admitted sender under the `integrity` alarm kind
-/// (#794): the body differs from what its sender hashed (and, when signed, signed), so it can
-/// never deliver and the quarantined raw post is the evidence. Kept apart from the routine
-/// unparseable alarm so one dismiss cannot close both. Returns the quarantine ID (the
-/// envelope's message ID).
-///
-/// Since #2160 it alarms only when the message was not delivered another way: when the
-/// receiving team's ledger already holds the same message (same id, same hash) the post is
-/// kept with `twin` and counted, never alarmed; otherwise it waits
-/// [`INTEGRITY_TWIN_GRACE_MS`] (`awaiting_twin_until`) for that copy, and
-/// [`raise_due_alarms`] alarms it if none came.
+/// Count one relay copy delivered despite a body-hash mismatch and keep it as evidence: its
+/// ID, sender, route, both hashes and the delivery outcome, also logged (#2420).
 #[allow(clippy::too_many_arguments)]
-fn record_integrity_confirmed(
+fn note_body_hash_warning(
     state: &Path,
     declaration: &Declaration,
     route: &str,
     peer_sender: &str,
-    channel: &str,
-    text: &str,
     envelope: &Value,
     id: &str,
-    signed: bool,
-) -> DataResult<(String, Option<String>)> {
-    let reason = integrity_reason(signed);
-    if let Some(twin) = delivered_twin(state, &declaration.team, id, envelope) {
-        let _lock = lock_store(state)?;
-        store_integrity_post(
-            state,
-            declaration,
-            route,
-            peer_sender,
-            channel,
-            text,
-            envelope,
-            id,
-            &reason,
-            json!({"twin": twin}),
-        )?;
-        log_event(
-            state,
-            &json!({"event": "integrity", "outcome": "twin-delivered", "sender_id": peer_sender, "local_team": declaration.team, "id": id}),
-        );
-        return Ok((id.to_string(), None));
-    }
-    let until = format_rfc3339_ms(now_unix_ms() + INTEGRITY_TWIN_GRACE_MS);
-    let _lock = lock_store(state)?;
-    store_integrity_post(
-        state,
-        declaration,
-        route,
-        peer_sender,
-        channel,
-        text,
-        envelope,
-        id,
-        &reason,
-        json!({"awaiting_twin_until": until}),
-    )?;
+    answer: &crate::ledger::AcceptAnswer,
+) -> DataResult<()> {
+    let received = sha256_hex(
+        envelope
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    let record = json!({
+        "id": id, "route": route, "peer_sender": peer_sender,
+        "local_team": declaration.team,
+        "body_sha256": envelope.get("body_sha256"), "received_sha256": received,
+        "outcome": answer.outcome, "state": answer.state,
+        "at": format_rfc3339_ms(now_unix_ms()),
+    });
     log_event(
         state,
-        &json!({"event": "integrity", "outcome": "awaiting-twin", "sender_id": peer_sender, "local_team": declaration.team, "id": id, "until": until}),
+        &json!({"event": "relay-in", "outcome": "body-hash-warning", "delivery": answer.outcome, "id": id, "route": route, "peer_sender": peer_sender, "local_team": declaration.team, "received_sha256": received}),
     );
-    Ok((id.to_string(), Some(until)))
+    let _lock = lock_store(state)?;
+    let path = body_hash_warnings_path(state);
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(|doc| doc.get("schema").and_then(Value::as_str) == Some(BODY_HASH_WARNINGS_SCHEMA))
+        .unwrap_or_else(
+            || json!({"schema": BODY_HASH_WARNINGS_SCHEMA, "delivered": 0, "recent": []}),
+        );
+    let delivered = doc.get("delivered").and_then(Value::as_u64).unwrap_or(0) + 1;
+    doc["delivered"] = json!(delivered);
+    let mut recent = doc
+        .get("recent")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    recent.push(record);
+    if recent.len() > MAX_RECENT_BODY_HASH_WARNINGS {
+        let excess = recent.len() - MAX_RECENT_BODY_HASH_WARNINGS;
+        recent.drain(0..excess);
+    }
+    doc["recent"] = json!(recent);
+    write_json_atomic(&path, &doc)
+}
+
+/// Relay copies delivered (or found already delivered) despite a body-hash mismatch, for
+/// `relay status` (#2420): the count, and the most recent one's ID and time.
+pub fn body_hash_warning_count(state: &Path) -> (u64, Option<(String, String)>) {
+    let doc = std::fs::read_to_string(body_hash_warnings_path(state))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or(Value::Null);
+    let last = doc
+        .get("recent")
+        .and_then(Value::as_array)
+        .and_then(|recent| recent.last())
+        .map(|last| {
+            (
+                last.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+                last.get("at")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+            )
+        });
+    (
+        doc.get("delivered").and_then(Value::as_u64).unwrap_or(0),
+        last,
+    )
+}
+
+/// Replay the posts a #2160 build held for a body-hash mismatch (those carrying
+/// `awaiting_twin_until` or `twin`): under #2420 such a copy is delivered with a warning, or is
+/// `known` when its message was already delivered, so none stays held. Returns
+/// `(quarantine id, outcome)` per post replayed.
+pub fn replay_held_body_hash_posts(
+    state: &Path,
+    this_host: &str,
+) -> DataResult<Vec<(String, String)>> {
+    let held: Vec<String> = quarantined_posts(state)
+        .iter()
+        .filter(|post| post.get("awaiting_twin_until").is_some() || post.get("twin").is_some())
+        .filter_map(|post| post.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut results = Vec::new();
+    for id in held {
+        results.extend(retry_quarantine(state, this_host, Some(&id))?);
+    }
+    Ok(results)
 }
 
 /// Quarantine one post under the `integrity` alarm kind with a caller-named reason (a
@@ -3059,92 +3080,6 @@ fn alarm_integrity(
         let _ = raise_alarm_at(state, index, now_ms);
     }
     Ok(())
-}
-
-/// Settle the integrity posts waiting for a delivered twin (#2160): one whose message has
-/// since been delivered is marked `twin` and never alarms; one still alone at
-/// `awaiting_twin_until` joins its sender's integrity alarm, which is raised. Posts kept before
-/// #2160 carry neither field and are left exactly as they are.
-fn settle_integrity_quarantine(state: &Path, now_ms: i64) -> DataResult<()> {
-    let _lock = lock_store(state)?;
-    let path = quarantine_path(state);
-    let mut quarantine = load_json_list(&path, "posts");
-    let Some(posts) = quarantine.get_mut("posts").and_then(Value::as_array_mut) else {
-        return Ok(());
-    };
-    let mut due = Vec::new();
-    let mut changed = false;
-    for post in posts.iter_mut() {
-        let Some(until) = post
-            .get("awaiting_twin_until")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let team = post.get("local_team").and_then(Value::as_str).unwrap_or("");
-        let id = post.get("id").and_then(Value::as_str).unwrap_or("");
-        let twin = delivered_twin(state, team, id, &post["envelope"]);
-        let alone_past_grace = twin.is_none()
-            && crate::timeutil::parse_rfc3339_ms(&until).is_none_or(|until| now_ms >= until);
-        if twin.is_none() && !alone_past_grace {
-            continue;
-        }
-        if let Some(fields) = post.as_object_mut() {
-            fields.remove("awaiting_twin_until");
-            match twin {
-                Some(twin) => {
-                    fields.insert("twin".to_string(), twin);
-                }
-                None => due.push(Value::Object(fields.clone())),
-            }
-        }
-        changed = true;
-    }
-    if !changed {
-        return Ok(());
-    }
-    write_json_atomic(&path, &quarantine)?;
-    let declarations = load_declarations(state).unwrap_or_default();
-    for post in due {
-        let text = |key: &str| {
-            post.get(key)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        };
-        let team = text("local_team");
-        let Some((_, _, declaration)) = declarations.iter().find(|(name, _, _)| *name == team)
-        else {
-            continue;
-        };
-        alarm_integrity(
-            state,
-            declaration,
-            &text("route"),
-            &text("peer_sender"),
-            post["envelope"].get("from").cloned().unwrap_or(Value::Null),
-            &text("id"),
-            &text("reason"),
-            now_ms,
-        )?;
-    }
-    Ok(())
-}
-
-/// Integrity posts kept without an alarm, for `relay status` (#2160): those whose message was
-/// delivered another way (`twin`), and those still waiting for that copy.
-pub fn integrity_quarantine_counts(state: &Path) -> (usize, usize) {
-    let posts = quarantined_posts(state);
-    let twins = posts
-        .iter()
-        .filter(|post| post.get("twin").is_some())
-        .count();
-    let awaiting = posts
-        .iter()
-        .filter(|post| post.get("awaiting_twin_until").is_some())
-        .count();
-    (twins, awaiting)
 }
 
 /// Record an unparseable post as a STRANGER event. No envelope survived
@@ -3476,9 +3411,7 @@ fn raise_alarm_at(state: &Path, index: usize, now_ms: i64) -> DataResult<bool> {
 /// Raise every open alarm whose repeat is due. Called by `relay-in`,
 /// `pump`, and `relay alarms`, so no daemon is needed: any relay activity
 /// or pump run re-raises overdue stranger alarms.
-/// It first settles integrity posts waiting for a delivered copy of their message (#2160).
 pub fn raise_due_alarms(state: &Path, now_ms: i64) -> DataResult<Vec<String>> {
-    settle_integrity_quarantine(state, now_ms)?;
     let _lock = lock_store(state)?;
     let mut raised = Vec::new();
     let count = alarms(state).len();

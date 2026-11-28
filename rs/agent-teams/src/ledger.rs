@@ -3,7 +3,7 @@
 //! and 9.2). One file per ID under `teams.d/<team>/ledger/`.
 
 use crate::deliver::{Deliverer, Handover};
-use crate::envelope::{check_envelope, envelope_sender, render, sha256_hex};
+use crate::envelope::{check_envelope, envelope_sender, render_with_warning, sha256_hex};
 use crate::jsonfile::{
     create_private_dir_all, write_json_atomic, write_new, write_new_atomic, DataResult,
 };
@@ -167,6 +167,28 @@ pub fn accept(
     envelope: &Value,
     deliverer: &dyn Deliverer,
 ) -> DataResult<AcceptAnswer> {
+    accept_checked(ctx, envelope, deliverer, None)
+}
+
+/// [`accept`] for an envelope whose body no longer matches its signed hash (#2420): it is
+/// delivered as received, with `warning` shown under its team tag, instead of being refused.
+/// The ledger keys and dedupes it by its ID and signed hash exactly as [`accept`] does, so a
+/// copy of a message already delivered is `known`, never a second delivery.
+pub fn accept_with_body_warning(
+    ctx: &AcceptContext<'_>,
+    envelope: &Value,
+    deliverer: &dyn Deliverer,
+    warning: &str,
+) -> DataResult<AcceptAnswer> {
+    accept_checked(ctx, envelope, deliverer, Some(warning))
+}
+
+fn accept_checked(
+    ctx: &AcceptContext<'_>,
+    envelope: &Value,
+    deliverer: &dyn Deliverer,
+    body_warning: Option<&str>,
+) -> DataResult<AcceptAnswer> {
     // Opportunistic retention pruning (its own ledger lock, taken and
     // released before accept's): entries past their horizon are exactly
     // the ones no live envelope can need, since any replay of them is
@@ -175,9 +197,11 @@ pub fn accept(
     let team = &ctx.declaration.team;
     // Route refusals first: no ledger entry, nothing fenced (section 9.4).
     if let Err(reason) = check_envelope(envelope) {
-        return Ok(AcceptAnswer::route_refused(format!(
-            "envelope refused: {reason}"
-        )));
+        if !(reason == "body-hash-mismatch" && body_warning.is_some()) {
+            return Ok(AcceptAnswer::route_refused(format!(
+                "envelope refused: {reason}"
+            )));
+        }
     }
     let id = envelope["id"].as_str().unwrap_or_default().to_string();
     let to_team = envelope["to"]["team"].as_str().unwrap_or_default();
@@ -275,7 +299,7 @@ pub fn accept(
                     findings: Vec::new(),
                 });
             }
-            let recovered = recover_claim(ctx, envelope, deliverer, &existing)?;
+            let recovered = recover_claim(ctx, envelope, deliverer, &existing, body_warning)?;
             return Ok(recovered);
         }
         // A retry of an accepted-but-maybe-undrained item nudges delivery:
@@ -483,7 +507,7 @@ pub fn accept(
     // Supersede older untyped messages on the topic and explicit keys.
     apply_supersede(ctx, envelope, deliverer)?;
 
-    let rendered = render(envelope, ctx.via, ctx.proof_note);
+    let rendered = render_with_warning(envelope, ctx.via, ctx.proof_note, body_warning);
     let outcome = deliverer.handover(&id, envelope, &rendered);
     finish_handover(ctx, &id, outcome)
 }
@@ -541,6 +565,7 @@ fn recover_claim(
     envelope: &Value,
     deliverer: &dyn Deliverer,
     existing: &Value,
+    body_warning: Option<&str>,
 ) -> DataResult<AcceptAnswer> {
     let id = envelope["id"].as_str().unwrap_or_default();
     match deliverer.contains(id) {
@@ -557,7 +582,7 @@ fn recover_claim(
             })
         }
         Some(false) => {
-            let rendered = render(envelope, ctx.via, ctx.proof_note);
+            let rendered = render_with_warning(envelope, ctx.via, ctx.proof_note, body_warning);
             let outcome = deliverer.handover(id, envelope, &rendered);
             finish_handover(ctx, id, outcome)
         }

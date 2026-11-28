@@ -138,6 +138,18 @@ pub fn team_tag(envelope: &Value) -> String {
 /// first non-blank character is `[` are indented so a body can neither forge a
 /// header nor be posted by a bridge reading a long idle pane.
 pub fn render(envelope: &Value, via: &str, proof_note: &str) -> String {
+    render_with_warning(envelope, via, proof_note, None)
+}
+
+/// [`render`], with a `[relay warning: ...]` line right under the team tag when the message
+/// was delivered despite a failed check (#2420: a body that differs from its signed hash is
+/// delivered as received, never held), so the coordinator sees the warning before the body.
+pub fn render_with_warning(
+    envelope: &Value,
+    via: &str,
+    proof_note: &str,
+    warning: Option<&str>,
+) -> String {
     let kind = envelope
         .get("kind")
         .and_then(Value::as_str)
@@ -165,8 +177,11 @@ pub fn render(envelope: &Value, via: &str, proof_note: &str) -> String {
         rendered_body.push_str(line);
         rendered_body.push('\n');
     }
+    let warning_line = warning
+        .map(|text| format!("[relay warning: {}]\n", text.replace(['\n', '\r'], " ")))
+        .unwrap_or_default();
     format!(
-        "{}\n[team message: {meta}]\n{}[reply: agent-teams reply {id} --file FILE]\n",
+        "{}\n{warning_line}[team message: {meta}]\n{}[reply: agent-teams reply {id} --file FILE]\n",
         team_tag(envelope),
         rendered_body
     )
@@ -237,5 +252,38 @@ mod tests {
         );
         assert!(rendered.starts_with("[from sim@host-b via agent-teams · "));
         assert!(check_envelope(&env).is_ok());
+    }
+
+    #[test]
+    fn a_warning_line_sits_under_the_tag_on_one_line() {
+        let env = build_envelope(
+            "tm-sim-0123456789abcdef",
+            "k",
+            "sim",
+            "host-b",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            0,
+            7_200_000,
+            None,
+            "real line",
+        );
+        assert_eq!(
+            render_with_warning(&env, "local", "proof", None),
+            render(&env, "local", "proof"),
+            "no warning renders exactly as before"
+        );
+        let warned = render_with_warning(&env, "local", "proof", Some("differs\nfrom its hash"));
+        let lines: Vec<&str> = warned.lines().collect();
+        assert_eq!(lines[0], team_tag(&env));
+        assert_eq!(lines[1], "[relay warning: differs from its hash]");
+        assert!(lines[2].starts_with("[team message: "), "{warned}");
+        assert_eq!(lines[3], "real line");
     }
 }

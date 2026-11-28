@@ -397,18 +397,17 @@ A `-` followed by a space, a quote or the end of the body may have been
 a `•`, so every combination of those positions is tried, up to 16 of
 them and 256 MiB of hashing. Past that, only two bodies are tried:
 every one a bullet, and only the line-leading ones. A body-hash mismatch that survives these undos,
-from a confirmed sender, is quarantined under its own integrity alarm
-kind (dismissable, kept as evidence), with one exception. When the
-receiving team's ledger already holds the same message (same ID, same
-hash), the post is kept with a `twin` field naming that copy's state:
-a provider damaged a duplicate and nothing is lost, so it raises no
-alarm. Any other mismatch waits 10 minutes for such a copy, because a
-relay copy can arrive before the direct one, and is marked
-`awaiting_twin_until`. If the copy arrives in time the post is settled
-the same way. Otherwise its alarm is raised at the next `relay-in`,
-`pump` or `relay alarms` after the wait. The alarm goes to the team the
-message was addressed to. `relay status` counts the posts kept without
-an alarm and those still waiting. A
+from an admitted sender, is never held (#2420). The message is delivered
+as received, with a `[relay warning: ...]` line under its team tag saying
+its body differs from the hash its sender signed or declared. It is
+counted in `relay status` ("delivered with a body-hash warning", the
+last one's ID and time; JSON `quarantine.delivered_with_body_hash_warning`),
+and logged with both hashes in `relay/body-hash-warnings.json`. It is
+never quarantined and never alarms. The ledger still keys the message by
+its ID and signed hash, so a damaged copy of a message already delivered
+is a known duplicate, not a second delivery. A post that a #2160 build
+held for this reason (with `awaiting_twin_until` or `twin`) is replayed
+the same way at the next `relay-in`, `pump` or `relay alarms`. A
 signed envelope whose tag line was lost (the fence-only piece of a
 split) is still delivered: the signature, not the tag, is the authority. The envelope is authoritative — a provider may rewrite
 visible text, so the receiver re-derives the tag from the envelope and

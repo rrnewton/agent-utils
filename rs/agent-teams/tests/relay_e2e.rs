@@ -734,11 +734,9 @@ fn shared_bot_signed_identity_admits_forgery_is_stranger() {
     let outcome = world.relay_in(SHARED, &post);
     assert_eq!(outcome["outcome"], "known", "{outcome}");
     assert!(world.ledger_has("tools", &id), "exactly once");
-    // A tampered body fails the hash check: from this confirmed sender
-    // it is filed under the integrity kind, never delivered (#794). Its
-    // message was already delivered, so since #2160 it is kept with
-    // `twin` and raises no alarm; a tampered copy of an undelivered
-    // message alarms (a_damaged_relay_copy_with_no_delivered_copy_...).
+    // A tampered body fails the hash check. Since #2420 such a copy is
+    // delivered with a warning, never held; this message was already
+    // delivered, so the copy is a known duplicate and nothing changes.
     let mut forged: serde_json::Value = serde_json::from_str(
         post.split("```agent-teams-envelope\n")
             .nth(1)
@@ -750,12 +748,13 @@ fn shared_bot_signed_identity_admits_forgery_is_stranger() {
     .expect("envelope json");
     forged["body"] = serde_json::json!("forged body");
     let outcome = world.relay_in(SHARED, &agent_teams::relay::render_post(&forged));
-    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
+    assert!(world.ledger_has("tools", &id), "still exactly once");
     assert!(
         agent_teams::relay::quarantined_posts(&world.state)
             .iter()
-            .any(|post| post["id"] == id.as_str() && post["twin"]["state"].is_string()),
-        "kept as evidence with its delivered twin: {:?}",
+            .all(|post| post["id"] != id.as_str()),
+        "nothing quarantined: {:?}",
         agent_teams::relay::quarantined_posts(&world.state)
     );
     assert!(
@@ -2537,43 +2536,27 @@ fn slack_link_markup_is_rescued_and_hash_mismatch_is_integrity_not_stranger() {
         .expect("id")
         .to_string();
     let outcome = world.relay_in(BOT1, &tampered);
-    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
-    // #2160: the same message was delivered directly, so the damaged relay copy is kept as
-    // integrity evidence without an alarm, now and after the grace period.
-    let kept = agent_teams::relay::quarantined_posts(&world.state)
-        .into_iter()
-        .find(|post| post["id"] == fresh_id.as_str())
-        .expect("kept as evidence");
-    assert!(kept["twin"]["state"].is_string(), "{kept}");
-    assert!(kept.get("awaiting_twin_until").is_none(), "{kept}");
-    assert!(
-        kept["reason"].as_str().is_some_and(|r| r.contains("hash")),
-        "{kept}"
-    );
-    let later = agent_teams::timeutil::now_unix_ms()
-        + agent_teams::relay::INTEGRITY_TWIN_GRACE_MS
-        + 300_000;
-    agent_teams::relay::raise_due_alarms(&world.state, later).expect("raise");
+    // #2420: the body differs from its hash, but the same message was delivered directly, so
+    // the damaged relay copy is a known duplicate: nothing quarantined, no alarm, counted.
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
     assert!(
         agent_teams::relay::alarms(&world.state)
             .iter()
-            .all(|a| a["kind"] != "integrity" || a["state"] != "open"),
-        "no integrity alarm for a copy of a delivered message"
+            .all(|a| a["kind"] != "integrity"),
+        "no integrity alarm"
+    );
+    assert_eq!(
+        world.copies_of("tools", &fresh_id),
+        1,
+        "the damaged copy is not delivered again"
     );
     let (code, out, err) = world.run(&["relay", "status"]);
     assert_eq!(code, 0, "status: {out} {err}");
     assert!(
-        out.contains("1 without an alarm (the same message was delivered)"),
+        out.contains("delivered with a body-hash warning: 1"),
         "{out}"
     );
-    let (_, out, _) = world.run(&["relay", "quarantine", "list"]);
-    assert!(
-        out.contains("[the same message was delivered; no alarm]"),
-        "{out}"
-    );
-    let (code, out, err) = world.run(&["relay", "quarantine", "dismiss", &fresh_id]);
-    assert_eq!(code, 0, "dismiss: {out} {err}");
-    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
 }
 
 /// A body with the bullet shapes Slack rewrote on 2026-11-27 (#2160: every U+2022 in a relay
@@ -2702,11 +2685,11 @@ fn open_integrity_alarms(world: &World) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn a_damaged_relay_copy_with_no_delivered_copy_alarms_after_the_grace_under_its_own_team() {
-    // #2160: a body that is genuinely different and whose message was never delivered still
-    // quarantines and alarms, once the grace period for a delivered copy has passed. A second
-    // local team on the same route and channel sorts before `tools`; the alarm is still filed
-    // under the team the message was addressed to.
+fn a_damaged_relay_copy_with_no_delivered_copy_is_delivered_with_a_warning_to_its_own_team() {
+    // #2420 (owner decision 2026-11-27): a body that differs from its hash is never held. It is
+    // delivered as received, with a warning under its team tag, to the team it is addressed
+    // to, and counted; nothing is quarantined and no alarm is raised. A second local team on
+    // the same route and channel sorts before `tools` and gets nothing.
     let world = World::new();
     world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
     let pid = std::process::id().to_string();
@@ -2726,87 +2709,124 @@ fn a_damaged_relay_copy_with_no_delivered_copy_alarms_after_the_grace_under_its_
     ]);
     assert_eq!(code, 0, "init plain: {out} {err}");
     let now = agent_teams::timeutil::now_unix_ms();
-    let id = "tm-sim-2160a1a1a1a1a1a1";
-    let (_, damaged) = damaged_legacy_post(id, now);
+    let (_, damaged) = damaged_legacy_post("tm-sim-2420a1a1a1a1a1a1", now);
     let outcome = world.relay_in(BOT1, &damaged);
-    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
     assert!(
-        outcome["detail"]
-            .as_str()
-            .is_some_and(|d| d.contains("alarms at")),
-        "{outcome}"
+        delivered[0]
+            .contains("[relay warning: this body differs from the hash its sender declared"),
+        "{}",
+        delivered[0]
     );
-    let kept = |world: &World| {
-        agent_teams::relay::quarantined_posts(&world.state)
-            .into_iter()
-            .find(|post| post["id"] == id)
-            .expect("kept")
-    };
-    assert!(kept(&world)["awaiting_twin_until"].is_string());
-    assert_eq!(kept(&world)["local_team"], "tools");
-    let grace = agent_teams::relay::INTEGRITY_TWIN_GRACE_MS;
-    agent_teams::relay::raise_due_alarms(&world.state, now + grace - 60_000).expect("raise");
     assert!(
-        open_integrity_alarms(&world).is_empty(),
-        "no alarm within the grace"
+        delivered[0].contains("alphb report for tools"),
+        "{}",
+        delivered[0]
     );
-    let (_, out, _) = world.run(&["relay", "status"]);
+    let lines: Vec<&str> = delivered[0].lines().collect();
     assert!(
-        out.contains("and 1 waiting for a delivered copy before alarming"),
-        "{out}"
+        lines[0].starts_with("[from sim@host-a via agent-teams"),
+        "{lines:?}"
     );
-    agent_teams::relay::raise_due_alarms(&world.state, now + grace + 300_000).expect("raise");
-    let alarms = open_integrity_alarms(&world);
-    assert_eq!(alarms.len(), 1, "{alarms:?}");
-    assert_eq!(alarms[0]["local_team"], "tools", "{alarms:?}");
-    assert_eq!(alarms[0]["quarantine_ids"], serde_json::json!([id]));
-    assert!(kept(&world).get("awaiting_twin_until").is_none());
-    assert!(kept(&world).get("twin").is_none());
-    let notices = world.hook_inbox_texts("tools");
     assert!(
-        notices
-            .iter()
-            .any(|text| text.contains("body does not match its signed hash")
-                || text.contains("[relay alarm: body does not match")),
-        "{notices:?}"
+        lines[1].starts_with("[relay warning: "),
+        "warning right under the tag: {lines:?}"
     );
     assert!(
         world.hook_inbox_texts("plain").is_empty(),
         "not the other team"
     );
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+    assert!(open_integrity_alarms(&world).is_empty());
+    let (_, out, _) = world.run(&["relay", "status"]);
+    assert!(
+        out.contains("delivered with a body-hash warning: 1 (last tm-sim-2420a1a1a1a1a1a1 at "),
+        "{out}"
+    );
+    let (_, out, _) = world.run(&["relay", "status", "--json"]);
+    let status: serde_json::Value = serde_json::from_str(&out).expect("status json");
+    assert_eq!(
+        status["quarantine"]["delivered_with_body_hash_warning"], 1,
+        "{status}"
+    );
 }
 
 #[test]
-fn a_damaged_relay_copy_that_arrives_before_its_message_is_delivered_never_alarms() {
-    // #2160: the relay copy can come first. Once the same message is delivered, the waiting
-    // quarantine is settled as a damaged duplicate and no alarm is ever raised.
+fn a_damaged_signed_relay_copy_is_delivered_with_a_warning_and_its_intact_copy_is_known() {
+    // #2420, signed and relay-only: the damaged copy arrives first and is delivered as received
+    // with the warning; the intact copy after it is the same message (same ID and signed hash),
+    // so it is a known duplicate, never a second delivery and never a quarantine.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let public = world.ensure_signing_key("sim");
+    agent_teams::relay::trust_key(&world.state, "sim", "host-a", &public, "test").expect("trust");
+    let (id, post) = world.send_sim_to_tools("Signed alpha for tools.", "relay-2420-signed");
+    assert!(post.contains("\"sig2\""), "a signed envelope: {post}");
+    let (head, tail) = post.split_at(post.find("```").expect("fence"));
+    let damaged = format!("{head}{}", tail.replace("alpha", "alphb"));
+    let outcome = world.relay_in(BOT1, &damaged);
+    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1);
+    assert!(
+        delivered[0].contains("[relay warning: this body differs from the hash its sender signed"),
+        "{}",
+        delivered[0]
+    );
+    let outcome = world.relay_in(BOT1, &post);
+    assert_eq!(outcome["outcome"], "known", "{outcome}");
+    assert_eq!(world.copies_of("tools", &id), 1, "exactly once");
+    assert!(agent_teams::relay::quarantined_posts(&world.state).is_empty());
+    assert!(open_integrity_alarms(&world).is_empty());
+}
+
+#[test]
+fn a_post_a_2160_build_held_for_a_body_hash_mismatch_is_delivered_at_the_next_relay_run() {
+    // #2420: a #2160 build kept a body-hash mismatch in quarantine with `awaiting_twin_until`
+    // (or `twin`). The next relay run replays it: delivered with the warning, and removed.
     let world = World::new();
     world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
     let now = agent_teams::timeutil::now_unix_ms();
-    let id = "tm-sim-2160c2c2c2c2c2c2";
-    let (intact, damaged) = damaged_legacy_post(id, now);
-    let outcome = world.relay_in(BOT1, &damaged);
-    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
-    let outcome = world.relay_in(BOT1, &intact);
-    assert_eq!(outcome["outcome"], "accepted", "{outcome}");
-    let grace = agent_teams::relay::INTEGRITY_TWIN_GRACE_MS;
-    agent_teams::relay::raise_due_alarms(&world.state, now + grace + 300_000).expect("raise");
+    let id = "tm-sim-2420b2b2b2b2b2b2";
+    let (_, damaged) = damaged_legacy_post(id, now);
+    let fence = damaged
+        .split("```agent-teams-envelope\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n```").next())
+        .expect("fence");
+    let envelope: serde_json::Value = serde_json::from_str(fence).expect("envelope");
+    let held = serde_json::json!({
+        "schema": "agent-teams-relay/v1",
+        "posts": [{
+            "id": id, "peer_sender": BOT1, "route": "relay-coord", "channel": CHAN,
+            "envelope": envelope, "post": damaged,
+            "reason": "body does not match its declared hash", "local_team": "tools",
+            "quarantined_at": agent_teams::timeutil::format_rfc3339_ms(now),
+            "awaiting_twin_until": agent_teams::timeutil::format_rfc3339_ms(now + 600_000),
+        }],
+    });
+    std::fs::create_dir_all(world.state.join("relay")).expect("relay dir");
+    std::fs::write(
+        world.state.join("relay/quarantine.json"),
+        serde_json::to_string_pretty(&held).expect("json"),
+    )
+    .expect("write quarantine");
+    let (code, out, err) = world.run(&["relay", "alarms"]);
+    assert_eq!(code, 0, "relay alarms: {out} {err}");
+    assert!(
+        agent_teams::relay::quarantined_posts(&world.state).is_empty(),
+        "replayed"
+    );
+    let delivered = world.hook_inbox_texts("tools");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert!(
+        delivered[0].contains("[relay warning: "),
+        "{}",
+        delivered[0]
+    );
     assert!(open_integrity_alarms(&world).is_empty());
-    let kept = agent_teams::relay::quarantined_posts(&world.state)
-        .into_iter()
-        .find(|post| post["id"] == id)
-        .expect("kept as evidence");
-    assert!(kept["twin"]["state"].is_string(), "{kept}");
-    assert!(kept.get("awaiting_twin_until").is_none(), "{kept}");
-    let (_, out, _) = world.run(&["relay", "status"]);
-    assert!(
-        out.contains("1 without an alarm (the same message was delivered)"),
-        "{out}"
-    );
-    assert!(
-        out.contains("and 0 waiting for a delivered copy before alarming"),
-        "{out}"
-    );
 }
 
 #[test]

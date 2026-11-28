@@ -2174,6 +2174,8 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let _lock = agent_queue::fsio::HeldLock::new(lock_file);
     // Stranger alarms repeat on their timer whenever pump runs; under the
     // lock, so two pumps never post the same alarm or race the quarantine.
+    // #2420: posts a #2160 build held for a body-hash mismatch are delivered now.
+    let _ = crate::relay::replay_held_body_hash_posts(&globals.state, &globals.host);
     let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());
     let _ = crate::relay::drain_quarantine(&globals.state, &globals.host);
     let teams = globals.load_teams()?;
@@ -2614,6 +2616,8 @@ fn cmd_relay_in(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .read_to_string(&mut text)
         .map_err(|e| err("io", e.to_string()))?;
     // Any relay activity re-raises overdue stranger alarms.
+    // #2420: posts a #2160 build held for a body-hash mismatch are delivered now.
+    let _ = crate::relay::replay_held_body_hash_posts(&globals.state, &globals.host);
     let _ = crate::relay::raise_due_alarms(&globals.state, now_unix_ms());
     // Loop-back guard for this bridge's own bot posts: LEGACY MODE ONLY.
     // In signed mode the bot ID proves nothing (one bot may post for
@@ -2721,16 +2725,8 @@ fn cmd_relay_quarantine(globals: &Globals, args: &[String]) -> Result<i32, DataE
                 println!("quarantine is empty");
             }
             for post in &posts {
-                // #2160: say when the message was delivered another way, or when it alarms.
-                let note = if post.get("twin").is_some() {
-                    " [the same message was delivered; no alarm]".to_string()
-                } else if let Some(until) = post["awaiting_twin_until"].as_str() {
-                    format!(" [alarms at {until} unless the same message is delivered first]")
-                } else {
-                    String::new()
-                };
                 println!(
-                    "{} from {} on {} ({}): {}{note}",
+                    "{} from {} on {} ({}): {}",
                     post["id"].as_str().unwrap_or("?"),
                     post["peer_sender"].as_str().unwrap_or("?"),
                     post["route"].as_str().unwrap_or("?"),
@@ -2914,16 +2910,15 @@ fn cmd_relay_setup(globals: &Globals, args: &[String]) -> Result<i32, DataError>
     Ok(0)
 }
 
-/// The relay quarantine for `relay status` (#2160): every kept post, the body-hash
-/// quarantines kept without an alarm because the same message was delivered another way, and
-/// those still waiting for such a copy before they alarm.
+/// The relay quarantine and body-hash warnings for `relay status`: every kept post, and the
+/// relay copies delivered with a warning although their body differs from its hash (#2420).
 fn quarantine_summary(globals: &Globals) -> Value {
     let posts = crate::relay::quarantined_posts(&globals.state).len();
-    let (delivered_elsewhere, awaiting) = crate::relay::integrity_quarantine_counts(&globals.state);
+    let (warned, last) = crate::relay::body_hash_warning_count(&globals.state);
     json!({
         "posts": posts,
-        "delivered_elsewhere": delivered_elsewhere,
-        "awaiting_delivered_copy": awaiting,
+        "delivered_with_body_hash_warning": warned,
+        "last_body_hash_warning": last.map(|(id, at)| json!({"id": id, "at": at})),
     })
 }
 
@@ -3001,9 +2996,20 @@ fn cmd_relay_status(globals: &Globals, args: &[String]) -> Result<i32, DataError
         );
     }
     let quarantine = &value["quarantine"];
+    println!("quarantined posts: {}", quarantine["posts"]);
+    let last = &quarantine["last_body_hash_warning"];
     println!(
-        "quarantined posts: {}, of them {} without an alarm (the same message was delivered) and {} waiting for a delivered copy before alarming",
-        quarantine["posts"], quarantine["delivered_elsewhere"], quarantine["awaiting_delivered_copy"]
+        "delivered with a body-hash warning: {}{}",
+        quarantine["delivered_with_body_hash_warning"],
+        if last.is_object() {
+            format!(
+                " (last {} at {})",
+                last["id"].as_str().unwrap_or("?"),
+                last["at"].as_str().unwrap_or("?")
+            )
+        } else {
+            String::new()
+        }
     );
     println!("note: candidates are never admitted until confirmed (relay confirm).");
     Ok(0)
@@ -3503,6 +3509,8 @@ fn cmd_relay_unban(globals: &Globals, args: &[String]) -> Result<i32, DataError>
 }
 
 fn cmd_relay_alarms(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    // #2420: posts a #2160 build held for a body-hash mismatch are delivered now.
+    let _ = crate::relay::replay_held_body_hash_posts(&globals.state, &globals.host);
     let raised = crate::relay::raise_due_alarms(&globals.state, now_unix_ms())?;
     let all = crate::relay::alarms(&globals.state);
     let open: Vec<&Value> = all
@@ -3559,12 +3567,9 @@ fn cmd_relay_alarms(globals: &Globals, args: &[String]) -> Result<i32, DataError
         "quarantined posts: {}",
         crate::relay::quarantined_posts(&globals.state).len()
     );
-    // #2160: damaged relay copies of messages delivered another way are kept without an
-    // alarm, and a body-hash quarantine waits a grace period for that copy before alarming.
-    let (twins, awaiting) = crate::relay::integrity_quarantine_counts(&globals.state);
-    println!(
-        "of them {twins} without an alarm (the same message was delivered) and {awaiting} waiting for a delivered copy before alarming"
-    );
+    // #2420: a body that differs from its hash is delivered with a warning, never held.
+    let (warned, _) = crate::relay::body_hash_warning_count(&globals.state);
+    println!("delivered with a body-hash warning: {warned}");
     Ok(0)
 }
 
