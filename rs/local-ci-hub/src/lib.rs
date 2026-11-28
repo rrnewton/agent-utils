@@ -14,6 +14,7 @@ pub mod digest;
 pub mod event;
 pub mod expand;
 pub mod fold;
+pub mod full_cover;
 pub mod index;
 pub mod project_config;
 pub mod pyjson;
