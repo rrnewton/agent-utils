@@ -1,6 +1,6 @@
 ---
 title: 'compact-rows-swipe-post-race: the compact rows check asserts the swipe''s Done reached the server the instant the row shows archived'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: cl-flaketriage
@@ -8,8 +8,9 @@ labels:
 - vibe-talk
 - tests
 - hot-host
-created_at: 2026-11-28T02:30:00-05:00
-updated_at: 2026-11-28T02:30:00-05:00
+created_at: 2026-11-28T00:40:00-05:00
+updated_at: 2026-11-28T01:31:00-05:00
+closed_at: 2026-11-28T01:31:00-05:00
 ---
 
 # Description
@@ -46,3 +47,10 @@ Filed by `cl-flaketriage` at the coordinator's request (2026-11-28), from the #2
 The fix (2026-11-28) is in the same commit as this file. The walk gains `posted(entry, why)`, which waits for the fake server to log a request, under the hang backstop. It is used for both such assertions: the swipe's Done for 507 and the Unarchive for 503.
 - Alone 5 of 5 at load1 226-241.
 - Negative control with the Done never logged: fails by name after the backstop (126 s), "the swipe sent no Done for 507: []".
+
+## Resolution
+
+Fixed by e28099e1 (vibe-talk: the compact rows check waits for the swipe's Done and the Unarchive to reach the server before asserting them). The walk's `posted(entry, why)` waits for the fake server's request log under the hang backstop, for both the swipe's Done for 507 and the Unarchive for 503.
+
+- Gate `1795844620776974561-9132a702` on 46458d22: the changed check passed. The only red was the known-red `vibe-talk.check.discuss-browser` (#2175), under the liaison's STEP-WAIVER.
+- Alone 5 of 5 at load1 226-241. The negative control (Done never logged) fails by name after the backstop.
