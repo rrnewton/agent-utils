@@ -8,7 +8,7 @@ labels:
 - safety
 - testing
 created_at: 2026-11-27T19:40:00-05:00
-updated_at: 2026-11-27T20:15:00-05:00
+updated_at: 2026-11-28T03:22:00-05:00
 ---
 
 # Description
@@ -74,6 +74,11 @@ Host opt-out trial (2026-11-27, one paired trial, load1 about 220). The wrapper 
 - The result comes from one call each, not from documentation.
 - The switch is a host mitigation only. It is not repo content, and it is offered to the other team as an optional production setting.
 - It is NOT set in this harness's gate environment, because it would hide the race that this issue fixes.
+
+Test side, 2026-11-28 (#2065 option B, coordinator's decision). Marking namespaced tests one at a time did not converge: each gate showed new victims of this cause in remove, audit and validate tests, in both editions.
+- So the wrkslots tests get a git stand-in first on PATH. It makes itself a child subreaper, runs the real git, and returns only after every process that call started has exited. The census in a test then never sees a git call's leftovers.
+- That masks the race in TESTS only. The product subreaper-wait designed here (P1) stays the real fix, for production removes on a host whose git leaves helpers.
+- It waits behind #2392 and the hold on removal changes, and needs its cold review.
 
 Related:
 - #2065: hot-host census tests; the marked differentials and the inventory.
