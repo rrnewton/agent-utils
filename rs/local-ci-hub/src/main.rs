@@ -194,13 +194,13 @@ fn effective(cli: &Cli) -> Result<Effective, String> {
             None
         }
     });
-    let counted_repos = project.as_ref().and_then(|project| {
-        if project.counted_repos.is_empty() {
-            None
-        } else {
-            Some(project.counted_repos.iter().cloned().collect())
-        }
-    });
+    // A loaded project config brings the Python allow-list with it
+    // (possibly empty: no repository-naming row counts); without one,
+    // the deployment reader counts every repository, as before.
+    let counted_repos = project
+        .as_ref()
+        .filter(|project| project.loaded)
+        .map(|project| project.counted_repo_set());
     let repo = cli
         .repo
         .clone()

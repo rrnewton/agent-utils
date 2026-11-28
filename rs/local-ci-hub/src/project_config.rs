@@ -14,6 +14,7 @@
 //! file's directory), exactly as the Python loader resolves them.
 
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Built-in default project name.
@@ -249,6 +250,20 @@ impl ProjectConfig {
         let mut config = Self::from_toml(&text, &root)?;
         config.path = path.to_path_buf();
         Ok(config)
+    }
+
+    /// The repository identities whose rows count toward verdicts:
+    /// `counted_repos ∪ repo_aliases ∪ {repo}`, exactly the Python
+    /// receipt allow-list. The set may be empty (then no row naming
+    /// a repository counts); callers with no project config at all
+    /// keep the deployment reader's count-everything default instead.
+    pub fn counted_repo_set(&self) -> BTreeSet<String> {
+        let mut set: BTreeSet<String> = self.counted_repos.iter().cloned().collect();
+        set.extend(self.repo_aliases.iter().cloned());
+        if let Some(repo) = &self.repo {
+            set.insert(repo.clone());
+        }
+        set
     }
 
     /// Discover a project config under `base`, in the Python loader's

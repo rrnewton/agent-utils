@@ -70,6 +70,22 @@ fn python_fixture_shape_parses() {
 }
 
 #[test]
+fn counted_repo_set_unions_aliases_and_repo() {
+    let text = "[project]\nrepo=\"main-repo\"\n\
+        [ledger]\ncounted_repos=[\"counted\"]\nrepo_aliases=[\"alias\"]\nrepo=\"ledger-repo\"\n";
+    let config = ProjectConfig::from_toml(text, Path::new("/proj")).expect("parses");
+    // [project] repo wins over [ledger] repo, as in the Python loader.
+    assert_eq!(config.repo.as_deref(), Some("main-repo"));
+    let set = config.counted_repo_set();
+    assert_eq!(
+        set.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["alias", "counted", "main-repo"]
+    );
+    let bare = ProjectConfig::from_toml("", Path::new("/proj")).expect("empty parses");
+    assert!(bare.counted_repo_set().is_empty());
+}
+
+#[test]
 fn empty_document_keeps_python_defaults() {
     let config = ProjectConfig::from_toml("", Path::new("/proj")).expect("empty parses");
     assert_eq!(config.name, "example");

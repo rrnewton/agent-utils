@@ -260,6 +260,7 @@
         "common/docs/local-ci-hub/",
         "py/bin/local-ci-hub",
         "py/local_ci_hub/",
+        "rs/bin/local-ci-hub",
         "rs/local-ci-hub/"
       ],
       "reverse_dependencies": [],
