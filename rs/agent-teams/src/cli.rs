@@ -3264,7 +3264,7 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
             if delivered.dropped.is_empty() {
                 String::new()
             } else {
-                format!("; dropped: {}", delivered.dropped.iter().map(|(id, state)| format!("{id} ({state})")).collect::<Vec<_>>().join(", "))
+                format!("; refused by the ledger and kept quarantined: {}", delivered.dropped.iter().map(|(id, state)| format!("{id} ({state})")).collect::<Vec<_>>().join(", "))
             }
         );
         return Ok(0);
@@ -3293,7 +3293,7 @@ fn cmd_relay_confirm(globals: &Globals, args: &[String]) -> Result<i32, DataErro
             if delivered.dropped.is_empty() {
                 String::new()
             } else {
-                format!("; dropped: {}", delivered.dropped.iter().map(|(id, state)| format!("{id} ({state})")).collect::<Vec<_>>().join(", "))
+                format!("; refused by the ledger and kept quarantined: {}", delivered.dropped.iter().map(|(id, state)| format!("{id} ({state})")).collect::<Vec<_>>().join(", "))
             }
         );
         return Ok(0);

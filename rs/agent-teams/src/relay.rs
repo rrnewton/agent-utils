@@ -3500,7 +3500,8 @@ pub fn unban_sender(state: &Path, sender_id: &str) -> DataResult<()> {
 pub struct DrainOutcome {
     /// IDs accepted or already known at the receiving ledger.
     pub delivered: Vec<String>,
-    /// `(id, state)` posts the ledger terminally refused (expired, ...).
+    /// `(id, state)` posts the ledger refused (expired, ...). Since #2420 they stay
+    /// quarantined, with the refusal recorded on the post as `drain_refused`.
     pub dropped: Vec<(String, String)>,
 }
 
@@ -3513,7 +3514,8 @@ pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<DrainOutcom
     let mut delivered: Vec<String> = Vec::new();
     let mut dropped: Vec<(String, String)> = Vec::new();
     let mut remaining: Vec<Value> = Vec::new();
-    for post in posts {
+    for mut post in posts {
+        let mut refusal: Option<Value> = None;
         let envelope = post.get("envelope").cloned().unwrap_or(Value::Null);
         let peer_sender = post
             .get("peer_sender")
@@ -3607,7 +3609,23 @@ pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<DrainOutcom
                     );
                     false
                 }
-                Ok(answer) if matches!(answer.outcome.as_str(), "accepted" | "known") => {
+                // `known` counts only when the ledger's record is a delivery: a message the
+                // ledger already refused answers `known` too (#2420 R10).
+                Ok(answer)
+                    if answer.outcome == "accepted"
+                        || (answer.outcome == "known"
+                            && answer.state.as_deref().is_none_or(|recorded| {
+                                matches!(
+                                    recorded,
+                                    "accepted"
+                                        | "claimed"
+                                        | "typing"
+                                        | "presented"
+                                        | "delivered"
+                                        | "possibly_submitted"
+                                )
+                            })) =>
+                {
                     delivered.push(id);
                     log_event(
                         state,
@@ -3615,18 +3633,29 @@ pub fn drain_quarantine(state: &Path, this_host: &str) -> DataResult<DrainOutcom
                     );
                     true
                 }
+                // A refusal by the ledger (expired, refused, conflict, ...) no longer deletes
+                // the post (#2420 R10): it stays quarantined, the refusal named on it, for the
+                // owner to see and dismiss.
                 Ok(answer) => {
-                    dropped.push((id.clone(), answer.state.unwrap_or(answer.outcome)));
+                    let refused_state = answer.state.clone().unwrap_or(answer.outcome.clone());
+                    dropped.push((id.clone(), refused_state.clone()));
                     log_event(
                         state,
-                        &json!({"event": "relay-quarantine", "outcome": "dropped", "id": id, "peer_sender": peer_sender}),
+                        &json!({"event": "relay-quarantine", "outcome": "refused-kept", "state": refused_state, "id": id, "peer_sender": peer_sender}),
                     );
-                    true
+                    refusal = Some(json!({
+                        "state": refused_state, "detail": answer.detail,
+                        "at": format_rfc3339_ms(now_unix_ms()),
+                    }));
+                    false
                 }
                 Err(_) => false,
             }
         };
         if !delivered_one {
+            if let Some(refusal) = refusal {
+                post["drain_refused"] = refusal;
+            }
             remaining.push(post);
         }
     }

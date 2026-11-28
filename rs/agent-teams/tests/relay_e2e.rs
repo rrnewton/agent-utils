@@ -3277,3 +3277,69 @@ fn every_state_a_receiver_answers_settles_the_senders_outbox() {
         assert_eq!(value["outbox"]["state"], expected, "{state}: {out}");
     }
 }
+
+#[test]
+fn a_drained_post_the_ledger_refuses_stays_quarantined_and_visible() {
+    // #2420 R10: draining the quarantine after a sender is confirmed deleted every post the
+    // ledger refused (here: its sender is not in the receiving team's accepts_from), so the
+    // post and its evidence were gone. It now stays quarantined with the refusal named, for
+    // the owner to see and dismiss; a later drain never counts it as delivered.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let now = agent_teams::timeutil::now_unix_ms();
+    let id = "tm-plain-2420d4d4d4d4d4d4";
+    let envelope = agent_teams::envelope::build_envelope(
+        id,
+        "k",
+        "plain",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        now,
+        now + 7_200_000,
+        None,
+        "from a team tools does not accept",
+    );
+    let outcome = world.relay_in(BOT2, &agent_teams::relay::render_post(&envelope));
+    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    let announce = agent_teams::relay::build_announce(
+        "plain",
+        "host-a",
+        BOT2,
+        "https://example.invalid/org/repo.git",
+    );
+    let outcome = world.relay_in(BOT2, &agent_teams::relay::render_announce(&announce));
+    assert_eq!(outcome["outcome"], "candidate-recorded", "{outcome}");
+    let (code, out, err) = world.run(&["relay", "confirm", BOT2, "--owner-approved"]);
+    assert_eq!(code, 0, "{out} {err}");
+    let kept = agent_teams::relay::quarantined_posts(&world.state)
+        .into_iter()
+        .find(|post| post["id"] == id)
+        .expect("still quarantined after the drain");
+    assert!(
+        kept["drain_refused"]["state"].as_str() == Some("refused"),
+        "the refusal is named: {kept}"
+    );
+    assert!(
+        world
+            .hook_inbox_texts("tools")
+            .iter()
+            .all(|text| !text.contains("from a team tools does not accept")),
+        "not delivered (the inbox holds only alarm notices)"
+    );
+    // A second drain (any later relay run) keeps it, never counting it delivered.
+    let (code, out, err) = world.run(&["relay", "alarms"]);
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(
+        agent_teams::relay::quarantined_posts(&world.state)
+            .iter()
+            .any(|post| post["id"] == id),
+        "kept after a second drain"
+    );
+}
