@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-reply-keyboard-hides-message-top: with the phone keyboard up after Reply, the answered message''s top stands above the screen'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-27T22:42:44-05:00
-updated_at: 2026-11-27T22:42:44-05:00
+updated_at: 2026-11-28T01:02:00-05:00
+closed_at: 2026-11-28T01:02:00-05:00
 ---
 
 # Description
@@ -33,3 +34,12 @@ updated_at: 2026-11-27T22:42:44-05:00
 # Notes
 
 Reserved as #2428's follow-up (the coordinator); filed after #2428 landed (e2baf4c3). Its fix follows #2432.
+
+## Resolution
+
+Fixed by 7f578235 (vibe-talk: the phone's keyboard over a Reply keeps the answered message's header on screen). Deployed in 3c5da567; post-deploy guards green: reply_keyboard_head, keyboard_hides_bar, ios_keyboard_send, composer_stays, inline_reply, reply_continuity, reply_box_clear, quote_still, reply_open_instant.
+
+- Cause: keepWrittenBox (#429 keyboard-hides-bar) brought the whole reply box above the keys when the keyboard shrank the list (keepBoxInView). With gathered replies that scrolled 146 px at 412x915 and put the answered message's header above the screen (top -14 px).
+- Fix: for a reply in the stream, keepBoxInView never moves the list past the answered message's top (the row marked data-replying). The box comes up as far as that allows, field first. Other callers are unchanged.
+- Walk: tests/reply_keyboard_head_browser.py (dag 193). Main had the header at -3 px.
+- Accepted trade-off (liaison 1125): on a 393x852 phone, gathered replies may sit under the docked box while the message and the field stay visible; at 412x915 the box's button row may sit under the keys while Send shows. Revisit together with #2438 if the owner picks docking there.
