@@ -1,0 +1,22 @@
+steps:
+  # `#2419 vibe-talk-read-run-separator-over-label`: a folded run's line naming its pins stays one
+  # centred sentence between its two rules whatever state its head row is in: the run's first
+  # message pinned, a reply (the read veil), the line selected, and the owner's view (selected after
+  # Last 5, about 1117 px). Geometry and computed style only: both rules in the line's flow and as
+  # wide as each other, the sentence centred between First and Last to a pixel, the line no wider
+  # than the list. Phone (touch) and desk, light and dark.
+  - group: check
+    job: read-run-line-browser
+    desc: a folded run's line with pins stays a centred sentence between rules that never leave its flow, whatever its head row's state (pinned, a reply, selected, after Last 5), in current Chromium at 412x915 by touch, 1280x800 and 1117x800, light and dark (#2419)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/read_run_line_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 120
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

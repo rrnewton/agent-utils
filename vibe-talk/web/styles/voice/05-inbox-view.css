@@ -1423,6 +1423,35 @@ body .side-card-row[data-linked="true"] {
   border-top: 1px dashed var(--edge);
 }
 
+/* `#2419 vibe-talk-read-run-separator-over-label`. Those two rules are the head ROW's own
+   pseudo-elements, which row states also draw on: the pin edge (`[data-pinned]::after`), the read
+   veil (`[data-is-reply]`, `[data-seam]`, `[data-bookmark]`, ...`::after`), the landed and Done
+   moments. Each makes the pseudo-element `position: absolute`, so when the run's first message is
+   pinned, a reply, under a seam..., its rule left the line's flow: the sentence stood off centre
+   and the rule was drawn over the line's words and buttons. A run's line is no message, so none of
+   that is drawn on it: the rules stay plain flex items whatever state the head row is in. */
+#side-log li.discord-message[data-read-run="head"]:has(> .read-run-pins:not([hidden]))::before,
+#side-cards li.discord-message[data-read-run="head"]:has(> .read-run-pins:not([hidden]))::before,
+#discord-log li.discord-message[data-read-run="head"]:has(> .read-run-pins:not([hidden]))::before,
+#side-cards li.side-card-row[data-read-run="head"]:has(> .read-run-pins:not([hidden]))::before,
+#side-log li.discord-message[data-read-run="head"]:has(> .read-run-pins:not([hidden]))::after,
+#side-cards li.discord-message[data-read-run="head"]:has(> .read-run-pins:not([hidden]))::after,
+#discord-log li.discord-message[data-read-run="head"]:has(> .read-run-pins:not([hidden]))::after,
+#side-cards li.side-card-row[data-read-run="head"]:has(> .read-run-pins:not([hidden]))::after {
+  position: static !important;
+  inset: auto !important;
+  width: auto !important;
+  height: auto !important;
+  background: none !important;
+  box-shadow: none !important;
+  border-radius: 0 !important;
+  outline: none !important;
+  opacity: 1 !important;
+  animation: none !important;
+  transition: none !important;
+  pointer-events: none;
+}
+
 #side-log li.discord-message[data-read-run="head"]:has(> .read-run-pins:not([hidden])) > .read-run,
 #side-cards li.discord-message[data-read-run="head"]:has(> .read-run-pins:not([hidden])) > .read-run,
 #discord-log li.discord-message[data-read-run="head"]:has(> .read-run-pins:not([hidden])) > .read-run,
