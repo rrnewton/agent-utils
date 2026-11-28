@@ -201,7 +201,13 @@ explicit rule.
   the receiver first, resends the same ID only when the receipt says
   unknown, and never tries a second contact after ambiguity without a
   fence. `--retry-refused` only reports the successor key; a refused ID is
-  never reopened.
+  never reopened. A deferred or ambiguous message is never expired by
+  its `not_after` (#2420): the pump keeps retrying it, and current
+  receivers deliver it late with the warning on its first line. A day
+  past its `not_after`, one notice tells the sending team: the outbox
+  entry gets `overdue_notice_at`, and agentctl watch-agents reads
+  `teams.d/<team>/notices/<id>.json` (event `overdue-notice`) and tells
+  the coordinator as an alarm, not as a refusal.
   `--deferred` retries only messages that never reached a receiver
   (state `deferred`); `agentctl watch-agents` pumps that way. One pump runs
   at a time per state directory (`pump.lock`); a second one does nothing.

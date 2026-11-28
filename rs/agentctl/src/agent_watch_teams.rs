@@ -16,6 +16,24 @@ pub const TEAM_PUMP_INTERVAL_SECONDS: f64 = 600.0;
 /// Most notices listed in one message; the rest are counted.
 const TEAM_NOTICE_LINES: usize = 20;
 
+/// The agent-teams notice events that are alarms, not refusals (#2420 relay-never-lossy): a
+/// message delivered more than 30 days late as unverified, a runaway sender paced, a message
+/// still undelivered a day past its `not_after`.
+const TEAM_ALARM_EVENTS: [&str; 3] = [
+    "replay-unproven-notice",
+    "rate-paced-notice",
+    "overdue-notice",
+];
+
+/// One team notice: its file and its contents, borrowed from the pass's list.
+type TeamNotice<'a> = &'a (PathBuf, Value);
+
+fn is_team_alarm(notice: &Value) -> bool {
+    notice["event"]
+        .as_str()
+        .is_some_and(|event| TEAM_ALARM_EVENTS.contains(&event))
+}
+
 /// Who receives agent-teams notices: the registry's designated coordinator now, else the
 /// watcher's configured coordinator.
 fn team_recipient(probe: &mut dyn Probe, options: &WatchAgentsOptions) -> String {
@@ -138,31 +156,50 @@ pub(super) fn report_team_notices(
         .collect();
     let mut told = Ok(Value::Null);
     if !fresh.is_empty() {
-        let mut lines: Vec<String> = fresh
-            .iter()
-            .take(TEAM_NOTICE_LINES)
-            .map(|(_, notice)| {
-                format!(
-                    "- team {}: {} from {}: {}",
-                    notice["team"].as_str().unwrap_or("?"),
-                    notice["id"].as_str().unwrap_or("?"),
-                    notice["sender"].as_str().unwrap_or("?"),
-                    notice["reason"].as_str().unwrap_or("?")
-                )
-            })
-            .collect();
-        if fresh.len() > TEAM_NOTICE_LINES {
-            lines.push(format!(
-                "- and {} more under teams.d/<team>/notices/",
-                fresh.len() - TEAM_NOTICE_LINES
+        let lines_of = |group: &[&TeamNotice]| -> String {
+            let mut lines: Vec<String> = group
+                .iter()
+                .take(TEAM_NOTICE_LINES)
+                .map(|(_, notice)| {
+                    format!(
+                        "- team {}: {} from {}: {}",
+                        notice["team"].as_str().unwrap_or("?"),
+                        notice["id"].as_str().unwrap_or("?"),
+                        notice["sender"].as_str().unwrap_or("?"),
+                        notice["reason"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect();
+            if group.len() > TEAM_NOTICE_LINES {
+                lines.push(format!(
+                    "- and {} more under teams.d/<team>/notices/",
+                    group.len() - TEAM_NOTICE_LINES
+                ));
+            }
+            lines.join("\n")
+        };
+        // agent-teams alarms (#2420 relay-never-lossy) are not refusals: the message was
+        // delivered (late, superseded or unverified, with a first-line warning) or is kept and
+        // retried; each is told under its own heading.
+        let (alarms, refusals): (Vec<&TeamNotice>, Vec<&TeamNotice>) =
+            fresh.iter().partition(|(_, notice)| is_team_alarm(notice));
+        let mut paragraphs = Vec::new();
+        if !refusals.is_empty() {
+            paragraphs.push(format!(
+                "agent-teams refused {} inter-team message(s) to this host as undeliverable. Nothing was claimed here; each sender keeps its message and retries it with `agent-teams pump` (a sender's watch-agents pumps every {} min) once the delivery target is fixed. Fix the target first (`agent-teams check` names each fix):\n{}",
+                refusals.len(),
+                (TEAM_PUMP_INTERVAL_SECONDS / 60.0) as u64,
+                lines_of(&refusals)
             ));
         }
-        let text = format!(
-            "[agentctl watch-agents] agent-teams refused {} inter-team message(s) to this host as undeliverable. Nothing was claimed here; each sender keeps its message and retries it with `agent-teams pump` (a sender's watch-agents pumps every {} min) once the delivery target is fixed. Fix the target first (`agent-teams check` names each fix):\n{}",
-            fresh.len(),
-            (TEAM_PUMP_INTERVAL_SECONDS / 60.0) as u64,
-            lines.join("\n")
-        );
+        if !alarms.is_empty() {
+            paragraphs.push(format!(
+                "agent-teams raised {} alarm(s). Nothing was dropped: each message was delivered with a warning on its first line, or is kept and retried:\n{}",
+                alarms.len(),
+                lines_of(&alarms)
+            ));
+        }
+        let text = format!("[agentctl watch-agents] {}", paragraphs.join("\n\n"));
         let ids: Vec<&str> = fresh
             .iter()
             .map(|(_, notice)| notice["id"].as_str().unwrap_or("?"))
@@ -443,6 +480,50 @@ mod tests {
         assert_eq!(notifier.sent[0].0, "coord-new");
         assert!(notifier.sent[0].1.contains("tm-a from sim@host-b"));
         assert_eq!(notifier.acknowledged, vec![path]);
+    }
+
+    /// #2420: agent-teams alarms are told as alarms (nothing dropped), not as refusals.
+    #[test]
+    fn team_alarms_are_told_as_alarms_not_refusals() {
+        let options = options();
+        let refused = PathBuf::from("/state/teams.d/tools/notices/tm-a.json");
+        let overdue = PathBuf::from("/state/teams.d/tools/notices/tm-b.json");
+        let mut probe = TeamsProbe {
+            notices: vec![
+                (
+                    refused.clone(),
+                    json!({"event": "undeliverable-notice", "team": "tools", "id": "tm-a",
+                           "sender": "sim", "reason": "target archived"}),
+                ),
+                (
+                    overdue.clone(),
+                    json!({"event": "overdue-notice", "team": "tools", "id": "tm-b",
+                           "sender": "tools", "reason": "still deferred a day past its not_after"}),
+                ),
+            ],
+            ..TeamsProbe::default()
+        };
+        let mut notifier = TeamsNotifier::default();
+        let rows = report_team_notices(&mut probe, &mut notifier, 1_000.0, &options);
+        assert!(rows.iter().all(|row| row["reported"] == true), "{rows:?}");
+        let text = &notifier.sent[0].1;
+        assert!(
+            text.starts_with("[agentctl watch-agents] agent-teams refused 1 inter-team message(s)"),
+            "{text}"
+        );
+        let (refusal_part, alarm_part) = text
+            .split_once("agent-teams raised 1 alarm(s). Nothing was dropped")
+            .expect("an alarm paragraph");
+        assert!(
+            refusal_part.contains("tm-a from sim: target archived"),
+            "{text}"
+        );
+        assert!(!refusal_part.contains("tm-b"), "{text}");
+        assert!(
+            alarm_part.contains("tm-b from tools: still deferred a day past its not_after"),
+            "{text}"
+        );
+        assert_eq!(notifier.acknowledged, vec![refused, overdue]);
     }
 
     /// A refused retry of a message already told about is set aside without telling again.

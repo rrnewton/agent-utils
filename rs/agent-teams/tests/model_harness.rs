@@ -2042,6 +2042,93 @@ fn an_older_message_arriving_after_a_newer_one_on_its_topic_is_delivered_superse
 }
 
 #[test]
+fn an_undelivered_message_past_its_not_after_keeps_retrying_with_one_overdue_notice() {
+    // #2420 R13: a deferred message past its not_after was set `expired` by the sender and
+    // never tried again. It stays deferred, the pump keeps retrying it, and a day past its
+    // not_after ONE notice tells the sending team.
+    let state = temp_state("overdue");
+    declaration_for(&state, "tools", "sim");
+    declaration_for(&state, "sim", "tools");
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let id = agent_teams::envelope::message_id("sim", "host-a", "tools@host-a", "overdue-key");
+    let envelope = build_envelope(
+        &id,
+        "overdue-key",
+        "sim",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        now_ms - 30 * 3_600_000,
+        now_ms - 25 * 3_600_000,
+        None,
+        "still wanted",
+    );
+    let mut entry = write_outbox(&state, &envelope, "tools@host-a", &json!({})).expect("outbox");
+    let team_entry = Entry {
+        host: "host-a".into(),
+        coordinator: None,
+        contacts: vec![Contact::Host],
+        routes: None,
+    };
+    let host = Host {
+        name: "host-a".into(),
+        routes: vec!["down".into()],
+        agent_teams: None,
+        services: BTreeMap::new(),
+    };
+    let down = |seed: u64| -> Vec<Box<dyn Route>> {
+        vec![Box::new(FaultyRoute {
+            name: "down".into(),
+            state: state.clone(),
+            host: "host-a".into(),
+            seed: Mutex::new(seed),
+            history: Mutex::new(Vec::new()),
+            forced: Some(Fault::BeforeSend),
+        })]
+    };
+    let result = walk(&state, &mut entry, &team_entry, &host, &down(1), &[]).expect("walk");
+    assert_eq!(result.state, "deferred", "kept, never expired");
+    let notice_path = state.join("teams.d/sim/notices").join(format!("{id}.json"));
+    let notice: Value =
+        serde_json::from_str(&std::fs::read_to_string(&notice_path).expect("one notice"))
+            .expect("notice json");
+    assert_eq!(notice["event"], "overdue-notice");
+    let first_at = entry["overdue_notice_at"].clone();
+    assert!(first_at.is_string(), "{entry}");
+    std::fs::remove_file(&notice_path).expect("told");
+    let result = walk(&state, &mut entry, &team_entry, &host, &down(2), &[]).expect("walk");
+    assert_eq!(result.state, "deferred");
+    assert_eq!(entry["overdue_notice_at"], first_at, "once");
+    assert!(!notice_path.exists(), "no second notice");
+    // The route comes back: the late message is delivered, the late warning first.
+    let up: Vec<Box<dyn Route>> = vec![Box::new(FaultyRoute {
+        name: "down".into(),
+        state: state.clone(),
+        host: "host-a".into(),
+        seed: Mutex::new(3),
+        history: Mutex::new(Vec::new()),
+        forced: Some(Fault::Ok),
+    })];
+    let result = walk(&state, &mut entry, &team_entry, &host, &up, &[]).expect("walk");
+    assert_eq!(result.state, "accepted", "{entry}");
+    let text = delivered_text(&state, "tools", &id).expect("delivered late");
+    assert!(
+        text.lines()
+            .next()
+            .unwrap_or_default()
+            .contains(" · warning: late: its not_after "),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
 fn a_second_delivery_of_a_huge_body_gets_its_own_file_and_never_overwrites_the_first() {
     // lead-014 (#2420): a saved body is written once, read-only, and a later delivery of the
     // same message (here a crashed claim recovered) gets its own file.

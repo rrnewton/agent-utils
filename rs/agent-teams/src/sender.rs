@@ -142,6 +142,41 @@ pub fn is_terminal(state: &str) -> bool {
     )
 }
 
+/// How long past its `not_after` an undelivered message runs before its one overdue notice
+/// (#2420 R13).
+pub const OVERDUE_NOTICE_AFTER_MS: i64 = 86_400_000;
+
+/// Tell the sending team, once, that a message is still undelivered a day past its `not_after`:
+/// `overdue_notice_at` on the outbox entry, a team-log event, and a notice in
+/// `teams.d/<sending team>/notices/` for agentctl watch-agents (#2420 R13).
+fn note_overdue(
+    state: &Path,
+    entry_value: &mut Value,
+    envelope: &Value,
+    id: &str,
+    now_state: &str,
+) {
+    let now_ms = now_unix_ms();
+    entry_value["overdue_notice_at"] = json!(format_rfc3339_ms(now_ms));
+    let team = envelope["from"]["team"].as_str().unwrap_or_default();
+    let notice = json!({
+        "event": "overdue-notice", "team": team, "id": id, "sender": team,
+        "addressed_to": entry_value["addressed_to"],
+        "reason": format!(
+            "still {now_state} to {} a day past its not_after {}; the pump keeps retrying it (agent-teams outbox shows it)",
+            entry_value["addressed_to"].as_str().unwrap_or("?"),
+            envelope["not_after"].as_str().unwrap_or("?")
+        ),
+        "at": format_rfc3339_ms(now_ms),
+    });
+    log_event(state, &notice);
+    if crate::model::valid_team_name(team) && crate::envelope::valid_message_id(id) {
+        let notices = state.join("teams.d").join(team).join("notices");
+        let _ = fs::create_dir_all(&notices);
+        let _ = write_json_atomic(&notices.join(format!("{id}.json")), &notice);
+    }
+}
+
 /// Run the walk for one outbox entry against its entry's contacts.
 /// `routes_for` maps a host contact to its candidate routes in order.
 /// `mirrors` are mirror-enabled relay routes (#782): after a delivery
@@ -455,15 +490,18 @@ pub fn walk(
         break 'contacts;
     }
 
+    // A message still deferred or ambiguous past its not_after was set `expired` (or
+    // `ambiguous-expired`), and the pump never tried it again (#2420 R13): it stays as it is and
+    // the pump keeps retrying it; current receivers deliver it late, the warning on its first
+    // line. OVERDUE_NOTICE_AFTER_MS past not_after, ONE notice tells the sending team.
     if (final_state == "deferred" || final_state == "ambiguous")
         && not_after_ms > 0
-        && now_unix_ms() > not_after_ms
+        && now_unix_ms() > not_after_ms.saturating_add(OVERDUE_NOTICE_AFTER_MS)
+        && entry_value
+            .get("overdue_notice_at")
+            .is_none_or(Value::is_null)
     {
-        final_state = if any_ambiguous {
-            "ambiguous-expired".to_string()
-        } else {
-            "expired".to_string()
-        };
+        note_overdue(state, entry_value, &envelope, &id, &final_state);
     }
     let _ = host;
     if !matches!(
