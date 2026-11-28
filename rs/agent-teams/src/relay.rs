@@ -3684,6 +3684,41 @@ fn remove_quarantined(state: &Path, id: &str, peer_sender: &str) -> DataResult<b
     Ok(removed)
 }
 
+/// Whether a quarantined post's message is now recorded delivered in its receiving team's
+/// ledger (#2420 R11): same ID, same signed body hash, a delivered state.
+fn post_delivered(state: &Path, post: &Value) -> bool {
+    let Some(envelope) = post.get("envelope") else {
+        return false;
+    };
+    let id = envelope.get("id").and_then(Value::as_str).unwrap_or("");
+    let team = envelope
+        .get("to")
+        .and_then(|to| to.get("team"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !crate::envelope::valid_message_id(id) || !crate::model::valid_team_name(team) {
+        return false;
+    }
+    let Some(entry) = std::fs::read_to_string(crate::ledger::entry_path(state, team, id))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return false;
+    };
+    entry.get("body_sha256") == envelope.get("body_sha256")
+        && matches!(
+            entry.get("state").and_then(Value::as_str),
+            Some(
+                "accepted"
+                    | "claimed"
+                    | "typing"
+                    | "presented"
+                    | "delivered"
+                    | "possibly_submitted"
+            )
+        )
+}
+
 /// Reprocess quarantined posts through `relay_in` with the current
 /// parser and trust state. This is how posts quarantined by a since-
 /// fixed parser (or before their sender was confirmed) are recovered:
@@ -3729,7 +3764,22 @@ pub fn retry_quarantine(
             false,
             raw,
         )?;
-        let consumed = !matches!(out.outcome.as_str(), "stranger-quarantined" | NOT_RECORDED);
+        // A post leaves the quarantine only once nothing is lost (#2420 R11): its message is
+        // recorded delivered in the receiving team's ledger, or the post was a receipt or an
+        // announcement that is now handled. A banned sender, another team's filter, a ledger
+        // refusal or a new quarantine keeps it.
+        let consumed = post_delivered(state, &post)
+            || matches!(
+                out.outcome.as_str(),
+                "accepted"
+                    | "receipt-recorded"
+                    | "receipt-ignored-terminal"
+                    | "receipt-unknown"
+                    | "candidate-recorded"
+                    | "ignored-own-announce"
+                    | "ignored-own-post"
+                    | "ignored-unparseable-receipt"
+            );
         if consumed {
             remove_quarantined(state, &id, &peer_sender)?;
         }

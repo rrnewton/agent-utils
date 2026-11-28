@@ -3343,3 +3343,44 @@ fn a_drained_post_the_ledger_refuses_stays_quarantined_and_visible() {
         "kept after a second drain"
     );
 }
+
+#[test]
+fn a_quarantine_retry_removes_a_post_only_once_it_is_delivered() {
+    // #2420 R11: `relay quarantine retry` removed a post on any outcome but a new quarantine,
+    // so a retry while its sender was banned (or the post was filtered as another team's)
+    // deleted it undelivered. A post now leaves the quarantine only once it is delivered.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let now = agent_teams::timeutil::now_unix_ms();
+    let id = "tm-sim-2420e5e5e5e5e5e5";
+    let envelope = agent_teams::envelope::build_envelope(
+        id,
+        "k",
+        "sim",
+        "host-a",
+        6,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        now,
+        now + 7_200_000,
+        None,
+        "posted by an unlisted bot",
+    );
+    let outcome = world.relay_in(BOT2, &agent_teams::relay::render_post(&envelope));
+    assert_eq!(outcome["outcome"], "stranger-quarantined", "{outcome}");
+    let (code, out, err) = world.run(&["relay", "ban", BOT2]);
+    assert_eq!(code, 0, "ban: {out} {err}");
+    let (code, out, err) = world.run(&["relay", "quarantine", "retry"]);
+    assert_eq!(code, 0, "retry: {out} {err}");
+    assert!(
+        agent_teams::relay::quarantined_posts(&world.state)
+            .iter()
+            .any(|post| post["id"] == id),
+        "a banned sender's post stays quarantined: {out}"
+    );
+}
