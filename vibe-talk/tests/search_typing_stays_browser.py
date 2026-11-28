@@ -21,6 +21,11 @@ settled pass and the server's answer each used to move the row being read (40 px
 Pass --trace DIR for one JSON sidecar per walk, --screenshots DIR for a PNG before the first key,
 once settled, and after a scroll up and back to the foot (the hold's room given back), --all-schemes for every walk in dark too, --only NAME for the walks whose names
 contain NAME, and --report-only to measure a page that fails (main before the change) without failing.
+
+A failing walk prints its own trace with the failure (`#2463 search-typing-foot-jump`): every frame where
+the scroll, the list's padding above and below its rows (the place-keeper's head and foot room), what
+stands above the list and past its foot, the viewport or the row being read changed, failing frames
+marked, so a move seen once in a gate's step log names its cause.
 """
 
 from __future__ import annotations
@@ -65,8 +70,18 @@ TRACE_JS = """() => { window.__rr = []; window.__rrStop = false;
     const tops = {};
     for (const li of rows) { const r = li.getBoundingClientRect(); if (r.bottom > head - 600 && r.top < head + 1600) tops[li.dataset.id] = r.top; }
     const reading = rows.find((li) => li.getBoundingClientRect().bottom > head);
+    // What else stands in the scroll, so a failing frame names what moved: the list's own room above
+    // and below its rows (the place-keeper's head and foot room), what stands above the list and
+    // past its foot in the scroll, and the visual viewport (the keyboard).
+    const log = document.getElementById('discord-log');
+    const logStyle = log ? getComputedStyle(log) : null;
+    const logTop = log ? log.getBoundingClientRect().top - area.getBoundingClientRect().top + area.scrollTop : null;
     const frame = {frame: window.__rr.length, query: document.getElementById('search-field').value,
       scrollTop: area.scrollTop, height: area.scrollHeight, client: area.clientHeight,
+      padTop: logStyle ? parseFloat(logStyle.paddingTop) : null,
+      padBottom: logStyle ? parseFloat(logStyle.paddingBottom) : null,
+      logTop, below: log && logTop !== null ? area.scrollHeight - (logTop + log.offsetHeight) : null,
+      viewport: window.visualViewport ? window.visualViewport.height : null,
       reading: reading ? reading.dataset.id : null, tops};
     if (prev && prev.reading !== null) {
       frame.prior = prev.reading;
@@ -179,6 +194,32 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# The per-frame fields a failure's digest prints, in order, and the ones whose change makes a frame worth a line.
+DIGEST_FIELDS = ("scrollTop", "height", "client", "padTop", "padBottom", "logTop", "below", "viewport")
+
+
+def trace_digest(frames: list[Json], failing: list[int]) -> str:
+    """Every frame where the scroll, the list's rooms or what stands around it, the viewport or the row
+    being read changed (and the frames on either side of a failing one), as one line each; failing frames
+    are marked. Answers the trace a gate's step log keeps, so a move nobody reproduced names its cause."""
+    near = {index for at in failing for index in range(at - 2, at + 3)}
+    lines = [f"per-frame trace (changed frames; {', '.join(DIGEST_FIELDS)}; '!' marks a failing frame):"]
+    previous: Json | None = None
+    for frame in frames:
+        index = int(clear_walk.number(frame.get("frame")))
+        keys = [frame.get(field) for field in DIGEST_FIELDS] + [frame.get("reading"), frame.get("query")]
+        changed = previous is None or keys != [previous.get(field) for field in DIGEST_FIELDS] + \
+            [previous.get("reading"), previous.get("query")]
+        moving = frame.get("drift") not in (None, 0)
+        if changed or moving or index in near:
+            values = " ".join(f"{field}={frame.get(field)}" for field in DIGEST_FIELDS)
+            drift = frame.get("drift")
+            lines.append(f"{'!' if index in failing else ' '} f{index} q={frame.get('query')!r} {values} "
+                         f"reading={frame.get('reading')} drift={drift}")
+        previous = frame
+    return "\n    ".join(lines)
+
+
 def walk(page: Page, api: TypingApi, name: str, parked: int, delay: int, touch: bool,
          traces: Path | None, shots: Path | None) -> tuple[str, list[str]]:
     """Type "needle" from message `parked`; answer the report line and the failures found."""
@@ -211,6 +252,7 @@ def walk(page: Page, api: TypingApi, name: str, parked: int, delay: int, touch: 
     worst_free = 0.0
     worst_clamped = 0.0
     clamped: list[int] = []
+    failing: list[int] = []
     for before, frame in zip(frames, frames[1:]):
         if "prior" not in frame:
             continue
@@ -238,9 +280,14 @@ def walk(page: Page, api: TypingApi, name: str, parked: int, delay: int, touch: 
         else:
             worst_free = max(worst_free, moved)
         if moved > limit:
+            failing.append(int(clear_walk.number(frame.get("frame"))))
             failures.append(f"frame {frame.get('frame')} (query {frame.get('query')!r}): the row being read "
                             f"{frame.get('prior')} moved {clear_walk.number(drift):+.2f} px"
                             f"{' on a clamp-bound frame (limit 1.0 px)' if bound else ' (limit 0.5 px)'}")
+    if failing:
+        # A gate keeps only this step's log, so a failure carries its own trace: every frame where the
+        # scroll, the list's rooms or what stands around it, the viewport or the row being read changed.
+        failures.append(trace_digest(frames, failing))
     if traces is not None:
         (traces / f"{name}.json").write_text(json.dumps({"walk": name, "parked": parked, "delay_ms": delay,
                                                          "worst_px": worst_free, "worst_px_clamp_bound": worst_clamped,

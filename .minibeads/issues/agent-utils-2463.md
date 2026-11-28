@@ -40,3 +40,5 @@ On a passing trace the walk stands at the list's foot throughout (`scrollHeight 
 # Notes
 
 - Found in the `#2445` owner gate; the table above is from 2026-11-28 7:5x-8:0x AM ET.
+- The walk's failure digest, shown with a forced failure (its limits set to 0) on main: the ~105 px the first key adds is content above the list (`logTop` 214 -> 320, the scroll following in the same frame), not the list's own head room (`padTop` stays 0); the hold's foot room shows as `padBottom` (103.75 px at the final settle). So the gate's +110 px at `need` fits that content above the list changing without the scroll following, more than a foot element going.
+- The same gate's other load reds (fold-steps, reload-place, view-switch) and this one all passed on its solo rerun (load1 about 127).
