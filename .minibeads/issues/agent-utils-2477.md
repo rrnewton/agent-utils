@@ -8,7 +8,7 @@ labels:
 - tests
 - hot-host
 created_at: 2026-11-28T12:15:00-05:00
-updated_at: 2026-11-28T12:15:00-05:00
+updated_at: 2026-11-28T12:42:00-05:00
 ---
 
 # Description
@@ -51,3 +51,10 @@ Filed by `cl-redaudit` (number pre-assigned by the coordinator, 2026-11-28), fro
 
 - No issue named this case before.
 - #827, #1025 and #1174 mention the shared deadline only as a feature.
+
+## Quarantine landed (2026-11-28)
+
+- The dated quarantine landed in 33c273b7, gated as 9c268096: 363 of 364 steps green in the full gate; the one red, in an untouched crate, passed a solo rerun.
+- In the gate, `rust.chat-subscription.slack` passed 201 of 201 cases, the quarantined case among them reported `ok`.
+- The "quarantined until 2026-12-05 (#2477)" line does not appear in gate logs: libtest captures `eprintln!` output from passing tests, so it is visible only with `--nocapture`.
+- This fix should make the line visible: `load_quarantined` should write it with `std::io::stderr().write_all`, which libtest does not capture. If the quarantine is gone by then, the helper goes with it.
