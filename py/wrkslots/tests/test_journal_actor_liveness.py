@@ -219,7 +219,6 @@ def _live_finish_journal(project: Path, sleeper_pid: int) -> tuple[Path, dict[st
     return journal_path, raw
 
 
-@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: remove after journal wait exceeds its proc-scan budget under host churn
 def test_remove_waits_for_a_live_finish_journal_then_proceeds(
     tmp_path: Path,
 ) -> None:

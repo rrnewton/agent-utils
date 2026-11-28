@@ -415,7 +415,6 @@ def test_a_holder_born_after_the_first_listing_still_refuses(
         census.assert_slot_unused(slot, None, ignore_current_process=False)
 
 
-@pytest.mark.load_quarantine  # #2065 hot-host-census-tests: argv/environ naming races late forks on a busy host; red on unrelated heads
 def test_naming_matches_read_argv_and_environ_from_proc(slot: Path) -> None:
     """The real argv/environ reader finds a target named by a live process."""
 
