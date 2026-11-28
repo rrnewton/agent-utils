@@ -175,8 +175,13 @@ explicit rule.
     of a settled message under a derived key is refused (`refused: repeat`,
     exit 65) — pass `--key` or `--again`.
   - `--topic` makes the newest message from one sender supersede older
-    untyped ones on that topic. `--supersedes KEY` cancels one earlier
-    message. Both act at the receiver, where delivery happens.
+    untyped ones on that topic. `--supersedes KEY` supersedes one earlier
+    message. Both act at the receiver, where delivery happens. A superseded
+    message is still delivered, never cancelled (#2420): the first line of
+    a hook-inbox delivery, and of one that arrives after its newer one,
+    carries `· warning: superseded by <newer id>: reconfirm before acting`.
+    Its ledger entry records `superseded_by`. A message already waiting in
+    an agentctl queue is typed as queued.
   - `--private` keeps the body off routes that expose it.
   - `--from-service NAME` needs NAME registered for this host with a systemd
     unit and this process inside that unit; it is refused when an agent

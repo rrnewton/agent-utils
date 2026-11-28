@@ -163,6 +163,11 @@ fn note_rate_paced(state: &Path, team: &str, sender: &str, id: &str, detail: &st
     }
 }
 
+/// The first-line warning of a message a newer one superseded (#2420 R7).
+pub fn superseded_warning(newer_id: &str) -> String {
+    format!("superseded by {newer_id}: reconfirm before acting")
+}
+
 /// The first-line warning of a message delivered after its `not_after` (#2420 R4).
 pub fn late_warning(not_after: &str, not_after_ms: i64, now_ms: i64) -> String {
     format!(
@@ -641,17 +646,14 @@ fn accept_checked(
             ));
         }
     }
-    // Topic rule: an older message than the newest taken for delivery on its
-    // topic starts superseded and is never queued (section 12.1).
+    // Topic rule (section 12.1): an older message than the newest taken for delivery on its
+    // topic started `superseded` and was never delivered (#2420 R7). It is delivered, the
+    // warning first: "superseded by <newer id>: reconfirm before acting".
     if let Some(topic) = envelope["topic"].as_str() {
-        if let Some(newer) = newest_on_topic(ctx.state, team, &sender, topic) {
+        if let Some((newer, newer_id)) = newest_on_topic(ctx.state, team, &sender, topic) {
             let order = (created_ms, envelope["from"]["seq"].as_i64().unwrap_or(0));
             if order < newer {
-                return refuse(
-                    "superseded",
-                    format!("a newer message on topic {topic} was already taken for delivery"),
-                    lock,
-                );
+                warnings.head.push(superseded_warning(&newer_id));
             }
         }
     }
@@ -708,7 +710,7 @@ fn accept_checked(
     }
 
     // Supersede older untyped messages on the topic and explicit keys.
-    apply_supersede(ctx, envelope, deliverer)?;
+    apply_supersede(ctx, envelope)?;
 
     if replay_unproven {
         let notice = json!({
@@ -847,11 +849,16 @@ fn recover_claim(
     }
 }
 
-/// The newest `(created_ms, seq)` taken for delivery per sender and topic.
-fn newest_on_topic(state: &Path, team: &str, sender: &str, topic: &str) -> Option<(i64, i64)> {
+/// The newest `((created_ms, seq), id)` taken for delivery per sender and topic.
+fn newest_on_topic(
+    state: &Path,
+    team: &str,
+    sender: &str,
+    topic: &str,
+) -> Option<((i64, i64), String)> {
     let dir = ledger_dir(state, team);
     let entries = fs::read_dir(dir).ok()?;
-    let mut newest: Option<(i64, i64)> = None;
+    let mut newest: Option<((i64, i64), String)> = None;
     for entry in entries.flatten() {
         if !is_entry_file_name(&entry.file_name().to_string_lossy()) {
             continue;
@@ -878,18 +885,24 @@ fn newest_on_topic(state: &Path, team: &str, sender: &str, topic: &str) -> Optio
             .and_then(parse_rfc3339_ms)
             .unwrap_or(0);
         let seq = value.get("seq").and_then(Value::as_i64).unwrap_or(0);
-        newest = Some(newest.map_or((created, seq), |n| n.max((created, seq))));
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        if newest
+            .as_ref()
+            .is_none_or(|(order, _)| (created, seq) > *order)
+        {
+            newest = Some(((created, seq), id));
+        }
     }
     newest
 }
 
-/// Write tombstones for older untyped messages this one supersedes, and mark
-/// their ledger entries `superseded` (sections 12.1, 12.2).
-fn apply_supersede(
-    ctx: &AcceptContext<'_>,
-    envelope: &Value,
-    deliverer: &dyn Deliverer,
-) -> DataResult<()> {
+/// Mark older undelivered messages this one supersedes with `superseded_by` (sections 12.1,
+/// 12.2); they are still delivered, with that warning first (#2420 R7).
+fn apply_supersede(ctx: &AcceptContext<'_>, envelope: &Value) -> DataResult<()> {
     let team = &ctx.declaration.team;
     let sender = envelope_sender(envelope);
     let topic = envelope["topic"].as_str();
@@ -940,10 +953,15 @@ fn apply_supersede(
                 .and_then(Value::as_str)
                 .is_some_and(|key| supersedes.iter().any(|k| k == key));
         if same_topic || named {
-            other["state"] = json!("superseded");
-            other["detail"] = json!(format!("superseded by {my_id}"));
+            // Superseding cancelled the older message's delivery with a tombstone (#2420 R7):
+            // it is still delivered, and a hook inbox shows "superseded by <id>" on its first
+            // line. The entry stays `accepted`, so its delivery is tracked as usual.
+            other["superseded_by"] = json!(my_id);
             write_json_atomic(&entry.path(), &other)?;
-            write_tombstone(deliverer, &other_id, "superseded");
+            crate::sender::log_event(
+                ctx.state,
+                &json!({"event": "supersede", "outcome": "marked-still-delivered", "team": team, "id": other_id, "superseded_by": my_id}),
+            );
         }
     }
     Ok(())

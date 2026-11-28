@@ -749,3 +749,55 @@ fn the_hook_prints_an_item_that_went_late_in_its_inbox_with_the_late_warning_fir
     let (_, out, _) = world.run(&["hook", "--team", "tools"]);
     assert!(!out.contains("Ship it now."), "printed once: {out}");
 }
+
+#[test]
+fn a_superseded_message_is_still_delivered_with_the_warning_first() {
+    // #2420 R7: a newer message on a topic cancelled an older queued one with a tombstone, and
+    // an older one arriving after the newer started `superseded`: neither was ever delivered.
+    // Both are delivered, each first line saying "superseded by <newer id>: reconfirm".
+    let world = World::new();
+    world.init_both();
+    let send = |text: &str, key: &str| {
+        let (code, out, err) = world.run(&[
+            "send",
+            "tools",
+            "--from-team",
+            "sim",
+            "--text",
+            text,
+            "--topic",
+            "deploy",
+            "--key",
+            key,
+            "--json",
+        ]);
+        assert_eq!(code, 75, "{out} {err}");
+        let value: serde_json::Value = serde_json::from_str(&out).expect("send json");
+        value["id"].as_str().expect("id").to_string()
+    };
+    let older = send("Deploy build 1.", "k1");
+    let newer = send("Deploy build 2 instead.", "k2");
+    assert_eq!(world.hook_inbox_count("tools"), 2, "both queued");
+    let (code, out, err) = world.run(&["hook", "--team", "tools"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("Deploy build 1."),
+        "the older is still delivered: {out}"
+    );
+    assert!(out.contains("Deploy build 2 instead."), "{out}");
+    let older_tag = out
+        .lines()
+        .find(|line| line.contains(&format!("id: {older}")))
+        .expect("older tag");
+    assert!(
+        older_tag.ends_with(&format!(
+            " · warning: superseded by {newer}: reconfirm before acting]"
+        )),
+        "{older_tag}"
+    );
+    let newer_tag = out
+        .lines()
+        .find(|line| line.contains(&format!("id: {newer}")))
+        .expect("newer tag");
+    assert!(!newer_tag.contains("warning:"), "{newer_tag}");
+}

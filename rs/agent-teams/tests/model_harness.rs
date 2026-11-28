@@ -1977,3 +1977,57 @@ fn a_ttl_beyond_max_ttl_is_delivered() {
     assert!(delivered_text(&state, "tools", id).is_some());
     let _ = std::fs::remove_dir_all(&state);
 }
+
+#[test]
+fn an_older_message_arriving_after_a_newer_one_on_its_topic_is_delivered_superseded() {
+    // #2420 R7: it started `superseded` and was never delivered.
+    let state = temp_state("superseded-late");
+    declaration_for(&state, "tools", "sim");
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let on_topic = |id: &str, seq: i64, created_ms: i64, body: &str| {
+        build_envelope(
+            id,
+            &format!("k{seq}"),
+            "sim",
+            "host-a",
+            seq,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            Some("deploy"),
+            &[],
+            false,
+            created_ms,
+            now_ms + 7_200_000,
+            None,
+            body,
+        )
+    };
+    let newer = "tm-sim-c2c2c2c2c2c2c2c2";
+    let older = "tm-sim-c1c1c1c1c1c1c1c1";
+    let answer = handle_verb(
+        &state,
+        "host-a",
+        "host-a",
+        "accept",
+        &on_topic(newer, 2, now_ms, "build 2"),
+    );
+    assert_eq!(answer["outcome"], "accepted", "{answer}");
+    let answer = handle_verb(
+        &state,
+        "host-a",
+        "host-a",
+        "accept",
+        &on_topic(older, 1, now_ms - 60_000, "build 1"),
+    );
+    assert_eq!(answer["outcome"], "accepted", "{answer}");
+    let text = delivered_text(&state, "tools", older).expect("delivered");
+    assert!(
+        text.lines().next().unwrap_or_default().ends_with(&format!(
+            " · warning: superseded by {newer}: reconfirm before acting]"
+        )),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&state);
+}

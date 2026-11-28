@@ -2490,6 +2490,18 @@ fn cmd_hook(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             // An item past its not_after was moved aside unprinted (#2420 R4b): it is printed
             // late, the late warning on its first line, never dropped.
             let mut text = item["text"].as_str().unwrap_or_default().to_string();
+            // A newer message superseded it after it was queued (#2420 R7): printed with
+            // "superseded by <id>: reconfirm before acting" on its first line.
+            if let Some(newer) = ledger
+                .as_ref()
+                .and_then(|entry| entry.get("superseded_by"))
+                .and_then(Value::as_str)
+            {
+                let warning = crate::ledger::superseded_warning(newer);
+                if !text.contains(&warning) {
+                    text = crate::envelope::add_header_warning(&text, &warning);
+                }
+            }
             let not_after = item["not_after"].as_str().unwrap_or_default();
             let not_after_ms = parse_rfc3339_ms(not_after);
             if let Some(not_after_ms) = not_after_ms.filter(|ms| *ms <= now_unix_ms()) {
