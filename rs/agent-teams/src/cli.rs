@@ -2248,14 +2248,24 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            let route_objs = routes_for_entry(
+            // One entry the pump cannot build routes for (a host naming an undefined route)
+            // is skipped and reported, never a failure that leaves every other entry unwalked
+            // (#2420 R14).
+            let route_objs = match routes_for_entry(
                 globals,
                 &teams,
                 &routes,
                 &to_team,
                 &team_entry,
                 Some(&sender_decl),
-            )?;
+            ) {
+                Ok(route_objs) => route_objs,
+                Err(error) => {
+                    report_pump_skip(globals, &mut entry, &error.to_string());
+                    count += 1;
+                    continue;
+                }
+            };
             let mirror_objs = mirror_routes_for(
                 globals,
                 &routes,
@@ -2264,14 +2274,21 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                 &sender_decl,
                 &sender_decl,
             );
-            let result = crate::sender::walk(
+            let result = match crate::sender::walk(
                 &globals.state,
                 &mut entry,
                 &team_entry,
                 &host_obj,
                 &route_objs,
                 &mirror_objs,
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    report_pump_skip(globals, &mut entry, &error.to_string());
+                    count += 1;
+                    continue;
+                }
+            };
             println!("{}: {}", entry["id"].as_str().unwrap_or("?"), result.state);
             worst = worst.max(result.exit_code);
             count += 1;
@@ -2281,6 +2298,26 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         println!("pump: nothing to do");
     }
     Ok(worst)
+}
+
+/// Report an outbox entry `pump` could not walk this run (#2420): printed with the reason,
+/// logged, and kept on the entry as `pump_skipped` {reason, at}, so `status` and `outbox` show
+/// it. The entry stays in the outbox and is tried again on the next pump.
+fn report_pump_skip(globals: &Globals, entry: &mut Value, reason: &str) {
+    let id = entry["id"].as_str().unwrap_or("?").to_string();
+    println!("{id}: skipped: {reason}");
+    crate::sender::log_event(
+        &globals.state,
+        &json!({"event": "pump", "outcome": "skipped", "id": id, "reason": reason}),
+    );
+    entry["pump_skipped"] =
+        json!({"reason": reason, "at": crate::timeutil::format_rfc3339_ms(now_unix_ms())});
+    if crate::envelope::valid_message_id(&id) {
+        let _ = crate::jsonfile::write_json_atomic(
+            &crate::sender::outbox_path(&globals.state, &id),
+            entry,
+        );
+    }
 }
 
 /// `prune`: remove terminal ledger/outbox entries 30 days past their own

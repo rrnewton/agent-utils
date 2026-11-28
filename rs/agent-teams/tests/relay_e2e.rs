@@ -3384,3 +3384,59 @@ fn a_quarantine_retry_removes_a_post_only_once_it_is_delivered() {
         "a banned sender's post stays quarantined: {out}"
     );
 }
+
+/// Send sim -> tools over the relay, then rewrite its outbox entry as a deferred copy
+/// addressed to `addressed_to` under a new ID, so `pump` walks it (#2420 R14/R15).
+fn deferred_copy_addressed_to(world: &World, source_id: &str, new_id: &str, addressed_to: &str) {
+    let mut entry = world.outbox(source_id);
+    entry["id"] = serde_json::json!(new_id);
+    entry["envelope"]["id"] = serde_json::json!(new_id);
+    entry["addressed_to"] = serde_json::json!(addressed_to);
+    entry["state"] = serde_json::json!("deferred");
+    std::fs::write(
+        world.state.join("outbox").join(format!("{new_id}.json")),
+        serde_json::to_string_pretty(&entry).expect("json"),
+    )
+    .expect("write outbox entry");
+}
+
+#[test]
+fn one_entry_whose_route_is_undefined_does_not_stop_the_pump() {
+    // #2420 R14: an outbox entry whose destination host names an undefined route made
+    // `pump` fail outright, so every other entry in the outbox stayed unwalked. That entry is
+    // now reported as skipped and the pump goes on.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    let (good, _) = world.send_sim_to_tools("Walk me even if another entry is broken.", "r14-good");
+    let mut good_entry = world.outbox(&good);
+    good_entry["state"] = serde_json::json!("deferred");
+    std::fs::write(
+        world.state.join("outbox").join(format!("{good}.json")),
+        serde_json::to_string_pretty(&good_entry).expect("json"),
+    )
+    .expect("rewrite");
+    world.write_teams(
+        r#"{
+  "schema": "agent-teams-teams/v1",
+  "hosts": {"host-a": {"routes": ["relay-coord"], "agent_teams": "agent-teams"},
+            "host-z": {"routes": ["no-such-route"], "agent_teams": "agent-teams"}},
+  "teams": {
+    "tools": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+    "sim": {"primary": "host-a", "entries": [{"host": "host-a", "contacts": [{"kind": "host"}]}]},
+    "ghost": {"primary": "host-z", "entries": [{"host": "host-z", "contacts": [{"kind": "host"}]}]}
+  }
+}
+"#,
+    );
+    deferred_copy_addressed_to(&world, &good, "tm-sim-2420f6f6f6f6f6f6", "ghost@host-z");
+    let (code, out, err) = world.run(&["pump"]);
+    assert!(
+        out.contains("tm-sim-2420f6f6f6f6f6f6: skipped:") && out.contains("no-such-route"),
+        "the broken entry is reported: {code} {out} {err}"
+    );
+    assert!(
+        out.contains(&format!("{good}: ")),
+        "the good entry is walked: {out} {err}"
+    );
+    assert_ne!(code, 2, "not a pump failure: {out} {err}");
+}
