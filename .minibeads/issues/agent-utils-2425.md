@@ -1,0 +1,48 @@
+---
+title: 'vibe-talk-search-date-filter: the search bar reminds the after:/before: syntax, with last-K-days and since-DATE from a calendar icon, applied server-side so old results are never fetched'
+status: open
+priority: 1
+issue_type: feature
+labels:
+- vibe-talk
+- search
+- owner-ui
+created_at: 2026-11-27T19:46:00-05:00
+updated_at: 2026-11-27T19:46:00-05:00
+---
+
+# Description
+
+Owner, 2026-11-27 7:09 PM ET, verbatim: "Fourth I was getting old results I don't want. The search interface should support "after:" like gmail and remind me the syntax. But also there should be a calendar icon in the search bar and clicking it should provide an option for last K days or since DATE (e.g. date range where you don't have to fill in both)"
+
+Today `before:` and `after:` already parse and match on both sides (`search_query.rs`, `web/src/core/search/language.ts`: a calendar date `YYYY-MM-DD`, `YYYY/MM/DD` or `MM/DD/YYYY`, resolved at the start of that day in the reader's time zone; `after:` includes its day, `before:` does not), and a typed date already reaches the server inside `q` on `GET /api/v1/channels/{channel_id}/search` and `GET /api/v1/search`. What is missing is everything the owner asked for around it:
+
+- Nothing in the bar reminds the reader of the syntax. The field's placeholder names only the scope ("Search Main", "Search All", "Search this thread", `searchScopeWords`), the syntax lives only in the `title` tooltip, and the accessible name mentions only Enter and Up/Down. A reader who does not already know `after:` cannot discover it.
+- There is no calendar icon and no way to say "the last K days" or "since DATE" without typing an exact date. Relative spellings (`after:7d`, `after:yesterday`) are not syntax: they fall back to ordinary words, as the corpus pins (`before:yesterday` is a word).
+- Old results are still fetched before they are filtered out. The cache search bounds rows only above (`below_ms`, newest first, budget about 20,000 rows per channel) and tests each row in Rust, so an `after:` search still scans and counts old rows against its budget; the SQL shapes that already take a lower bound (`:from_ms` in `RARE_SQL` / `scan_sql`) are not used by the live path. Without any date at all, the newest 50 hits are simply old whenever the recent hits are few, which is the owner's complaint.
+- The design note comes first: no code until the liaison has reviewed it (owner-UI; see Design).
+
+# Design
+
+DESIGN NOTE FIRST, no code until the liaison has reviewed it. The note (harness repo, `ai_docs/plans/`) covers, from the code as it stands:
+
+- The operator as it will read to the owner: `after:` and `before:` with the date forms accepted today; whether relative forms (`after:7d`, `after:today`, `before:7d`) join them, and if so their exact reading (calendar days in the reader's zone, `after:7d` = at or after the start of the day 7 days before today); how an invalid value keeps falling back to an ordinary word, as Gmail treats an unknown operator, so typing is never an error.
+- An inline syntax hint in the search bar that reminds the reader of the syntax without spending the placeholder (the placeholder names the scope, #2251): a short hint line or chip row under the field while the bar stands, naming `after:`, `before:`, `"phrase"`, `from:` in a few words (R4, R5), never a sentence of page chrome.
+- A calendar icon in the bar (an icon button like the bar's other toggles, 48x48 target, R9) opening a small panel that reuses the page's existing surfaces (R15): "Last K days" (K picked from a few choices and / or typed) and "Since DATE" (one date, no end date needed), plus "Before DATE" and clearing the date. Choosing one writes or replaces the matching `after:` / `before:` token in the field's text, so the query stays the one source of truth: visible, editable, removable by deleting the text, remembered by Up/Down history exactly as typed, and sent to the server inside `q` with no new API parameter. An open-ended range is one token (`after:DATE` alone); a closed range is the pair. The panel says the date it will write before it writes it.
+- Applied server-side so old results are never fetched: the server derives the query's date window (the latest `after:` day's start, the earliest `before:` day's start, in the `tz` zone it already receives) and passes it into the cache search as the rows' lower / upper bound in SQL (`created_ms >= from_ms AND created_ms < before_ms`, the bounds the unused SQL shapes already carry), so rows outside the window are neither read nor counted in `examined`, and the budget is spent only inside the window. The page's loaded-rows filter and the cache-only path (`Sink::search`, no upstream search, `upstream` stays `none`) apply the same window, so what is loaded, what the server holds and what is counted agree. `below` (paging) keeps working inside the window: a continuation never returns a row the window excludes.
+- How it composes: a date token is an ordinary AND term, so it composes with quoted phrases (`"exact words" after:2026-11-01`), `OR`, `-term`, `from:`, `in:thread` / `in:main`, `has:link`, `label:` and parentheses exactly as the language already composes; it binds neither tighter nor looser. Channel scope is unchanged: the same `q` goes to the one-channel route or the all-channels route, and the window applies in both. Two `after:` tokens (typed, or one typed and one from the calendar) read as the later one wins for the window while both still match; the calendar replaces the token it owns rather than stacking a second one. The count line and the bucket chips keep counting only what the window lets through (#2200's one fold).
+- Accessibility and layout: the calendar button has a text accessible name ("Dates: any time" / "Dates: since Nov 20") and `aria-expanded` / `aria-haspopup` like the Labels button; the panel is a dialog with a labelled date input (`type=date` where the browser gives one, typed `YYYY-MM-DD` always accepted), the hint is associated with the field (`aria-describedby`), and focus returns to the field with the caret after the inserted token. Phone and desktop: the bar already crowds a 360px line (field, count, Whole threads, Whose, Links, Labels, glass, close), so the calendar stands with the other icon toggles and the panel hangs under the bar like the link-kinds row, full-width on a phone, never pushing the list (R12); the screenshot matrix (R16) covers the bar with the panel open and a date standing, light / dark x phone / desktop.
+- Open choices for the owner, each with a recommendation: typed relative forms or calendar-only recency; whether "Last K days" writes `after:<computed date>` (frozen at writing, recommended: the text says what it does) or a relative token that moves with today; whether a date with no other term is a search at all (today an operator-only query still searches: yes, "everything since DATE" is the owner's ask); and whether the hint stands whenever the bar is open or only until the reader has used a date once.
+
+# Acceptance Criteria
+
+- Design note first: the note above is reviewed by the liaison before any code; the landed behaviour matches the note's settled choices, and any choice the note left open is settled in the note or in a comment here before the fix gates.
+- Typing `after:2026-11-01` (and each accepted form) filters the loaded rows and the server's hits to messages created at or after the start of that day in the reader's zone, and `before:` to before its start, in the one-channel and all-channels scopes, with quoted phrases and the other operators composing as the language already composes; an invalid date value is an ordinary word, never an error, on the page and on the server (the shared corpus pins both twins).
+- The server never fetches outside the window: with a date standing, rows older than the window (or at / after a `before:` bound) are not read and not counted in `examined`, the per-channel budget is spent only inside the window, and paging (`below` / `resume_below_ms`) never returns an excluded row; a test over the real route proves the examined count and the hits, not only the hits.
+- The bar reminds the syntax: while the search bar stands, the `after:` / `before:` syntax (with one example) is visible in the bar without hovering, the field's accessible description names it, and the scope placeholder is unchanged.
+- The calendar icon stands in the bar; opening it offers "Last K days" and "Since DATE" (one date, no end required), "Before DATE", and clearing; choosing one writes / replaces the matching token in the field, the search runs with it at once through the same path as typed text, and the button's accessible name says the date standing (or "any time").
+- Phone and desktop screenshot matrix (R16: light / dark x phone / desktop, bar open, panel open, a date standing, results filtered) for the liaison before landing, beside what screenshots cannot prove (R17: the server's examined window, focus order, the moving-with-today question if a relative token is chosen).
+
+# Notes
+
+Owner request 2026-11-27 7:09 PM ET (fourth of four that evening); owner-UI fast-track (reply 286). Pre-assigned #2425. Filed by mu-searchdate; design note first, no code until the liaison has reviewed it. Search-language history: #521 / #605 server-side-search (the shared language and its corpus), #2251 (the field names its scope), #2200 (the bucket counts are one fold over the result state), #2422 (hits shown as cards stay through a redraw).
