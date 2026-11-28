@@ -337,7 +337,8 @@ fn consume(state: &BridgeState, batch: DeliveryBatch) -> (Result<ConsumedItem>, 
 }
 
 #[test]
-fn a_full_population_retires_answered_requests_first_then_holds_new_messages_until_space_frees() {
+fn a_full_population_retires_answered_requests_first_then_the_oldest_unanswered_never_holding_a_message(
+) {
     let root = temporary("window-capacity");
     let state =
         BridgeState::initialize(&root, config_without_reaction()).expect("initialize state");
@@ -411,45 +412,12 @@ fn a_full_population_retires_answered_requests_first_then_holds_new_messages_unt
     assert!(batches[0].requests.is_empty());
     assert!(state.request_capacity_hold().is_none());
 
-    // The next one finds nothing that may close: it is held, uncommitted, and the cursor stays.
-    let held = indexed_delivery_at(1, 50_002, "cursor-held", "held owner message");
-    for refusal in 1..=2 {
-        let (consumed, acknowledged) = consume(&state, held.clone());
-        let error = consumed.expect_err("refused at the limit").to_string();
-        assert!(error.contains("population limit reached"), "{error}");
-        assert!(
-            error.contains("1 new message(s) held uncommitted"),
-            "{error}"
-        );
-        assert!(acknowledged.is_empty(), "nothing committed upstream");
-        assert_eq!(
-            state.cursor().expect("cursor").as_deref(),
-            Some("cursor-next")
-        );
-        assert_eq!(
-            state
-                .subscribe_request()
-                .expect("request")
-                .resume_from()
-                .map(ProviderCursor::as_str),
-            Some("cursor-next"),
-            "a reconnect resumes before the held message"
-        );
-        let hold = state.request_capacity_hold().expect("hold recorded");
-        assert_eq!(hold.refusals, refusal);
-        assert_eq!(hold.held_since_millis, base + HOUR);
-        assert_eq!(hold.waiting_messages, 1);
-        assert_eq!(hold.request_count, MAX_REQUESTS);
-    }
-    let status = state.status().expect("status");
-    assert_eq!(status["request_capacity"]["hold"]["refusals"], 2);
-    assert_eq!(status["request_capacity"]["request_count"], MAX_REQUESTS);
-
-    // A day after admission the oldest unanswered request may close under pressure: the held
-    // message is admitted on the next delivery, and that request is listed.
-    crate::prompt_time::test_clock::set(base + 2 + 24 * HOUR, 0, "UTC");
-    let (consumed, acknowledged) = consume(&state, held);
-    let ConsumedItem::Batch(admission) = consumed.expect("admitted once space frees") else {
+    // The next one finds no answered request and no unanswered one past the pressure age. It used
+    // to be held for a day; now the oldest unanswered request (an hour old) makes room at once and
+    // is listed, so an owner message is never held (#2440 option 3, lead-014).
+    let next = indexed_delivery_at(1, 50_002, "cursor-held", "next owner message, never held");
+    let (consumed, acknowledged) = consume(&state, next);
+    let ConsumedItem::Batch(admission) = consumed.expect("admitted at once") else {
         panic!("expected a batch");
     };
     assert_eq!(admission.new_request_keys.len(), 1);
@@ -458,7 +426,7 @@ fn a_full_population_retires_answered_requests_first_then_holds_new_messages_unt
         state.cursor().expect("cursor").as_deref(),
         Some("cursor-held")
     );
-    assert!(state.request_capacity_hold().is_none());
+    assert!(state.request_capacity_hold().is_none(), "never held");
     let oldest = oldest_unanswered.expect("oldest key");
     assert!(state.retired_key(&oldest).expect("retired guard").is_some());
     let (batches, _) = state.closure_batches().expect("outbox");
@@ -472,6 +440,62 @@ fn a_full_population_retires_answered_requests_first_then_holds_new_messages_unt
     );
     crate::prompt_time::test_clock::clear();
     fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn a_closed_owner_request_awaiting_a_reply_gets_an_alarm_line_naming_its_key() {
+    // #2440 option 3, lead-014: when making room closes an OWNER request still awaiting the
+    // agent's reply, the agent's notice opens with an alarm line naming it; another sender's
+    // request closed the same way gets none.
+    use crate::chat_runtime::reply_windows::{ClosedRequest, ClosureBatch};
+    use crate::chat_service::reply_windows::agent_notice;
+    let request = |key: &str, from_owner: bool| ClosedRequest {
+        key: key.to_owned(),
+        reply_id: format!("{}_1", &key[..6]),
+        message_number: None,
+        first_line: "please review".to_owned(),
+        sender_id: if from_owner { "U0OWNER" } else { "U0OTHER" }.to_owned(),
+        from_owner,
+        admitted_at_millis: 1_790_000_000_000,
+        unknown: Default::default(),
+    };
+    let owner_key = "a".repeat(64);
+    let other_key = "b".repeat(64);
+    let batch = |requests: Vec<ClosedRequest>| ClosureBatch {
+        id: "batch-1".to_owned(),
+        cause: ClosureCause::Capacity,
+        closed_at_millis: 1_790_000_100_000,
+        answered_closed: 0,
+        requests,
+        logged: false,
+        agent_notified: false,
+        owner_notified: false,
+        unknown: Default::default(),
+    };
+    let owner = agent_notice(&batch(vec![request(&owner_key, true)]), 48 * HOUR);
+    let first = owner.lines().next().expect("first line");
+    assert!(
+        first.starts_with(&format!(
+            "[chat-bridge ALARM] The request store was full, so the chat bridge closed OWNER request {owner_key} (reply ID aaaaaa_1) while it still awaited your reply"
+        )),
+        "{first}"
+    );
+    assert!(first.contains("`agentctl chat publish`"), "{first}");
+    let other = agent_notice(&batch(vec![request(&other_key, false)]), 48 * HOUR);
+    assert!(!other.contains("[chat-bridge ALARM]"), "{other}");
+    assert!(
+        other.starts_with("[chat-bridge] 1 chat request(s) got no reply"),
+        "{other}"
+    );
+    // Both in one batch: one alarm line, for the owner's.
+    let both = agent_notice(
+        &batch(vec![request(&other_key, false), request(&owner_key, true)]),
+        48 * HOUR,
+    );
+    assert_eq!(both.matches("[chat-bridge ALARM]").count(), 1, "{both}");
+    assert!(
+        both.contains(&owner_key) && !both.lines().next().unwrap_or_default().contains(&other_key)
+    );
 }
 
 #[test]

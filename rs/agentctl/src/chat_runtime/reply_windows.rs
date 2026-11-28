@@ -17,15 +17,19 @@
 //! * A request whose prompt is pending, being submitted or uncertain, or which has a reply that is
 //!   not sent yet, never closes by these rules.
 //! * At the request population limit, answered requests close oldest last reply first, with no age
-//!   floor, and then unanswered requests admitted more than `pressure_unanswered_age_seconds`
-//!   (24 h) ago, oldest first, until the new batch fits.
+//!   floor, then unanswered requests admitted more than `pressure_unanswered_age_seconds` (24 h)
+//!   ago, oldest first, and then any other unanswered request, oldest first, until the new batch
+//!   fits: an owner message is never held while an unanswered request could make room (#2440,
+//!   lead-014). An owner's request closed that way while it awaited a reply gets an alarm line,
+//!   naming its key, in the agent's notice.
 //!
 //! An unanswered request is never closed silently: before any is closed, the batch is appended to
 //! [`CLOSURE_OUTBOX_FILE`] (one batch per sweep or per forced close), and the service drains it:
 //! it logs each request, queues one notice to the bridge's agent, and posts one owner-alarm notice
 //! for the requests an owner sent.
 //!
-//! When nothing can be closed, admission refuses as before: the batch is not committed, so the
+//! When nothing can be closed (every request's prompt or reply is still in flight), admission
+//! refuses as before: the batch is not committed, so the
 //! provider redelivers it from the saved cursor once space frees. [`REQUEST_CAPACITY_FILE`]
 //! records the hold until the next admission succeeds; `chat health` reports it, and the owner
 //! alarm warns about it once an hour and once more when it clears.
@@ -497,17 +501,19 @@ impl BridgeState {
                 Window::Answered { last_reply_millis } => {
                     answered.push((last_reply_millis, record.key));
                 }
+                // Past the pressure age first; then, so that an owner message is never held, any
+                // other unanswered request, oldest first (#2440 option 3, lead-014).
                 Window::Unanswered => {
-                    if now_millis.saturating_sub(record.admitted_at_millis)
-                        >= rules.pressure_unanswered_age_millis
-                    {
-                        unanswered.push((record.admitted_at_millis, bytes, record));
-                    }
+                    let young = now_millis.saturating_sub(record.admitted_at_millis)
+                        < rules.pressure_unanswered_age_millis;
+                    unanswered.push((young, record.admitted_at_millis, bytes, record));
                 }
             }
         }
         answered.sort();
-        unanswered.sort_by(|left, right| (left.0, &left.2.key).cmp(&(right.0, &right.2.key)));
+        unanswered.sort_by(|left, right| {
+            (left.0, left.1, &left.3.key).cmp(&(right.0, right.1, &right.3.key))
+        });
         let mut answered_closed = 0;
         for (_, key) in answered {
             if fits(checkpoint) {
@@ -521,7 +527,7 @@ impl BridgeState {
         let mut count = checkpoint.request_count.saturating_add(additional_count);
         let mut bytes = checkpoint.request_bytes.saturating_add(additional_bytes);
         let mut chosen = Vec::new();
-        for (_, record_bytes, record) in unanswered {
+        for (_, _, record_bytes, record) in unanswered {
             if count <= MAX_REQUESTS && bytes <= MAX_REQUEST_BYTES {
                 break;
             }

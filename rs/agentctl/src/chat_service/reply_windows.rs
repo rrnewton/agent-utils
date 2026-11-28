@@ -287,11 +287,29 @@ pub(crate) fn agent_notice(batch: &ClosureBatch, unanswered_max_age_millis: u64)
              early to make room for new messages (its request store was full)"
             .to_owned(),
     };
-    let mut lines = vec![format!(
+    let mut lines = Vec::new();
+    // An owner's request closed to make room while it still awaited the agent's reply: an alarm
+    // line each, naming its key, so the agent answers it by publish at once (#2440, lead-014).
+    if batch.cause == ClosureCause::Capacity {
+        for request in batch
+            .requests
+            .iter()
+            .filter(|request| request.from_owner)
+            .take(MAX_LISTED)
+        {
+            lines.push(format!(
+                "[chat-bridge ALARM] The request store was full, so the chat bridge closed OWNER \
+                 request {} (reply ID {}) while it still awaited your reply: answer it now in its \
+                 thread with `agentctl chat publish`.",
+                request.key, request.reply_id
+            ));
+        }
+    }
+    lines.push(format!(
         "[chat-bridge] {} chat request(s) {why}; their reply IDs take no more replies, and the \
          owner was told about their own:",
         batch.requests.len()
-    )];
+    ));
     for request in batch.requests.iter().take(MAX_LISTED) {
         lines.push(format!(
             "- reply ID {} (sent {}{}): \"{}\"",

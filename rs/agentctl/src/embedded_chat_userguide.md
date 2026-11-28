@@ -1174,7 +1174,11 @@ busy bridge never fills up:
   a reply not sent yet, never closes by these rules;
 - at the 2,048-request limit, answered requests close oldest last reply first,
   whatever their age, then unanswered requests admitted more than 24 hours ago,
-  oldest first, until the new messages fit.
+  oldest first, then any other unanswered request, oldest first, until the new
+  messages fit: an owner message is never held while an unanswered request can
+  make room (#2440). An owner's request closed that way while it still awaited
+  a reply opens the agent's closure notice with a `[chat-bridge ALARM]` line
+  naming its key, so the agent answers it at once with `agentctl chat publish`.
 
 The service sweeps every 10 minutes. The windows are set in the bridge
 configuration (`bridge.json`), each in seconds and absent for its default:
@@ -1203,7 +1207,8 @@ one notice listing them to the bridge's agent (queue ID
 owner's own. Each step is recorded once done, so a restart neither repeats nor
 skips one, and the file is removed when every batch is told.
 
-When nothing can close, admission refuses as before: the provider batch stays
+When nothing can close (every request's prompt or reply is still in flight),
+admission refuses as before: the provider batch stays
 uncommitted, the cursor does not move, and the provider delivers it again after
 each reconnect until space frees. `request-capacity.json` records the hold
 (`held_since_millis`, `last_refused_at_millis`, `refusals`, `request_count`,
@@ -1211,7 +1216,9 @@ each reconnect until space frees. `request-capacity.json` records the hold
 removed at the next admission. While it exists `chat health` is DOWN, the
 bridge log has an error line, and the owner alarm posts a
 `[chat-bridge WARNING]` once an hour (saved as `capacity` in
-`owner-alarm.json`) and one resolved line when it clears; `chat status` shows
+`owner-alarm.json`) and one resolved line when it clears; the bridge's agent gets
+one `[chat-bridge ALARM]` line in its pane at once, once per hold (queue ID
+`chat-capacity-hold-<held_since_millis>`, #2440); `chat status` shows
 it under `request_capacity`, and `chat health` is DEGRADED from 90% full.
 
 A closed request remains active until its prompt delivery is confirmed,
