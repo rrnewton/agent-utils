@@ -10,7 +10,7 @@ labels:
 - owner-ui
 - scroll
 created_at: 2026-11-27T21:45:00-05:00
-updated_at: 2026-11-27T21:45:00-05:00
+updated_at: 2026-11-28T01:35:00-05:00
 ---
 
 # Description
@@ -36,5 +36,9 @@ Hypothesis from reading the code (a local repro will confirm or correct it): cle
 
 # Notes
 
+- Scope (liaison 1116, 2026-11-27 10:3x PM ET, agreeing that the owner's ask overrides `#1968`): closing the search keeps the found or highlighted message put only when the reader landed on a result (the `#1734` entry landing took them to the newest hits, or they moved in the results themselves) or highlighted one (the selection: a desk pointer's light, a tap, the keys). A query typed and closed with nothing found keeps today's behaviour: the row read before the search comes back where it stood (`#243`'s hold, and `#1968`'s restore where the entry had moved them and no result is shown).
+- `#1968` change: its close used to put back the parked place after an entry landing; now that close keeps the found result, and the restore runs only for a close that kept no shown result. `search_close_browser.py` checks the landed case against the found hit, and the parked case as before.
+- Scope correction (liaison 1133, 2026-11-28 ~12:50 AM ET, after the first owner gate's catch): the found message is kept in the channel list only, with one column on screen. The right column (its cards, a thread) keeps its own close, and with two columns up the list on the left keeps today's close too. The first head kept a found row in the left list for a search typed and closed in the right column's cards, and the thread opened there next no longer followed an arriving reply at its foot (`column_overscroll_browser.py` FOLLOW, 3 of 3 on that head, 0 of 3 on main and on `#2427`). Skipping only the right column, or only a reader whose last pane was the right column, did not clear it (a reader who only turned the wheel there is not seen as working in it), so two columns keep today's close until the interaction is understood: a follow-up. `search_clear_stays_browser.py` now walks that case (two columns: a search closed in the right column, then the gate's thread walk there).
+- Found on the way, left to `#2424`: over 200 rows the typing's fast pass (`#1913`) hides rows before the place-keeper measures and notes the typed-at screen again at every key, so the entry's landing (`#1734`) never fires and the typing's hold sits on whichever row the fast pass kept; the landed and typed-closed walks over 260 rows join `search_clear_stays_browser.py` with `#2424`.
 - Owner UI, fast-track (owner 7:09 PM ET 2026-11-27). Filed at the coordinator's request (issue file only); the same owner message's second half is `#2424`.
 - Related: `#2346` the search-landed reader follows the foot (entry side), `#2354` scroll causes, `#2230` the reading row stays put, `#2422` search hits vanish after a redraw, `#2426` loading program.

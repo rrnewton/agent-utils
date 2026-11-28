@@ -15,7 +15,9 @@ export interface SearchFieldControl extends SearchFieldLike {
 
 /** What opening and closing the search bar asks of the page. */
 export interface SearchOpenDependencies {
-  keepingFilterPlace(act: () => void): void;
+  /** `clearing` (`#2423`): the change clears the search's words, so the place-keeper measures the
+   * message found among its results before the rows come back. */
+  keepingFilterPlace(act: () => void, tapped?: HTMLElement | null, clearing?: boolean): void;
   /**
    * `#1968 vibe-talk-search-close-x`: put the reader back where a typed search's entry
    * landing took them from, after the bar has closed. Absent: closing keeps the place
@@ -55,7 +57,7 @@ export interface SearchOpen {
 export function createSearchOpenControl(deps: SearchOpenDependencies): SearchOpen {
   function setSearchOpen(open: boolean): void {
     if (!open) {
-      deps.keepingFilterPlace(() => showSearchOpen(false));
+      deps.keepingFilterPlace(() => showSearchOpen(false), null, true);
       // `#1968`: only after the bar has folded and every row is back may the entry's
       // place be restored — placing it over a still-filtered list would look for the
       // anchor among the hits.

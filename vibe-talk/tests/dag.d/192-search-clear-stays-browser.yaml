@@ -1,0 +1,21 @@
+steps:
+  # `#2423 search-escape-clear-moves-found-message`: clearing a search keeps the message the reader found
+  # where it stands. Real Chromium at 1280x800 (Escape) and 412x915 by touch (the X), keyboard open
+  # and closed: a per-frame trace of the found message's top across the clear (entry landed, scrolled,
+  # tapped, the magnifier, the field emptied; 120 and 260 rows) moves it at most 0.5 px, and a search
+  # typed and closed with nothing found still puts back the row read before it.
+  - group: check
+    job: search-clear-stays-browser
+    desc: clearing a search (Escape, the X, the magnifier, the field emptied) keeps the found message's top within 0.5 px per frame, and a search closed with nothing found puts back the row read before it, in current Chromium at 1280x800 and 412x915 by touch, keyboard open and closed (#2423)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/search_clear_stays_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 900
+    cpu_timeout: 240
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 240
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

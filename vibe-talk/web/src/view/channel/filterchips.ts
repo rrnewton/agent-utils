@@ -144,7 +144,9 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
     deps.setQuery((el("search-field") as HTMLInputElement).value);
     // `#249 search-highlight`. Cleared — no word left to find — the marks go with the words, in this
     // one redraw; otherwise they follow once the typing pauses (`searchField.marked()`).
-    if (!deps.searchTyped(deps.query())) deps.setMarked(deps.query());
+    // `#2423`: the field emptied is the search cleared (asked once; see the fast pass below).
+    const clearing = !deps.searchTyped(deps.query());
+    if (clearing) deps.setMarked(deps.query());
     const fullChange = (): void => {
       // `#262 search-load-older`. The first term typed, or the last taken away, may make Hide read step
       // aside or come back (`liftingHideRead`).
@@ -168,7 +170,10 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
     } catch (_error) {
       bigList = false;
     }
-    if (bigList && deps.applySearchFast && deps.deferFullSearch) {
+    // `#2423` (owner 2026-11-27, rule 370): the field emptied is the search cleared, one key and no
+    // typing to keep pace with: its full change runs at once, so the place-keeper measures the message
+    // the reader found while the search's rows still stand, before the hidden rows come back around it.
+    if (bigList && !clearing && deps.applySearchFast && deps.deferFullSearch) {
       deps.applySearchFast();
       // `#1984 vibe-talk-search-typing-changed-only`: mark and full are one settled pass — the
       // typed words become the marked words inside it, so no separate mark timer lands between

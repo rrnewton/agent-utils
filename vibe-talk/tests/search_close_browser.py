@@ -9,7 +9,9 @@ This drives the real page (fixture API only, served on a kernel-picked loopback 
   played as a shrunken `visualViewport` the way tests/search_scroll_browser.py plays it):
   sign in, park mid-list, open search from the magnifier, type a query that filters,
   then click `#search-close` -> the bar folds, the query is cleared, every row is back,
-  and the reader is on the same row at the same scroll offset as before the search.
+  and: where the search's entry landed the reader on the newest hits, the hit they found
+  stays where it stood (`#2423`; it used to put back the parked row), and where hits stood
+  on the parked screen (no landing), the reader is on the parked row at the parked offset.
   The X itself: named "Close search", at least 44px square, the rightmost control in
   `#search-float`, overlapping neither the field nor any chip on the bar.
 
@@ -27,6 +29,7 @@ from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import bookmark_browser as fixture
+import search_clear_stays_browser as clear_walk
 from bookmark_browser import AGENT, CHANNEL, TOKEN, FakeApi, Json, check, serve
 import page_sources
 import browser_waits
@@ -156,6 +159,19 @@ def walk(page: Page, label: str, shots: Path | None, keyboard: bool) -> None:
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = Math.round((a.scrollHeight - a.clientHeight) / 2); }")
     page.wait_for_function("() => document.getElementById('scroll-area').scrollTop > 100", timeout=10_000)
     parked = state()
+    # `#1734`: with a hit on the parked screen the search's entry lands nowhere; with none it lands the
+    # reader on the newest hits. Which of the two the X then honours differs (`#2423`, below).
+    # The screen the reader sees: above an open keyboard (the shrunken `visualViewport`) and the dock.
+    hit_parked = page.evaluate("""() => { const area = document.getElementById('scroll-area');
+      const clip = area.getBoundingClientRect();
+      let foot = clip.top + area.clientHeight;
+      const visual = window.visualViewport;
+      if (visual && visual.height > 0) foot = Math.min(foot, visual.offsetTop + visual.height);
+      const dock = document.getElementById('dock');
+      if (dock && dock.getClientRects().length) { const top = dock.getBoundingClientRect().top; if (top > clip.top && top < foot) foot = top; }
+      return [...document.querySelectorAll('#discord-log > li[data-id]')].some((li) => {
+        const r = li.getBoundingClientRect();
+        return /needle/.test(li.textContent || '') && r.bottom > clip.top && r.top < foot; }); }""")
     page.click("#search-toggle")
     page.wait_for_selector("#search-close", state="visible", timeout=10_000)
     open_state = state()
@@ -172,6 +188,13 @@ def walk(page: Page, label: str, shots: Path | None, keyboard: bool) -> None:
     page.fill("#search-field", "needle")
     page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length === 15",
                            timeout=10_000)
+    # `#2423`: where the entry landed the reader on the newest hits (none stood where they parked),
+    # the hit their eye is on is what they found, and the X keeps it where it stands.
+    seen = clear_walk.hits(page)
+    found = clear_walk.hit_list(seen)
+    check(bool(found), f"{label}: no hit stands on the screen after the search's entry ({seen})")
+    target = str(found[0].get("id"))
+    found_top = clear_walk.number(found[0].get("top"))
     shot("search-typed")
     page.click("#search-close")
     page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length === 40",
@@ -181,10 +204,20 @@ def walk(page: Page, label: str, shots: Path | None, keyboard: bool) -> None:
     after = state()
     check(after.get("query") == "", f"{label}: the X left the query {after.get('query')!r} in the field")
     check(after.get("searching") is not True, f"{label}: the X left the bar's room at the head of the list")
-    check(after.get("firstVisible") == parked.get("firstVisible"),
-          f"{label}: the row at the head changed {parked.get('firstVisible')} -> {after.get('firstVisible')}")
-    check(abs(number(after, "top") - number(parked, "top")) <= 2,
-          f"{label}: closing with the X moved the scroll from {number(parked, 'top')} to {number(after, 'top')}")
+    if hit_parked:
+        # Typed where hits stood and closed with nothing found: the parked row and scroll come back
+        # (`#243`, `#1968`; the liaison's scope for `#2423`).
+        check(after.get("firstVisible") == parked.get("firstVisible"),
+              f"{label}: the row at the head changed {parked.get('firstVisible')} -> {after.get('firstVisible')}")
+        check(abs(number(after, "top") - number(parked, "top")) <= 2,
+              f"{label}: closing with the X moved the scroll from {number(parked, 'top')} to {number(after, 'top')}")
+    else:
+        # `#2423` (owner 2026-11-27, liaison 1116): landed on the results, the found hit stays put,
+        # where `#1968` used to put the parked row back.
+        kept = page.evaluate("(id) => { const row = document.querySelector(`#discord-log > li[data-id=\"${id}\"]`); "
+                             "return row ? row.getBoundingClientRect().top : null; }", target)
+        check(isinstance(kept, (int, float)) and abs(float(kept) - found_top) <= 0.5,
+              f"{label}: closing with the X moved the found hit {target} from {found_top} to {kept}")
     shot("search-closed-by-x")
     if keyboard:
         page.evaluate("() => window.__iosClose()")
@@ -231,7 +264,7 @@ def main() -> int:
                             walk(page, name, args.screenshots, keyboard)
                             check(not errors, f"{name}: the page threw: {errors}")
                             context.close()
-                            report.append(f"{name} {width}x{height}: the X closed search and restored the parked view")
+                            report.append(f"{name} {width}x{height}: the X closed search and kept the found hit (or the parked row) where it stood")
                     finally:
                         api.stopping.set()
                         server.shutdown()

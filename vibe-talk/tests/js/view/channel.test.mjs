@@ -1588,8 +1588,10 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
   state.typed = false;
   state.side = true;
   el("search-field").value = " ";
-  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["history reset", "note screen", "query  ", "typed? \"< >\"", "marked \"< >\"", "fast", "defer", "marked \"< >\"", "keep place (", "lift (", "chips", "side cards", ")", ")", "land"],
-    "a cleared search kept its marks, or the right column's cards were not filtered again");
+  // `#2423`: cleared, even over a long list, the change runs at once (no fast pass ahead of the
+  // place-keeper), so the message found among the results is measured before the rows come back.
+  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["history reset", "note screen", "query  ", "typed? \"< >\"", "marked \"< >\"", "keep place (", "lift (", "chips", "side cards", ")", ")", "land", "mark soon"],
+    "a cleared search kept its marks, ran the fast pass ahead of the place-keeper, or the right column's cards were not filtered again");
   assert.deepStrictEqual([run(() => fire("search-field", "keydown", { key: "Enter" })), run(() => { state.older = true; fire("search-field", "keydown", { key: "Enter" }); }),
     run(() => fire("search-field", "keydown", { key: "Escape" })), run(() => fire("search-field", "keydown", { key: "Escape", isComposing: true })),
     run(() => fire("search-field", "keydown", { key: "Enter", isComposing: true })), run(() => fire("search-field", "keydown", { key: "a" }))],

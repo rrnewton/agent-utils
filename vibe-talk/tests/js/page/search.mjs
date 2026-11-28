@@ -6,8 +6,8 @@
 import assert from "node:assert/strict";
 
 import { ALICE, CHANNEL, CODER, CSS, FakeElement, HOLD_MS, HTML, HTML_CODE, LINK_ATTRS, PAGE_CODE,
-  RECORD_EPOCH, UNPACK_STORAGE, allLeavingOut, assertMarkupContains, assistantSays,
-  authorChannel, authorState, backlog, beforeOf, boxesOf, builtSince, cardRow, channelSummaryText,
+  RECORD_EPOCH, SCRIPT, UNPACK_STORAGE, allLeavingOut, assertMarkupContains, assistantSays,
+  authorChannel, authorState, backlog, beforeOf, boxesOf, brokenModule, builtSince, cardRow, channelSummaryText,
   chooseAuthor, chooseReadMode, collapsedRows, cssBlock, cssRules, deliver, enterVoice, excerptOf, foldButton,
   gate, headOf, hitsIn, inTwoColumns, json, lineText, longMessage, marksPending, message,
   messageCacheStatus, messageRows, newPage, nodeWithinFixture, openerOf, pagedThreads, pickThread,
@@ -3541,30 +3541,69 @@ test("`#2260 vibe-talk-search-barely-overflowing-list-clamp`: a reader at the he
   }
 });
 
-test("`#1968 vibe-talk-search-close-x`: closing after a search entry moved the reader puts them back where they were reading", async () => {
-  // The entry landing is a loan, not a move: typing "needle" from a parked place with
-  // no hit on screen takes the reader to the newest hits, and closing the bar — here
-  // with the X — owes them the parked row at the parked offset, not the newest hits.
+test("`#2423 search-escape-clear-moves-found-message`: closing after a search entry landed the reader on the newest hits keeps the hit they found where it stands", async () => {
+  // The owner, 2026-11-27: "when I find a message and I press escape to clear the search. The
+  // highlighted message doesn't stay put on screen." Typing "needle" from a parked place with no hit
+  // on screen lands the reader on the newest hits (`#1734`); they found one there, and closing the bar
+  // (here with the X) keeps it at its top, where `#1968` used to take them back to the parked row.
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    await showDiscord(page, Array.from({ length: 40 }, (_u, i) =>
+      message({ id: String(i + 1), content: `haystack note ${i}${i >= 25 ? " needle" : ""}` })));
+    const area = page.el("scroll-area");
+    area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) / 3);
+    await page.settle();
+    await search(page, "needle");
+    const foot = area.scrollHeight - area.clientHeight;
+    assert.ok(Math.abs(area.scrollTop - foot) <= 2, "the entry did not take the reader to the newest hits, so this proves nothing");
+    // The hit the eye is on: the shown row nearest the middle of the list's box.
+    const box = area.getBoundingClientRect();
+    const middle = box.top + area.clientHeight / 2;
+    const shown = unfiltered(page, "discord-log").filter((li) => {
+      const r = li.getBoundingClientRect();
+      return r.bottom > box.top && r.top < box.top + area.clientHeight;
+    });
+    const found = shown.reduce((best, li) => {
+      const gap = (row) => Math.abs((row.getBoundingClientRect().top + row.getBoundingClientRect().bottom) / 2 - middle);
+      return gap(li) < gap(best) ? li : best;
+    });
+    const before = found.getBoundingClientRect().top;
+    await page.el("search-close").click();
+    await page.settle();
+    assert.equal(unfiltered(page, "discord-log").length, 40, "closing left the filter on");
+    return { page, found, before };
+  };
+  const { found, before } = await run(SCRIPT);
+  assert.ok(Math.abs(found.getBoundingClientRect().top - before) <= 0.5,
+    `the found hit ${found.getAttribute("data-id")} moved from ${before} to ${found.getBoundingClientRect().top}`);
+  // THE CONTROL: with no message found among the results, the close takes the reader back to the parked row.
+  const unfound = await run(await brokenModule([{ file: "src/view/channel/filterplace.ts",
+    find: "      const found = !standing && measureFound ? foundAnchor() : null;",
+    replace: "      const found = null;" }]));
+  assert.ok(Math.abs(unfound.found.getBoundingClientRect().top - unfound.before) > 1, "the test cannot see the found hit move");
+});
+
+test("`#2423 search-escape-clear-moves-found-message`: typed where hits stood and closed with nothing found, the parked row comes back where it stood (`#1968`, `#243`)", async () => {
+  // The liaison's scope: only a reader who landed on a result, moved in the results or highlighted
+  // one has found something. Typing "haystack" with hits on the screen lands nowhere; closing at once
+  // keeps today's behaviour, the row read before the search where it stood.
   const page = newPage();
   await signIn(page);
   await showDiscord(page, Array.from({ length: 40 }, (_u, i) =>
-    message({ id: String(i + 1), content: `haystack note ${i}${i >= 25 ? " needle" : ""}` })));
+    message({ id: String(i + 1), content: `haystack note ${i}${i % 3 === 0 ? " needle" : ""}` })));
   const area = page.el("scroll-area");
   area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) / 3);
   await page.settle();
   const anchor = page.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > area.getBoundingClientRect().top);
   const anchorTop = anchor.getBoundingClientRect().top;
   const parked = area.scrollTop;
-
   await search(page, "needle");
-  const foot = area.scrollHeight - area.clientHeight;
-  assert.ok(Math.abs(area.scrollTop - foot) <= 2, "the entry did not take the reader to the newest hits, so this proves nothing");
-
+  assert.ok(Math.abs(area.scrollTop - (area.scrollHeight - area.clientHeight)) > 2,
+    "the entry took the reader to the newest hits, so this is not the case without a landing");
   await page.el("search-close").click();
   await page.settle();
   assert.equal(unfiltered(page, "discord-log").length, 40, "closing left the filter on");
-  const head = page.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > area.getBoundingClientRect().top);
-  assert.equal(head, anchor, "closing left the reader on a different row than they parked on");
   assert.ok(Math.abs(anchor.getBoundingClientRect().top - anchorTop) <= 2,
     `the parked row moved from ${anchorTop} to ${anchor.getBoundingClientRect().top}`);
   assert.ok(Math.abs(area.scrollTop - parked) <= 2, `closing moved the scroll from ${parked} to ${area.scrollTop}`);

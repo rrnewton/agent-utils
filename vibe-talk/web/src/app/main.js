@@ -2284,6 +2284,8 @@ const filterPlaceOwner = createFilterPlace({
   rowMessages: (row) => rowMessages(/** @type {any} */ (row)),
   clearEntryLanding: () => { entryState().landing = null; entryState().threadOwed = null; entryState().threadAwaitsRead = false; },
   sideShowing: () => sideShowing(),
+  // `#2423`: whether the right column is up beside the channel list (two columns at a desk).
+  twoColumnsUp: () => sideColumnUp(),
 });
 const { filterChanges, filterKey, filterState, endFilterWalk, anchorAt, anchorHolder, anchorRow, nearestShownRow, currentFilterHold, heldFilterRow, readerActed, followsNewest, keepFilterHold, filterAnchor, keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace, holdFilterRow } = filterPlaceOwner;
 
@@ -3503,7 +3505,9 @@ function landSearchEntry() {
  * hits. Only then: an entry that stayed put, and a message the reader chose among
  * the results, keep the close's own kept place (`#243`). The anchor's own reader-moved
  * guard (`placeFilterAnchor`) makes this a no-op when the reader scrolled themselves
- * after the entry landed.
+ * after the entry landed. `#2423` (owner 2026-11-27, rule 370): a close that kept a
+ * message shown among the results where it stood (the one the reader found) is not
+ * undone here either, so in practice this restores only a search that showed nothing.
  */
 function restoreSearchEntryPlace() {
   const anchor = searchEntryAnchor;
@@ -3512,7 +3516,9 @@ function restoreSearchEntryPlace() {
   searchEntryMoved = false;
   if (!moved || !anchor) return;
   const current = filterAnchor();
-  if (current && current.selected) return;
+  // `#2423` (owner 2026-11-27): nor over the message the reader found among the results, which
+  // the close kept where it stood (`foundAnchor`).
+  if (current && (current.selected || current.found)) return;
   if (!(anchor.newest || anchorHolder(anchor))) return;
   placeFilterAnchor(anchor);
 }

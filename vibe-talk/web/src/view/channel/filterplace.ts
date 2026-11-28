@@ -52,6 +52,12 @@ export interface FilterAnchor {
    * where the change hides the row they read, they keep the list's head, not a place for the nearest
    * row that the list as it now stands may not be able to hold. */
   head?: boolean;
+  /** `#2423`: the search result the reader was looking at when the search's words cleared
+   * (`foundAnchor`); it keeps its top, and the search's entry place is not put back over it. */
+  found?: boolean;
+  /** `#2423`: the row the search's entry landing took the reader to (`holdFilterRow`), carried by the
+   * holds that keep it: the reader landed on a result, so clearing the search keeps what they found. */
+  landed?: boolean;
 }
 
 /** A pane's selection mark, as the filter place reads it. */
@@ -137,6 +143,8 @@ export interface FilterPlaceDependencies {
   rowMessages(row: HTMLElement): readonly { timestamp?: unknown }[];
   clearEntryLanding(): void;
   sideShowing(): boolean;
+  /** `#2423`: whether the right column is up beside the channel list. Optional for doubles. */
+  twoColumnsUp?(): boolean;
 }
 
 /** The filter-kept place, as the page calls it. */
@@ -155,7 +163,7 @@ export interface FilterPlace {
   followsNewest(area: HTMLElement): boolean;
   keepFilterHold(): boolean;
   filterAnchor(): FilterAnchor | null;
-  keepingFilterPlace<T>(change: () => T, tapped?: HTMLElement | null): T;
+  keepingFilterPlace<T>(change: () => T, tapped?: HTMLElement | null, clearing?: boolean): T;
   placeFilterAnchor(anchor: FilterAnchor | null, wasEmptied?: boolean, walked?: boolean, room?: boolean): void;
   settlePendingFilterPlace(): void;
   /** `#2346`: hold `row` where it stands now, as a filter change holds the row it kept. */
@@ -377,7 +385,7 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     const pane = deps.view() === "discord" ? (deps.columnSide() ? deps.sidePane() : deps.channelPane()) : null;
     const mark = pane ? deps.markOf(pane) : null;
     filterState().hold = {
-      key: filterKey(), row, ids: idsOf(row), at: area.scrollTop, origin: anchorAt(row),
+      key: filterKey(), row, ids: idsOf(row), at: area.scrollTop, origin: { ...anchorAt(row), landed: true },
       offset: row.getBoundingClientRect().top - deps.listPlaceTop(area), mark: mark ? mark.id : null,
     };
   }
@@ -435,6 +443,61 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
   }
 
   /**
+   * `#2423` (owner 2026-11-27, rule 370; scoped by the liaison): the message the reader found among a
+   * search's results, measured while its words still choose the rows. Found only where the reader
+   * highlighted a result (the selection, lit by a desk's pointer or chosen by a tap or the keys, on a
+   * shown row), or landed on the results: the search's entry landing took them there, or they moved in
+   * the results themselves since the search last placed them. That message is the selected one, else
+   * the shown row nearest the middle of the screen (the one the eye is on). Null where they did neither
+   * (typed and closed where they were: the search's hold puts back the place they read before it, as
+   * `#243`/`#1968` have it), with no list on screen, or with no row shown.
+   */
+  function foundAnchor(): FilterAnchor | null {
+    // The channel list's own, with one column on screen. The right column (cards, a thread) keeps its
+    // own place through the close as before, and with two columns up the list keeps today's close too:
+    // a found row held on the left there left the thread opened next on the right short of following
+    // an arriving reply (the first owner gate's catch), so two columns wait for that to be understood.
+    if (deps.screen() !== "main" || deps.columnSide() || (deps.twoColumnsUp && deps.twoColumnsUp())) return null;
+    const area = deps.el("scroll-area");
+    const pane = deps.view() === "discord" ? (deps.columnSide() ? deps.sidePane() : deps.channelPane()) : null;
+    const mark = pane ? deps.markOf(pane) : null;
+    const chosen = pane ? deps.markedRow(pane, mark) : null;
+    if (pane && mark && chosen && deps.rowInView(pane, chosen)) return { ...anchorAt(chosen, mark), found: true };
+    const held = currentFilterHold();
+    if (held !== null && !held.hold.origin.landed) return null;
+    const head = pane ? pane.head() : deps.floatingClearance(area);
+    let foot = pane ? pane.foot() : area.getBoundingClientRect().top + (area.clientHeight || 0);
+    // The screen the reader sees: above an open keyboard, and above the dock bar where it stands
+    // over the list's foot (as the scroll owner's visible band has it).
+    const visual = typeof window !== "undefined" ? window.visualViewport : null;
+    if (visual && visual.height > 0) foot = Math.min(foot, visual.offsetTop + visual.height);
+    try {
+      const dock = deps.el("dock").getBoundingClientRect().top;
+      if (dock > head && dock < foot) foot = dock;
+    } catch {
+      // No dock bar: the list's own foot.
+    }
+    const middle = (head + foot) / 2;
+    let best: HTMLElement | null = null;
+    let bestGap = Infinity;
+    for (const row of deps.visibleList().children) {
+      if (!isMessageRow(row) || standingRow(row) !== row) continue;
+      const box = row.getBoundingClientRect();
+      if (box.bottom <= head || box.top >= foot) continue;
+      // The middle of the part on screen, so a long message cut by an edge counts where it shows.
+      const gap = Math.abs((Math.max(box.top, head) + Math.min(box.bottom, foot)) / 2 - middle);
+      if (gap < bestGap) {
+        best = row as HTMLElement;
+        bestGap = gap;
+      }
+    }
+    return best ? { ...anchorAt(best), found: true } : null;
+  }
+
+  /** `#2423`: whether the list's rows were last chosen with search words in the field (`keepingFilterPlace`). */
+  let searchWordsShown = false;
+
+  /**
    * Run `change`, a change of what the list shows, keeping the reader's message where it is on the
    * screen in every column showing messages. A `change` that returns a promise — a read — is waited
    * for, and the reader placed when it lands. Returns what `change` returns.
@@ -449,26 +512,41 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
    * @param {() => T} change
    * @returns {T}
    */
-  function keepingFilterPlace<T>(change: () => T, tapped: HTMLElement | null = null): T {
+  function keepingFilterPlace<T>(change: () => T, tapped: HTMLElement | null = null, clearing = false): T {
     if (filterChanges.changing()) return change();
-    /** @type {Array<[ColumnFields, FilterAnchor | null, boolean, boolean]>} */
-    const kept: Array<[unknown, FilterAnchor | null, boolean, boolean]> = [];
+    /** @type {Array<[ColumnFields, FilterAnchor | null, boolean, boolean, FilterAnchor | null]>} */
+    const kept: Array<[unknown, FilterAnchor | null, boolean, boolean, FilterAnchor | null]> = [];
+    // `#2423`: rows a search's words chose, which this change clears (the bar closing says so in
+    // `clearing`; the field emptied has no words left in it already): the message found among them is
+    // measured too, before the rows they hid come back around it. A change that keeps the words reads
+    // no more of the layout than before.
+    const wordsBefore = searchWordsShown;
+    const measureFound = wordsBefore && (clearing || !searchWordsIn());
     deps.eachColumn(() => {
       const standing = tapped ? listChildHolding(tapped) : null;
-      kept.push([deps.activeColumn(), standing ? anchorAt(standing) : filterAnchor(), deps.listEmptied(), standing !== null]);
+      const found = !standing && measureFound ? foundAnchor() : null;
+      kept.push([deps.activeColumn(), standing ? anchorAt(standing) : filterAnchor(), deps.listEmptied(), standing !== null, found]);
       // A landing a thread's entry made, or still owes, is spent: the reader has acted since. `#221`.
       deps.clearEntryLanding();
     });
     // A walk back for an earlier change is over: this one decides where the reader goes.
     endFilterWalk();
     const result = filterChanges.whileChanging(change);
+    // `#2423` (owner 2026-11-27, rule 370): the search's words cleared — Escape, the X, the
+    // magnifier, the field emptied. The message the reader found keeps its top exactly, as a tapped
+    // row does (with the room the list lacks where it cannot scroll that far), not the place the
+    // search's last hold would take them back to, nor the newest line they stood at in the results.
+    searchWordsShown = searchWordsIn();
+    const cleared = wordsBefore && !searchWordsShown;
     // `#2285`: the rooms an earlier tap held (above the rows, the floor under them) go before this
     // change places anyone; the anchors were measured on screen, so the placement below puts each
     // back where it stood.
     if (deps.clearTapRooms) deps.clearTapRooms();
     const place = (landed = false): void => {
-      for (const [column, anchor, wasEmptied, room] of kept) {
+      for (const [column, measured, wasEmptied, tappedRoom, found] of kept) {
         if (column === deps.sideColumn() && !deps.sideShowing()) continue;
+        const anchor = cleared && found ? found : measured;
+        const room = tappedRoom || (found !== null && anchor === found);
         deps.inColumn(column, () => {
           // Once a read has landed, only for a reader still where the change put them.
           if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied, false, room);
