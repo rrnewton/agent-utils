@@ -1,13 +1,14 @@
 ---
 title: 'agent-teams-relay-slack-bullet-rewrite: the relay quarantines messages whose bullets Slack rewrote'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: cl-bridgeretire
 labels:
 - agent-teams
 created_at: 2026-11-23T08:05:00-05:00
-updated_at: 2026-11-27T17:22:21-05:00
+updated_at: 2026-11-27T19:10:00-05:00
+closed_at: 2026-11-27T19:10:00-05:00
 ---
 
 # Description
@@ -46,3 +47,21 @@ Found by comparing a quarantined message with its direct-route copy; filed by th
 Raised to P1 on 2026-11-27, when the open integrity alarm had grown to 45 copies.
 
 Out of scope, but seen in the same state directory: every atomic rewrite keeps a timestamped backup beside its file. There were 1,280 for the quarantine file, 1,075 for the alarms file, and over 20,000 in one team's ledger. See #599, #767 and #856.
+
+## Resolution
+
+Fixed. Landed as d8aae6a1 on 2026-11-27, replaying f2824f8a.
+
+- **Senders:** the relay fence escapes the bullet glyphs as `\uXXXX`, like the link escapes. The parsed envelope is identical, so old and new receivers verify the same bytes.
+- **Receivers:** bullets are restored in older senders' bodies after the link-markup undo, and accepted only on the exact body hash.
+  - On the 45 quarantined copies the restore recovers all 45, worst case 3,284 hashes. Rules on line-leading bullets alone would have recovered 37.
+- **Copies of delivered messages:** a body that still fails while the receiving team's ledger holds the same message is kept with `twin` and counted in `relay status`, never alarmed.
+  - Any other mismatch waits 10 minutes (`awaiting_twin_until`) before it alarms.
+  - The alarm is filed under the team the message was addressed to.
+- **Tests:**
+  - Unit tests: the fence escape, the exact-hash restore, and the candidate cap.
+  - End-to-end: an older sender's rewritten post is restored and delivered; a damaged copy of a delivered message raises no alarm; one that arrives first is settled once its message is delivered; one with no delivered copy alarms after the grace, under its own team.
+
+**Evidence: gate `1795819431460526104-1a21900a` on f2824f8a.** Path-selected validate, 36 steps, verdict pass, with failed, incomplete and known-red all empty. The envelope and persisted changes were sent to both other teams that run the tool before landing; one had no objection, and the other did not answer by the announced deadline.
+
+Superseded in part by #2420 (owner, 2026-11-27): a hash mismatch must be delivered with a warning, never quarantined or delayed. That retires the grace period and the alarm for this case.
