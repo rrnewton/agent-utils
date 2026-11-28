@@ -9262,6 +9262,10 @@ pub struct FakeSeedRequest {
     /// The named thread's root message, for a reply in it.
     #[serde(default)]
     pub root_message_id: Option<crate::model::MessageId>,
+    /// For a thread root only: its exact reply count, which each reply seeded in the thread
+    /// after raises by one (`#2385`). Absent: the root carries no count, as before.
+    #[serde(default)]
+    pub reply_count: Option<u64>,
 }
 
 /// What the fake-seed route answers: the seeded message's id.
@@ -9290,6 +9294,7 @@ pub async fn fake_seed(
             thread_id,
             request.thread_root,
             request.root_message_id.as_ref(),
+            request.reply_count,
         ),
         None => state.providers.seed_fake_message(
             &channel,

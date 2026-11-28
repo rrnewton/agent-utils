@@ -1,0 +1,21 @@
+steps:
+  # `#2385 vibe-talk-thread-open-layout-first`, S-t1, on the shipped server (fake chat upstream
+  # through the fake-seed route, the message cache serving): the page's thread layout read reaches
+  # the real route and answers the thread's replies before their bodies, each box stands at its
+  # entry's price, and the bodies fill the boxes in place, the rows above holding. Only the bodies'
+  # read is held, at the page: an order of events, never a clock. Phone (touch, dark) and desk (light).
+  - group: check
+    job: thread-layout-server-browser
+    desc: on a real server, a thread's layout read goes out before its bodies and is answered by the real route with every reply, the boxes stand at their entries' prices within 1 px, and the bodies fill them in place with the rows above held, in current Chromium at 412x915 by touch and 1280x800 (#2385)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_layout_server_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 600
+    cpu_timeout: 240
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

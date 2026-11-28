@@ -83,6 +83,11 @@ struct State {
     /// Whether a test fixture has seeded thread-bearing messages, at which
     /// point this fake advertises the timeline views it now serves (`#1843`).
     threading_enabled: bool,
+    /// The threads whose roots a fixture gave an exact reply count (`#2385`,
+    /// [`FakeDiscord::count_thread_replies`]): each reply seeded in one of
+    /// them raises its root's count by one. Every other thread's root carries
+    /// no count, as before.
+    counted_threads: BTreeSet<String>,
     known: BTreeSet<ChannelId>,
     fetches: usize,
     messages: Vec<Message>,
@@ -543,6 +548,20 @@ impl FakeDiscord {
         };
         let mut state = self.lock();
         state.threading_enabled = true;
+        // `#2385`: a reply in a thread whose root carries an exact count raises it, as the
+        // provider's own count would rise with the post.
+        if !is_root && state.counted_threads.contains(thread_id) {
+            if let Some(root) = state.messages.iter_mut().find(|held| {
+                held.thread
+                    .as_ref()
+                    .is_some_and(|thread| thread.is_root && thread.id == thread_id)
+            }) {
+                if let Some(thread) = root.thread.as_mut() {
+                    thread.reply_count = Some(thread.reply_count.unwrap_or(0).saturating_add(1));
+                    thread.reply_count_exact = true;
+                }
+            }
+        }
         let message = state
             .messages
             .iter_mut()
@@ -576,6 +595,31 @@ impl FakeDiscord {
             replies_done: None,
         });
         id
+    }
+
+    /// Give a seeded thread root an exact reply count (`#2385`), opt-in: from then on each reply
+    /// seeded in its thread ([`FakeDiscord::seed_thread_at`]) raises the count by one, so a
+    /// fixture's root says what the provider's would. A root no fixture counted carries no count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `root` is not a seeded thread root, which is a mistake in the fixture.
+    pub fn count_thread_replies(&self, root: &MessageId, count: u64) {
+        let mut state = self.lock();
+        let message = state
+            .messages
+            .iter_mut()
+            .find(|held| held.id == *root)
+            .unwrap_or_else(|| panic!("no seeded message {root}"));
+        let thread = message
+            .thread
+            .as_mut()
+            .filter(|thread| thread.is_root)
+            .unwrap_or_else(|| panic!("{root} is not a seeded thread root"));
+        thread.reply_count = Some(count);
+        thread.reply_count_exact = true;
+        let id = thread.id.clone();
+        state.counted_threads.insert(id);
     }
 
     /// Rewrite the content of a message already seeded, as an upstream EDIT would.
@@ -1413,6 +1457,48 @@ mod tests {
             .await
             .expect("timeline before");
         assert_eq!(contents(&back), vec!["m2", "m3"]);
+    }
+
+    #[tokio::test]
+    async fn a_counted_root_says_its_exact_reply_count_and_each_seeded_reply_raises_it() {
+        let fake = FakeDiscord::new();
+        let root = fake.seed_thread_at(&channel(), "a", "counted root", "t-c", true, None, None);
+        let plain = fake.seed_thread_at(&channel(), "a", "plain root", "t-p", true, None, None);
+        fake.count_thread_replies(&root, 1);
+        for text in ["one", "two"] {
+            fake.seed_thread_at(&channel(), "b", text, "t-c", false, Some(&root), None);
+            fake.seed_thread_at(&channel(), "b", text, "t-p", false, Some(&plain), None);
+        }
+        let page = fake
+            .fetch_timeline(
+                &channel(),
+                &crate::threads::TimelineRequest {
+                    view: crate::threads::TimelineView::Main,
+                    thread_id: None,
+                    before: None,
+                    after: None,
+                    limit: 50,
+                },
+            )
+            .await
+            .expect("main");
+        let count_of = |id: &MessageId| {
+            page.messages
+                .iter()
+                .find(|message| message.id == *id)
+                .and_then(|message| message.thread.as_ref())
+                .map(|thread| (thread.reply_count, thread.reply_count_exact))
+        };
+        assert_eq!(
+            count_of(&root),
+            Some((Some(3), true)),
+            "1, then two replies seeded"
+        );
+        assert_eq!(
+            count_of(&plain),
+            Some((None, false)),
+            "an uncounted root is as before"
+        );
     }
 
     #[tokio::test]

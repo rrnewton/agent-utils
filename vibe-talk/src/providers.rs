@@ -174,7 +174,9 @@ impl ChatRouter {
     }
 
     /// Seed one non-owner message in a named thread of the fake backend
-    /// (`#1843`); None where this router serves no fake.
+    /// (`#1843`); None where this router serves no fake. `reply_count`, for a
+    /// root only, gives it that exact reply count, raised by each reply seeded
+    /// in its thread after (`#2385`, [`crate::discord::fake::FakeDiscord::count_thread_replies`]).
     #[allow(clippy::too_many_arguments)]
     pub fn seed_fake_thread_message(
         &self,
@@ -185,9 +187,10 @@ impl ChatRouter {
         thread_id: &str,
         is_root: bool,
         root_message_id: Option<&crate::model::MessageId>,
+        reply_count: Option<u64>,
     ) -> Option<crate::model::MessageId> {
         self.fake.as_ref().map(|fake| {
-            fake.seed_thread_at(
+            let id = fake.seed_thread_at(
                 channel,
                 author,
                 text,
@@ -195,7 +198,11 @@ impl ChatRouter {
                 is_root,
                 root_message_id,
                 at_ms,
-            )
+            );
+            if let (true, Some(count)) = (is_root, reply_count) {
+                fake.count_thread_replies(&id, count);
+            }
+            id
         })
     }
 
