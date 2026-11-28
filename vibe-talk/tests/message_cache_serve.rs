@@ -2620,6 +2620,172 @@ async fn slack_s_all_the_cache_holds_is_answered_at_once_and_the_read_behind_it_
     );
 }
 
+/// `#2433 slack-timeline-budget-drops-reads`: a Slack channel whose six messages each root a
+/// thread of one reply, every thread opened once, so the cache holds All whole. Thread `n`'s reply
+/// is "reply n"; thread 5 is the most recently active.
+async fn slack_six_threads_deployment(
+    tag: &str,
+) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut history: Vec<Value> = (0..6)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
+        .collect();
+    for (n, root) in (0_i64..).zip(history.iter_mut()) {
+        slack_fake::thread(
+            &mut fixture,
+            SLACK_CH,
+            root,
+            &[(slack_fake::ts(n * 60 + 10, 0), format!("reply {n}"))],
+        );
+    }
+    fixture.history.insert(SLACK_CH.to_owned(), history);
+    let fake = slack_fake::Fake::start(fixture, 10).await;
+    let dir = TempDir::new(tag);
+    let clock = ManualClock::at(slack_ms(3_600));
+    let text = format!(
+        r#"
+[auth]
+read_token = "{READ_TOKEN}"
+write_token = "{WRITE_TOKEN}"
+
+[[providers]]
+key = "{SLACK}"
+kind = "slack"
+api_base = "{base}"
+token = "{token}"
+request_timeout_seconds = 120
+
+[[channels]]
+id = "{SLACK_CH}"
+label = "team"
+writable = true
+"#,
+        base = fake.base,
+        token = slack_fake::TOKEN,
+    );
+    let (mut state, _discord, _store) = testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    for n in 0..6 {
+        ok(
+            &state,
+            &path(
+                SLACK_CH,
+                &format!(
+                    "/timeline?view=thread&thread_id={}&limit=50",
+                    slack_fake::ts(n * 60, 0)
+                ),
+            ),
+            WRITE_TOKEN,
+        )
+        .await;
+    }
+    settled(&state).await;
+    (state, fake, clock, dir)
+}
+
+#[tokio::test]
+async fn slack_s_all_refresh_that_reaches_its_budget_mid_batch_lands_the_threads_it_read() {
+    // `#2433 slack-timeline-budget-drops-reads`, end to end: the read behind a cache-first All
+    // answer has its first four thread reads in flight, against a replies route that answers
+    // nothing until the gate opens, when its 90 s budget runs out. It used to be cancelled
+    // there: the four requests dropped, the page thrown away, and the timeout kept as the
+    // page's next answer (an HTTP 400). Now the four run to their answers and land; the two
+    // threads not begun are owed and re-read on the schedule.
+    let (state, fake, clock, _dir) = slack_six_threads_deployment("budget-mid-batch").await;
+    state.message_cache.set_serve(true);
+    clock.advance(vibe_talk::ops::LISTED_FRESH.as_millis() as i64 + SECOND);
+    // Every thread moved upstream since the cache filled: the read behind must read them all.
+    fake.with(|fixture| {
+        for n in 0..6_i64 {
+            slack_fake::add_reply(
+                fixture,
+                SLACK_CH,
+                &slack_fake::ts(n * 60, 0),
+                &slack_fake::ts(1_000 + n, 0),
+                &format!("new reply {n}"),
+            );
+        }
+    });
+    let gate = slack_fake::ReplyGate::new();
+    fake.with(|fixture| fixture.replies_gate = Some(gate.clone()));
+    let all = path(SLACK_CH, "/timeline?view=flat&limit=50&reason=enter");
+    let first = ok(&state, &all, WRITE_TOKEN).await;
+    assert!(first["refresh_failed"].is_string(), "{first}");
+    // Hang backstop only: All reads four threads at once.
+    tokio::time::timeout(WAIT, async {
+        while gate.arrived() < 4 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the read behind the answer has four thread reads in flight");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(91)).await;
+    tokio::time::resume();
+    gate.open();
+    landed(&state, &newest_key(SLACK_CH, TimelineView::Flat, 50), None).await;
+    let (status, next) = call(
+        &state,
+        &path(SLACK_CH, "/timeline?view=flat&limit=50&reason=poll"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    let said = texts(&next);
+    for n in [5, 4, 3, 2] {
+        let reply = format!("new reply {n}");
+        assert!(
+            said.contains(&reply),
+            "{reply} (read before the budget ran out): {next}"
+        );
+    }
+    for n in [1, 0] {
+        let reply = format!("new reply {n}");
+        assert!(
+            !said.contains(&reply),
+            "{reply} was begun past the budget: {next}"
+        );
+    }
+
+    // The two owed threads are re-read on the schedule, not dropped.
+    state.refresh_schedule.age(Duration::from_secs(300));
+    let mut seen = Vec::new();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let body = ok(
+                &state,
+                &path(SLACK_CH, "/timeline?view=flat&limit=50&reason=poll"),
+                WRITE_TOKEN,
+            )
+            .await;
+            seen = texts(&body);
+            if seen.iter().any(|text| text == "new reply 0")
+                && seen.iter().any(|text| text == "new reply 1")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the owed threads were never re-read: {seen:?}"));
+}
+
 #[tokio::test]
 async fn a_page_entering_a_view_the_cache_holds_never_waits_on_the_provider() {
     let d = deployment("cache-first-enter").await;

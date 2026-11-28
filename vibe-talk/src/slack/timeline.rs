@@ -64,8 +64,15 @@ pub const ROOTS_KEEP: std::time::Duration = std::time::Duration::from_secs(2 * 6
 pub const DISCOVERY_PAGES: usize = 10;
 /// The page size asked of `users.conversations`.
 const DISCOVERY_PAGE_LIMIT: u16 = 100;
-/// The longest one timeline request may take, all of its requests together.
+/// The longest one timeline request may take, all of its requests together. For a timeline read
+/// it is the budget ([`super::budget::within`]): past it, no request waits for room and a Flat
+/// read starts no costly thread read, and the read answers with what it has. `#2433`.
 pub(super) const TIMELINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// How many request timeouts past [`TIMELINE_TIMEOUT`] a timeline read may run before it is
+/// stopped: room for the requests already sent when the budget ran out, and one more of the few
+/// that need no wait (a history page, an author). Only a read that stopped making progress
+/// reaches it. `#2433 slack-timeline-budget-drops-reads`.
+const TIMELINE_BACKSTOP_REQUESTS: u32 = 2;
 /// The conversation kinds the channel browser lists.
 const DISCOVERY_TYPES: &str = "public_channel,private_channel,mpim,im";
 
@@ -484,10 +491,24 @@ impl HttpSlackClient {
         channel: &ChannelId,
         request: &TimelineRequest,
     ) -> Result<TimelinePage, ChatError> {
-        // `#2433`: transient, never a refusal kept as the view's next answer.
-        tokio::time::timeout(TIMELINE_TIMEOUT, self.timeline_inner(channel, request))
-            .await
-            .map_err(|_| ChatError::time_budget_spent("the timeline"))?
+        // `#2433 slack-timeline-budget-drops-reads`: the budget ends the read by what it would
+        // start next (`budget::within`), never by cancelling a request in flight, which threw the
+        // whole page away. The backstop behind it waits out the requests already sent, so it
+        // stops only a read that made no progress, and that stop is transient: never a refusal
+        // kept as the view's next answer.
+        let deadline = tokio::time::Instant::now() + TIMELINE_TIMEOUT;
+        let backstop = TIMELINE_TIMEOUT + self.request_timeout * TIMELINE_BACKSTOP_REQUESTS;
+        let read = super::budget::within(deadline, self.timeline_inner(channel, request));
+        tokio::time::timeout(backstop, read).await.map_err(|_| {
+            tracing::warn!(
+                view = ?request.view,
+                reason = ?crate::read_reason::ReadReason::current(),
+                backstop_s = backstop.as_secs(),
+                "a Slack timeline read made no progress past its budget and the requests it had \
+                 sent; it was stopped"
+            );
+            ChatError::time_budget_spent("the timeline")
+        })?
     }
 
     async fn timeline_inner(
@@ -821,11 +842,13 @@ impl HttpSlackClient {
         let upstream_cap = flat_upstream_cap(ReadReason::current());
         let stopped = std::sync::atomic::AtomicBool::new(false);
         let costly = std::sync::atomic::AtomicUsize::new(0);
+        // `#2433`: threads not begun because the read's time budget ran out (`budget::within`).
+        let out_of_time = std::sync::atomic::AtomicUsize::new(0);
         let reads: Vec<_> = roots
             .iter()
             .map(|root| {
                 let source = source.clone();
-                let (stopped, costly) = (&stopped, &costly);
+                let (stopped, costly, out_of_time) = (&stopped, &costly, &out_of_time);
                 async move {
                     // A thread longer than an upstream read brings is read upstream too, so that
                     // All holds the same newest replies of it whichever way they come.
@@ -841,10 +864,16 @@ impl HttpSlackClient {
                     // A root parsed from Slack always converts; without an id there is
                     // nothing to name as owed, and the notice's count still says so.
                     let root_id = ids::message_id_from_ts(&root.ts);
-                    if !self.flat_free(conversation, root)
-                        && (stopped.load(ordering) || costly.fetch_add(1, ordering) >= upstream_cap)
-                    {
-                        return Replies::Skipped(root_id);
+                    if !self.flat_free(conversation, root) {
+                        // Past the budget a costly thread is owed, not begun: every thread already
+                        // being read still runs to its answer and is kept (`#2433`).
+                        if super::budget::past_deadline(tokio::time::Instant::now()) {
+                            out_of_time.fetch_add(1, ordering);
+                            return Replies::Skipped(root_id);
+                        }
+                        if stopped.load(ordering) || costly.fetch_add(1, ordering) >= upstream_cap {
+                            return Replies::Skipped(root_id);
+                        }
                     }
                     match self.flat_replies(conversation, root).await {
                         Ok(read) => Replies::Upstream(root.reply_count(), read),
@@ -863,11 +892,13 @@ impl HttpSlackClient {
         let mut held = Vec::new();
         let mut owed_threads = Vec::new();
         let (mut cut, mut skipped, mut failed) = (0_usize, 0_usize, 0_usize);
+        let mut upstream = 0_usize;
         let mut failure = None;
         for read in replies {
             match read {
                 Replies::Held(messages) => held.extend(messages),
                 Replies::Upstream(count, read) => {
+                    upstream += 1;
                     cut += usize::from(count > FLAT_MAX_REPLIES as u64);
                     raws.extend(read);
                 }
@@ -890,6 +921,19 @@ impl HttpSlackClient {
                 skipped,
                 %error,
                 "a Slack All read left some threads' replies out: they could not be read"
+            );
+        }
+        let out_of_time = out_of_time.into_inner();
+        if out_of_time > 0 {
+            // Counts only. `#2433`: the read answers with what it has; the owed threads are
+            // read again on the refresh schedule (`#2278`).
+            tracing::info!(
+                conversation,
+                read = upstream,
+                owed = skipped + failed,
+                out_of_time,
+                "a Slack All read reached its time budget; it answers with the threads it read and \
+                 owes the rest to the next read"
             );
         }
         raws.sort_by_key(|raw| raw.micros);

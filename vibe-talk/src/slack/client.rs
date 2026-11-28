@@ -176,6 +176,9 @@ pub struct HttpSlackClient {
     token: Secret,
     owner_user_id: Option<String>,
     client: reqwest::Client,
+    /// The most one request may take, as the HTTP client enforces it: how far past a timeline
+    /// read's budget the backstop waits for the requests already sent. `#2433`.
+    pub(super) request_timeout: Duration,
     pub(super) channel_registration: bool,
     pub(super) registered_writable: bool,
     pub(super) channel_discovery: bool,
@@ -275,13 +278,14 @@ impl HttpSlackClient {
                     .with_provider(&config.provider_name),
             );
         }
+        let request_timeout = Duration::from_secs(config.request_timeout_seconds.max(1));
         let client = crate::egress::client_builder()
             .user_agent(concat!(
                 "vibe-talk (https://github.com/rrnewton/agent-utils, ",
                 env!("CARGO_PKG_VERSION"),
                 ")"
             ))
-            .timeout(Duration::from_secs(config.request_timeout_seconds.max(1)))
+            .timeout(request_timeout)
             .build()
             .map_err(|e| {
                 ChatError::Transport(e.to_string()).with_provider(&config.provider_name)
@@ -297,6 +301,7 @@ impl HttpSlackClient {
                 .filter(|id| !id.is_empty())
                 .map(str::to_owned),
             client,
+            request_timeout,
             channel_registration: config.channel_registration,
             registered_writable: config.registered_channels_writable,
             channel_discovery: config.channel_discovery,
@@ -494,6 +499,7 @@ impl HttpSlackClient {
                         || one_try
                         || attempts >= most
                         || waited + wait > RATE_LIMIT_BUDGET
+                        || super::budget::waits_past_deadline(tokio::time::Instant::now(), wait)
                     {
                         return Err(ChatError::RateLimited(RateLimitExhausted {
                             provider: "slack",
@@ -571,8 +577,9 @@ impl HttpSlackClient {
                     return Some(refusal(*waited, wait));
                 }
                 super::budget::WhileLimiting::HoldForWrites => {
-                    let longest =
-                        super::budget::WRITE_HOLD.min(RATE_LIMIT_BUDGET.saturating_sub(*waited));
+                    let longest = super::budget::WRITE_HOLD
+                        .min(RATE_LIMIT_BUDGET.saturating_sub(*waited))
+                        .min(super::budget::left_of_deadline(now).unwrap_or(Duration::MAX));
                     *waited += self.hold_for_writes(longest).await;
                 }
             }
@@ -593,6 +600,7 @@ impl HttpSlackClient {
             if priority == super::budget::Priority::Crawl
                 || patience == Patience::BestEffort
                 || *waited + wait > RATE_LIMIT_BUDGET
+                || super::budget::waits_past_deadline(now, wait)
             {
                 return Some(refusal(*waited, wait));
             }
@@ -628,6 +636,7 @@ impl HttpSlackClient {
             if priority <= super::budget::Priority::Page
                 || patience == Patience::BestEffort
                 || *waited + wait > RATE_LIMIT_BUDGET
+                || super::budget::waits_past_deadline(tokio::time::Instant::now(), wait)
             {
                 return Some(refusal(*waited, wait));
             }

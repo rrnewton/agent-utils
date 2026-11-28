@@ -774,27 +774,52 @@ async fn the_flat_view_merges_replies_of_the_roots_on_the_page_and_states_its_bo
     assert_eq!(quiet.notice, None, "no bound applied, so none is stated");
 }
 
-/// `#2433 slack-timeline-budget-drops-reads`: a Flat read still waiting on one thread's
-/// replies when its time budget runs out fails as a transient error, like a request that
-/// timed out, so the cache stands in and the read is retried. It used to fail as a
-/// refusal, which the server keeps as the view's next answer: an HTTP 400 to the page.
+/// `#2433 slack-timeline-budget-drops-reads`: six threads, each with replies, the most recently
+/// active rooted last: `(roots newest activity first, fixture)`.
+fn six_threads() -> (Vec<String>, FakeState) {
+    let mut state = FakeState::default();
+    let mut list = Vec::new();
+    let mut roots = Vec::new();
+    for n in 0..6_i64 {
+        let root_ts = ts(10 + n, 0);
+        let mut root = profiled(&root_ts, "UADA00001", "Ada", &format!("root {n}"));
+        thread(
+            &mut state,
+            CH,
+            &mut root,
+            &[(ts(1_000 + 100 * n, 0), format!("reply in thread {n}"))],
+        );
+        list.push(root);
+        roots.push(root_ts);
+    }
+    state.history.insert(CH.to_owned(), list);
+    roots.reverse();
+    (roots, state)
+}
+
+/// `#2433 slack-timeline-budget-drops-reads`, the reproduction: a Flat read whose first four
+/// thread reads are all still in flight when its 90 s budget runs out. The budget used to
+/// cancel the read: the four requests in flight were dropped (the transport in front of Slack
+/// then wrote into closed connections), the page built so far was thrown away, and the read
+/// failed. Now every request already sent runs to its answer, no thread read begins past the
+/// budget, and the read answers with the four threads it read and the other two owed.
 ///
-/// The held thread does not answer until the end, so the budget is what ends the read at
-/// any host load. The clock is paused only once that request is in flight, and from then
-/// advances only while nothing else can run.
+/// The gate holds the four requests until the test opens it, so the budget runs out with them in
+/// flight at any host load; the clock is paused only to step it past the budget.
 #[tokio::test]
-async fn a_timeline_that_outruns_its_time_budget_fails_transient_not_refused() {
-    let (state, [_, busy, _]) = three_threads();
+async fn a_flat_read_that_reaches_its_budget_mid_batch_keeps_what_it_read_and_owes_the_rest() {
+    let (roots, state) = six_threads();
     let fake = Fake::start(state, 20).await;
-    let hold = slack_fake::Hold::new(&busy);
-    fake.with(|state| state.hold_replies = Some(hold.clone()));
-    // A per-request timeout far past the budget, so the budget, not the request, ends it.
+    let gate = slack_fake::ReplyGate::new();
+    fake.with(|state| state.replies_gate = Some(gate.clone()));
+    let profile = vibe_talk::upstream_profile::UpstreamProfile::new().provider("slack", "Slack");
     let client = std::sync::Arc::new(
         HttpSlackClient::new(&vibe_talk::slack::SlackConfig {
             request_timeout_seconds: 3_600,
             ..fake.config()
         })
-        .expect("client"),
+        .expect("client")
+        .with_shim_profile(std::sync::Arc::clone(&profile)),
     );
     let reading = {
         let client = std::sync::Arc::clone(&client);
@@ -804,20 +829,61 @@ async fn a_timeline_that_outruns_its_time_budget_fails_transient_not_refused() {
                 .await
         })
     };
-    // Hang backstop only: the held request arrives as soon as the history read answers.
-    tokio::time::timeout(Duration::from_secs(60), hold.arrived.notified())
-        .await
-        .expect("the held thread's replies request reached the fake");
+    // Hang backstop only: a Flat read reads four threads at once.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while gate.arrived() < 4 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the first four thread reads reached the fake");
     tokio::time::pause();
-    let error = reading
+    tokio::time::advance(Duration::from_secs(91)).await;
+    tokio::time::resume();
+    gate.open();
+    let page = tokio::time::timeout(Duration::from_secs(60), reading)
         .await
+        .expect("the read ended")
         .expect("the read ran")
-        .expect_err("the held thread outlasts the budget");
-    hold.release.notify_one();
+        .expect("the read answers with what it has, not an error");
+    let said: Vec<&str> = page
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect();
+    for n in [5, 4, 3, 2] {
+        let reply = format!("reply in thread {n}");
+        assert!(said.contains(&reply.as_str()), "{reply}: {said:?}");
+    }
+    for n in [1, 0] {
+        let reply = format!("reply in thread {n}");
+        assert!(
+            !said.contains(&reply.as_str()),
+            "{reply} was read past the budget"
+        );
+    }
+    let owed: Vec<String> = page.owed_threads.iter().map(|id| id.0.clone()).collect();
+    let expected: Vec<String> = roots[4..].iter().map(|root| mid(root).0).collect();
+    assert_eq!(owed, expected, "the two threads not begun are owed");
+    assert!(page.notice.is_some(), "the page says threads were left out");
+    assert_eq!(gate.arrived(), 4, "no thread read began past the budget");
+    let report = profile.report();
     assert!(
-        !matches!(error.cause(), ChatError::Refused(_)),
-        "a budget expiry is no refusal: {error}"
+        report
+            .shim_calls
+            .iter()
+            .all(|call| call.outcome != vibe_talk::upstream_profile::Outcome::Abandoned),
+        "a request in flight was abandoned: {:?}",
+        report.shim_calls
     );
+}
+
+/// `#2433`: a timeline budget expiry is transient, like a request that timed out, never a
+/// refusal the server keeps as the view's next answer.
+#[test]
+fn a_time_budget_expiry_is_transient_not_refused() {
+    let error = ChatError::time_budget_spent("the timeline");
+    assert!(!matches!(error.cause(), ChatError::Refused(_)), "{error}");
     assert!(
         matches!(error.cause(), ChatError::Transport(detail) if detail.contains("time budget")),
         "{error}"

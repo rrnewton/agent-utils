@@ -110,6 +110,57 @@ pub fn is_write(method: &str) -> bool {
     WRITE_METHODS.contains(&method)
 }
 
+tokio::task_local! {
+    /// When the read being made stops waiting for room: its time budget. `#2433
+    /// slack-timeline-budget-drops-reads`; see [`within`].
+    static READ_DEADLINE: Instant;
+}
+
+/// Run `work` as one read with a time budget ending at `deadline` (`#2433
+/// slack-timeline-budget-drops-reads`).
+///
+/// Time spent waiting for room (this server's ceiling, a `Retry-After`) is the budget's to
+/// spend: a request whose wait would end past the deadline is refused at once, without being
+/// sent, as a rate limit (so a Flat read leaves that thread, and the ones after it, owed to the
+/// next read), and a Flat read starts no costly thread read once the deadline has passed. A
+/// request already sent always runs to its answer. So the budget ends a read by what it does
+/// next, never by cancelling a request in flight, which used to throw away the whole page and
+/// leave the transport in front of Slack writing into a closed connection.
+///
+/// A deadline already in force (the outer read of a catch-up that reads several pages) is kept
+/// when it is earlier.
+pub(super) async fn within<F: std::future::Future>(deadline: Instant, work: F) -> F::Output {
+    let deadline = READ_DEADLINE
+        .try_with(|outer| (*outer).min(deadline))
+        .unwrap_or(deadline);
+    READ_DEADLINE.scope(deadline, work).await
+}
+
+/// Whether waiting `wait` from `now` would end past the deadline of the read being made
+/// ([`within`]); never, outside one.
+#[must_use]
+pub(super) fn waits_past_deadline(now: Instant, wait: Duration) -> bool {
+    READ_DEADLINE
+        .try_with(|deadline| now + wait > *deadline)
+        .unwrap_or(false)
+}
+
+/// Whether the deadline of the read being made ([`within`]) has passed; never, outside one.
+#[must_use]
+pub(super) fn past_deadline(now: Instant) -> bool {
+    READ_DEADLINE
+        .try_with(|deadline| now >= *deadline)
+        .unwrap_or(false)
+}
+
+/// How long is left of the deadline of the read being made ([`within`]), if it has one.
+#[must_use]
+pub(super) fn left_of_deadline(now: Instant) -> Option<Duration> {
+    READ_DEADLINE
+        .try_with(|deadline| deadline.saturating_duration_since(now))
+        .ok()
+}
+
 /// Whether a read of `method` gives way to writes while the provider is limiting
 /// ([`while_limiting`]).
 #[must_use]

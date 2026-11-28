@@ -103,6 +103,9 @@ pub struct FakeState {
     pub fail_posts: Vec<usize>,
     /// Answer the next `conversations.replies` request for one thread late: see [`Hold`].
     pub hold_replies: Option<Hold>,
+    /// Hold EVERY `conversations.replies` request until the gate opens: see [`ReplyGate`].
+    /// `#2433 slack-timeline-budget-drops-reads`.
+    pub replies_gate: Option<ReplyGate>,
     /// Answer the next `conversations.history` request for one conversation late: see [`Hold`],
     /// whose `thread` names the conversation here. `#2264 vibe-talk-all-view-older-load-stuck`.
     pub hold_history: Option<Hold>,
@@ -165,6 +168,48 @@ impl Hold {
     }
 }
 
+/// Every `conversations.replies` request held until the test opens the gate, so a whole batch of
+/// thread reads is in flight at once while the test moves the clock. Each request counts itself
+/// as it arrives; its answer is computed from the state once the gate opens.
+#[derive(Clone)]
+pub struct ReplyGate {
+    arrived: Arc<std::sync::atomic::AtomicUsize>,
+    open: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Default for ReplyGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReplyGate {
+    /// A closed gate.
+    pub fn new() -> Self {
+        Self {
+            arrived: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            open: Arc::new(tokio::sync::watch::channel(false).0),
+        }
+    }
+
+    /// How many replies requests have reached the gate.
+    pub fn arrived(&self) -> usize {
+        self.arrived.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Let every held request, and every later one, through.
+    pub fn open(&self) {
+        self.open.send_replace(true);
+    }
+
+    async fn pass(&self) {
+        let mut open = self.open.subscribe();
+        self.arrived
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = open.wait_for(|open| *open).await;
+    }
+}
+
 impl FakeState {
     fn count(&mut self, method: &str) {
         *self.calls.entry(method.to_owned()).or_default() += 1;
@@ -194,6 +239,12 @@ impl Fake {
             let shared = Arc::clone(&shared);
             async move {
                 let hold = take_hold(&shared, &uri, &body);
+                let gate = (uri.path().trim_start_matches("/api/") == "conversations.replies")
+                    .then(|| shared.lock().expect("state").replies_gate.clone())
+                    .flatten();
+                if let Some(gate) = gate {
+                    gate.pass().await;
+                }
                 let delay = shared.lock().expect("state").delay;
                 if let Some(delay) = delay {
                     tokio::time::sleep(delay).await;
