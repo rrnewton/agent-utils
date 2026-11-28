@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 from pathlib import Path
 from typing import cast
@@ -177,8 +178,10 @@ def _own_fs(tmp_path: Path) -> Iterator[Path]:
             "no distinct-device fixture filesystem available: census tests "
             "need e.g. /dev/shm on a different device than the pytest tmp dir"
         )
-    base = shm / f"wrkslots-remove-{os.getpid()}-{tmp_path.name}"
-    base.mkdir(parents=True, exist_ok=True)
+    # Unique by exclusive creation: /dev/shm is host-wide, and inside the gate's PID namespace
+    # every shard's pytest has the same small pid, so a pid-and-test-name base was shared by the
+    # same test in two concurrent gates, and one run's cleanup deleted the other's fixture.
+    base = Path(tempfile.mkdtemp(prefix=f"wrkslots-remove-{tmp_path.name}-", dir=shm))
     try:
         yield base
     finally:

@@ -16,6 +16,7 @@ import errno
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -108,8 +109,9 @@ def test_fresh_use_ignores_unreadable_foreign_descriptor(
     shm = Path("/dev/shm")
     if not shm.is_dir() or os.stat(shm).st_dev == os.stat(tmp_path).st_dev:
         pytest.skip("no second filesystem device available")
-    slot = shm / f"wrkslots-census-slot-{os.getpid()}"
-    slot.mkdir()
+    # Unique by exclusive creation: in the gate's PID namespace every shard's pytest has the
+    # same small pid, and /dev/shm is host-wide, so a pid-named slot could be another gate's.
+    slot = Path(tempfile.mkdtemp(prefix="wrkslots-census-slot-", dir=shm))
     outside = tmp_path / "outside.txt"
     outside.write_text("x\n")
     holder = _holder(outside)
