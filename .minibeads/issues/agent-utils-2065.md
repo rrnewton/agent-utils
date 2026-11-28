@@ -8,7 +8,7 @@ labels:
 - agentctl
 - testing
 created_at: 2026-11-21T12:45:00-05:00
-updated_at: 2026-11-28T07:14:00-05:00
+updated_at: 2026-11-28T07:42:00-05:00
 ---
 
 # Description
@@ -116,6 +116,15 @@ The holder scan's 600 s timeouts in the two image unmount tests are the #2372 su
 - **Test fix, not a mark.** `test_eden_restart.py::test_hung_daemon_times_out_and_the_other_slot_still_restarts` patched both eden timeouts to 0.5 s, so the healthy slot's start was refused inside a gate's host shard. Both timeouts are now 10 s: the hung fake sleeps 30 s and still times out by name. Alone 5 of 5 at load1 215-261.
 - **Landed (2026-11-28).** Step A', its follow-ups and option B' as f58a74e0 (8d6c7421..f58a74e0, seven commits). The gate on the source head 54b0854a (1795865238081247654-6865f313) had all 30 wrkslots and lifecycle steps green. 28 sessions reported 94,442 git calls in their own namespace, none fell back. Four off-path reds were waived (liaison 1171): `rust.agentctl.test` (#2381, console refused under the lane's harness), `rust.merge-queue.test` (CPU cap), `vibe-talk.check.discuss-browser` (#2175 known-red) and `vibe-talk.check.thread-reader-resume-browser`.
   - Still open against the acceptance criteria: the 281 host-identity cases read the live host process table in the host shards, and the load quarantines above remain until hermetic versions exist (the fixture proc root of #2434, a controlled inventory for the census cases). The product side of the helper race is #2418.
+- **C1, out of quarantine (2026-11-28).** Fifteen namespaced cases leave the load quarantine. Each was quarantined for the host census or host churn, which the namespaced shards remove. Evidence: inside the gate's own wrapper (`with-private-tmp --host-temp` plus the user/PID namespace), quarantine opted in, with the session git stand-in, 18 cases passed 5 of 5 rounds at load1 141-187 (about 7,550 git calls a round, none fell back).
+  - 13 by mark only: `test_batch_lock_scope` x2, `test_dead_fuse_entry` x2, `test_journal_actor_liveness::test_remove_waits_for_a_live_finish_journal_then_proceeds`, `test_remove_fenced_lock_scope` x6, `test_census_late_fork::test_naming_matches_read_argv_and_environ_from_proc`, `test_audit_state_rust::test_audit_size_unknown_text_matches_python`.
+  - 2 with a test fix (owner rule 346): `test_lifecycle.py::test_validate_batch_census_deadline_restores_seals_before_outer_bound` now checks census-call order and the outcome instead of an 8 s wall-clock rollback reserve. `test_journal_actor_liveness::test_wait_lock_waits_for_a_live_journal_then_proceeds` waits for the adopt's verdict on an event, with a 900 s hang backstop past the adopt's own 300 s `--wait-lock` bound, instead of a 300 s join.
+  - Held, pending the coordinator: `test_shared_submodules.py` x2. They passed 5 of 5 too, but their cause is the product's per-item remove budget (below) spent in salvage git work under load, not the census.
+  - Still quarantined: the 14 host-shard cases that need the initial user namespace, and `test_worktrees_image.py::test_unmount_busy_clears_on_a_bounded_retry` (#2434).
+- **The "60 s budget" in the quarantine reasons is a product budget.** `_AGENT_REMOVE_BATCH_ITEM_SECONDS = 60.0` (`py/wrkslots/cli.py`, next to its rationale) bounds how long one remove-agent-batch item holds the registry lock before its first deletion. Other clients wait for that lock with finite bounds (a heartbeat waits 110 s). Ordinary remove of an agent slot runs as a batch of one, so it has the budget too.
+  - It grows 15 s per nested submodule, up to 600 s. Each /proc scan inside it gets 30 s plus 10 s per 1,000 processes, held to what is left of the item budget.
+  - When it runs out, the item is refused ("this remove-agent-batch item used its N-second budget for work ...") and the slot is kept.
+  - So on a busy host a real remove can refuse here: a host-wide census at load about 250 is what spends it. It fails safe, but it is a wall-clock product bound. Whether it should count CPU or retry is a product question, not a test one.
 - **Coverage.** Removal-path coverage for the quarantined set now rests on #2392's new tests and on this on-demand set. The 9 `test_remove_write_rust.py` Rust/Python remove differentials are back in the namespaced shards with the git stand-in (next note); #2418 stays the product fix.
 - **Git stand-in, option B' (2026-11-28, coordinator's approval).** The wrkslots tests put a git stand-in first on PATH for the session (`py/wrkslots/tests/git_stand_in.c` and `git_stand_in.py`, wired in the conftest).
   - The stand-in runs the real git in its own unprivileged user and PID namespace under a small init. When git exits, the kernel kills whatever git left behind (the host wrapper's helper) before the call returns. No privilege beyond unprivileged user namespaces; plain git where they are refused, counted in the session summary.
