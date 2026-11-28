@@ -494,6 +494,9 @@ through the ledger as usual.
   under the key `<id>-rest-<k>`: `· warning: late parts 3-4 of 4 of <id>;
   all 4 parts now verified; the whole body matches its signed hash;
   reconfirm before acting`.
+- A part post is never rendered as if it were an envelope: before assembly
+  it is held, and when delivered at all it is UNVERIFIED, under its own key
+  (`unverified-...`), with no proof line and no reply command.
 - **Delivered on its own as UNVERIFIED**, never dropped, with no proof line
   and the tag naming only the relay bot that posted it:
   - a part that does not match its signed hash;

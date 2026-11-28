@@ -155,10 +155,21 @@ So no check in the relay or the chat bridges may lose or delay a message unless 
     whole-body verdict. Orphans after 24 h are delivered as UNVERIFIED.
   - Rollout (lead-014 point 4): new receivers on every host first, each proven by
     chunked messages to and from it (1, 2 and 3 parts, a missing part, a forged
-    part). Only then chunk_posts ON. The receivers on devbig030 and devbig176
+    part). Only then chunk_posts ON. The receivers on the other two hosts
     belong to their hosts' coordinators: their rollout note goes to them through
     coordb and lead-014 before anyone touches their serve.
   - Older receivers: a build with part A delivers part 1 with a body-hash warning
     (unit test: sig and sig2 verify, and the first post is only a body mismatch).
     Part posts are delivered as unparseable with R1, else quarantined with an
     alarm.
+  - Receivers to upgrade before chunk_posts goes ON (coordb, 2026-11-27): the
+    agent-teams binary each host's relay-in actually runs. One host has no serve
+    of its own: the lead host's serve invokes that host's installed agent-teams,
+    currently 5c78da37, which predates part A and would quarantine a chunked
+    part 1. The round-trip proof must run through that same invocation path. The
+    third host's answer is pending.
+  - Top-level part posts (lead-014 OK): a part post is never rendered as a
+    standalone envelope. Before assembly it is held. When delivered at all (an
+    orphan, a forgery) it is UNVERIFIED, under its own key, with no proof line
+    and no reply command. Test:
+    a_lone_part_post_is_never_rendered_as_a_standalone_envelope.

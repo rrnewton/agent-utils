@@ -3949,3 +3949,75 @@ fn the_total_assembly_bound_delivers_the_arriving_posters_own_message_early_neve
         .iter()
         .any(|text| text.contains("late parts")));
 }
+
+#[test]
+fn a_lone_part_post_is_never_rendered_as_a_standalone_envelope() {
+    // lead-014 (#2420 R12, top-level part posts): before assembly a part post is held, never
+    // delivered as if it were an envelope; when it is delivered at all (an orphan after 24 hours),
+    // it is UNVERIFIED, under its own key, with no proof line.
+    let world = World::new();
+    world.init_tools(&format!("relay-coord:{CHAN}:{BOT1}=sim@host-a"));
+    world.ensure_signing_key("sim");
+    world.write_chunked_route();
+    let (id, posts) = world.send_in_parts(&numbered_body(5_000), "lone-part");
+    let lone = &posts[1];
+    // Nothing in the part post parses as an envelope.
+    assert!(matches!(
+        agent_teams::relay::parse_post(lone),
+        Ok(agent_teams::relay::RelayPost::BodyPart(_))
+    ));
+    let outcome = world.relay_in(BOT1, lone);
+    assert_eq!(outcome["outcome"], "part-held", "{outcome}");
+    assert!(
+        outcome["receipt_text"].is_null(),
+        "no receipt for a lone part: {outcome}"
+    );
+    assert!(
+        world.hook_inbox_texts("tools").is_empty(),
+        "nothing rendered"
+    );
+    assert!(
+        !world.ledger_has("tools", &id),
+        "no ledger entry for the message"
+    );
+    // From a poster that is not confirmed: quarantined, never rendered.
+    // From a poster that is not confirmed: quarantined with the usual stranger alarm, its text
+    // never rendered.
+    let outcome = world.relay_in(STRANGER, lone);
+    assert_eq!(outcome["outcome"], "not-recorded", "{outcome}");
+    let not_alarms = |texts: Vec<String>| -> Vec<String> {
+        texts
+            .into_iter()
+            .filter(|text| !text.starts_with("[stranger alarm:"))
+            .collect()
+    };
+    assert!(not_alarms(world.hook_inbox_texts("tools")).is_empty());
+    assert!(
+        world
+            .hook_inbox_texts("tools")
+            .iter()
+            .all(|text| !text.contains("of a long report") && !text.contains(&id)),
+        "the part's text and ID are never rendered"
+    );
+    // A day later the orphan is delivered once, UNVERIFIED, never as the message.
+    world.age_assembly(&id, 25 * 3_600_000);
+    world.run(&["pump"]);
+    let delivered = not_alarms(world.hook_inbox_texts("tools"));
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    let first = delivered[0].lines().next().unwrap_or_default();
+    assert!(
+        first.contains("· warning: UNVERIFIED: orphan body part 2 of "),
+        "{first}"
+    );
+    assert!(
+        !first.contains(&format!("· id: {id}]")) && !first.contains(&format!("· id: {id} ·")),
+        "the tag never carries the message's own ID: {first}"
+    );
+    assert!(first.contains("· id: unverified-"), "{first}");
+    assert!(!delivered[0].contains("[team message:"), "no proof line");
+    assert!(
+        !delivered[0].contains("[reply: agent-teams reply"),
+        "no reply command"
+    );
+    assert!(!world.ledger_has("tools", &id));
+}
