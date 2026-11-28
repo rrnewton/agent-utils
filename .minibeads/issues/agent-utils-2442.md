@@ -9,7 +9,7 @@ labels:
 - search
 - owner-ui
 created_at: 2026-11-27T23:40:00-05:00
-updated_at: 2026-11-27T23:40:00-05:00
+updated_at: 2026-11-27T23:58:00-05:00
 ---
 
 # Description
@@ -37,3 +37,8 @@ Four defects already on main, found by the advisory design review of `#2423` sea
 
 - Filed at the coordinator's request after the liaison accepted `#2423` (follow-up of its design review; issue file only). To be fixed after `#2424`.
 - The review and its crops: the `#2423` evidence (design-review.md and crops/ of that lane's evidence).
+- Three more, from the advisory design review of `#2424` search-view-unstable-while-searching (also in the stills of the page before that change; folded in at the coordinator's request):
+  - R12: the row the place-keepers treat as the one being read (the first row below the floating panel, `floatingClearance`: the freshness pill and the search bar) can stand under the search's bucket-chips sheet, which that clearance does not count: wholly on a desk, about 94 of its 146 CSS px on a phone, after typing near the foot.
+  - R9: on a phone with Discuss open, the "Newest (N)" jump pill covers the "N in main" bucket chip.
+  - R5 and R7: on a desk the count line ("29 found (23 loaded, 6 older)") wraps to four lines beside the search bar's tools.
+  Each joins the acceptance criteria as a walk that fails on main: the row being read stands clear of the chips sheet, >= 8 px between the pill and the chips, the count line on one line (or a chip) at 1280x800.
