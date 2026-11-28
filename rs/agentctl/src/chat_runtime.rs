@@ -84,6 +84,12 @@ const MAX_IGNORED_TEXT_PREFIXES: usize = 32;
 const MAX_IGNORED_TEXT_PREFIX_BYTES: usize = 256;
 const REPLY_NONCE_BYTES: usize = 16;
 pub(crate) const MAX_REPLY_BYTES: usize = 30_000;
+/// A reply longer than this is stored as consecutive replies, each opening with `(part k/N)`,
+/// never refused (#2439 chat-never-truncate, C5). It leaves room under [`MAX_REPLY_BYTES`] for the
+/// agent label, the part line and a late tag.
+const MAX_REPLY_PART_BYTES: usize = MAX_REPLY_BYTES - 2_000;
+/// The longest reply text `chat reply` takes; it is split into parts as it is stored (#2439).
+pub(crate) const MAX_SUBMITTED_REPLY_BYTES: usize = 1_024 * 1_024;
 /// The fenced prompt's last sentence (#2386 headless-reply-in-thinking): a block the agent writes
 /// only in its thinking reaches no transcript, event log or screen, so the bridge cannot capture
 /// it. The reply reminder says the same after the fact (#292).
@@ -13715,7 +13721,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             ));
         }
         let body = body.trim_end_matches(['\r', '\n']);
-        validate_reply_body(body)?;
+        validate_submitted_reply_body(body)?;
         // Such a line would end or start a block wherever the text is shown in the pane.
         if body
             .lines()
@@ -13786,7 +13792,11 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         }
         let (ordinal, already_stored) = match capture.ordinals.first() {
             Some(ordinal) => (*ordinal, false),
-            None => (self.stored_ordinal_locked(key, body)?, true),
+            // A reply stored in parts is found by its first part (#2439).
+            None => (
+                self.stored_ordinal_locked(key, &split_reply_body(body)[0])?,
+                true,
+            ),
         };
         let phase = reply_phase_name(&self.read_reply(key, ordinal)?.phase);
         Ok(ReplyStoreOutcome::Stored(StoredReply {
@@ -14748,7 +14758,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         // the transcript holds is about to be stored.
         let mut stored_bodies: Option<Vec<String>> = None;
 
-        for block in blocks {
+        'blocks: for block in blocks {
             let identity = ReplyIdentity::of(&block.body);
             let refusal = |reason: &dyn fmt::Display| {
                 ReplyRefusal::new(&block.identifier, &block.body, reason)
@@ -14852,84 +14862,102 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                     screen_table_warning = true;
                 }
             }
-            if expected > MAX_REPLY_ORDINAL {
-                refused.push(refusal(&"reply ordinal space is exhausted"));
-                continue;
-            }
-            if request.reply_count >= MAX_REQUEST_REPLIES {
-                refused.push(refusal(&"request reply count limit reached"));
-                continue;
-            }
-            if let Err(error) = validate_outbound_body(&self.config.agent_label, body) {
-                refused.push(refusal(&error));
-                continue;
-            }
-            let stored_body = if screen_table_warning {
-                format!("{SCREEN_TABLE_WARNING}\n{body}")
-            } else {
-                body.clone()
-            };
-            let reply = match ReplyRecord::new(key, expected, stored_body) {
-                Ok(reply) => reply,
-                Err(error) => {
-                    refused.push(refusal(&error));
-                    continue;
-                }
-            };
-            let path = self.reply_path(key, expected);
-            let (bytes, exists) = if fs::symlink_metadata(&path).is_ok() {
-                let (saved, _actual_bytes): (ReplyRecord, u64) =
-                    read_document_sized(&path, MAX_REPLY_RECORD_BYTES)?;
-                saved.validate(key, expected)?;
-                if saved.body != reply.body {
-                    return Err(ChatRuntimeError::invalid(
-                        "existing reply ordinal contains different content",
-                    ));
-                }
-                (saved.reserved_bytes, true)
-            } else {
-                let encoded_bytes = encoded_document_bytes(&reply)?;
-                if encoded_bytes > MAX_REPLY_RECORD_BYTES {
-                    refused.push(refusal(&format!(
-                        "reply record exceeds {MAX_REPLY_RECORD_BYTES} bytes"
-                    )));
-                    continue;
-                }
-                (reply.reserved_bytes, false)
-            };
-            let next_request_bytes = request.reply_bytes.saturating_add(bytes);
-            let next_state_count = checkpoint.reply_count.saturating_add(1);
-            let next_state_bytes = checkpoint.reply_bytes.saturating_add(bytes);
-            if next_request_bytes > MAX_REQUEST_REPLY_BYTES
-                || next_state_count > MAX_STATE_REPLIES
-                || next_state_bytes > MAX_STATE_REPLY_BYTES
+            // A reply over the part bound is stored as consecutive parts, never refused (#2439
+            // chat-never-truncate, C5). A block captured again splits the same way, so its first
+            // part already stored means the whole block is.
+            let parts = split_reply_body(body);
+            if parts.len() > 1
+                && known
+                    .find(self, key, &ReplyIdentity::of(&parts[0]))?
+                    .is_some()
             {
-                refused.push(refusal(&"chat reply population limit reached"));
                 continue;
             }
-            if !exists {
-                unwritten.push((path, reply));
-            }
-            request.reply_count = request.reply_count.saturating_add(1);
-            if request.reply_count == 1 && request.latency_folded_at.is_none() {
-                // Mark the in-memory record the capture path writes last;
-                // the summary folds after the final writes below.
-                request.latency_folded_at = Some(unix_millis());
-                if request.turn_timing.is_none() {
-                    request.turn_timing = Some(self.turn_timing_now(&request, unix_millis()));
+            for part in &parts {
+                if expected > MAX_REPLY_ORDINAL {
+                    refused.push(refusal(&"reply ordinal space is exhausted"));
+                    continue 'blocks;
                 }
-                latency_first_reply = Some(request.clone());
+                if request.reply_count >= MAX_REQUEST_REPLIES {
+                    refused.push(refusal(&"request reply count limit reached"));
+                    continue 'blocks;
+                }
+                if let Err(error) = validate_outbound_body(&self.config.agent_label, part) {
+                    refused.push(refusal(&error));
+                    continue 'blocks;
+                }
+                let stored_body = if screen_table_warning {
+                    format!("{SCREEN_TABLE_WARNING}\n{part}")
+                } else {
+                    part.clone()
+                };
+                let reply = match ReplyRecord::new(key, expected, stored_body) {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        refused.push(refusal(&error));
+                        continue 'blocks;
+                    }
+                };
+                let path = self.reply_path(key, expected);
+                let (bytes, exists) = if fs::symlink_metadata(&path).is_ok() {
+                    let (saved, _actual_bytes): (ReplyRecord, u64) =
+                        read_document_sized(&path, MAX_REPLY_RECORD_BYTES)?;
+                    saved.validate(key, expected)?;
+                    if saved.body != reply.body {
+                        return Err(ChatRuntimeError::invalid(
+                            "existing reply ordinal contains different content",
+                        ));
+                    }
+                    (saved.reserved_bytes, true)
+                } else {
+                    let encoded_bytes = encoded_document_bytes(&reply)?;
+                    if encoded_bytes > MAX_REPLY_RECORD_BYTES {
+                        refused.push(refusal(&format!(
+                            "reply record exceeds {MAX_REPLY_RECORD_BYTES} bytes"
+                        )));
+                        continue 'blocks;
+                    }
+                    (reply.reserved_bytes, false)
+                };
+                let next_request_bytes = request.reply_bytes.saturating_add(bytes);
+                let next_state_count = checkpoint.reply_count.saturating_add(1);
+                let next_state_bytes = checkpoint.reply_bytes.saturating_add(bytes);
+                if next_request_bytes > MAX_REQUEST_REPLY_BYTES
+                    || next_state_count > MAX_STATE_REPLIES
+                    || next_state_bytes > MAX_STATE_REPLY_BYTES
+                {
+                    refused.push(refusal(&"chat reply population limit reached"));
+                    continue 'blocks;
+                }
+                if !exists {
+                    unwritten.push((path, reply));
+                }
+                request.reply_count = request.reply_count.saturating_add(1);
+                if request.reply_count == 1 && request.latency_folded_at.is_none() {
+                    // Mark the in-memory record the capture path writes last;
+                    // the summary folds after the final writes below.
+                    request.latency_folded_at = Some(unix_millis());
+                    if request.turn_timing.is_none() {
+                        request.turn_timing = Some(self.turn_timing_now(&request, unix_millis()));
+                    }
+                    latency_first_reply = Some(request.clone());
+                }
+                request.reply_bytes = next_request_bytes;
+                checkpoint.reply_count = next_state_count;
+                checkpoint.reply_bytes = next_state_bytes;
+                if from_transcript {
+                    transcript_ordinals.push(expected);
+                }
+                if parts.len() > 1 {
+                    known.insert(ReplyIdentity::of(part));
+                }
+                captured.push(expected);
+                expected = expected.saturating_add(1);
             }
-            request.reply_bytes = next_request_bytes;
-            checkpoint.reply_count = next_state_count;
-            checkpoint.reply_bytes = next_state_bytes;
             known.insert(identity);
             if from_transcript {
                 known.insert(ReplyIdentity::of(body));
-                transcript_ordinals.push(expected);
             }
-            captured.push(expected);
-            expected = expected.saturating_add(1);
         }
 
         if !captured.is_empty() {
@@ -18486,6 +18514,89 @@ pub(crate) fn valid_key(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// `body` as the replies it is stored as (#2439 chat-never-truncate, C5): itself when it fits
+/// [`MAX_REPLY_PART_BYTES`], else consecutive parts, each opening with `(part k/N)` on a line of
+/// its own. Cuts fall at line ends; a line longer than a part is cut at a character boundary. A
+/// cut inside a code fence closes the fence at the end of its part and opens it again, with the
+/// same opening line, at the start of the next, so every part renders on its own. The same text
+/// always splits the same way, so a block captured again matches the parts already stored.
+fn split_reply_body(body: &str) -> Vec<String> {
+    if body.len() <= MAX_REPLY_PART_BYTES {
+        return vec![body.to_owned()];
+    }
+    // Room for the part line and a closing fence.
+    let limit = MAX_REPLY_PART_BYTES - 200;
+    let mut pieces: Vec<(&str, bool)> = Vec::new();
+    for line in body.split_inclusive('\n') {
+        let mut rest = line;
+        let mut first = true;
+        while rest.len() > limit {
+            let mut cut = limit;
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            pieces.push((&rest[..cut], first));
+            first = false;
+            rest = &rest[cut..];
+        }
+        pieces.push((rest, first));
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut fence: Option<String> = None;
+    for (piece, starts_line) in pieces {
+        if !current.is_empty() && current.len() + piece.len() > limit {
+            let mut done = std::mem::take(&mut current);
+            if let Some(opener) = &fence {
+                if !done.ends_with('\n') {
+                    done.push('\n');
+                }
+                done.push_str("```\n");
+                current = format!("{opener}\n");
+            }
+            chunks.push(done);
+        }
+        current.push_str(piece);
+        if starts_line && piece.trim_start().starts_with("```") {
+            fence = match fence {
+                Some(_) => None,
+                None => Some(piece.trim_end().to_owned()),
+            };
+        }
+    }
+    if !current.trim().is_empty() {
+        chunks.push(current);
+    }
+    let total = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            format!(
+                "(part {}/{total})\n\n{}",
+                index + 1,
+                chunk.trim_end_matches(['\r', '\n'])
+            )
+        })
+        .collect()
+}
+
+/// A reply text as `chat reply` takes it: nonempty, at most [`MAX_SUBMITTED_REPLY_BYTES`], no
+/// terminal control characters. A text over [`MAX_REPLY_BYTES`] is stored in parts.
+fn validate_submitted_reply_body(body: &str) -> Result<()> {
+    if body.trim().is_empty() || body.len() > MAX_SUBMITTED_REPLY_BYTES {
+        return Err(ChatRuntimeError::invalid(format!(
+            "chat reply body must be nonempty and at most {MAX_SUBMITTED_REPLY_BYTES} UTF-8 bytes"
+        )));
+    }
+    if body.chars().any(invalid_rendered_character) {
+        return Err(ChatRuntimeError::invalid(
+            "chat reply body contains terminal control characters",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_reply_body(body: &str) -> Result<()> {
@@ -29344,7 +29455,7 @@ ordinary text.\nIf you have trouble, run: "
     }
 
     #[test]
-    fn capture_reserves_agent_label_bytes_before_durable_outbox_admission() {
+    fn a_captured_reply_over_the_bound_is_stored_in_parts_never_refused() {
         let root = temporary("labelled-reply-bound");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let admission = state
@@ -29352,45 +29463,59 @@ ordinary text.\nIf you have trouble, run: "
             .expect("admit request");
         let key = &admission.new_request_keys[0];
         let nonce = state.read_request(key).expect("request").reply_nonce;
+        // A block over the bound was refused (#2439 chat-never-truncate, C5): it is stored as
+        // consecutive replies, each opening with `(part k/N)`, which together hold the whole text.
         let oversized = "x".repeat(MAX_REPLY_BYTES);
-        // An oversized block is refused, not stored, and the capture itself still succeeds.
-        let refused = state
+        let stored = state
             .capture_replies(
                 key,
                 &format!("<CHAT_REPLY_{nonce}_1>\n{oversized}\n</CHAT_REPLY_{nonce}_1>"),
             )
-            .expect("an oversized block is refused without failing the capture");
-        assert!(refused.ordinals.is_empty());
-        assert_eq!(refused.refused.len(), 1);
-        assert_eq!(refused.refused[0].identifier, format!("{nonce}_1"));
-        assert!(
-            refused.refused[0]
-                .reason
-                .contains("agent-labelled chat reply"),
-            "label prefix must count toward transport bound: {}",
-            refused.refused[0]
-        );
+            .expect("an oversized block is stored in parts");
+        assert!(stored.refused.is_empty(), "{:?}", stored.refused);
+        assert_eq!(stored.ordinals, vec![1, 2]);
+        let first = state.read_reply(key, 1).expect("part 1").body;
+        let second = state.read_reply(key, 2).expect("part 2").body;
+        assert!(first.starts_with("(part 1/2)\n\n"), "{}", &first[..20]);
+        assert!(second.starts_with("(part 2/2)\n\n"), "{}", &second[..20]);
+        let joined: String = [first, second]
+            .iter()
+            .map(|part| {
+                part.split_once("\n\n")
+                    .map(|(_, text)| text)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(joined, oversized, "the parts hold the whole text");
+        // Each part fits the transport bound with the agent label before it.
+        for ordinal in [1, 2] {
+            let body = state.read_reply(key, ordinal).expect("part").body;
+            assert!(outbound_text("codex coordinator", &body).len() <= MAX_REPLY_BYTES);
+        }
+        // The same block captured again is the same parts: nothing is stored twice.
+        let again = state
+            .capture_replies(
+                key,
+                &format!("<CHAT_REPLY_{nonce}_1>\n{oversized}\n</CHAT_REPLY_{nonce}_1>"),
+            )
+            .expect("recapture");
+        assert!(again.ordinals.is_empty(), "{:?}", again.ordinals);
         assert_eq!(
             state.read_request(key).expect("request").next_reply_ordinal,
-            1
+            3
         );
-        assert!(state.read_reply(key, 1).is_err());
-
-        let prefix = "[codex coordinator] ";
-        let maximum = "y".repeat(MAX_REPLY_BYTES - prefix.len());
-        assert_eq!(
-            outbound_text("codex coordinator", &maximum).len(),
-            MAX_REPLY_BYTES
-        );
+        // A block that fits the part bound is stored whole, label and all.
+        let fits = "y".repeat(MAX_REPLY_PART_BYTES);
         assert_eq!(
             state
                 .capture_replies(
                     key,
-                    &format!("<CHAT_REPLY_{nonce}_1>\n{maximum}\n</CHAT_REPLY_{nonce}_1>"),
+                    &format!("<CHAT_REPLY_{nonce}_2>\n{fits}\n</CHAT_REPLY_{nonce}_2>"),
                 )
-                .expect("maximum labelled reply")
+                .expect("a block at the part bound")
                 .ordinals,
-            vec![1]
+            vec![3]
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -44399,14 +44524,56 @@ is unknown\n"
     }
 
     #[test]
+    fn a_long_reply_splits_at_line_ends_and_keeps_each_code_fence_balanced() {
+        let mut body = String::from("Intro line\n```rust\n");
+        while body.len() < MAX_REPLY_PART_BYTES * 2 {
+            body.push_str("let value = compute_something_long(argument_one, argument_two);\n");
+        }
+        body.push_str("```\nOutro line");
+        let parts = split_reply_body(&body);
+        assert!(parts.len() >= 3, "{}", parts.len());
+        for (index, part) in parts.iter().enumerate() {
+            assert!(
+                part.len() <= MAX_REPLY_PART_BYTES,
+                "part {index}: {}",
+                part.len()
+            );
+            assert!(
+                part.starts_with(&format!("(part {}/{}){}", index + 1, parts.len(), "\n\n")),
+                "{}",
+                &part[..20]
+            );
+            let fences = part
+                .lines()
+                .filter(|line| line.trim_start().starts_with("```"))
+                .count();
+            assert_eq!(fences % 2, 0, "part {index} opens and closes its fences");
+            assert!(
+                part.lines().all(|line| line.is_empty()
+                    || line.starts_with("(part ")
+                    || line == "Intro line"
+                    || line == "Outro line"
+                    || line.starts_with("```")
+                    || line == "let value = compute_something_long(argument_one, argument_two);"),
+                "cuts fall at line ends"
+            );
+        }
+        assert_eq!(
+            split_reply_body(&body),
+            parts,
+            "the same text splits the same way"
+        );
+        assert_eq!(split_reply_body("short"), vec!["short".to_owned()]);
+    }
+
+    #[test]
     fn a_refused_reply_command_stores_nothing() {
         let (state, key, nonce, root) = open_request("reply-command-refusals");
         let id = format!("{nonce}_1");
-        let oversize = "x".repeat(MAX_REPLY_BYTES + 1);
-        // As for a capture, the agent label that the service puts before a reply counts toward
-        // the bound, so the largest reply leaves room for it.
+        // Only a text past the submitted bound is refused; one over the reply bound is stored in
+        // parts (#2439).
+        let oversize = "x".repeat(MAX_SUBMITTED_REPLY_BYTES + 1);
         let largest = "x".repeat(MAX_REPLY_BYTES - "[codex coordinator] ".len());
-        let unlabelled_maximum = "x".repeat(MAX_REPLY_BYTES);
         let whole_block = format!("before\n{}after", reply_block(&id, "inside"));
         let closing = reply_block("999", "x");
         let closing_line = format!(
@@ -44414,15 +44581,14 @@ is unknown\n"
             closing.lines().last().expect("closing marker line")
         );
         for (body, reason) in [
-            ("", "must be nonempty and at most 30000 UTF-8 bytes"),
-            (" \n\r\n", "must be nonempty and at most 30000 UTF-8 bytes"),
+            ("", "must be nonempty and at most 1048576 UTF-8 bytes"),
             (
-                oversize.as_str(),
-                "must be nonempty and at most 30000 UTF-8 bytes",
+                " \n\r\n",
+                "must be nonempty and at most 1048576 UTF-8 bytes",
             ),
             (
-                unlabelled_maximum.as_str(),
-                "agent-labelled chat reply exceeds 30000 UTF-8 bytes",
+                oversize.as_str(),
+                "must be nonempty and at most 1048576 UTF-8 bytes",
             ),
             (
                 "red \u{1b}[31malert",
@@ -44481,7 +44647,18 @@ is unknown\n"
                 .expect("store the largest reply"),
             stored_reply(1, false)
         );
-        assert_eq!(state.read_reply(&key, 1).expect("reply").body, largest);
+        // Over the part bound, so it is stored in two parts that hold the whole text (#2439).
+        let parts: String = (1..=2)
+            .map(|ordinal| {
+                let body = state.read_reply(&key, ordinal).expect("part").body;
+                assert!(body.starts_with(&format!("(part {ordinal}/2)\n\n")));
+                body.split_once("\n\n")
+                    .map(|(_, text)| text)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(parts, largest);
         fs::remove_dir_all(root).expect("cleanup");
     }
 

@@ -3116,7 +3116,7 @@ impl ChatReply {
     /// one, which the store refuses.
     fn read_reply(&self) -> Result<String, Failure> {
         if self.file == Path::new("-") {
-            let maximum = crate::chat_runtime::MAX_REPLY_BYTES;
+            let maximum = crate::chat_runtime::MAX_SUBMITTED_REPLY_BYTES;
             let bytes = read_stdin_bounded(maximum, "chat reply").map_err(Failure::Usage)?;
             if bytes.len() > maximum {
                 return Err(Failure::Chat(
@@ -3131,7 +3131,7 @@ impl ChatReply {
                 Failure::Usage("standard input does not contain valid UTF-8".to_owned())
             });
         }
-        let maximum = crate::chat_runtime::MAX_REPLY_BYTES;
+        let maximum = crate::chat_runtime::MAX_SUBMITTED_REPLY_BYTES;
         let unreadable = |error: io::Error| {
             Failure::Usage(format!("cannot read {}: {error}", self.file.display()))
         };

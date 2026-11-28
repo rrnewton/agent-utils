@@ -385,12 +385,6 @@ fn chat_reply_exits_1_for_a_refused_reply_and_2_for_an_unusable_file() {
         1,
         "the reply ID is not one that this request's prompt gives",
     );
-    let unlabelled = scratch.file("unlabelled.md", "x".repeat(30_000).as_bytes());
-    assert_failed(
-        &scratch.reply_with(&scratch.reply_id, &unlabelled),
-        1,
-        "agent-labelled chat reply exceeds 30000 UTF-8 bytes",
-    );
     assert_failed(
         &scratch.reply(&[
             "--request",
@@ -430,9 +424,9 @@ fn chat_reply_exits_1_for_a_refused_reply_and_2_for_an_unusable_file() {
         ),
         (
             "long.md",
-            format!("{}\n", "x".repeat(30_000)).into_bytes(),
+            format!("{}\n", "x".repeat(1_048_577)).into_bytes(),
             1,
-            "chat reply exceeds 30000 UTF-8 bytes",
+            "chat reply exceeds 1048576 UTF-8 bytes",
         ),
         (
             "binary.md",
@@ -1148,4 +1142,26 @@ fn chat_reply_reads_standard_input_with_file_dash() {
     assert_eq!(run.stderr, "");
     let printed: Value = serde_json::from_str(&run.stdout).expect("one JSON object");
     assert_eq!(printed["outcome"], "stored");
+}
+
+#[test]
+fn chat_reply_stores_a_text_over_the_reply_bound_in_parts() {
+    // #2439 chat-never-truncate (C5): a reply over 30,000 bytes was refused; it is stored as
+    // consecutive replies, each opening with `(part k/N)`, and the command reports the first.
+    let scratch = Scratch::new("parts");
+    let long: String = (0..2_000)
+        .map(|n| format!("row {n:04} of a long answer\n"))
+        .collect();
+    assert!(long.len() > 30_000);
+    let file = scratch.file("long.md", long.as_bytes());
+    assert_stored(
+        &scratch.reply_with(&scratch.reply_id, &file),
+        &scratch.result("stored", 1),
+    );
+    // Again: already stored, found by its first part.
+    let file = scratch.file("long-again.md", long.as_bytes());
+    assert_stored(
+        &scratch.reply_with(&scratch.reply_id, &file),
+        &scratch.result("already_stored", 1),
+    );
 }

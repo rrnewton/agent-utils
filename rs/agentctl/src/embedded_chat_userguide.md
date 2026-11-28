@@ -1028,9 +1028,12 @@ like any reply it reads. The same rules apply. The ID must be one that the
 request's prompt gives: the request's reply alias, or `<nonce>_<ordinal>` with
 any valid ordinal. Neither the key nor the ID is a secret; both must match so
 that a reply meant for another request is refused. The file is read with a
-30,000-byte bound, the line breaks at its end are dropped, and the text must be
-nonempty, hold no terminal control characters, fit in 30,000 UTF-8 bytes once
-the agent label is added, and have no line that is a reply marker line. A closed
+1 MiB bound, the line breaks at its end are dropped, and the text must be
+nonempty, hold no terminal control characters, and have no line that is a reply
+marker line. A text that does not fit in 28,000 UTF-8 bytes is stored as
+consecutive replies, each opening with `(part k/N)` on a line of its own (#2439):
+cuts fall at line ends, and a cut inside a code fence closes the fence and opens
+it again in the next part. The command reports the first part's ordinal. A closed
 or retired request takes no more replies. A text the request already holds,
 read from the screen or stored by an earlier command, is not stored again, so
 running the command twice sends that text once. Nor is a text that reads the
@@ -1042,7 +1045,7 @@ command answers `already_stored` with the held reply's ordinal. The command prin
 object with `request`, `reply_id`, `outcome` (`stored` or `already_stored`),
 `ordinal`, `phase` and `service_woken`, and exits 0. A refused reply exits 1
 with the reason on standard error and stores nothing; that includes an empty or
-blank text and a file over 30,000 bytes. A state that cannot be read or written
+blank text and a file over 1 MiB. A state that cannot be read or written
 also exits 1, and so does a result that cannot be printed after the reply was
 stored. Exit 75 means nothing was stored and the same command can succeed later.
 A usage error exits 2, and so does a file that cannot be read or is not UTF-8.
@@ -1669,11 +1672,11 @@ side, can cause others:
   which a renderer can draw when a cell would need too many lines or the grid
   would not fit the terminal.
 
-A block that cannot be posted is skipped, and the other blocks are still
-captured. That covers a block that is empty, holds terminal control characters,
-or exceeds 30,000 UTF-8 bytes once the agent label is added, a block beyond the
-request's reply limits, and a block that matches a stored reply only column by
-column. `chat run` logs such a block as
+A block over 28,000 UTF-8 bytes is stored in parts, as `chat reply` stores a
+long text (#2439), never refused. A block that cannot be posted is skipped, and
+the other blocks are still captured. That covers a block that is empty or holds
+terminal control characters, a block beyond the request's reply limits, and a
+block that matches a stored reply only column by column. `chat run` logs such a block as
 `TIME agentctl: chat reply capture: reply block ID (text HASH) was not sent: REASON`,
 where TIME is the UTC time that begins every `chat run` log line and HASH is the
 first 12 hex digits of the SHA-256 of the block's text without whitespace or
