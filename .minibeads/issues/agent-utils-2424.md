@@ -10,7 +10,7 @@ labels:
 - owner-ui
 - scroll
 created_at: 2026-11-27T21:45:00-05:00
-updated_at: 2026-11-27T21:45:00-05:00
+updated_at: 2026-11-28T03:20:00-05:00
 ---
 
 # Description
@@ -35,5 +35,7 @@ Existing work this builds on: `#2346` (landed) holds the row a search's first ke
 
 # Notes
 
+- Measured (fixture server answering the search, server hits placed as cards; per-frame trace of the row being read, the first row standing below the floating search panel): with the reader near the newest rows, main moved it 40 px then 140 px at a desk and 39 then 111 px on a phone over 300 loaded rows, and 29 then 57 px on a phone over 120 rows; mid-list it held. Writers, stack-traced: (1) over 200 rows the typing's fast pass (`#1913`, `#2257`) nudged the row taking the reader's place into the browser's clamp where the shortened list could not scroll that far, the foot settled a frame later, and the settled pass then measured the newest line the clamp left the reader at and followed the foot; (2) the chips' row shrinking (the jump pill going as the search narrows the list) took its room out of the list's foot under a reader near it; (3) the foot room a hold grows is short by part of a pixel (`scrollHeight` is a whole number), 0.66 px on a phone as server hits were placed, at the foot the browser clamps to: left as it is (a +1 px room for it made the mention jump walk's Load older intermittently not draw under load, found by the owner gate), and the walk allows 1.0 px on such whole-pixel frames.
+- Over 200 rows the entry does not land on the newest hits (`#1734`): the fast pass keeps the reader's place (`#2257`), now held through the settled pass. Whether a long list should land as a short one does is a separate question for the liaison.
 - Owner UI, fast-track (owner 7:09 PM ET 2026-11-27). Filed at the coordinator's request (issue file only); the same owner message's first half is `#2423`.
 - Related: `#2346`, `#2354`, `#2422` search hits vanish after a redraw, `#2425` date filter, `#2426` loading program, `#2230` the reading row stays put.

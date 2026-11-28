@@ -1,0 +1,21 @@
+steps:
+  # `#2424 search-view-unstable-while-searching`: typing a search never moves the row being read. Real
+  # Chromium at 1280x800 and 412x915 by touch, keyboard open and closed, Discuss open; 120 and 300
+  # loaded rows (the typing's fast pass over 200), read near the newest rows and mid-list, typed one
+  # key at a time and fast, with the server's answer placed as cards: a per-frame trace of the row
+  # being read moves it at most 0.5 px, and it hands over to the next row only on a key.
+  - group: check
+    job: search-typing-stays-browser
+    desc: typing a search, one key at a time or fast, and its settled pass, marks and server answer never move the row being read more than 0.5 px per frame, in current Chromium at 1280x800 and 412x915 by touch, keyboard open and closed (#2424)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && VIBE_TALK_WEB_ROOT=$PWD/target/web python3 tests/search_typing_stays_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools, build.page]
+    timeout: 900
+    cpu_timeout: 240
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 180
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 1073741824

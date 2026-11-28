@@ -15,8 +15,8 @@ a phone (412x915, keyboard closed and open), in light and dark:
 
 A search typed where hits stood and closed at once, with nothing found (no landing, no scroll, no
 result highlighted), keeps today's behaviour: the row read before the search comes back where it
-stood (`#243`, `#1968`). Over 200 rows the walks run where the reader moved or highlighted a result
-(the typing's own fast pass is `#2424`'s), and with the Discuss half-pane open.
+stood (`#243`, `#1968`). Over 200 rows the walks run where the reader moved or highlighted a result,
+and typed and closed (`#2424`), and with the Discuss half-pane open.
 
 Pass --screenshots DIR for a PNG before and after each clear, --trace DIR for one JSON
 sidecar per walk, --only NAME to run the walks whose names contain NAME, --count N for one
@@ -432,12 +432,11 @@ def launch(playwright: Playwright, args: argparse.Namespace, profile: str, width
 # (scheme, profile, keyboard, walk, channel size): every walk in light on a 120-row channel; on a
 # 260-row channel (the typing's fast pass, `#1913`) the clears where the reader moved or highlighted;
 # dark once per profile. `--all-schemes` runs every walk in dark too. Over 200 rows the typing's fast
-# pass hides rows before the place-keeper measures, so the entry's landing (`#1734`) and the typing's
-# hold are not yet what they are on a short list: the landed and typed-closed walks join the 260-row
-# set with `#2424 search-view-unstable-while-searching`.
+# pass keeps the reader's place (`#2257`; `#2424` holds it to the settled pass): the entry does not
+# land on the newest hits there, so the landed walks are a short list's; typed-closed runs on both.
 PROFILES = {"desk": (1280, 800, False, "escape"), "phone": (412, 915, True, "x")}
 BIG = 260
-BIG_WALKS = ("landed-scrolled", "onscreen-scrolled", "landed-tapped", "landed-scrolled-emptied")
+BIG_WALKS = ("landed-scrolled", "onscreen-scrolled", "landed-tapped", "landed-scrolled-emptied", "typed-closed")
 
 
 DISCUSS_WALKS = ("landed-scrolled", "onscreen-scrolled")

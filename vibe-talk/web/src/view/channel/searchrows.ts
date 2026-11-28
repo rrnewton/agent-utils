@@ -109,6 +109,17 @@ export interface SearchRowsDependencies {
   nudge?(area: HTMLElement, delta: number): void;
   /** `#2257`: the viewport y the floating search panel covers down to (the filter keeper's head). */
   floatingClearance?(area: Element): number;
+  /**
+   * `#2424`: hold `row`'s top through the scroll owner with the room the list lacks where it cannot
+   * scroll that far (`holdRowAt`, as a filter change holds its row). Optional for doubles.
+   */
+  holdRowAt?(area: HTMLElement, row: HTMLElement, delta: number): void;
+  /**
+   * `#2424`: tell the filter's place-keeper the fast pass kept `kept` where `read` (the row being read
+   * as the key came, at `readTop`) stood, so the settled pass keeps it too rather than measuring a
+   * fresh anchor (the newest line, where the list's foot came up to the reader). Optional for doubles.
+   */
+  holdFastPassRow?(kept: HTMLElement, read: HTMLElement, readTop: number): void;
   /** `#2200`: bring a row into view through the scroll owner (`#1251`), so an
    * opened run's first row lands fully below the chip panel. Optional for doubles. */
   intoView?(element: Element, block: string): void;
@@ -518,7 +529,26 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     for (let next = hold.row.nextElementSibling; !kept && next; next = next.nextElementSibling) if (stands(next)) kept = next;
     for (let prev = hold.row.previousElementSibling; !kept && prev; prev = prev.previousElementSibling) if (stands(prev)) kept = prev;
     if (!kept || !deps.nudge) return;
-    deps.nudge(hold.area, kept.getBoundingClientRect().top - hold.top);
+    const delta = kept.getBoundingClientRect().top - hold.top;
+    // `#2424` (owner 2026-11-27, rule 370): where the list the new words left cannot scroll that far
+    // (its foot came up past the place, or it starts below it), the row is held with the room the list
+    // lacks, not nudged into the browser's clamp, which moved it a frame later as the foot settled; and
+    // the settled pass is told the row this pass kept, so it keeps it instead of following the foot the
+    // clamp would have left the reader at.
+    const area = hold.area;
+    const wanted = area.scrollTop + delta;
+    if (deps.holdRowAt && (wanted < -0.5 || wanted > area.scrollHeight - (area.clientHeight || 0) + 0.5)) {
+      deps.holdRowAt(area, kept as HTMLElement, delta);
+    } else {
+      deps.nudge(area, delta);
+    }
+    // The row the settled pass keeps is the one the reader now reads: the first standing below the
+    // floating panel once this pass placed its row (the kept row itself, or the next one where the
+    // kept row is short and stands under the panel, as a hidden row's stand-in can).
+    if (deps.holdFastPassRow) {
+      const reading = fastPassAnchor();
+      deps.holdFastPassRow((reading ? reading.row : kept) as HTMLElement, hold.row as HTMLElement, hold.top);
+    }
   }
 
   /**

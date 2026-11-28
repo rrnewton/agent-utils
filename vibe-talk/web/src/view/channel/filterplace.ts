@@ -168,6 +168,7 @@ export interface FilterPlace {
   settlePendingFilterPlace(): void;
   /** `#2346`: hold `row` where it stands now, as a filter change holds the row it kept. */
   holdFilterRow(row: HTMLElement): void;
+  holdFastPassRow(kept: HTMLElement, read: HTMLElement, readTop: number): void;
 }
 
 /** Make the filter-kept place from the page's columns, panes and list. */
@@ -387,6 +388,25 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     filterState().hold = {
       key: filterKey(), row, ids: idsOf(row), at: area.scrollTop, origin: { ...anchorAt(row), landed: true },
       offset: row.getBoundingClientRect().top - deps.listPlaceTop(area), mark: mark ? mark.id : null,
+    };
+  }
+
+  /**
+   * `#2424` (owner 370): the search's fast pass (`#1913`, `#2257`) kept `kept` where `read` stood at
+   * `readTop` as the key came. Hold it as a filter change holds its row, so the settled pass after the
+   * typing keeps it; the hold's origin stays the place read before the search (the earlier hold's
+   * while the reader has not moved, else `read` where it stood), as typing a search and closing it
+   * gives back.
+   */
+  function holdFastPassRow(kept: HTMLElement, read: HTMLElement, readTop: number): void {
+    const area = deps.el("scroll-area");
+    const prior = currentFilterHold();
+    const pane = deps.view() === "discord" ? (deps.columnSide() ? deps.sidePane() : deps.channelPane()) : null;
+    const mark = pane ? deps.markOf(pane) : null;
+    const origin = prior ? prior.hold.origin : { ...anchorAt(read), offset: readTop - deps.listPlaceTop(area) };
+    filterState().hold = {
+      key: filterKey(), row: kept, ids: idsOf(kept), at: area.scrollTop, origin,
+      offset: kept.getBoundingClientRect().top - deps.listPlaceTop(area), mark: mark ? mark.id : null,
     };
   }
 
@@ -784,6 +804,6 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     filterChanges, filterKey,
     filterState, endFilterWalk, anchorAt, anchorHolder, anchorRow, nearestShownRow,
     currentFilterHold, heldFilterRow, readerActed, followsNewest, keepFilterHold, filterAnchor,
-    keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace, holdFilterRow,
+    keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace, holdFilterRow, holdFastPassRow,
   };
 }

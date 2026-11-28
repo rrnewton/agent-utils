@@ -595,6 +595,7 @@ if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(([entry]) => {
     const height = entry.contentRect.height;
     const grew = Math.max(0, height - scrollToolsHeight);
+    const previousHeight = scrollToolsHeight;
     scrollToolsHeight = height;
     const area = el("scroll-area");
     // `#221 read-modes`. A reader just landed on a thread's first unread is reading that, however near
@@ -603,10 +604,21 @@ if (typeof window.ResizeObserver === "function") {
     // `#243 filter-keeps-selection`: nor one whose message a filter change holds in place. `#241 voice-composer`:
     // the call's transcript follows too, not only the channel.
     const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area, grew);
+    // `#2424` (owner 2026-11-27, rule 370): the chips' row shrinking (the jump's pill going as a search
+    // narrows the list, a chip leaving) takes its room out of the channel list's foot. A reader near
+    // the foot was then dropped by the browser's clamp, every row moving down by the room in one frame,
+    // and the search's next key followed the foot from there. The row the reader's eye is on is taken
+    // before the room changes and held at its top after, with room at the foot where the clamp would
+    // move it, as `#2367` holds it for the read strip; the reader's next scroll gives the room back.
+    const shrank = !landed && !pinned && height < previousHeight && screens.screen() === "main" &&
+      screens.view() === "discord";
+    const readRow = shrank ? scrollKeeping.scrollAnchor(area) : null;
+    const readTop = readRow ? readRow.getBoundingClientRect().top : 0;
     const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
     // `#280`: the lists and their boxes, inside #screen-main, are written only while it shows
     // (`held`); the status pill, over every screen, always (`live`). `#2277`: on the readers only.
     geometry.write("--scroll-tools-clearance", room);
+    if (readRow && readRow.parentNode) scrollKeeping.holdRowAt(area, readRow, readRow.getBoundingClientRect().top - readTop);
     // `#433 read-strip-low`. The row's height itself, without the half-rem the room keeps over
     // it: the read-aloud strip stands on the row's top edge, with no gap, so it hugs the row as
     // it wraps, empties or is hidden away.
@@ -2287,7 +2299,7 @@ const filterPlaceOwner = createFilterPlace({
   // `#2423`: whether the right column is up beside the channel list (two columns at a desk).
   twoColumnsUp: () => sideColumnUp(),
 });
-const { filterChanges, filterKey, filterState, endFilterWalk, anchorAt, anchorHolder, anchorRow, nearestShownRow, currentFilterHold, heldFilterRow, readerActed, followsNewest, keepFilterHold, filterAnchor, keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace, holdFilterRow } = filterPlaceOwner;
+const { filterChanges, filterKey, filterState, endFilterWalk, anchorAt, anchorHolder, anchorRow, nearestShownRow, currentFilterHold, heldFilterRow, readerActed, followsNewest, keepFilterHold, filterAnchor, keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace, holdFilterRow, holdFastPassRow } = filterPlaceOwner;
 
 /** Channel views, threads and the channel composer are web/src/view/channel's now
  * (`createChannelViews`, `#624 voice-page-modularity`). */
@@ -3335,6 +3347,10 @@ const searchRows = createSearchRows({
   retireStaleBuckets: (loadedHits) => retireStaleBuckets(loadedHits),
   afterSearchPass: () => litCardsOwner.syncLitFlags(),
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
+  // `#2424`: the fast pass holds its row with room where the list cannot scroll that far, and the
+  // settled pass keeps that row.
+  holdRowAt: (area, row, delta) => scrollKeeping.holdRowAt(area, row, delta),
+  holdFastPassRow: (kept, read, readTop) => holdFastPassRow(kept, read, readTop),
   floatingClearance: (area) => floatingClearance(area),
   bucketOn: (id) => bucketOnFor(id),
   foldCounts: () => foldCounts(),
