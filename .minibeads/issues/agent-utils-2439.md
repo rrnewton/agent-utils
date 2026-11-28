@@ -36,3 +36,25 @@ Step (c) of #2420 relay-never-lossy. The owner decided on 2026-11-27: no lossy t
 # Notes
 
 - Split from #2420 (audit rows C5, S4, S8) on 2026-11-27, numbered by coordb. Relay size handling (R3, R12) stays under #2420. Request-store and gap handling are #2440.
+- 2026-11-28 (cl-bridgeretire), land note:
+  - C5: a captured reply or `chat reply` text over 28,000 bytes is stored as
+    consecutive replies, each opening with `(part k/N)`, never refused.
+    - Cuts fall at line ends. A code fence cut is closed and reopened, so every part
+      renders alone.
+    - The split is deterministic, so a recapture finds the stored parts by part 1
+      and stores nothing twice.
+    - `chat reply` reads up to 1 MiB.
+  - S4: chat_subscription::MAX_MESSAGE_TEXT_BYTES goes from 32,000 to 160 KiB, which
+    holds every Slack message whole.
+    - The Slack plugin cuts only past that, or where the JSON-escaped text would not
+      fit a delivery batch (384 KiB escaped).
+    - The stream-line bound goes from 256 KiB to 1 MiB.
+    - The plugin-protocol frame test is sized by the batch bound: a maximum-length
+      text of control characters does not fit a batch, which is why the plugin
+      bounds escaping.
+    - Wire: plugin and bridge come from one snapshot.
+  - S8: a chunk Slack refuses as msg_too_long (or invalid_blocks on a text-only post)
+    is posted as halved pieces, in order, down to 2 KB, never given up.
+    - Persisted: an optional `split` {bytes, pieces} on an outbound-ledger chunk,
+      ignored by older readers.
+  - Unchanged: the request and state reply population limits.
